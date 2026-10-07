@@ -3,7 +3,8 @@
 The attestor sidecar for the **wYEC bridge** between Ycash and Ethereum. Each bridge attestor runs
 Hawkeye next to its own `ycashd` (the vault upgrade, `UPGRADE_VAULT` / branch ID `0x6d5b7a31`) and
 an Ethereum endpoint. The name is the job: an attestor watches Ethereum like a hawk for wYEC
-burns, and watches Ycash just as closely for any release that no burn paid for. Hawkeye:
+burns, and watches Ycash just as closely for cross-chain mints (implied by a user locking YEC
+collateral in a vault). Hawkeye:
 
 - turns confirmed `WYEC` locks on Ycash into wYEC mints on Ethereum (EIP-712 attestations),
 - turns finalized `BurnToYcash` events on Ethereum into delayed-release intents on Ycash,
