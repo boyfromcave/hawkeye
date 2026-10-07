@@ -50,6 +50,10 @@ pub enum Error {
     /// A lock destination `OP_RETURN` that does not decode (plan §4.1 rule 3).
     #[error("bad destination: {0}")]
     Destination(&'static str),
+    /// A transaction that does not parse as Overwinter v3 / Sapling v4, or an input index it
+    /// does not have.
+    #[error("bad transaction: {0}")]
+    Tx(&'static str),
 }
 
 /// `Result` with [`enum@Error`].

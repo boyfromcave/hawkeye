@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+blake2b_simd = "=1.0.5"
 bs58 = { version = "=0.5.1", default-features = false, features = ["alloc"] }
 hex = "=0.4.3"
 k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "std"] }
