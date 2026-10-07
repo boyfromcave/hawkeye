@@ -377,7 +377,7 @@ takeover overlap are a benign race: the later one is cancelled, nobody is slashe
 3. Each fault opens a `SlashCase` with a self-contained evidence bundle (transactions, signatures,
    the recovered key, the reason). The case is gossiped to other Hawkeyes over the authenticated peer
    channel (H5, §6) or exchanged out of band; each Hawkeye **verifies independently**, then
-   contributes its act signature: `set_buildact remove {burn:1}` by the case owner →
+   contributes its act signature: `set_buildact remove {"burn": true}` (a JSON bool; the decoded act prints it as 1) by the case owner →
    `set_signact` on each verifying peer's node → `set_sendact` once `slashThreshold` is reached.
    `auto_slash = true|false` per operator (default false on mainnet: an operator confirms).
 4. Equivocation proofs (`set_equivocation`) need no vote and are submitted automatically.
