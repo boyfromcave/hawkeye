@@ -11,7 +11,28 @@ updates:
     directory: /
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
+    ignore:
+      # The byte-exact stack (txids, lockId, recipient hashes, set-signature messages, keccak
+      # addresses, hash160, ZIP-243). The RustCrypto digest 0.11 generation cannot move alone
+      # (k256 0.13 and alloy are on digest 0.10): it moves together with k256 and alloy in one
+      # deliberate change, re-run against the golden vectors and the real-node devnet demo.
+      # Patch releases still come through.
+      - dependency-name: sha2
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: sha3
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: ripemd
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: k256
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: blake2b_simd
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
   - package-ecosystem: npm
     directory: /eth
     schedule: { interval: weekly }
     open-pull-requests-limit: 3
+    ignore:
+      # Pinned to the versions the wyec contracts of record are compiled with (wyec design §8),
+      # so the ABIs and bytecode Hawkeye binds match the deployed contract.
+      - dependency-name: "@openzeppelin/contracts"
+      - dependency-name: solc
