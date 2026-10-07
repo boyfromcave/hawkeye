@@ -507,8 +507,12 @@ installer and the native `solc` download are blocked, Foundry's npm packages
 H1, H2 and H3 run in parallel; H4 needs H1; H5 needs H2–H4; H6 needs a built `ycashd`.
 
 **The success criterion of this round (owner, 2026-10-07):** Hawkeye demonstrably runs as a sidecar
-next to a real `ycashd`. `devnet/` therefore owns a self-contained devnet: N regtest `ycashd` nodes
-built from `ycash-dd` `upgrade/vault` (later also `ycash6`), activated with
+next to a real node — one step beyond the mock — on **both** `upgrade/vault` node lines: `ycash-dd`
+(v4.5.0) and `ycash6` (6.2x). "Real" means the node binary built from that branch, unmodified
+`src/`, on regtest and on the devnet; the in-process mock (`hawkeye-ycash::mock`) and the golden
+vectors are unit-test aids only and never count toward this criterion. `scenario demo` must pass,
+with a committed transcript, once per line. `devnet/` therefore owns a self-contained devnet: N regtest nodes built from `ycash-dd`
+`upgrade/vault` or `ycash6` `upgrade/vault` (selected by `YCASHD`/`YCASH_CLI`), activated with
 `-nuparams=6d5b7a31:<h>`, one anvil chain with wyec deployed by `eth/script/Deploy.s.sol`, and one
 Hawkeye per attestor node, each talking only to its own node's RPC. `devnet/hawkeye-devnet up |
 lock | burn | rogue | silence | status | down` mirrors `bridge-sim`'s commands so the two can be
