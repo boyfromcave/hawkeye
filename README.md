@@ -6,7 +6,10 @@ an Ethereum endpoint. The name is the job: an attestor watches Ethereum like a h
 burns, and watches Ycash just as closely for cross-chain mints (implied by a user locking YEC
 collateral in a vault). Hawkeye:
 
-- turns confirmed `WYEC` locks on Ycash into wYEC mints on Ethereum (EIP-712 attestations),
+- turns confirmed YEC locks on Ycash — vaults carrying the bridge's application tag `WYEC` — into
+  wYEC mints on Ethereum (EIP-712 attestations). The tag is opaque to consensus (no registered
+  module: the generic vault primitive alone governs the YEC); Hawkeye uses it to tell bridge locks
+  from every other vault,
 - turns finalized `BurnToYcash` events on Ethereum into delayed-release intents on Ycash,
 - watches every other attestor: it cancels what it cannot match during the challenge window, and
   co-signs slashing of the attestor who signed it,
