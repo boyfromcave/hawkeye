@@ -1,5 +1,6 @@
 [package]
 name = "hawkeye-store"
+description = "Hawkeye's SQLite ledger: the §5.1 state machines, sign-once records, slash cases, chain cursors and reorg rewinds, the audit event log"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,6 +8,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+hawkeye-core = { path = "../hawkeye-core" }
+hex = "=0.4.3"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "fallible_uint"] }
+thiserror = "=2.0.17"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
 
 [lints]
 workspace = true

@@ -1,0 +1,188 @@
+//! The ledger schema as an ordered list of migrations.
+//!
+//! `PRAGMA user_version` is the number of migrations applied. [`MIGRATIONS`] is append-only:
+//! a released migration is never edited; a change is a new entry.
+
+/// Every migration, in order. Entry `i` takes `user_version` from `i` to `i + 1`.
+pub const MIGRATIONS: &[&str] = &[V1];
+
+/// Version 1: the H4 ledger.
+const V1: &str = r#"
+-- Chain cursors (§5.4) and the recent block hashes a Ycash rewind needs.
+CREATE TABLE chain_cursor (
+    chain       TEXT    PRIMARY KEY CHECK (chain IN ('ycash', 'ethereum')),
+    height      INTEGER NOT NULL CHECK (height >= 0),
+    hash        BLOB    CHECK (hash IS NULL OR length(hash) = 32),
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE chain_blocks (
+    chain       TEXT    NOT NULL CHECK (chain IN ('ycash', 'ethereum')),
+    height      INTEGER NOT NULL CHECK (height >= 0),
+    hash        BLOB    NOT NULL CHECK (length(hash) = 32),
+    PRIMARY KEY (chain, height)
+) WITHOUT ROWID;
+
+-- WYEC locks seen on Ycash (§1.2, §4.1). lock_id = SHA256(txid_internal || vout LE).
+CREATE TABLE locks (
+    lock_id          BLOB    PRIMARY KEY CHECK (length(lock_id) = 32),
+    txid             BLOB    NOT NULL CHECK (length(txid) = 32),
+    vout             INTEGER NOT NULL CHECK (vout >= 0),
+    value_zat        INTEGER NOT NULL CHECK (value_zat >= 0),
+    owner_height     INTEGER NOT NULL CHECK (owner_height >= 0),
+    destination      BLOB    CHECK (destination IS NULL OR length(destination) = 20),
+    block_hash       BLOB    NOT NULL CHECK (length(block_hash) = 32),
+    block_height     INTEGER NOT NULL CHECK (block_height >= 0),
+    state            TEXT    NOT NULL,
+    rejection_reason TEXT,
+    exposure         INTEGER NOT NULL DEFAULT 0 CHECK (exposure IN (0, 1)),
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE (txid, vout)
+);
+CREATE INDEX locks_state  ON locks (state);
+CREATE INDEX locks_height ON locks (block_height);
+
+-- BurnToYcash events (§1.3). The natural key is (chain_id, bridge, nonce).
+CREATE TABLE burns (
+    id              INTEGER PRIMARY KEY,
+    chain_id        INTEGER NOT NULL CHECK (chain_id >= 0),
+    bridge          BLOB    NOT NULL CHECK (length(bridge) = 20),
+    nonce           INTEGER NOT NULL CHECK (nonce >= 0),
+    tx_hash         BLOB    NOT NULL CHECK (length(tx_hash) = 32),
+    block_number    INTEGER NOT NULL CHECK (block_number >= 0),
+    block_hash      BLOB    NOT NULL CHECK (length(block_hash) = 32),
+    sender          BLOB    NOT NULL CHECK (length(sender) = 20),
+    amount          INTEGER NOT NULL CHECK (amount >= 0),
+    recipient       BLOB    NOT NULL CHECK (length(recipient) = 32),
+    state           TEXT    NOT NULL,
+    leader          BLOB    CHECK (leader IS NULL OR length(leader) = 33),
+    assigned_height INTEGER,
+    waiting_epoch   INTEGER,
+    intent_txid     BLOB,
+    intent_vout     INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE (chain_id, bridge, nonce),
+    CHECK ((intent_txid IS NULL) = (intent_vout IS NULL)),
+    FOREIGN KEY (intent_txid, intent_vout) REFERENCES intents (txid, vout)
+);
+CREATE INDEX burns_state ON burns (state, nonce);
+CREATE INDEX burns_block ON burns (block_number);
+
+-- Intents seen on Ycash, mempool or block (§5.3), keyed by the intent output.
+CREATE TABLE intents (
+    txid              BLOB    NOT NULL CHECK (length(txid) = 32),
+    vout              INTEGER NOT NULL CHECK (vout >= 0),
+    value_zat         INTEGER NOT NULL CHECK (value_zat >= 0),
+    recipient_hash    BLOB    NOT NULL CHECK (length(recipient_hash) = 32),
+    vault_hash        BLOB    NOT NULL CHECK (length(vault_hash) = 32),
+    origin_txid       BLOB    CHECK (origin_txid IS NULL OR length(origin_txid) = 32),
+    origin_vout       INTEGER,
+    signer_key        BLOB    CHECK (signer_key IS NULL OR length(signer_key) = 33),
+    memo              BLOB,
+    classification    TEXT,
+    matched_burn      INTEGER REFERENCES burns (id),
+    first_seen_height INTEGER NOT NULL CHECK (first_seen_height >= 0),
+    confirmed_height  INTEGER,
+    state             TEXT    NOT NULL,
+    cancel_txid       BLOB    CHECK (cancel_txid IS NULL OR length(cancel_txid) = 32),
+    cancel_height     INTEGER,
+    cancel_by_us      INTEGER NOT NULL DEFAULT 0 CHECK (cancel_by_us IN (0, 1)),
+    released_txid     BLOB    CHECK (released_txid IS NULL OR length(released_txid) = 32),
+    released_height   INTEGER,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (txid, vout),
+    CHECK ((origin_txid IS NULL) = (origin_vout IS NULL))
+);
+CREATE INDEX intents_state ON intents (state);
+CREATE INDEX intents_burn  ON intents (matched_burn);
+
+-- WYEC vault outputs of the set (§3.1 rolls and drain order).
+CREATE TABLE vaults (
+    txid            BLOB    NOT NULL CHECK (length(txid) = 32),
+    vout            INTEGER NOT NULL CHECK (vout >= 0),
+    value_zat       INTEGER NOT NULL CHECK (value_zat >= 0),
+    owner_height    INTEGER NOT NULL CHECK (owner_height >= 0),
+    created_height  INTEGER NOT NULL CHECK (created_height >= 0),
+    state           TEXT    NOT NULL,
+    spent_txid      BLOB    CHECK (spent_txid IS NULL OR length(spent_txid) = 32),
+    spent_height    INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (txid, vout)
+);
+CREATE INDEX vaults_state ON vaults (state, owner_height);
+
+-- Sign-once, EIP-712 Mint (HK-7): one (amount, to, digest) per lockId, ever.
+CREATE TABLE sign_once_mint (
+    lock_id    BLOB    PRIMARY KEY CHECK (length(lock_id) = 32)
+                       REFERENCES locks (lock_id) ON DELETE RESTRICT,
+    amount     INTEGER NOT NULL CHECK (amount >= 0),
+    recipient  BLOB    NOT NULL CHECK (length(recipient) = 20),
+    digest     BLOB    NOT NULL CHECK (length(digest) = 32),
+    signature  BLOB    NOT NULL CHECK (length(signature) = 65),
+    signed_at  INTEGER NOT NULL
+);
+
+-- Sign-once, Ycash set and act signatures requested through the node (mirrors the node's
+-- guard, upgrade finding (70)): one signed transaction per (domain, set, prevout).
+CREATE TABLE sign_once_ycash (
+    domain        TEXT    NOT NULL CHECK (domain IN ('ycash-unlock', 'ycash-cancel', 'ycash-act')),
+    set_id        BLOB    NOT NULL CHECK (length(set_id) = 32),
+    prevout_txid  BLOB    NOT NULL CHECK (length(prevout_txid) = 32),
+    prevout_vout  INTEGER NOT NULL CHECK (prevout_vout >= 0),
+    sighash       BLOB    NOT NULL CHECK (length(sighash) = 32),
+    built_hex     TEXT    NOT NULL,
+    signed_hex    TEXT    NOT NULL,
+    signed_at     INTEGER NOT NULL,
+    PRIMARY KEY (domain, set_id, prevout_txid, prevout_vout)
+) WITHOUT ROWID;
+
+-- Slash cases (§2.3, §5.3). (fault, subject, target_key) is unique: one case per fault.
+CREATE TABLE slash_cases (
+    id              INTEGER PRIMARY KEY,
+    target_key      BLOB    NOT NULL CHECK (length(target_key) = 33),
+    fault           TEXT    NOT NULL,
+    subject         BLOB    NOT NULL,
+    evidence        TEXT    NOT NULL CHECK (json_valid(evidence)),
+    opened_height   INTEGER,
+    state           TEXT    NOT NULL,
+    my_vote         TEXT,
+    act_hex         TEXT,
+    txid            BLOB    CHECK (txid IS NULL OR length(txid) = 32),
+    slashed_height  INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE (fault, subject, target_key)
+);
+CREATE INDEX slash_cases_state ON slash_cases (state);
+
+-- The audit log: every state transition, append-only.
+CREATE TABLE events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT    NOT NULL,
+    object_id   TEXT    NOT NULL,
+    from_state  TEXT,
+    to_state    TEXT    NOT NULL,
+    height      INTEGER,
+    detail      TEXT,
+    at          INTEGER NOT NULL
+);
+CREATE INDEX events_object ON events (kind, object_id, id);
+
+CREATE TRIGGER events_append_only_update BEFORE UPDATE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+CREATE TRIGGER events_append_only_delete BEFORE DELETE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+
+CREATE TRIGGER sign_once_mint_immutable_update BEFORE UPDATE ON sign_once_mint
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_mint_immutable_delete BEFORE DELETE ON sign_once_mint
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_ycash_immutable_update BEFORE UPDATE ON sign_once_ycash
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_ycash_immutable_delete BEFORE DELETE ON sign_once_ycash
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+"#;
