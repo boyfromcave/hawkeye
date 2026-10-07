@@ -87,6 +87,7 @@ cargo build --locked -p hawkeye          # target/debug/hawkeye; or HAWKEYE=/pat
 
 ```sh
 export YCASHD=... YCASH_CLI=...          # the node binaries; default: ycashd / ycash-cli on PATH
+# DEVNET_NODE_LINE=ycash-dd|ycash6       # optional: the node line; default: read from `ycashd -version`
 devnet/hawkeye-devnet up [--attestors 3] [--dir devnet/run] [--activation 110] [--interval 2]
 devnet/hawkeye-devnet status [--json]
 devnet/hawkeye-devnet lock 10 [--dest 0x<holder>] [--owner-age N]  # node0 → WYEC vault + dest OP_RETURN
@@ -105,6 +106,17 @@ devnet/hawkeye-devnet scenario roll [--fresh] [--keep]  # drill D-13: a vault ro
 ```
 
 `--dir` (or `$HAWKEYE_DEVNET_DIR`) works before or after the command. `devnet/run` is gitignored.
+
+### Both node lines
+
+The same script drives `ycash-dd` (v4.5.0) and `ycash6` (6.2x) `upgrade/vault` nodes. It reads the
+line from `ycashd -version` (major version 6 or above is `ycash6`), or from `DEVNET_NODE_LINE`,
+records it in `devnet.json`, and passes that line's extra start-up arguments the way its qa harness
+does: none on `ycash-dd`, and `-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025` on
+`ycash6`. `ycash6` needs no zk parameters. On `ycash6`, `set_heartbeat` is refused with -4 ("this
+wallet holds no current member key of the set") while the member's `SET_JOIN` is still in the mempool,
+so `heartbeat` first waits for every join to confirm, on both lines. Hawkeye itself heartbeats only
+as a current member, so it is not affected.
 
 ### What `up` does
 
@@ -207,8 +219,9 @@ Each step is asserted, with a timeout:
 10. **Invariant:** `wYEC.totalSupply()` equals 6 YEC and is at most the WYEC value under the set.
 11. `down`, unless `--keep`.
 
-A passing run writes its transcript to `devnet/transcripts/demo-<date>.txt`, which is committed
-as evidence. A failing run writes `<run>/transcripts/demo-<date>-FAILED.txt`. The demo needs a
+A passing run writes its transcript to `devnet/transcripts/demo-<date>-<line>-<version>.txt` (for
+example `demo-2026-10-07-ycash6-v6.22.0-rc1.txt`), which is committed as evidence, one per node
+line. A failing run writes `<run>/transcripts/demo-<date>-<line>-<version>-FAILED.txt`. The demo needs a
 fresh directory: with `--fresh`, it cleans a *stopped* devnet first, and it never touches a
 running one.
 
@@ -240,7 +253,7 @@ the drill uses `min_owner_age = 20` and `roll_margin = 40` (the other values as 
    pay back into the old `ownerHeight`, and fails the drill), and the new vault is in `vault_list`.
 6. No member lost its seat; `wYEC.totalSupply()` (12) ≤ the WYEC value under the set.
 
-A passing run writes `devnet/transcripts/roll-<date>.txt`.
+A passing run writes `devnet/transcripts/roll-<date>-<line>-<version>.txt`.
 
 ## Troubleshooting
 

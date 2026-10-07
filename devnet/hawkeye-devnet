@@ -20,6 +20,8 @@ on PATH.
 Environment:
   YCASHD, YCASH_CLI   the node binaries, built from ycash-dd `upgrade/vault` (devnet/README.md);
                       default: `ycashd` / `ycash-cli` on PATH
+  DEVNET_NODE_LINE    ycash-dd | ycash6: the node line (its start-up args, the transcript name);
+                      default: read from `ycashd -version` (major version >= 6 is ycash6)
   HAWKEYE             the daemon binary (default: <repo>/target/debug/hawkeye)
   HAWKEYE_DEVNET_FALLBACK=1
                       use this script's own lock/burn/rogue/enroll/key-derivation even when the
@@ -60,6 +62,12 @@ VAULT_BRANCH = "6d5b7a31"
 # plain regtest's getblocktemplate aborts at height >= 150 without them (devnet/README.md).
 UPGRADE_ARGS = ["-nuparams=5ba81b19:1", "-nuparams=76b809bb:1", "-nuparams=374d694f:1",
                 "-nuparams=8e471bd6:1", "-nuparams=66314da3:1", "-nuparams=19bd2d2f:1"]
+# Per node line, the extra start-up arguments its qa harness passes (util.start_node). ycash-dd is the v4.5.0
+# line; ycash6 is the 6.2x line (Zcash 6.x lineage), whose start_node always passes the zebrad/zallet
+# acknowledgement flag (a regtest start without it gets through init, but the devnet runs as the harness does).
+NODE_LINES = ("ycash-dd", "ycash6")
+LINE_ARGS = {"ycash-dd": [],
+             "ycash6": ["-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025"]}
 RPC_USER, RPC_PASSWORD = "u", "p"
 ANVIL_DEPLOYER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"  # anvil account 0 (public dev key)
 ETH_FUNDING = hex(1000 * 10**18)
@@ -413,6 +421,30 @@ def jdump(x):
     return json.dumps(x, default=str, sort_keys=True)
 
 
+def node_line(ycashd):
+    """(line, version, banner) of a ycashd binary. The line is $DEVNET_NODE_LINE when set (ycash-dd | ycash6),
+    else read from `ycashd -version`: "Ycash Daemon version v4.5.0-..." is ycash-dd, a major version of 6 or
+    more ("v6.22.0-rc1-...") is ycash6. The version is the release part of the tag (v4.5.0, v6.22.0-rc1)."""
+    banner = ""
+    if ycashd and os.access(ycashd, os.X_OK):
+        try:
+            p = subprocess.run([ycashd, "-version"], capture_output=True, text=True, timeout=60)
+            banner = (p.stdout.splitlines() or [""])[0].strip()
+        except (OSError, subprocess.TimeoutExpired):
+            banner = ""
+    m = re.search(r"\bv(\d+)\.(\d+)\.(\d+)(-(?:rc|beta|alpha)\d+)?", banner)
+    version = m.group(0) if m else None
+    line = os.environ.get("DEVNET_NODE_LINE")
+    if line:
+        if line not in NODE_LINES:
+            die("DEVNET_NODE_LINE must be one of %s, not %r" % (", ".join(NODE_LINES), line))
+    elif m:
+        line = "ycash6" if int(m.group(1)) >= 6 else "ycash-dd"
+    else:
+        die("cannot tell the node line from `%s -version` (%r): set DEVNET_NODE_LINE=ycash-dd|ycash6" % (ycashd, banner))
+    return line, version or "unknown", banner
+
+
 # ====================================================================== the devnet
 
 class Devnet:
@@ -597,8 +629,10 @@ class Devnet:
         if busy:
             die("ports in use: %s (choose --base-port / --anvil-port)" % busy)
 
+        line, version, banner = node_line(ycashd)
         os.makedirs(self.dir, exist_ok=True)
         self.s = {"version": 1, "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "activation": activation,
+                  "node_line": line, "node_version": version, "node_banner": banner,
                   "attestor_count": attestors, "base_port": base_port, "interval": interval,
                   "nodes": [], "attestors": [], "binaries": {"ycashd": ycashd, "ycash_cli": cli, "hawkeye": hawkeye},
                   "bridge": dict(BRIDGE, **(bridge or {}))}
@@ -622,6 +656,9 @@ class Devnet:
         n = attestors + 1
         self.say("hawkeye-devnet up: %d regtest ycashd nodes (node0 user/miner, node1..%d attestors), vault upgrade "
                  "%s at height %d, dir %s" % (n, attestors, VAULT_BRANCH, activation, self.dir))
+        self.say("  node line %s %s (%s); extra start-up args: %s"
+                 % (self.s["node_line"], self.s["node_version"], self.s["node_banner"],
+                    " ".join(LINE_ARGS[self.s["node_line"]]) or "none"))
         # ---- 1. nodes
         for nd in self.s["nodes"]:
             self.write_node_conf(nd)
@@ -759,7 +796,9 @@ class Devnet:
 
     def start_node(self, nd):
         ycashd = self.s["binaries"]["ycashd"]
-        argv = [ycashd, "-datadir=%s" % nd["datadir"]] + UPGRADE_ARGS + ["-nuparams=%s:%d" % (VAULT_BRANCH, self.s["activation"])]
+        line = self.s.get("node_line") or node_line(ycashd)[0]     # a devnet.json from before the field: detect
+        argv = [ycashd, "-datadir=%s" % nd["datadir"]] + LINE_ARGS[line] + UPGRADE_ARGS \
+            + ["-nuparams=%s:%d" % (VAULT_BRANCH, self.s["activation"])]
         nd["pid"] = spawn(argv, os.path.join(nd["datadir"], "stdout.log"))
         nd["argv"] = argv
 
@@ -1156,8 +1195,38 @@ format = "text"
                  "no burn" % (intent, amount, vault["outpoint"], thief, attestor))
         return {"intent": intent, "txid": txid, "vault": vault["outpoint"], "recipient": thief, "via": "fallback"}
 
+    def join_confirmed(self, a):
+        txid = a.get("join_txid")
+        if not txid:
+            return True
+        try:
+            return self.node(a["node"]).getrawtransaction(txid, 1).get("confirmations", 0) >= 1
+        except RPCError:
+            return False
+
+    def wait_joins_confirmed(self, timeout=120):
+        """SET_HEARTBEAT needs the member's SET_JOIN in a block on ycash6 (6.2x): with the join still in the
+        mempool its wallet answers -4 "this wallet holds no current member key of the set" (ycash-dd accepts
+        it). So a heartbeat waits for the joins, on both lines: the background miner confirms them, or, with it
+        paused or off, this mines one block itself."""
+        pending = [a for a in self.s["attestors"] if not self.join_confirmed(a)]
+        if not pending:
+            return
+        miner = self.s.get("miner") or {}
+        mining = proc_alive(miner.get("pid"), "hawkeye-devnet") and not os.path.exists(miner.get("pause_file", ""))
+        self.say("waiting for the SET_JOIN of attestor%s to confirm before heartbeats (%s)"
+                 % (",".join(str(a["index"]) for a in pending), "background miner" if mining else "mining 1 block"))
+        if not mining:
+            self.mine(1)
+        deadline = time.time() + timeout
+        while any(not self.join_confirmed(a) for a in pending):
+            if time.time() > deadline:
+                die("SET_JOIN not confirmed within %ds" % timeout)
+            time.sleep(0.5)
+
     def heartbeat(self):
         self.load()
+        self.wait_joins_confirmed()
         for a in self.s["attestors"]:
             try:
                 r = self.node(a["node"]).set_heartbeat(self.s["set"]["setid"], a["memberkey"])
@@ -1379,12 +1448,26 @@ format = "text"
                         owners.add(a["index"])
         return sorted(owners)
 
+    def transcript_name(self, kind, started):
+        """<kind>-<date>-<node line>-<version>.txt, e.g. demo-2026-10-07-ycash6-v6.22.0-rc1.txt: one committed
+        transcript per scenario per node line (plan §9)."""
+        s = self.s or {}
+        if s.get("node_line"):
+            line, version = s["node_line"], s.get("node_version") or "unknown"
+        else:
+            try:
+                line, version = node_line(self.binaries()[0])[:2]
+            except DevnetError:
+                line, version = "unknown", "unknown"
+        return "%s-%s-%s-%s.txt" % (kind, started.strftime("%Y-%m-%d"), line, version)
+
     def scenario_demo(self, attestors, activation, base_port, anvil_port, interval, block_time, keep, timeout):
         started = datetime.datetime.now(datetime.timezone.utc)
         self.say("=== hawkeye-devnet scenario demo (plan §8 D-1 + D-2), %s" % started.strftime("%Y-%m-%d %H:%M:%S UTC"))
         ycashd = self.binaries()[0]
         if ycashd:
-            self.say("ycashd: %s" % run_cmd([ycashd, "-version"], check=False).stdout.splitlines()[0])
+            line, version, banner = node_line(ycashd)
+            self.say("ycashd: %s (node line %s %s): %s" % (ycashd, line, version, banner))
         hk = self.binaries()[2]
         self.say("hawkeye: %s (%s)" % (hk, run_cmd([hk, "--version"], check=False).stdout.strip() if os.access(hk, os.X_OK) else "missing"))
         ok = False
@@ -1508,7 +1591,7 @@ format = "text"
                     self.down()
                 except Exception as error:
                     self.say("down: %s" % error)
-            name = "demo-%s.txt" % started.strftime("%Y-%m-%d")
+            name = self.transcript_name("demo", started)
             target = TRANSCRIPTS if ok else self.path("transcripts")
             os.makedirs(target, exist_ok=True)
             out = os.path.join(target, name if ok else name.replace(".txt", "-FAILED.txt"))
@@ -1527,7 +1610,8 @@ format = "text"
         self.say("=== hawkeye-devnet scenario roll (plan §8 D-13, HK-6), %s" % started.strftime("%Y-%m-%d %H:%M:%S UTC"))
         ycashd = self.binaries()[0]
         if ycashd:
-            self.say("ycashd: %s" % run_cmd([ycashd, "-version"], check=False).stdout.splitlines()[0])
+            line, version, banner = node_line(ycashd)
+            self.say("ycashd: %s (node line %s %s): %s" % (ycashd, line, version, banner))
         ok = False
         overrides = {"min_owner_age": 20, "roll_margin": 40}
         try:
@@ -1637,7 +1721,7 @@ format = "text"
                     self.down()
                 except Exception as error:
                     self.say("down: %s" % error)
-            name = "roll-%s.txt" % started.strftime("%Y-%m-%d")
+            name = self.transcript_name("roll", started)
             target = TRANSCRIPTS if ok else self.path("transcripts")
             os.makedirs(target, exist_ok=True)
             out = os.path.join(target, name if ok else name.replace(".txt", "-FAILED.txt"))
