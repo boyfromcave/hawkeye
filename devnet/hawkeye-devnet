@@ -1,0 +1,1627 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Ycash developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://www.opensource.org/licenses/mit-license.php .
+
+"""hawkeye-devnet: real regtest ycashd nodes + anvil with wYEC + one Hawkeye per attestor (plan H6).
+
+The success criterion of plan §9: Hawkeye runs as a sidecar next to a real `ycashd`. This script
+starts N+1 regtest nodes (node0 = the user: miner, depositor, wYEC holder; node1..N = attestors),
+activates the vault upgrade (`-nuparams=6d5b7a31:<h>`), creates the attestor set with the plan §2
+regtest row, enrols one member key per attestor node, deploys wYEC on anvil with those members'
+Ethereum addresses as guardians (eth/script/Deploy.s.sol), writes one hawkeye.toml per attestor and
+starts `hawkeye run` beside each attestor's own node. Each Hawkeye talks only to its own node.
+
+The commands mirror bridge-sim's (ycash-dd contrib/yellowback/devnet/bridge-sim) so the two can be
+compared: up | lock | burn | rogue | silence | unsilence | mine | pause | resume | status | logs |
+cli | down | clean | scenario demo.  Python 3 standard library only; Foundry (anvil, forge, cast)
+on PATH.
+
+Environment:
+  YCASHD, YCASH_CLI   the node binaries, built from ycash-dd `upgrade/vault` (devnet/README.md);
+                      default: `ycashd` / `ycash-cli` on PATH
+  HAWKEYE             the daemon binary (default: <repo>/target/debug/hawkeye)
+  HAWKEYE_DEVNET_FALLBACK=1
+                      use this script's own lock/burn/rogue/enroll/key-derivation even when the
+                      binary offers the subcommand (they are always used when it does not)
+  FOUNDRY_SOLC, FOUNDRY_OFFLINE
+                      passed to `forge script`; unset, the solc-js shim (eth/tools/solc) is used
+                      when it is present - set DEVNET_NATIVE_SOLC=1 to let forge use native solc
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from base64 import b64encode
+from decimal import Decimal
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+ETH = os.path.join(REPO, "eth")
+DEFAULT_DIR = os.path.join(HERE, "run")
+TRANSCRIPTS = os.path.join(HERE, "transcripts")
+
+COIN = 100_000_000
+FEE = 10_000
+TAG = b"WYEC"
+VAULT_BRANCH = "6d5b7a31"
+# The four Ycash upgrades and the two Zcash ones they sit on, all at 1 (the qa tests' YCASH_UPGRADE_ARGS);
+# plain regtest's getblocktemplate aborts at height >= 150 without them (devnet/README.md).
+UPGRADE_ARGS = ["-nuparams=5ba81b19:1", "-nuparams=76b809bb:1", "-nuparams=374d694f:1",
+                "-nuparams=8e471bd6:1", "-nuparams=66314da3:1", "-nuparams=19bd2d2f:1"]
+RPC_USER, RPC_PASSWORD = "u", "p"
+ANVIL_DEPLOYER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"  # anvil account 0 (public dev key)
+ETH_FUNDING = hex(1000 * 10**18)
+
+# Hawkeye's [bridge] section for the devnet (plan §2 regtest column, §3.1); also used by the fallbacks.
+BRIDGE = {"delay": 6, "confirmations": 2, "min_owner_age": 400, "roll_margin": 50, "takeover_blocks": 4,
+          "heartbeat_blocks": 10, "min_lock": "0.1", "max_lock": "1000", "mint_mode": "threshold",
+          "mint_threshold": 1}
+# Bonds stay locked this many blocks past the join (>= bondlockmin), so a slashed bond is still frozen in place.
+BOND_LOCK = 5000
+# The fallback lock's ownerHeight slack above min_owner_age, so the lock still passes L-policy item 2
+# (ownerHeight - coinHeight >= MIN_OWNER_AGE) when it confirms a few blocks late.
+OWNER_AGE_SLACK = 20
+
+
+def set_params(n):
+    """The plan §2 regtest row for n attestors. SET_REMOVE needs slashThreshold distinct current members
+    other than the target, so slashthreshold = n - 1 (at least 1)."""
+    return {"seats": n, "unlockthreshold": 1, "cancelthreshold": 1, "slashthreshold": max(1, n - 1),
+            "ratelimitbps": 5000, "ratewindow": 20, "livenesswindow": 60, "maturity": 2, "bondmin": 1,
+            "bondlockmin": 50}
+
+
+class DevnetError(Exception):
+    pass
+
+
+def die(msg):
+    raise DevnetError(msg)
+
+
+# ====================================================================== encodings (stdlib only)
+
+def sha256(b):
+    return hashlib.sha256(b).digest()
+
+
+def sha256d(b):
+    return sha256(sha256(b))
+
+
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58check_encode(payload):
+    data = payload + sha256d(payload)[:4]
+    n = int.from_bytes(data, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = B58[r] + out
+    return "1" * (len(data) - len(data.lstrip(b"\0"))) + out
+
+
+def b58check_decode(s):
+    n = 0
+    for ch in s:
+        n = n * 58 + B58.index(ch)
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    raw = b"\0" * (len(s) - len(s.lstrip("1"))) + raw
+    payload, check = raw[:-4], raw[-4:]
+    if sha256d(payload)[:4] != check:
+        die("bad base58check checksum in %s" % s)
+    return payload
+
+
+# secp256k1
+_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+      0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+
+
+def _ec_add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and (a[1] + b[1]) % _P == 0:
+        return None
+    if a == b:
+        lam = 3 * a[0] * a[0] * pow(2 * a[1], -1, _P) % _P
+    else:
+        lam = (b[1] - a[1]) * pow(b[0] - a[0], -1, _P) % _P
+    x = (lam * lam - a[0] - b[0]) % _P
+    return x, (lam * (a[0] - x) - a[1]) % _P
+
+
+def compressed_pubkey(secret32):
+    k = int.from_bytes(secret32, "big")
+    if not 0 < k < _N:
+        die("secret out of range")
+    acc, add = None, _G
+    while k:
+        if k & 1:
+            acc = _ec_add(acc, add)
+        add = _ec_add(add, add)
+        k >>= 1
+    return bytes([2 + (acc[1] & 1)]) + acc[0].to_bytes(32, "big")
+
+
+def new_secret():
+    while True:
+        s = secrets.token_bytes(32)
+        if 0 < int.from_bytes(s, "big") < _N:
+            return s
+
+
+def wif_regtest(secret32):
+    """Compressed WIF; regtest SECRET_KEY prefix 0xEF (ycash-dd src/chainparams.cpp, regtest params)."""
+    return b58check_encode(b"\xef" + secret32 + b"\x01")
+
+
+REGTEST_P2PKH, REGTEST_P2SH = b"\x1c\x95", b"\x1c\x2a"   # plan §4.2
+
+
+def ycash_recipient32(address):
+    """Plan §4.2: version 0x01, kind (0 P2PKH | 1 P2SH), 10 zero bytes, hash160."""
+    payload = b58check_decode(address)
+    if len(payload) != 22:
+        die("%s is not a transparent address" % address)
+    prefix, h160 = payload[:2], payload[2:]
+    kind = {REGTEST_P2PKH: 0, REGTEST_P2SH: 1}.get(prefix)
+    if kind is None:
+        die("%s is not a regtest t-address" % address)
+    return bytes([1, kind]) + bytes(10) + h160
+
+
+# script
+OP_0, OP_PUSHDATA1, OP_PUSHDATA2, OP_1NEGATE, OP_1 = 0x00, 0x4c, 0x4d, 0x4f, 0x51
+OP_IF, OP_ELSE, OP_ENDIF, OP_VERIFY, OP_RETURN = 0x63, 0x67, 0x68, 0x69, 0x6a
+OP_2DROP, OP_DROP, OP_DUP, OP_EQUAL, OP_EQUALVERIFY = 0x6d, 0x75, 0x76, 0x87, 0x88
+OP_CHECKSIG, OP_CLTV, OP_CHECKSETSIG, OP_CHECKSETDORMANT = 0xac, 0xb1, 0xc0, 0xc1
+OP_2, OP_3, OP_4 = 0x52, 0x53, 0x54
+
+
+def script_num(n):
+    if n == 0:
+        return b""
+    neg, a, out = n < 0, abs(n), bytearray()
+    while a:
+        out.append(a & 0xFF)
+        a >>= 8
+    if out[-1] & 0x80:
+        out.append(0x80 if neg else 0)
+    elif neg:
+        out[-1] |= 0x80
+    return bytes(out)
+
+
+def push(data):
+    n = len(data)
+    if n < OP_PUSHDATA1:
+        return bytes([n]) + data
+    if n <= 0xFF:
+        return bytes([OP_PUSHDATA1, n]) + data
+    return bytes([OP_PUSHDATA2]) + n.to_bytes(2, "little") + data
+
+
+def push_int(n):
+    if n == 0:
+        return bytes([OP_0])
+    if n == -1:
+        return bytes([OP_1NEGATE])
+    if 1 <= n <= 16:
+        return bytes([OP_1 + n - 1])
+    return push(script_num(n))
+
+
+def txid_internal(display_hex):
+    return bytes.fromhex(display_hex)[::-1]
+
+
+def vault_script(tag, set_id, cancel_set_id, delay, owner_height, app_height, owner_key):
+    """The V scriptPubKey (upgrade plan §15.3; ycash-dd qa/rpc-tests/test_framework/vault.py vault_script)."""
+    return (push(tag) + push(cancel_set_id) + push_int(delay) + bytes([OP_2DROP, OP_DROP])
+            + bytes([OP_DUP, OP_1, OP_EQUAL, OP_IF])
+            + bytes([OP_DROP]) + push(set_id) + bytes([OP_1, OP_CHECKSETSIG])
+            + bytes([OP_ELSE, OP_DUP, OP_2, OP_EQUAL, OP_IF])
+            + bytes([OP_DROP]) + push_int(owner_height) + bytes([OP_CLTV, OP_DROP])
+            + push(owner_key) + bytes([OP_CHECKSIG])
+            + bytes([OP_ELSE, OP_DUP, OP_3, OP_EQUAL, OP_IF])
+            + bytes([OP_DROP]) + push(set_id) + bytes([OP_CHECKSETDORMANT, OP_VERIFY])
+            + push(owner_key) + bytes([OP_CHECKSIG])
+            + bytes([OP_ELSE])
+            + bytes([OP_4, OP_EQUALVERIFY]) + push_int(app_height) + bytes([OP_CLTV])
+            + bytes([OP_ENDIF, OP_ENDIF, OP_ENDIF]))
+
+
+def _compact(n):
+    if n < 253:
+        return bytes([n])
+    if n < 0x10000:
+        return b"\xfd" + n.to_bytes(2, "little")
+    return b"\xfe" + n.to_bytes(4, "little")
+
+
+def serialize_tx_v4(vin, vout, lock_time, expiry_height):
+    """A transparent-only Sapling v4 transaction (fOverwintered | 4, versionGroupId 0x892F2085).
+    vin: [(txid_display_hex, n)], unsigned; vout: [(zat, script)]."""
+    r = ((1 << 31) | 4).to_bytes(4, "little") + (0x892F2085).to_bytes(4, "little")
+    r += _compact(len(vin))
+    for txid, n in vin:
+        r += txid_internal(txid) + n.to_bytes(4, "little") + _compact(0) + (0xFFFFFFFF).to_bytes(4, "little")
+    r += _compact(len(vout))
+    for value, spk in vout:
+        r += value.to_bytes(8, "little", signed=True) + _compact(len(spk)) + spk
+    r += lock_time.to_bytes(4, "little") + expiry_height.to_bytes(4, "little")
+    r += bytes(8) + _compact(0) + _compact(0) + _compact(0)  # valueBalance, spends, outputs, joinsplits
+    return r
+
+
+HKB1 = b"HKB1"
+MEMO_SPK_PREFIX = bytes([OP_RETURN, 0x49]) + HKB1        # 6a 49 "HKB1": the 75-byte memo script (plan §4.3)
+
+
+def decode_memo(spk_hex):
+    spk = bytes.fromhex(spk_hex)
+    if len(spk) != 75 or not spk.startswith(MEMO_SPK_PREFIX):
+        return None
+    d = spk[2:]
+    return {"kind": d[4], "chainid": int.from_bytes(d[5:13], "little"), "bridge": "0x" + d[13:33].hex(),
+            "ref": int.from_bytes(d[33:41], "little"), "data": d[41:73].hex()}
+
+
+def zat(amount):
+    return int((Decimal(str(amount)) * COIN).to_integral_value())
+
+
+def yec(z):
+    return Decimal(z) / COIN
+
+
+# ====================================================================== processes
+
+def free_port(port):
+    s = socket.socket()
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def proc_alive(pid, match=None):
+    """pid is running (not a zombie) and, if given, its command line contains `match`."""
+    if not pid:
+        return False
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                return False
+        if match:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                if match.encode() not in f.read():
+                    return False
+        return True
+    except (OSError, IndexError):
+        return False
+
+
+def spawn(argv, log_path, env=None, cwd=None):
+    """Its own session and process group (pgid = pid), so `down` can stop it and everything it started."""
+    log = open(log_path, "ab")
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True, env=env, cwd=cwd)
+    log.close()
+    return proc.pid
+
+
+def stop_group(pid, match=None, grace=15.0):
+    if not proc_alive(pid, match):
+        return False
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            os.kill(pid, sig)
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if not proc_alive(pid):
+                _reap(pid)
+                return True
+            time.sleep(0.1)
+    return not proc_alive(pid)
+
+
+def _reap(pid):
+    """Collect our own child's exit status (a process started by this same invocation, e.g. the scenario)."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+
+def run_cmd(argv, timeout=120, env=None, cwd=None, check=True):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
+    except FileNotFoundError:
+        die("not found: %s" % argv[0])
+    except subprocess.TimeoutExpired:
+        die("timed out after %ss: %s" % (timeout, " ".join(argv)))
+    if check and p.returncode != 0:
+        die("%s exited %d:\n%s%s" % (" ".join(argv), p.returncode, p.stdout[-2000:], p.stderr[-2000:]))
+    return p
+
+
+# ====================================================================== ycashd RPC
+
+class RPCError(Exception):
+    def __init__(self, error):
+        self.error = error
+        super().__init__("%s (code %s)" % (error.get("message"), error.get("code")))
+
+
+class Node:
+    def __init__(self, port, timeout=120):
+        self.url = "http://127.0.0.1:%d/" % port
+        self.auth = "Basic " + b64encode(("%s:%s" % (RPC_USER, RPC_PASSWORD)).encode()).decode()
+        self.timeout = timeout
+
+    def call(self, method, *params):
+        body = json.dumps({"jsonrpc": "1.0", "id": method, "method": method, "params": list(params)},
+                          default=str).encode()
+        req = urllib.request.Request(self.url, data=body, headers={"Authorization": self.auth,
+                                                                   "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                out = json.loads(r.read(), parse_float=Decimal)
+        except urllib.error.HTTPError as e:
+            try:
+                out = json.loads(e.read(), parse_float=Decimal)
+            except ValueError:
+                raise RPCError({"code": e.code, "message": "HTTP %d" % e.code})
+        if out.get("error"):
+            raise RPCError(out["error"])
+        return out["result"]
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return lambda *p: self.call(name, *p)
+
+
+def jdump(x):
+    return json.dumps(x, default=str, sort_keys=True)
+
+
+# ====================================================================== the devnet
+
+class Devnet:
+    def __init__(self, directory, quiet=False):
+        self.dir = os.path.abspath(directory)
+        self.state_path = os.path.join(self.dir, "devnet.json")
+        self.quiet = quiet
+        self.s = None
+        self.lines = []        # the transcript (scenario)
+        self._help_cache = {}
+
+    # ---------------------------------------------------------------- output
+    def say(self, text=""):
+        stamp = time.strftime("%H:%M:%S")
+        line = "%s %s" % (stamp, text) if text else ""
+        self.lines.append(line)
+        if not self.quiet:
+            print(line, flush=True)
+
+    # ---------------------------------------------------------------- state
+    def load(self, required=True):
+        if self.s is None:
+            try:
+                with open(self.state_path) as f:
+                    self.s = json.load(f)
+            except OSError:
+                if required:
+                    die("no devnet in %s (`hawkeye-devnet up` first)" % self.dir)
+                return None
+        return self.s
+
+    def save(self):
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.s, f, indent=2, sort_keys=True, default=str)
+        os.replace(tmp, self.state_path)
+
+    def path(self, *parts):
+        return os.path.join(self.dir, *parts)
+
+    def node(self, i, timeout=120):
+        return Node(self.s["nodes"][i]["rpcport"], timeout)
+
+    def anvil_url(self):
+        return "http://127.0.0.1:%d" % self.s["anvil"]["port"]
+
+    def processes(self):
+        """(label, pid, match) for every process the devnet started, in stop order."""
+        s = self.s or {}
+        out = []
+        if s.get("miner"):
+            out.append(("miner", s["miner"].get("pid"), "hawkeye-devnet"))
+        for a in s.get("attestors", []):
+            out.append(("hawkeye%d" % a["index"], a.get("pid"), "hawkeye"))
+        if s.get("depositor", {}).get("pid"):
+            out.append(("hawkeye0", s["depositor"]["pid"], "hawkeye"))
+        if s.get("anvil"):
+            out.append(("anvil", s["anvil"].get("pid"), "anvil"))
+        for n in s.get("nodes", []):
+            out.append(("ycashd%d" % n["index"], n.get("pid"), "ycashd"))
+        return out
+
+    def running(self):
+        return [(label, pid) for label, pid, match in self.processes() if proc_alive(pid, match)]
+
+    # ---------------------------------------------------------------- binaries
+    @staticmethod
+    def binaries():
+        ycashd = os.environ.get("YCASHD") or shutil.which("ycashd")
+        cli = os.environ.get("YCASH_CLI") or shutil.which("ycash-cli")
+        hawkeye = os.environ.get("HAWKEYE") or os.path.join(REPO, "target", "debug", "hawkeye")
+        return ycashd, cli, hawkeye
+
+    def hawkeye_help(self, *path):
+        key = path
+        if key not in self._help_cache:
+            hk = self.binaries()[2]
+            text = ""
+            if os.access(hk, os.X_OK):
+                try:
+                    p = subprocess.run([hk] + list(path) + ["--help"], capture_output=True, text=True, timeout=20)
+                    text = p.stdout + p.stderr
+                except (OSError, subprocess.TimeoutExpired):
+                    text = ""
+            self._help_cache[key] = text
+        return self._help_cache[key]
+
+    def hawkeye_has(self, *path):
+        """The binary offers `hawkeye <path...>` (clap's help lists it as an indented command)."""
+        if not path:
+            return False
+        text = self.hawkeye_help(*path[:-1])
+        return re.search(r"^\s+%s(\s|,|$)" % re.escape(path[-1]), text, re.M) is not None
+
+    def use_binary(self, *path):
+        return os.environ.get("HAWKEYE_DEVNET_FALLBACK") != "1" and self.hawkeye_has(*path)
+
+    def hawkeye(self, config, *args, timeout=120, check=True):
+        hk = self.binaries()[2]
+        return run_cmd([hk, "--config", config] + list(args), timeout=timeout, check=check)
+
+    # ---------------------------------------------------------------- chain helpers
+    def tip(self):
+        return self.node(0).getblockcount()
+
+    def sync(self, timeout=120):
+        deadline = time.time() + timeout
+        n = len(self.s["nodes"])
+        while time.time() < deadline:
+            hashes = set()
+            for i in range(n):
+                try:
+                    hashes.add(self.node(i, 10).getbestblockhash())
+                except Exception:
+                    hashes.add(None)
+            if len(hashes) == 1 and None not in hashes:
+                return
+            time.sleep(0.25)
+        die("nodes did not sync within %ds" % timeout)
+
+    def mine(self, n, sync=True):
+        hashes = []
+        for _ in range(n):
+            hashes += self.node(0, 600).generate(1)
+        if sync:
+            self.sync()
+        return hashes
+
+    def wait_mempool(self, txid, nodes=None, timeout=60):
+        nodes = range(len(self.s["nodes"])) if nodes is None else nodes
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if all(txid in self.node(i).getrawmempool() for i in nodes):
+                return
+            time.sleep(0.2)
+        die("%s did not reach every mempool" % txid)
+
+    def cast(self, *args, timeout=60):
+        return run_cmd(["cast"] + list(args), timeout=timeout).stdout.strip()
+
+    def eth_call(self, to, sig, *args):
+        out = self.cast("call", "--rpc-url", self.anvil_url(), to, sig, *[str(a) for a in args])
+        return out.split()[0] if out else out
+
+    def eth_rpc(self, method, *params):
+        return self.cast("rpc", "--rpc-url", self.anvil_url(), method, *[str(p) for p in params])
+
+    def deployment(self):
+        with open(self.path("deployments", "31337.json")) as f:
+            return json.load(f)
+
+    # ================================================================ up
+    def up(self, attestors, activation, base_port, anvil_port, interval, block_time):
+        old = self.load(required=False)
+        if old is not None:
+            alive = self.running()
+            if alive:
+                die("the devnet in %s is already up (%s); `hawkeye-devnet down` first"
+                    % (self.dir, ", ".join("%s pid %d" % a for a in alive)))
+            return self.resume()
+        ycashd, cli, hawkeye = self.binaries()
+        if not ycashd or not os.access(ycashd, os.X_OK):
+            die("ycashd not found: set YCASHD (devnet/README.md: build ycash-dd upgrade/vault)")
+        for tool in ("anvil", "forge", "cast"):
+            if not shutil.which(tool):
+                die("%s not on PATH (Foundry; devnet/README.md)" % tool)
+        if not os.path.isdir(os.path.join(ETH, "vendor", "wyec", "contracts")):
+            die("eth/vendor/wyec missing: run `cd eth && ./tools/fetch-wyec.sh && npm ci --ignore-scripts`")
+        if not os.path.isdir(os.path.join(ETH, "node_modules", "forge-std")):
+            die("eth/node_modules missing: run `cd eth && npm ci --ignore-scripts`")
+        if attestors < 1 or attestors > 15:
+            die("--attestors must be 1..15")
+        ports = []
+        for i in range(attestors + 1):
+            ports += [base_port + 2 * i, base_port + 2 * i + 1]
+        api_ports = [7800 + i for i in range(1, attestors + 1)]
+        busy = [p for p in ports + api_ports + [anvil_port] if not free_port(p)]
+        if busy:
+            die("ports in use: %s (choose --base-port / --anvil-port)" % busy)
+
+        os.makedirs(self.dir, exist_ok=True)
+        self.s = {"version": 1, "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "activation": activation,
+                  "attestor_count": attestors, "base_port": base_port, "interval": interval,
+                  "nodes": [], "attestors": [], "binaries": {"ycashd": ycashd, "ycash_cli": cli, "hawkeye": hawkeye}}
+        for i in range(attestors + 1):
+            self.s["nodes"].append({"index": i, "port": base_port + 2 * i, "rpcport": base_port + 2 * i + 1,
+                                    "datadir": self.path("ycash%d" % i), "pid": None})
+        self.s["anvil"] = {"port": anvil_port, "block_time": block_time, "pid": None,
+                           "state": self.path("anvil-state.json"), "log": self.path("anvil.log")}
+        self.save()
+        try:
+            self._up(attestors, activation)
+        except BaseException:
+            self.say("up failed; stopping what was started (the directory is kept: %s)" % self.dir)
+            try:
+                self.down(quiet=True)
+            except Exception as error:
+                self.say("down after failure: %s" % error)
+            raise
+
+    def _up(self, attestors, activation):
+        n = attestors + 1
+        self.say("hawkeye-devnet up: %d regtest ycashd nodes (node0 user/miner, node1..%d attestors), vault upgrade "
+                 "%s at height %d, dir %s" % (n, attestors, VAULT_BRANCH, activation, self.dir))
+        # ---- 1. nodes
+        for nd in self.s["nodes"]:
+            self.write_node_conf(nd)
+            self.start_node(nd)
+        self.save()
+        for nd in self.s["nodes"]:
+            self.wait_node(nd)
+        for nd in self.s["nodes"][1:]:
+            self.node(nd["index"]).addnode("127.0.0.1:%d" % self.s["nodes"][0]["port"], "onetry")
+        self.wait_peers()
+        self.say("  nodes up: rpc ports %s" % ", ".join(str(x["rpcport"]) for x in self.s["nodes"]))
+        # ---- 2. past activation and coinbase maturity
+        target = activation + 101
+        self.say("  mining %d blocks on node0 (activation %d + coinbase maturity 100)" % (target, activation))
+        while self.tip() < target:
+            self.node(0, 900).generate(min(50, target - self.tip()))
+        self.sync()
+        info = self.node(0).vault_getinfo()
+        if not info.get("active"):
+            die("vault upgrade not active at %d: %s" % (self.tip(), jdump(info)))
+        self.say("  height %d: vault upgrade active (branch %s, activation %s), node0 balance %s YEC"
+                 % (self.tip(), info["branchid"], info["activationheight"], self.node(0).getbalance()))
+        # ---- 3. keys: one secret per attestor, member key and Ethereum address
+        self.s["attestors"] = []
+        for i in range(1, attestors + 1):
+            secret = new_secret()
+            member, eth = self.derive_keys(secret)
+            self.s["attestors"].append({"index": i, "node": i, "secret_hex": secret.hex(), "memberkey": member,
+                                        "eth_address": eth, "api": "127.0.0.1:%d" % (7800 + i),
+                                        "config": self.path("attestor%d.toml" % i), "home": self.path("attestor%d" % i),
+                                        "log": self.path("attestor%d" % i, "hawkeye.log"), "pid": None})
+            self.say("  attestor%d: member key %s, eth address %s" % (i, member, eth))
+        holder = new_secret()
+        holder_addr = self.cast("wallet", "address", "--private-key", "0x" + holder.hex())
+        self.s["holder"] = {"secret_hex": holder.hex(), "eth_address": holder_addr}
+        self.say("  holder (node0's Ethereum persona): %s" % holder_addr)
+        self.save()
+        # ---- 4. fund the attestor wallets with several coins each (finding (76): keep >= 8 coins)
+        outs = {}
+        for a in self.s["attestors"]:
+            for _ in range(8):
+                outs[self.node(a["node"]).getnewaddress()] = Decimal("2.5")
+        txid = self.node(0).sendmany("", outs)
+        self.wait_mempool(txid, nodes=[0])
+        self.mine(1)
+        for a in self.s["attestors"]:     # the wallet sees the block a moment after the chain tip moves
+            deadline = time.time() + 30
+            while self.node(a["node"]).getbalance() < 20:
+                if time.time() > deadline:
+                    die("attestor%d's node holds only %s YEC after funding" % (a["index"], self.node(a["node"]).getbalance()))
+                time.sleep(0.2)
+        self.say("  funded attestor wallets: 8 coins x 2.5 YEC each (tx %s)" % txid)
+        # ---- 5. the set (node0 creates it and holds the admit key)
+        params = set_params(attestors)
+        created = self.node(0).set_create(dict(params))
+        self.s["set"] = {"setid": created["setid"], "admitkey": created["admitkey"], "create_txid": created["txid"],
+                         "params": params, "creator": 0}
+        self.save()
+        self.wait_mempool(created["txid"], nodes=[0])
+        self.mine(1)                        # a set exists from the block after its SET_CREATE
+        self.say("  set_create on node0: setid %s (seats %d, unlock 1, cancel 1, slash %d, rate %d bps / %d, "
+                 "liveness %d, maturity %d, bondmin %d)" % (created["setid"], params["seats"], params["slashthreshold"],
+                                                            params["ratelimitbps"], params["ratewindow"],
+                                                            params["livenesswindow"], params["maturity"],
+                                                            params["bondmin"]))
+        # ---- 6. Ethereum: anvil + wYEC with the members' addresses as guardians
+        self.start_anvil()
+        self.deploy_wyec()
+        for addr in [a["eth_address"] for a in self.s["attestors"]] + [self.s["holder"]["eth_address"]]:
+            self.eth_rpc("anvil_setBalance", addr, ETH_FUNDING)
+        self.say("  funded %d Ethereum accounts with 1000 ETH each (anvil_setBalance)" % (attestors + 1))
+        # ---- 7. configs, enrolment, joins
+        for a in self.s["attestors"]:
+            os.makedirs(a["home"], exist_ok=True)
+            self.write_config(a["config"], a["node"], a["secret_hex"], a["home"], a["api"],
+                              [b["api"] for b in self.s["attestors"] if b is not a])
+        self.s["depositor"] = {"config": self.path("node0.toml"), "home": self.path("node0"), "pid": None}
+        os.makedirs(self.s["depositor"]["home"], exist_ok=True)
+        self.write_config(self.s["depositor"]["config"], 0, self.s["holder"]["secret_hex"],
+                          self.s["depositor"]["home"], "127.0.0.1:7800", [b["api"] for b in self.s["attestors"]])
+        self.save()
+        for a in self.s["attestors"]:
+            self.enroll(a)
+        self.join_all()
+        self.mine(1 + params["maturity"])
+        info = self.node(0).set_getinfo(self.s["set"]["setid"])
+        if info["current"] != attestors:
+            die("only %d of %d members current: %s" % (info["current"], attestors, jdump(info)))
+        self.say("  %d members current at height %d; lockedvalue %s" % (info["current"], self.tip(), info["lockedvalue"]))
+        # ---- 8. the sidecars and the miner
+        self.start_hawkeyes()
+        self.start_miner()
+        self.save()
+        self.say("devnet up at height %d; `hawkeye-devnet status`, `hawkeye-devnet down`" % self.tip())
+
+    def resume(self):
+        """`up` on a devnet that is down: restart the nodes on their datadirs, anvil from its state file,
+        the Hawkeyes and the miner."""
+        self.say("hawkeye-devnet up: resuming the devnet in %s" % self.dir)
+        busy = [p for nd in self.s["nodes"] for p in (nd["port"], nd["rpcport"]) if not free_port(p)]
+        busy += [self.s["anvil"]["port"]] if not free_port(self.s["anvil"]["port"]) else []
+        if busy:
+            die("ports in use: %s" % busy)
+        try:
+            for nd in self.s["nodes"]:
+                self.start_node(nd)
+            self.save()
+            for nd in self.s["nodes"]:
+                self.wait_node(nd)
+            for nd in self.s["nodes"][1:]:
+                self.node(nd["index"]).addnode("127.0.0.1:%d" % self.s["nodes"][0]["port"], "onetry")
+            self.wait_peers()
+            self.start_anvil()
+            if self.s.get("attestors"):
+                self.start_hawkeyes()
+            self.start_miner()
+            self.save()
+        except BaseException:
+            self.say("resume failed; stopping what was started")
+            self.down(quiet=True)
+            raise
+        self.say("devnet resumed at height %d" % self.tip())
+
+    # ---------------------------------------------------------------- nodes
+    def write_node_conf(self, nd):
+        os.makedirs(nd["datadir"], exist_ok=True)
+        peers = [x for x in self.s["nodes"] if x is not nd]
+        lines = ["regtest=1", "server=1", "showmetrics=0", "printtoconsole=0", "rpcuser=%s" % RPC_USER,
+                 "rpcpassword=%s" % RPC_PASSWORD, "rpcallowip=127.0.0.1", "listenonion=0", "discover=0",
+                 "dnsseed=0", "txindex=1", "keypool=1",
+                 "port=%d" % nd["port"], "rpcport=%d" % nd["rpcport"], "bind=127.0.0.1"]
+        lines += ["addnode=127.0.0.1:%d" % p["port"] for p in peers]
+        with open(os.path.join(nd["datadir"], "ycash.conf"), "w") as f:
+            f.write("\n".join(x for x in lines if x) + "\n")
+
+    def start_node(self, nd):
+        ycashd = self.s["binaries"]["ycashd"]
+        argv = [ycashd, "-datadir=%s" % nd["datadir"]] + UPGRADE_ARGS + ["-nuparams=%s:%d" % (VAULT_BRANCH, self.s["activation"])]
+        nd["pid"] = spawn(argv, os.path.join(nd["datadir"], "stdout.log"))
+        nd["argv"] = argv
+
+    def wait_node(self, nd, timeout=300):
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            if not proc_alive(nd["pid"], "ycashd"):
+                tail = open(os.path.join(nd["datadir"], "stdout.log"), errors="replace").read()[-2000:]
+                die("ycashd node%d exited during start-up:\n%s" % (nd["index"], tail))
+            try:
+                Node(nd["rpcport"], 10).getblockcount()
+                return
+            except RPCError as e:
+                last = e      # -28 warming up (zk params, block index)
+            except (OSError, urllib.error.URLError) as e:
+                last = e
+            time.sleep(0.5)
+        die("node%d did not answer RPC within %ds: %s" % (nd["index"], timeout, last))
+
+    def wait_peers(self, timeout=60):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.node(0).getconnectioncount() >= len(self.s["nodes"]) - 1 and \
+                    all(self.node(i).getconnectioncount() >= 1 for i in range(1, len(self.s["nodes"]))):
+                return
+            time.sleep(0.25)
+        die("nodes did not connect within %ds" % timeout)
+
+    # ---------------------------------------------------------------- keys and the set
+    def derive_keys(self, secret):
+        """(member key, eth address). `hawkeye keys derive --secret` when available, cross-checked against
+        this script's own derivation (compressed secp256k1 pubkey; cast for keccak256)."""
+        member = compressed_pubkey(secret).hex()
+        eth = self.cast("wallet", "address", "--private-key", "0x" + secret.hex())
+        if self.use_binary("keys", "derive"):
+            out = run_cmd([self.binaries()[2], "keys", "derive", "--secret", secret.hex()]).stdout
+            got = self.parse_derive(out)
+            if got[0] and got[0].lower() != member:
+                die("hawkeye keys derive: member key %s, expected %s" % (got[0], member))
+            if got[1] and got[1].lower() != eth.lower():
+                die("hawkeye keys derive: eth address %s, expected %s" % (got[1], eth))
+            if not all(got):
+                self.say("  note: could not parse `hawkeye keys derive` output, using the script's derivation: %r" % out[:200])
+            eth = got[1] or eth
+        return member, eth
+
+    @staticmethod
+    def parse_derive(out):
+        member = eth = None
+        try:
+            j = json.loads(out)
+            for k in ("memberkey", "member_key", "pubkey", "compressed_pubkey"):
+                member = member or j.get(k)
+            for k in ("eth_address", "ethaddress", "address", "eth"):
+                eth = eth or j.get(k)
+        except ValueError:
+            m = re.search(r"\b(0[23][0-9a-fA-F]{64})\b", out)
+            member = m.group(1) if m else None
+            m = re.search(r"\b(0x[0-9a-fA-F]{40})\b", out)
+            eth = m.group(1) if m else None
+        return member, eth
+
+    def enroll(self, a):
+        """The member key into that attestor's own node wallet (plan §3.5: importprivkey once, no rescan)."""
+        n = self.node(a["node"])
+        if self.use_binary("enroll"):
+            out = self.hawkeye(a["config"], "enroll").stdout.strip()
+            how = "hawkeye enroll: %s" % (out.splitlines()[-1] if out else "ok")
+        else:
+            n.importprivkey(wif_regtest(bytes.fromhex(a["secret_hex"])), "hawkeye-member", False)
+            how = "importprivkey (fallback; `hawkeye enroll` not in the binary)"
+        try:
+            addr = b58check_encode(REGTEST_P2PKH + hashlib.new("ripemd160", sha256(bytes.fromhex(a["memberkey"]))).digest())
+        except ValueError:      # OpenSSL 3 without the legacy provider
+            addr = None
+        if addr:
+            v = n.validateaddress(addr)
+            if not v.get("ismine"):
+                die("attestor%d: node%d's wallet does not hold the member key after enrolment" % (a["index"], a["node"]))
+        self.say("  attestor%d enrolled in node%d's wallet (%s)" % (a["index"], a["node"], how))
+
+    def join_all(self):
+        """bridge-sim's join_all: one SET_JOIN per attestor with its member key, built and member-signed on the
+        attestor's node; the closed set's admission signature added by the admit key on node0 (set_signact);
+        inputs signed and sent back on the attestor's node (set_sendact). All joins land before any matures,
+        so the admit key covers every one of them."""
+        set_id = self.s["set"]["setid"]
+        bond = self.s["set"]["params"]["bondmin"]
+        lock = self.tip() + 1 + BOND_LOCK
+        for a in self.s["attestors"]:
+            n = self.node(a["node"])
+            res = n.set_join(set_id, bond, lock, a["memberkey"])
+            if res.get("complete"):
+                txid = res["txid"]
+            else:
+                signed = self.node(self.s["set"]["creator"]).set_signact(res["hex"], set_id)
+                if not signed.get("complete"):
+                    die("join of attestor%d incomplete after the admit signature: %s" % (a["index"], jdump(signed)))
+                txid = n.set_sendact(signed["hex"])
+            a["join_txid"] = txid
+            a["bondoutpoint"] = res.get("bondoutpoint")
+            self.say("  attestor%d SET_JOIN %s (bond %s YEC at %s, bond lock %d)" % (a["index"], txid, bond,
+                                                                                   res.get("bondoutpoint"), lock))
+        for a in self.s["attestors"]:
+            self.wait_mempool(a["join_txid"], nodes=[0])
+        self.save()
+
+    # ---------------------------------------------------------------- Ethereum
+    def start_anvil(self):
+        an = self.s["anvil"]
+        argv = ["anvil", "--host", "127.0.0.1", "--port", str(an["port"]), "--slots-in-an-epoch", "1",
+                "--state", an["state"], "--state-interval", "5"]
+        if an.get("block_time"):
+            argv += ["--block-time", str(an["block_time"])]
+        an["pid"] = spawn(argv, an["log"])
+        an["argv"] = argv
+        self.save()
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            p = subprocess.run(["cast", "chain-id", "--rpc-url", self.anvil_url()], capture_output=True, text=True)
+            if p.returncode == 0 and p.stdout.strip() == "31337":
+                self.say("  anvil up on %s (block time %ss, --slots-in-an-epoch 1: finalized = latest - 2)"
+                         % (self.anvil_url(), an.get("block_time") or "auto"))
+                return
+            if not proc_alive(an["pid"], "anvil"):
+                die("anvil exited: %s" % open(an["log"], errors="replace").read()[-1500:])
+            time.sleep(0.2)
+        die("anvil did not answer on %s" % self.anvil_url())
+
+    def deploy_wyec(self):
+        env = dict(os.environ)
+        if "FOUNDRY_SOLC" not in env and os.environ.get("DEVNET_NATIVE_SOLC") != "1" \
+                and os.access(os.path.join(ETH, "tools", "solc"), os.X_OK):
+            env["FOUNDRY_SOLC"] = "./tools/solc"
+            env["FOUNDRY_OFFLINE"] = "true"
+        tmp = os.path.join(ETH, "deployments", ".test-devnet-%d.json" % os.getpid())   # gitignored; fs_permissions
+        env.update({"GUARDIANS": ",".join(a["eth_address"] for a in self.s["attestors"]),
+                    "THRESHOLD": str(BRIDGE["mint_threshold"]), "DEPLOYMENT_FILE": tmp})
+        self.say("  forge script script/Deploy.s.sol: guardians %s, threshold %d" % (env["GUARDIANS"], BRIDGE["mint_threshold"]))
+        log = self.path("forge-deploy.log")
+        p = run_cmd(["forge", "script", "script/Deploy.s.sol", "--rpc-url", self.anvil_url(), "--private-key",
+                     ANVIL_DEPLOYER_KEY, "--broadcast", "--slow"], timeout=900, env=env, cwd=ETH, check=False)
+        with open(log, "w") as f:
+            f.write(p.stdout + p.stderr)
+        if p.returncode != 0 or not os.path.exists(tmp):
+            die("forge script failed (log %s):\n%s" % (log, (p.stdout + p.stderr)[-2500:]))
+        os.makedirs(self.path("deployments"), exist_ok=True)
+        dest = self.path("deployments", "31337.json")
+        shutil.move(tmp, dest)
+        d = self.deployment()
+        got = self.eth_call(d["bridge"], "guardianCount()(uint256)")
+        if int(got) != len(self.s["attestors"]):
+            die("guardianCount %s" % got)
+        if self.eth_call(d["token"], "bridge()(address)").lower() != d["bridge"].lower():
+            die("token.bridge() mismatch")
+        self.s["eth"] = {"bridge": d["bridge"], "token": d["token"], "deployBlock": d["deployBlock"]}
+        self.save()
+        self.say("  wYEC deployed: bridge %s, token %s (deploy block %s, threshold %s) -> %s"
+                 % (d["bridge"], d["token"], d["deployBlock"], d["threshold"], dest))
+
+    # ---------------------------------------------------------------- Hawkeye
+    def write_config(self, path, node_index, secret_hex, home, api, peers):
+        nd = self.s["nodes"][node_index]
+        q = json.dumps      # TOML basic strings are JSON strings for this alphabet
+        b = BRIDGE
+        text = """# hawkeye-devnet: generated by `hawkeye-devnet up`; node%(node)d's sidecar. Do not edit while it runs.
+[network]
+name = "regtest"
+
+[ycash]
+rpc_url = %(ycash)s
+rpc_user = %(user)s
+rpc_password = %(password)s
+
+[eth]
+rpc_url = %(eth)s
+deployment = %(deployment)s
+finality = "finalized"
+
+[bridge]
+set_id = %(setid)s
+delay = %(delay)d
+confirmations = %(confirmations)d
+min_owner_age = %(min_owner_age)d
+roll_margin = %(roll_margin)d
+takeover_blocks = %(takeover_blocks)d
+heartbeat_blocks = %(heartbeat_blocks)d
+min_lock = %(min_lock)s
+max_lock = %(max_lock)s
+mint_mode = %(mint_mode)s
+mint_threshold = %(mint_threshold)d
+
+[keys]
+secret_hex = %(secret)s
+
+[store]
+path = %(store)s
+
+[api]
+listen = %(api)s
+
+[policy]
+auto_slash = true
+
+[peers]
+urls = [%(peers)s]
+
+[devnet]
+drills = true
+
+[log]
+level = "info"
+format = "text"
+""" % {"node": node_index, "ycash": q("http://127.0.0.1:%d" % nd["rpcport"]), "user": q(RPC_USER),
+       "password": q(RPC_PASSWORD), "eth": q(self.anvil_url()), "deployment": q(self.path("deployments", "31337.json")),
+       "setid": q(self.s["set"]["setid"]), "delay": b["delay"], "confirmations": b["confirmations"],
+       "min_owner_age": b["min_owner_age"], "roll_margin": b["roll_margin"], "takeover_blocks": b["takeover_blocks"],
+       "heartbeat_blocks": b["heartbeat_blocks"], "min_lock": q(b["min_lock"]), "max_lock": q(b["max_lock"]),
+       "mint_mode": q(b["mint_mode"]), "mint_threshold": b["mint_threshold"], "secret": q(secret_hex),
+       "store": q(os.path.join(home, "hawkeye.db")), "api": q(api), "peers": ", ".join(q("http://" + p) for p in peers)}
+        with open(path, "w") as f:
+            f.write(text)
+        os.chmod(path, 0o600)
+
+    def start_hawkeye(self, a):
+        hk = self.s["binaries"]["hawkeye"]
+        a["pid"] = spawn([hk, "--config", a["config"], "run"], a["log"], cwd=a["home"])
+        time.sleep(0.5)
+        if not proc_alive(a["pid"], "hawkeye"):
+            die("hawkeye for attestor%d exited at once:\n%s" % (a["index"], open(a["log"], errors="replace").read()[-2000:]))
+
+    def start_hawkeyes(self):
+        if not self.hawkeye_has("run"):
+            self.say("  NOTE: %s has no `run` subcommand yet; the attestor sidecars are NOT started (configs are "
+                     "written: %s)" % (self.s["binaries"]["hawkeye"], ", ".join(a["config"] for a in self.s["attestors"])))
+            return
+        for a in self.s["attestors"]:
+            if a.get("silenced"):
+                continue
+            self.start_hawkeye(a)
+            self.say("  hawkeye%d running (pid %d) beside node%d: %s run, log %s"
+                     % (a["index"], a["pid"], a["node"], a["config"], a["log"]))
+        self.save()
+
+    # ---------------------------------------------------------------- the miner
+    def start_miner(self):
+        m = self.s.setdefault("miner", {})
+        m["log"] = self.path("miner.log")
+        m["pause_file"] = self.path("miner.paused")
+        m["interval"] = self.s.get("interval", 2.0)
+        if m["interval"] <= 0:
+            self.say("  background miner disabled (--interval 0): `hawkeye-devnet mine N`")
+            m["pid"] = None
+            return
+        m["pid"] = spawn([sys.executable, os.path.abspath(__file__), "--dir", self.dir, "_miner"], m["log"])
+        self.say("  background miner: node0 mines 1 block every %ss (pid %d; `pause` / `resume`)" % (m["interval"], m["pid"]))
+
+    def miner_loop(self):
+        s = self.load()
+        stop = {"now": False}
+        signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("now", True))
+        interval = float(s["miner"]["interval"])
+        print("%s miner up, interval %ss" % (time.strftime("%H:%M:%S"), interval), flush=True)
+        while not stop["now"]:
+            if not os.path.exists(s["miner"]["pause_file"]):
+                try:
+                    h = self.node(0, 300).generate(1)
+                    print("%s mined %s at %d" % (time.strftime("%H:%M:%S"), h[0][:16], self.tip()), flush=True)
+                except Exception as error:
+                    print("%s generate failed: %s" % (time.strftime("%H:%M:%S"), error), flush=True)
+            t = time.time() + interval
+            while not stop["now"] and time.time() < t:
+                time.sleep(0.1)
+        print("%s miner stopped" % time.strftime("%H:%M:%S"), flush=True)
+
+    def pause(self, on):
+        self.load()
+        p = self.s["miner"]["pause_file"]
+        if on:
+            open(p, "w").write("%d\n" % self.tip())
+            self.say("background miner paused at height %d" % self.tip())
+        else:
+            if os.path.exists(p):
+                os.remove(p)
+            self.say("background miner resumed")
+
+    # ================================================================ commands
+    def lock(self, amount, dest=None):
+        """node0 locks YEC under the set: a WYEC V + the destination as an ABI bytes32 OP_RETURN (plan §1.2)."""
+        self.load()
+        dest = dest or self.s["holder"]["eth_address"]
+        dep = self.s["depositor"]["config"]
+        if self.use_binary("lock"):
+            out = self.hawkeye(dep, "lock", str(amount), "--dest", dest).stdout.strip()
+            self.say("hawkeye lock %s --dest %s: %s" % (amount, dest, out.replace("\n", " | ")))
+            m = re.search(r"\b([0-9a-f]{64})(?::(\d+))?", out)
+            return {"txid": m.group(1) if m else None, "outpoint": "%s:%s" % (m.group(1), m.group(2) or 0) if m else None,
+                    "via": "hawkeye", "output": out}
+        return self.lock_fallback(amount, dest)
+
+    def lock_fallback(self, amount, dest):
+        n = self.node(0)
+        dest_bytes = bytes.fromhex(dest[2:] if dest.startswith("0x") else dest)
+        if len(dest_bytes) == 20:
+            dest_bytes = bytes(12) + dest_bytes
+        if len(dest_bytes) != 32 or dest_bytes[:12] != bytes(12) or dest_bytes == bytes(32):
+            die("destination must be a non-zero 20-byte Ethereum address")
+        owner_key = bytes.fromhex(n.validateaddress(n.getnewaddress())["pubkey"])
+        tip = self.tip()
+        owner_height = tip + 1 + BRIDGE["min_owner_age"] + OWNER_AGE_SLACK
+        set_id = txid_internal(self.s["set"]["setid"])
+        spk = vault_script(TAG, set_id, set_id, BRIDGE["delay"], owner_height, 0, owner_key)
+        value = zat(amount)
+        locked = {(c["txid"], c["vout"]) for c in n.listlockunspent()}
+        pending = set()
+        for t in n.getrawmempool():
+            for i in n.getrawtransaction(t, 1)["vin"]:
+                if "txid" in i:
+                    pending.add((i["txid"], i["vout"]))
+        coins = sorted([u for u in n.listunspent(1) if u.get("spendable", True)
+                        and (u["txid"], u["vout"]) not in locked | pending], key=lambda u: -u["amount"])
+        vin, total = [], 0
+        for u in coins:
+            vin.append((u["txid"], u["vout"]))
+            total += zat(u["amount"])
+            if total >= value + FEE:
+                break
+        if total < value + FEE:
+            die("node0 holds %s spendable YEC, the lock needs %s" % (yec(total), amount))
+        vout = [(value, spk), (0, bytes([OP_RETURN]) + push(dest_bytes))]
+        change = total - value - FEE
+        if change > 0:
+            vout.append((change, bytes.fromhex(n.validateaddress(n.getnewaddress())["scriptPubKey"])))
+        raw = serialize_tx_v4(vin, vout, 0, tip + 40).hex()
+        signed = n.signrawtransaction(raw)
+        if not signed["complete"]:
+            die("signrawtransaction incomplete: %s" % jdump(signed.get("errors")))
+        txid = n.sendrawtransaction(signed["hex"])
+        decoded = n.vault_decodescript(spk.hex())
+        if decoded.get("type") != "vault":
+            die("the node does not decode the fallback lock's V: %s" % jdump(decoded))
+        self.say("locked %s YEC (fallback builder): %s:0 WYEC V under %s, ownerHeight %d, owner key %s.., dest %s"
+                 % (amount, txid, self.s["set"]["setid"][:16], owner_height, owner_key.hex()[:16], "0x" + dest_bytes[12:].hex()))
+        return {"txid": txid, "outpoint": "%s:0" % txid, "via": "fallback", "ownerheight": owner_height}
+
+    def burn(self, amount, recipient=None):
+        """The holder burns wYEC to a Ycash t-address (plan §4.2 recipient encoding)."""
+        self.load()
+        recipient = recipient or self.node(0).getnewaddress()
+        dep = self.s["depositor"]["config"]
+        if self.use_binary("burn"):
+            out = self.hawkeye(dep, "burn", str(amount), "--recipient", recipient).stdout.strip()
+            self.say("hawkeye burn %s --recipient %s: %s" % (amount, recipient, out.replace("\n", " | ")))
+            return {"recipient": recipient, "via": "hawkeye", "output": out}
+        r32 = "0x" + ycash_recipient32(recipient).hex()
+        out = self.cast("send", "--rpc-url", self.anvil_url(), "--private-key", "0x" + self.s["holder"]["secret_hex"],
+                        "--json", self.s["eth"]["bridge"], "burn(uint256,bytes32)", str(zat(amount)), r32, timeout=120)
+        receipt = json.loads(out)
+        if receipt.get("status") not in ("0x1", 1, "1"):
+            die("burn reverted: %s" % out[:500])
+        self.say("burned %s wYEC (fallback: cast send burn) to %s (ycashRecipient %s): tx %s, block %s"
+                 % (amount, recipient, r32, receipt.get("transactionHash"), int(receipt.get("blockNumber"), 16)))
+        return {"recipient": recipient, "via": "fallback", "tx": receipt.get("transactionHash")}
+
+    def rogue(self, amount, attestor=1):
+        """A member signs an unlock with no burn behind it (drill D-2)."""
+        self.load()
+        a = self.s["attestors"][attestor - 1]
+        if self.use_binary("rogue-unlock"):
+            out = self.hawkeye(a["config"], "rogue-unlock", str(amount)).stdout.strip()
+            self.say("hawkeye --config attestor%d.toml rogue-unlock %s: %s" % (attestor, amount, out.replace("\n", " | ")))
+            m = re.search(r"\b([0-9a-f]{64}):(\d+)", out)
+            return {"intent": m.group(0) if m else None, "via": "hawkeye", "output": out}
+        n = self.node(a["node"])
+        value = zat(amount)
+        vaults = sorted(n.vault_list({"tag": "WYEC", "setid": self.s["set"]["setid"], "kind": "vault"}),
+                        key=lambda r: -r["valuezat"])
+        vault = next((r for r in vaults if r["valuezat"] >= value), None)
+        if vault is None:
+            die("no WYEC vault under the set holds %s YEC" % amount)
+        thief = n.getnewaddress()
+        built = n.vault_buildunlock(vault["outpoint"], [{"address": thief, "amount": Decimal(str(amount))}])
+        signed = n.set_signunlock(built["hex"])
+        if not signed.get("complete"):
+            die("set_signunlock on node%d incomplete: %s" % (a["node"], jdump(signed)))
+        txid = n.vault_send(signed["hex"])
+        intent = "%s:%d" % (txid, built["intents"][0]["vout"])
+        self.say("rogue intent %s (fallback): %s YEC from vault %s to %s, signed by attestor%d's member key, no memo, "
+                 "no burn" % (intent, amount, vault["outpoint"], thief, attestor))
+        return {"intent": intent, "txid": txid, "vault": vault["outpoint"], "recipient": thief, "via": "fallback"}
+
+    def heartbeat(self):
+        self.load()
+        for a in self.s["attestors"]:
+            try:
+                r = self.node(a["node"]).set_heartbeat(self.s["set"]["setid"], a["memberkey"])
+                self.say("attestor%d SET_HEARTBEAT %s" % (a["index"], r["txid"]))
+            except RPCError as error:
+                self.say("attestor%d heartbeat refused: %s" % (a["index"], error))
+
+    def silence(self, i, on):
+        self.load()
+        a = self.s["attestors"][i - 1]
+        if on:
+            stopped = stop_group(a.get("pid"), "hawkeye")
+            a["silenced"] = True
+            self.save()
+            self.say("attestor%d's hawkeye %s" % (i, "stopped" if stopped else "was not running"))
+        else:
+            a["silenced"] = False
+            if proc_alive(a.get("pid"), "hawkeye"):
+                self.say("attestor%d's hawkeye is already running (pid %d)" % (i, a["pid"]))
+            elif not self.hawkeye_has("run"):
+                self.say("the hawkeye binary has no `run` subcommand; nothing to start")
+            else:
+                self.start_hawkeye(a)
+                self.say("attestor%d's hawkeye restarted (pid %d)" % (i, a["pid"]))
+            self.save()
+
+    def status(self):
+        self.load()
+        st = {"dir": self.dir, "processes": {label: {"pid": pid, "alive": proc_alive(pid, match)}
+                                             for label, pid, match in self.processes()}}
+        try:
+            n0 = self.node(0, 20)
+            st["height"] = n0.getblockcount()
+            st["vault"] = n0.vault_getinfo()
+            if self.s.get("set"):
+                info = n0.set_getinfo(self.s["set"]["setid"])
+                st["set"] = {k: info.get(k) for k in ("setid", "current", "active", "members", "dormant", "released",
+                                                      "lockedvalue", "epoch", "epochused", "unlockavailable",
+                                                      "slashthreshold")}
+                keys = {a["memberkey"]: a["index"] for a in self.s["attestors"]}
+                st["members"] = [{"attestor": keys.get(m["key"]), "key": m["key"], "status": m["status"],
+                                  "current": m["current"], "live": m["live"], "lastact": m["lastact"],
+                                  "bondfrozen": m["bondfrozen"]} for m in info["memberlist"]]
+                rows = n0.vault_list({"tag": "WYEC", "setid": self.s["set"]["setid"]})
+                st["vaults"] = [{"outpoint": r["outpoint"], "value": r["value"], "height": r["height"]}
+                                for r in rows if r["kind"] == "vault"]
+                st["intents"] = [{"outpoint": r["outpoint"], "value": r["value"], "mature": r["mature"],
+                                  "cancellable": r["cancellable"], "recipienthash": r["recipienthash"]}
+                                 for r in rows if r["kind"] == "intent"]
+                st["locked_zat"] = sum(r["valuezat"] for r in rows)
+        except Exception as error:
+            st["ycash_error"] = str(error)
+        try:
+            if self.s.get("eth"):
+                st["eth"] = {"block": int(self.cast("block-number", "--rpc-url", self.anvil_url())),
+                             "finalized": int(self.cast("block", "finalized", "--field", "number", "--rpc-url",
+                                                        self.anvil_url())),
+                             "totalSupply": int(self.eth_call(self.s["eth"]["token"], "totalSupply()(uint256)")),
+                             "holder": self.s["holder"]["eth_address"],
+                             "holderBalance": int(self.eth_call(self.s["eth"]["token"], "balanceOf(address)(uint256)",
+                                                                self.s["holder"]["eth_address"]))}
+                if "locked_zat" in st:
+                    st["supply_invariant"] = st["eth"]["totalSupply"] <= st["locked_zat"]
+        except Exception as error:
+            st["eth_error"] = str(error)
+        st["hawkeye"] = {}
+        if self.hawkeye_has("status"):
+            for a in self.s.get("attestors", []):
+                p = self.hawkeye(a["config"], "status", "--json", timeout=30, check=False)
+                try:
+                    st["hawkeye"]["attestor%d" % a["index"]] = json.loads(p.stdout)
+                except ValueError:
+                    st["hawkeye"]["attestor%d" % a["index"]] = {"exit": p.returncode,
+                                                                "output": (p.stdout + p.stderr)[-500:]}
+        return st
+
+    def print_status(self, st):
+        procs = ", ".join("%s %s" % (k, "up" if v["alive"] else "DOWN") for k, v in st["processes"].items())
+        print("devnet %s\n  processes: %s" % (st["dir"], procs))
+        if "height" in st:
+            v = st["vault"]
+            print("  ycash: height %d, vault upgrade %s (activation %s), sets %s, vaults %s, intents %s, lockedvalue %s"
+                  % (st["height"], "active" if v.get("active") else "inactive", v.get("activationheight"), v.get("sets"),
+                     v.get("vaults"), v.get("intents"), v.get("lockedvalue")))
+        if "set" in st:
+            s = st["set"]
+            print("  set %s: current %s/%s, dormant %s, released %s, lockedvalue %s, epoch %s used %s available %s"
+                  % (s["setid"], s["current"], s["members"], s["dormant"], s["released"], s["lockedvalue"], s["epoch"],
+                     s["epochused"], s.get("unlockavailable")))
+            for m in st["members"]:
+                print("    attestor%s %s.. %s current=%s live=%s lastact=%s bondfrozen=%s"
+                      % (m["attestor"], m["key"][:16], m["status"], m["current"], m["live"], m["lastact"], m["bondfrozen"]))
+            for r in st["vaults"]:
+                print("    vault  %s %s YEC (height %s)" % (r["outpoint"], r["value"], r["height"]))
+            for r in st["intents"]:
+                print("    intent %s %s YEC mature=%s cancellable=%s" % (r["outpoint"], r["value"], r["mature"], r["cancellable"]))
+        if "eth" in st:
+            e = st["eth"]
+            print("  eth: block %d (finalized %d), wYEC totalSupply %s, holder %s balance %s; supply invariant %s"
+                  % (e["block"], e["finalized"], yec(e["totalSupply"]), e["holder"], yec(e["holderBalance"]),
+                     "holds" if st.get("supply_invariant") else "BROKEN" if "supply_invariant" in st else "n/a"))
+        for k in ("ycash_error", "eth_error"):
+            if k in st:
+                print("  %s: %s" % (k, st[k]))
+        for k, v in st["hawkeye"].items():
+            print("  %s: %s" % (k, json.dumps(v, default=str)[:400]))
+        if not st["hawkeye"]:
+            print("  hawkeye status: the binary has no `status` subcommand yet")
+
+    def logs(self, lines, follow):
+        self.load()
+        files = [self.path("miner.log"), self.s["anvil"]["log"], self.path("forge-deploy.log")]
+        files += [os.path.join(n["datadir"], "regtest", "debug.log") for n in self.s["nodes"]]
+        files += [a["log"] for a in self.s.get("attestors", [])]
+        files = [f for f in files if os.path.exists(f)]
+        if follow:
+            os.execvp("tail", ["tail", "-n", str(lines), "-F"] + files)
+        for f in files:
+            print("==> %s <==" % f)
+            with open(f, errors="replace") as fh:
+                print("".join(fh.readlines()[-lines:]), end="")
+
+    def down(self, quiet=False):
+        self.load()
+        stopped = []
+        for label, pid, match in self.processes():
+            if not proc_alive(pid, match):
+                continue
+            if label.startswith("ycashd"):
+                i = int(label[len("ycashd"):])
+                try:
+                    self.node(i, 30).stop()
+                except Exception:
+                    pass
+                deadline = time.time() + 60
+                while time.time() < deadline and proc_alive(pid):
+                    time.sleep(0.2)
+            stop_group(pid, match)
+            stopped.append(label)
+        for a in self.s.get("attestors", []):
+            a["pid"] = None
+        if self.s.get("miner"):
+            self.s["miner"]["pid"] = None
+        if self.s.get("anvil"):
+            self.s["anvil"]["pid"] = None
+        for n in self.s.get("nodes", []):
+            n["pid"] = None
+        self.save()
+        left = self.running()
+        if left:
+            die("still running after down: %s" % left)
+        if not quiet:
+            self.say("devnet down (stopped: %s); the directory %s is kept (`up` resumes, `clean` removes it)"
+                     % (", ".join(stopped) or "nothing was running", self.dir))
+
+    def clean(self):
+        if self.load(required=False) is not None:
+            alive = self.running()
+            if alive:
+                die("the devnet is up (%s); `hawkeye-devnet down` first" % alive)
+        if os.path.isdir(self.dir):
+            if not os.path.exists(self.state_path) and os.listdir(self.dir):
+                die("%s has no devnet.json; refusing to remove a directory this script did not create" % self.dir)
+            shutil.rmtree(self.dir)
+        self.say("removed %s" % self.dir)
+
+    # ================================================================ scenario demo
+    def wait_for(self, what, predicate, timeout, poll=1.0):
+        t0 = time.time()
+        last_error = None
+        while time.time() - t0 < timeout:
+            try:
+                r = predicate()
+                if r:
+                    self.say("  ok: %s (%.0fs, height %d)" % (what, time.time() - t0, self.tip()))
+                    return r
+            except DevnetError:
+                raise
+            except Exception as error:
+                last_error = error
+            time.sleep(poll)
+        die("timed out after %ds waiting for: %s%s" % (timeout, what, " (last error: %s)" % last_error if last_error else ""))
+
+    def intents(self):
+        return self.node(0).vault_list({"tag": "WYEC", "setid": self.s["set"]["setid"], "kind": "intent"})
+
+    def memo_of(self, txid):
+        tx = self.node(0).getrawtransaction(txid, 1)
+        for o in tx["vout"]:
+            m = decode_memo(o["scriptPubKey"]["hex"])
+            if m:
+                return m
+        return None
+
+    def spender_of(self, outpoint, from_height):
+        """The confirmed or mempool transaction spending `outpoint` (txid, decoded tx) or None."""
+        txid, n = outpoint.split(":")
+        n0 = self.node(0)
+        cands = list(n0.getrawmempool())
+        for h in range(from_height, n0.getblockcount() + 1):
+            cands += n0.getblock(n0.getblockhash(h))["tx"]
+        for t in cands:
+            tx = n0.getrawtransaction(t, 1)
+            for i in tx["vin"]:
+                if i.get("txid") == txid and i.get("vout") == int(n):
+                    return t, tx
+        return None
+
+    def owner_of_inputs(self, tx):
+        """Which attestor's wallet funded `tx` (its non-template inputs)."""
+        owners = set()
+        for i in tx["vin"]:
+            if "txid" not in i:
+                continue
+            prev = self.node(0).getrawtransaction(i["txid"], 1)["vout"][i["vout"]]
+            for addr in prev["scriptPubKey"].get("addresses", []):
+                for a in self.s["attestors"]:
+                    if self.node(a["node"]).validateaddress(addr).get("ismine"):
+                        owners.add(a["index"])
+        return sorted(owners)
+
+    def scenario_demo(self, attestors, activation, base_port, anvil_port, interval, block_time, keep, timeout):
+        started = datetime.datetime.now(datetime.timezone.utc)
+        self.say("=== hawkeye-devnet scenario demo (plan §8 D-1 + D-2), %s" % started.strftime("%Y-%m-%d %H:%M:%S UTC"))
+        ycashd = self.binaries()[0]
+        if ycashd:
+            self.say("ycashd: %s" % run_cmd([ycashd, "-version"], check=False).stdout.splitlines()[0])
+        hk = self.binaries()[2]
+        self.say("hawkeye: %s (%s)" % (hk, run_cmd([hk, "--version"], check=False).stdout.strip() if os.access(hk, os.X_OK) else "missing"))
+        ok = False
+        try:
+            self.say("--- step 1: up")
+            self.up(attestors, activation, base_port, anvil_port, interval, block_time)
+            if not self.hawkeye_has("run"):
+                die("the hawkeye binary has no `run` subcommand: the demo needs the sidecars (devnet/README.md)")
+            dep = self.deployment()
+            token, holder = dep["token"], self.s["holder"]["eth_address"]
+            set_id = self.s["set"]["setid"]
+
+            self.say("--- step 2: lock 10 YEC on node0 to the holder %s" % holder)
+            lk = self.lock("10", holder)
+            if lk.get("txid"):
+                self.wait_for("lock %s confirmed" % lk["txid"][:16],
+                              lambda: self.node(0).getrawtransaction(lk["txid"], 1).get("confirmations", 0) >= 1, timeout)
+
+            self.say("--- step 3: wait for the mint (wYEC.balanceOf(holder) == 10e8)")
+            self.wait_for("holder holds 10 wYEC",
+                          lambda: int(self.eth_call(token, "balanceOf(address)(uint256)", holder)) == 10 * COIN, timeout)
+            self.say("  wYEC totalSupply %s" % yec(int(self.eth_call(token, "totalSupply()(uint256)"))))
+
+            recipient = self.node(0).getnewaddress()
+            spk = self.node(0).validateaddress(recipient)["scriptPubKey"]
+            rhash = hashlib.sha256(bytes.fromhex(spk)).hexdigest()
+            self.say("--- step 4: burn 4 wYEC to node0's %s (recipientHash %s..)" % (recipient, rhash[:16]))
+            before = {r["outpoint"] for r in self.intents()}
+            self.burn("4", recipient)
+
+            self.say("--- step 5: wait for the intent carrying the HKB1 memo")
+
+            def burn_intent():
+                for r in self.intents():
+                    if r["outpoint"] in before or r["recipienthash"] != rhash or r["valuezat"] != 4 * COIN:
+                        continue
+                    memo = self.memo_of(r["txid"])
+                    if memo and memo["kind"] == 1:
+                        return r, memo
+                return None
+            row, memo = self.wait_for("intent paying 4 YEC to the burn recipient, with an HKB1 kind-1 memo", burn_intent, timeout)
+            self.say("  intent %s: memo chainId %d bridge %s nonce %d burn tx 0x%s; matures at %s"
+                     % (row["outpoint"], memo["chainid"], memo["bridge"], memo["ref"], memo["data"], row["matureheight"]))
+            if memo["chainid"] != 31337 or memo["bridge"].lower() != dep["bridge"].lower():
+                die("memo names another deployment: %s" % memo)
+
+            self.say("--- step 6: wait for the release (node0 receives 4 YEC at %s)" % recipient)
+            self.wait_for("4 YEC received at %s" % recipient,
+                          lambda: Decimal(self.node(0).getreceivedbyaddress(recipient, 1)) == 4, timeout + 60)
+
+            self.say("--- step 7: rogue 1 YEC by attestor1 (an unlock with no burn behind it)")
+            from_h = self.tip()
+            before = {r["outpoint"] for r in self.intents()}
+            rg = self.rogue("1", 1)
+            if not rg.get("intent"):
+                def new_intent():
+                    mem = list(self.node(0).getrawmempool())
+                    for r in self.intents():
+                        if r["outpoint"] not in before and r["recipienthash"] != rhash:
+                            return r["outpoint"]
+                    for t in mem:
+                        tx = self.node(0).getrawtransaction(t, 1)
+                        for o in tx["vout"]:
+                            if self.node(0).vault_decodescript(o["scriptPubKey"]["hex"]).get("type") == "intent" \
+                                    and not self.memo_of(t):
+                                return "%s:%d" % (t, o["n"])
+                    return None
+                rg["intent"] = self.wait_for("the rogue intent appears", new_intent, 60)
+            self.say("  rogue intent %s" % rg["intent"])
+
+            self.say("--- step 8: wait for the cancel by another attestor (intent spent back into a vault)")
+
+            def cancelled():
+                sp = self.spender_of(rg["intent"], from_h)
+                if not sp:
+                    return None
+                t, tx = sp
+                types = [self.node(0).vault_decodescript(o["scriptPubKey"]["hex"]).get("type") for o in tx["vout"]]
+                if "vault" not in types:
+                    die("the rogue intent %s was spent by %s, which is not a cancel (outputs %s)" % (rg["intent"], t, types))
+                return t, tx
+            ctxid, ctx = self.wait_for("rogue intent cancelled", cancelled, timeout)
+            by = self.owner_of_inputs(ctx)
+            self.say("  cancel %s funded by attestor%s" % (ctxid, ",".join(map(str, by)) or "?"))
+            if 1 in by:
+                die("the cancel was funded by attestor1, the rogue itself")
+            self.wait_for("cancel confirmed", lambda: self.node(0).getrawtransaction(ctxid, 1).get("confirmations", 0) >= 1, 120)
+
+            self.say("--- step 9: wait for the slash (attestor1 removed, bond frozen)")
+            key1 = self.s["attestors"][0]["memberkey"]
+
+            def slashed():
+                for m in self.node(0).set_getinfo(set_id)["memberlist"]:
+                    if m["key"] == key1 and m["status"] == "removed" and m["bondfrozen"]:
+                        return m
+                return None
+            m = self.wait_for("attestor1 status removed, bondfrozen true", slashed, timeout + 120)
+            self.say("  member %s..: %s" % (key1[:16], jdump(m)))
+
+            self.say("--- step 10: the supply invariant")
+            supply = int(self.eth_call(token, "totalSupply()(uint256)"))
+            rows = self.node(0).vault_list({"tag": "WYEC", "setid": set_id})
+            locked = sum(r["valuezat"] for r in rows)
+            self.say("  wYEC totalSupply %s <= WYEC value under the set %s (%d vaults, %d intents)"
+                     % (yec(supply), yec(locked), sum(r["kind"] == "vault" for r in rows), sum(r["kind"] == "intent" for r in rows)))
+            if supply > locked:
+                die("supply invariant broken")
+            if supply != 6 * COIN:
+                die("totalSupply %s, expected 6" % yec(supply))
+            st = self.status()
+            for k, v in st["hawkeye"].items():
+                self.say("  %s status: %s" % (k, json.dumps(v, default=str)[:300]))
+            ok = True
+            self.say("=== PASS: lock -> mint, burn -> intent (HKB1) -> release, rogue -> cancel -> slash, invariant holds")
+        except DevnetError as error:
+            self.say("=== FAIL: %s" % error)
+        finally:
+            if not keep and self.load(required=False):
+                try:
+                    self.say("--- down")
+                    self.down()
+                except Exception as error:
+                    self.say("down: %s" % error)
+            name = "demo-%s.txt" % started.strftime("%Y-%m-%d")
+            target = TRANSCRIPTS if ok else self.path("transcripts")
+            os.makedirs(target, exist_ok=True)
+            out = os.path.join(target, name if ok else name.replace(".txt", "-FAILED.txt"))
+            with open(out, "w") as f:
+                f.write("\n".join(self.lines) + "\n")
+            print("transcript: %s" % out)
+        return 0 if ok else 1
+
+
+# ====================================================================== CLI
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)        # `hawkeye-devnet logs | head`
+    parser = argparse.ArgumentParser(prog="hawkeye-devnet", description=__doc__.split("\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dir", default=argparse.SUPPRESS,
+                        help="run directory (default $HAWKEYE_DEVNET_DIR or devnet/run)")
+    parser.add_argument("--dir", default=argparse.SUPPRESS, help="run directory (default $HAWKEYE_DEVNET_DIR or devnet/run)")
+    sub = parser.add_subparsers(dest="command", required=True)
+    _add = sub.add_parser
+    sub.add_parser = lambda *a, **kw: _add(*a, parents=[common], **kw)
+
+    def up_args(p):
+        p.add_argument("--attestors", type=int, default=3)
+        p.add_argument("--activation", type=int, default=110, help="UPGRADE_VAULT height (default 110)")
+        p.add_argument("--base-port", type=int, default=18400, help="node i: p2p base+2i, rpc base+2i+1")
+        p.add_argument("--anvil-port", type=int, default=18545)
+        p.add_argument("--interval", type=float, default=2.0, help="background miner: seconds per block (0: off)")
+        p.add_argument("--block-time", type=int, default=1, help="anvil block time in seconds (0: automine)")
+
+    up_args(sub.add_parser("up", help="start the devnet (or resume a stopped one)"))
+    p = sub.add_parser("lock", help="node0 locks YEC under the set (to the holder by default)")
+    p.add_argument("amount")
+    p.add_argument("--dest")
+    p = sub.add_parser("burn", help="the holder burns wYEC to a Ycash t-address (node0's by default)")
+    p.add_argument("amount")
+    p.add_argument("--recipient")
+    p = sub.add_parser("rogue", help="attestor1 signs an unlock with no burn (drill D-2)")
+    p.add_argument("amount")
+    p.add_argument("--attestor", type=int, default=1)
+    sub.add_parser("silence", help="stop attestor N's hawkeye").add_argument("n", type=int)
+    sub.add_parser("unsilence", help="start attestor N's hawkeye again").add_argument("n", type=int)
+    sub.add_parser("mine", help="node0 mines N blocks now").add_argument("n", type=int)
+    sub.add_parser("heartbeat", help="every attestor node sends SET_HEARTBEAT (by hand, when the sidecars are not running)")
+    sub.add_parser("pause", help="pause the background miner")
+    sub.add_parser("resume", help="resume the background miner")
+    sub.add_parser("status").add_argument("--json", action="store_true")
+    p = sub.add_parser("logs", help="tail every log (node debug.log, anvil, hawkeye, miner)")
+    p.add_argument("-n", type=int, default=20)
+    p.add_argument("-f", "--follow", action="store_true")
+    p = sub.add_parser("cli", help="ycash-cli against node I: cli I METHOD [ARGS...]")
+    p.add_argument("i", type=int)
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("down", help="stop everything, keep the directory")
+    sub.add_parser("clean", help="remove the (stopped) run directory")
+    p = sub.add_parser("scenario", help="scripted end-to-end scenarios")
+    p.add_argument("name", choices=["demo"])
+    up_args(p)
+    p.add_argument("--keep", action="store_true", help="leave the devnet up afterwards")
+    p.add_argument("--fresh", action="store_true", help="clean a stopped devnet in --dir first")
+    p.add_argument("--timeout", type=int, default=180, help="seconds per wait step")
+    sub.add_parser("_miner")
+    args = parser.parse_args()
+
+    dv = Devnet(getattr(args, "dir", None) or os.environ.get("HAWKEYE_DEVNET_DIR") or DEFAULT_DIR)
+    try:
+        if args.command == "up":
+            dv.up(args.attestors, args.activation, args.base_port, args.anvil_port, args.interval, args.block_time)
+        elif args.command == "lock":
+            dv.lock(args.amount, args.dest)
+        elif args.command == "burn":
+            dv.burn(args.amount, args.recipient)
+        elif args.command == "rogue":
+            dv.rogue(args.amount, args.attestor)
+        elif args.command in ("silence", "unsilence"):
+            dv.silence(args.n, args.command == "silence")
+        elif args.command == "mine":
+            dv.load()
+            dv.mine(args.n)
+            dv.say("mined %d; height %d" % (args.n, dv.tip()))
+        elif args.command == "heartbeat":
+            dv.heartbeat()
+        elif args.command in ("pause", "resume"):
+            dv.pause(args.command == "pause")
+        elif args.command == "status":
+            st = dv.status()
+            if args.json:
+                print(json.dumps(st, indent=2, default=str))
+            else:
+                dv.print_status(st)
+        elif args.command == "logs":
+            dv.logs(args.n, args.follow)
+        elif args.command == "cli":
+            s = dv.load()
+            cli = s["binaries"].get("ycash_cli") or "ycash-cli"
+            nd = s["nodes"][args.i]
+            os.execvp(cli, [cli, "-datadir=%s" % nd["datadir"]] + args.args)
+        elif args.command == "down":
+            dv.down()
+        elif args.command == "clean":
+            dv.clean()
+        elif args.command == "scenario":
+            if dv.load(required=False) is not None:
+                if dv.running():
+                    die("a devnet is up in %s; `down` (and `clean`) first, or use another --dir" % dv.dir)
+                if not args.fresh:
+                    die("%s holds a stopped devnet; the demo starts from a fresh one: `clean` first or pass --fresh" % dv.dir)
+                dv.clean()
+                dv.s = None
+            return dv.scenario_demo(args.attestors, args.activation, args.base_port, args.anvil_port, args.interval,
+                                    args.block_time, args.keep, args.timeout)
+        elif args.command == "_miner":
+            dv.miner_loop()
+    except DevnetError as error:
+        print("hawkeye-devnet: %s" % error, file=sys.stderr)
+        return 1
+    except RPCError as error:
+        print("hawkeye-devnet: RPC error: %s" % error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
