@@ -15,6 +15,28 @@ primitive's delayed-release output (§15.3 of the upgrade plan).
 
 ---
 
+## Execution status (2026-10-07)
+
+**Round success criterion met on both node lines** (§9): `scenario demo` PASS on real regtest nodes
+of ycash-dd `upgrade/vault` v4.5.0 (`dbc1ab0`) and ycash6 `upgrade/vault` v6.22.0-rc1 (`2997007`),
+each with three Hawkeyes beside their own nodes, anvil and wYEC at the pinned commit; `scenario roll`
+PASS on both. Transcripts: `devnet/transcripts/*-ycash-dd-v4.5.0.txt`, `*-ycash6-v6.22.0-rc1.txt`.
+
+| Phase | State |
+|---|---|
+| H0 plan + skeleton | done |
+| H1 core (encodings, templates, EIP-712, ZIP-243 attribution) | done; node and Foundry vectors pass |
+| H2 Ycash adapter | done |
+| H3 Ethereum adapter + `eth/` Foundry | done (Sepolia deploy prepared, not run: no Sepolia access from the build host) |
+| H4 store + engine | done, incl. independent slash verification, persisted progress, rolls, equivocation |
+| H5 daemon | done (CLI, API, metrics) |
+| H6 devnet + drills | D-1, D-2, D-13 on both lines; D-3..D-12, D-14..D-16 covered in engine tests, not yet as devnet drills |
+| H7 Sepolia | open (owner runbook §9) |
+| H8 audit/release | open; CR-W1 (optimistic mint in wyec) outstanding |
+
+CI: lint, fmt, clippy, tests (anvil), rustdoc, cargo-deny, coverage (≥ 90 % on core), release build,
+contracts; `devnet-e2e` builds both node lines on GitHub and runs the demo (nightly, on demand).
+
 ## 0. The answer in one page
 
 1. **What Hawkeye is.** The off-chain half of the wYEC bridge: a Rust daemon each attestor runs next
