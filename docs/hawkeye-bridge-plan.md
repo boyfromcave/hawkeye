@@ -500,6 +500,16 @@ installer and the native `solc` download are blocked, Foundry's npm packages
 
 H1, H2 and H3 run in parallel; H4 needs H1; H5 needs H2–H4; H6 needs a built `ycashd`.
 
+**The success criterion of this round (owner, 2026-10-07):** Hawkeye demonstrably runs as a sidecar
+next to a real `ycashd`. `devnet/` therefore owns a self-contained devnet: N regtest `ycashd` nodes
+built from `ycash-dd` `upgrade/vault` (later also `ycash6`), activated with
+`-nuparams=6d5b7a31:<h>`, one anvil chain with wyec deployed by `eth/script/Deploy.s.sol`, and one
+Hawkeye per attestor node, each talking only to its own node's RPC. `devnet/hawkeye-devnet up |
+lock | burn | rogue | silence | status | down` mirrors `bridge-sim`'s commands so the two can be
+compared; the drills of §8 run as scripted scenarios with a transcript committed as evidence.
+The node binary is built outside this repository (`devnet/README.md` records the recipe);
+Hawkeye never patches the node.
+
 ### Sepolia runbook (H7, run where Sepolia is reachable)
 
 ```
