@@ -1,5 +1,5 @@
-# Hawkeye beside a real node: build the node from a node line's upgrade/vault branch, start the
-# devnet (regtest nodes + anvil with wYEC + one Hawkeye per attestor) and run `scenario demo`
+# Hawkeye beside a real node, on both node lines (ycash-dd v4.5.0, ycash6 6.2x): build the node
+# from the line's upgrade/vault branch, start the devnet (regtest nodes + anvil with wYEC + one Hawkeye per attestor) and run `scenario demo`
 # (lock -> mint, burn -> HKB1 intent -> release, rogue -> cancel -> slash, supply invariant).
 # This is the plan's §9 success criterion as a repeatable job; the mock never counts toward it.
 #
@@ -50,6 +50,10 @@ jobs:
             repo: boyfromcave/ycash-dd
             daemon: src/ycashd
             cli: src/ycash-cli
+          - line: ycash6
+            repo: boyfromcave/ycash6
+            daemon: src/ycashd
+            cli: src/ycash-cli
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -91,6 +95,7 @@ jobs:
         if: steps.bin.outputs.cache-hit != 'true'
         working-directory: node
         env:
+          LINE: ${{ matrix.line }}
           DAEMON: ${{ matrix.daemon }}
           CLI: ${{ matrix.cli }}
         run: |
@@ -98,17 +103,23 @@ jobs:
           host=$(./depends/config.guess)
           ./autogen.sh
           CONFIG_SITE="$PWD/depends/$host/share/config.site" ./configure
+          if [ "$LINE" = ycash6 ]; then
+            # 6.20.0: a targeted make skips BUILT_SOURCES, so generate the cxxbridge headers first.
+            mapfile -t headers < <(sed -n '/^CXXBRIDGE_H = /,/bridge.h$/p' src/Makefile.am | grep -o 'rust/gen/include/[^ \\]*')
+            make -C src -j"$(nproc)" "${headers[@]}"
+          fi
           make -C src -j"$(nproc)" "$(basename "$DAEMON")" "$(basename "$CLI")"
           mkdir -p ../node-bin
           cp "$DAEMON" "$CLI" ../node-bin/
       - name: zk parameters
+        if: matrix.line == 'ycash-dd'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: params
         with:
           path: ~/.zcash-params
           key: zcash-params-${{ hashFiles('node/zcutil/fetch-params.sh') }}
       - name: fetch zk parameters
-        if: steps.params.outputs.cache-hit != 'true'
+        if: matrix.line == 'ycash-dd' && steps.params.outputs.cache-hit != 'true'
         working-directory: node
         run: ./zcutil/fetch-params.sh
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
