@@ -11,6 +11,11 @@ updates:
     directory: /
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
+    groups:
+      # Patch releases arrive as one PR, verified once (each merge otherwise rebases the rest and
+      # queues another devnet-e2e run). Minor and major bumps stay individual.
+      cargo-patch:
+        update-types: ["patch"]
     ignore:
       # The byte-exact stack (txids, lockId, recipient hashes, set-signature messages, keccak
       # addresses, hash160, ZIP-243). The RustCrypto digest 0.11 generation cannot move alone
