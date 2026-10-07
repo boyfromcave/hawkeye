@@ -239,7 +239,8 @@ mode must satisfy `mode = optimistic ∨ k ≥ 2` on mainnet (enforced at start-
 ### 3.4 F-4: recipient bytes are opaque on both chains (HK-5)
 
 `burn(amount, bytes32 ycashRecipient)` is unconditional and the contract never parses the
-recipient (R2). A malformed recipient cannot be paid. Hawkeye defines the encoding (§4.2), the
+recipient (R2). A malformed recipient cannot be paid. `burn(0, …)` also succeeds and consumes a
+burn nonce: it is orphaned, never treated as a gap in the nonce sequence. Hawkeye defines the encoding (§4.2), the
 `hawkeye burn` CLI and any dapp built on it validate before sending, and a burn whose recipient
 does not decode is held as **orphaned**: never released, reported, and refundable by a threshold
 mint to the burner with the synthetic `lockId = sha256("hawkeye-refund" ‖ chainId ‖ bridge ‖
@@ -275,7 +276,8 @@ A confirmed output is a mintable lock iff all hold:
    configured attestor set, `delay =` the configured D, `appHeight = 0`;
 2. `ownerHeight − coinHeight ≥ MIN_OWNER_AGE` (§3.1);
 3. the same transaction has exactly one `OP_RETURN` whose single push is 32 bytes, the first 12 of
-   which are zero (an Ethereum address, left-padded), not beginning `0x5956`; and exactly one
+   which are zero (an Ethereum address, left-padded), not beginning `0x5956`, and the address is
+   not zero (a mint to `address(0)` reverts and would leave the `lockId` unconsumed forever); and exactly one
    `WYEC` V output (a lock transaction with two V outputs is not minted, HK-3: keeps `lockId ↔
    destination` unambiguous);
 4. value ≥ `MIN_LOCK` and ≤ `MAX_LOCK` (operator policy, for the Ethereum mint cap);
@@ -521,7 +523,7 @@ cd eth && ./tools/fetch-wyec.sh            # wyec @ pinned commit into eth/vendo
 export SEPOLIA_RPC_URL=... DEPLOYER_KEY=... ETHERSCAN_API_KEY=...
 GUARDIANS=0x..,0x..,0x.. THRESHOLD=1 forge script script/Deploy.s.sol \
     --rpc-url $SEPOLIA_RPC_URL --private-key $DEPLOYER_KEY --broadcast --verify
-# writes deployments/sepolia.json {chainId, bridge, token, deployBlock, guardians, threshold}
+# writes deployments/11155111.json {chainId, bridge, token, deployBlock, guardians, threshold, mintMode, challengeWindow}
 hawkeye --config config/sepolia.toml status
 ```
 Guardian addresses come from the Ycash set: `hawkeye keys eth-address --set <setid>` derives them
@@ -533,7 +535,7 @@ from the members' compressed keys.
 
 | # | Repo | Change | Why | Blocking? |
 |---|---|---|---|---|
-| CR-W1 | wyec | Optimistic mint: `proposeMint(lockId, amount, to, sig)` by one guardian → `MINT_CHALLENGE_WINDOW` → `executeMint(lockId)` by anyone; `challengeMint(lockId)` by any guardian deletes the proposal (re-proposable); events `MintProposed`, `MintChallenged`; optional mint `RateLimiter` (E-6); keep the k-of-n `mint` | the Foundation's model on the mint side (§3.3) | mainnet at k = 1 only |
+| CR-W1 | wyec | Optimistic mint: `proposeMint(lockId, amount, to, sig)` by one guardian → `MINT_CHALLENGE_WINDOW` → `executeMint(lockId)` by anyone; `challengeMint(lockId, sig)` by any guardian's **signature** (EIP-712 `Challenge(lockId)`, submittable by anyone, so guardian keys need no ETH) deletes the proposal (re-proposable); events `MintProposed`, `MintChallenged`; optional mint `RateLimiter` (E-6); keep the k-of-n `mint`. Hawkeye's test double (`eth/test/mocks/OptimisticMintBridge.sol`) implements the sender-based variant | the Foundation's model on the mint side (§3.3) | mainnet at k = 1 only |
 | CR-W2 | wyec | Foundry project (replacing `compile.js`), `Deploy.s.sol` with the predicted-address assertion, ABI artefacts committed | Hawkeye binds the ABI; Sepolia deploy | no (Hawkeye's `eth/` carries it meanwhile) |
 | CR-W3 | wyec | Document §4.2's recipient encoding in the contract's NatSpec | one definition | no |
 | CR-N1 | ycash-dd, ycash6 | `vault_lock` `"data"` parameter (finding (73)) | wallets write the destination without hand-built transactions | no |
@@ -570,4 +572,5 @@ from the members' compressed keys.
 | HK-7 | One key on both chains; Ycash signing via the node wallet (its sign-once guard), EIP-712 via Hawkeye with its own sign-once record |
 | HK-8 | No batching and no burn splitting in v1 (one burn ↔ one intent ↔ one vault input) |
 | HK-9 | Deterministic leader by `nonce mod |live|`, takeover after `TAKEOVER` blocks; every attestor verifies everything |
+| HK-11 | Contract facts Hawkeye relies on (Foundry-tested in `eth/test/`): mint signatures carry no nonce (the `lockId` is the only replay key, valid across rotations while the signers remain guardians); one shared `adminNonce` serialises admin rounds (run one at a time); `setPaused` to the current state reverts; high-S signatures are rejected |
 | HK-10 | Hawkeye reaches the node only through stock and `set_*`/`vault_*` RPCs, and Ethereum only through standard JSON-RPC |
