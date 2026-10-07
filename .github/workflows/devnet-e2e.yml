@@ -1,0 +1,144 @@
+# Hawkeye beside a real node: build the node from a node line's upgrade/vault branch, start the
+# devnet (regtest nodes + anvil with wYEC + one Hawkeye per attestor) and run `scenario demo`
+# (lock -> mint, burn -> HKB1 intent -> release, rogue -> cancel -> slash, supply invariant).
+# This is the plan's §9 success criterion as a repeatable job; the mock never counts toward it.
+#
+# Slow (a cold node build is ~1 h), so it runs nightly, on demand, and when devnet/ or the
+# daemon changes on main. The node build is cached per node commit.
+name: devnet-e2e
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      node_ref:
+        description: node branch, tag or commit to build (both lines)
+        default: upgrade/vault
+  push:
+    branches: [main, "claude/**"]
+    paths: ["devnet/**", "crates/**", "eth/**", ".github/workflows/devnet-e2e.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devnet-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FOUNDRY_VERSION: v1.7.1
+  NODE_REF: ${{ inputs.node_ref || 'upgrade/vault' }}
+
+jobs:
+  demo:
+    name: demo on ${{ matrix.line }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - line: ycash-dd
+            repo: boyfromcave/ycash-dd
+            daemon: src/ycashd
+            cli: src/ycash-cli
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ env.NODE_REF }}
+          path: node
+          persist-credentials: false
+      - name: node commit
+        id: node
+        run: echo "sha=$(git -C node rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libc6-dev m4 g++-multilib \
+            autoconf libtool ncurses-dev unzip git python3 zlib1g-dev curl bsdmainutils \
+            automake libtinfo5
+      - name: cached node binaries
+        id: bin
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: node-bin
+          key: node-bin-${{ matrix.line }}-${{ steps.node.outputs.sha }}
+      - name: cached depends
+        if: steps.bin.outputs.cache-hit != 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            node/depends/x86_64-pc-linux-gnu
+            node/depends/built
+            node/depends/sources
+          key: depends-${{ matrix.line }}-${{ hashFiles('node/depends/Makefile', 'node/depends/funcs.mk', 'node/depends/config.site.in', 'node/depends/packages/**', 'node/depends/patches/**', 'node/depends/hosts/**', 'node/depends/builders/**') }}
+      - name: build the node (unmodified src/)
+        if: steps.bin.outputs.cache-hit != 'true'
+        working-directory: node
+        env:
+          DAEMON: ${{ matrix.daemon }}
+          CLI: ${{ matrix.cli }}
+        run: |
+          BUILD_STAGE=depends ./zcutil/build.sh -j"$(nproc)"
+          host=$(./depends/config.guess)
+          ./autogen.sh
+          CONFIG_SITE="$PWD/depends/$host/share/config.site" ./configure
+          make -C src -j"$(nproc)" "$(basename "$DAEMON")" "$(basename "$CLI")"
+          mkdir -p ../node-bin
+          cp "$DAEMON" "$CLI" ../node-bin/
+      - name: zk parameters
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: params
+        with:
+          path: ~/.zcash-params
+          key: zcash-params-${{ hashFiles('node/zcutil/fetch-params.sh') }}
+      - name: fetch zk parameters
+        if: steps.params.outputs.cache-hit != 'true'
+        run: ./node/zcutil/fetch-params.sh
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: devnet
+      - name: build hawkeye
+        run: cargo build --locked --bin hawkeye
+      - name: contracts
+        working-directory: eth
+        run: |
+          npm ci --ignore-scripts
+          ./tools/fetch-wyec.sh
+      - name: scenario demo
+        env:
+          DEVNET_NATIVE_SOLC: "1"
+          DAEMON: ${{ matrix.daemon }}
+          CLI: ${{ matrix.cli }}
+        run: |
+          YCASHD="$PWD/node-bin/$(basename "$DAEMON")"
+          YCASH_CLI="$PWD/node-bin/$(basename "$CLI")"
+          export YCASHD YCASH_CLI
+          "$YCASHD" -version | head -1
+          python3 devnet/hawkeye-devnet scenario demo --fresh
+      - name: stop the devnet
+        if: always()
+        run: python3 devnet/hawkeye-devnet down || true
+      - name: transcript and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: devnet-${{ matrix.line }}
+          path: |
+            devnet/transcripts/
+            devnet/run/transcripts/
+            devnet/run/**/*.log
+          retention-days: 14
+          if-no-files-found: warn
