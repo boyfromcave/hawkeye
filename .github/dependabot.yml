@@ -1,0 +1,17 @@
+# Weekly update PRs for the pinned actions, the Cargo workspace and the eth/ npm pins.
+# Every PR runs the full CI; nothing merges without review.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      actions: { patterns: ["*"] }
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+  - package-ecosystem: npm
+    directory: /eth
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 3
