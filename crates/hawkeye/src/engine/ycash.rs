@@ -11,15 +11,15 @@ use hawkeye_core::script::{is_op_return, op_return_single_push, parse_p2pkh, par
 use hawkeye_core::template::{TAG_WYEC, TemplateKind, parse_intent, parse_selector, parse_vault};
 use hawkeye_core::{IntentParams, OutPoint as CoreOutPoint, PubKey33, VaultParams};
 use hawkeye_store::{
-    BurnKey, BurnState, Chain, IntentState, NewIntent, NewLock, NewVault, StoreError, Tx,
-    VaultState, classification_code,
+    BurnKey, BurnState, Chain, IntentState, NewIntent, NewLock, NewVault, SeenSetSig, StoreError,
+    Tx, VaultState, classification_code,
 };
 use hawkeye_ycash::tx::Transaction;
 use hawkeye_ycash::types::{DecodedScript, TemplateKind as RpcKind, VaultListFilter};
 use hawkeye_ycash::{Hash256, HexBytes};
 use tracing::{debug, info, warn};
 
-use super::{Engine, SeenSig};
+use super::Engine;
 use crate::config::Params;
 use crate::convert::{intent_params, op_core, outputs, vault_params};
 
@@ -67,14 +67,79 @@ impl UnlockObs {
     }
 }
 
-/// The matcher context of the configured deployment.
-pub fn match_context(p: &Params, tip: u32) -> MatchContext {
+/// The matcher context of the configured deployment for an intent first seen at `height`: a
+/// roll's new `ownerHeight` must be at least `height + MIN_OWNER_AGE − ROLL_MARGIN` (plan §4.3 as
+/// revised; the leader writes `tip + MIN_OWNER_AGE + ROLL_MARGIN + slack`).
+pub fn match_context(p: &Params, height: u32) -> MatchContext {
     MatchContext {
         deployment: p.deployment,
         set_id: p.set_id,
         takeover: p.takeover,
-        min_roll_owner_height: tip.saturating_add(p.min_owner_age),
+        min_roll_owner_height: height
+            .saturating_add(p.min_owner_age)
+            .saturating_sub(p.roll_margin),
     }
+}
+
+/// One intent output of an unlock, as [`classify`] judges it.
+#[derive(Debug, Clone, Copy)]
+pub struct IntentFacts<'a> {
+    /// The unlock's txid.
+    pub txid: Hash32,
+    /// The height it was first seen at.
+    pub first_seen: u32,
+    /// The intent's parameters.
+    pub intent: &'a IntentParams,
+    /// Its value.
+    pub value: u64,
+    /// Every output of the unlock.
+    pub outputs: &'a [CoreTxOut],
+    /// The V the unlock spent (rolls).
+    pub spent_vault: Option<&'a VaultParams>,
+    /// The vault outpoint the unlock spent.
+    pub origin: Option<&'a CoreOutPoint>,
+}
+
+/// Classify an intent (§3.2) against this ledger's burns. On top of the matcher: a roll of a
+/// vault this ledger holds as a lock **refused by policy** is a bad roll (that lock was never
+/// minted; rolling it would only postpone its owner's recovery, §3.1).
+pub fn classify(t: &Tx<'_>, p: &Params, f: &IntentFacts<'_>) -> Classification {
+    let mctx = match_context(p, f.first_seen);
+    let c = classify_intent(
+        &mctx,
+        &ObservedIntent {
+            txid: f.txid,
+            first_seen: f.first_seen,
+            intent: f.intent,
+            value: f.value,
+            outputs: f.outputs,
+            spent_vault: f.spent_vault,
+        },
+        |n| t.matcher_burn(&p.deployment, n).ok().flatten(),
+    );
+    if let (Classification::MatchedRoll { .. }, Some(origin)) = (&c, f.origin)
+        && t.lock_by_outpoint(origin)
+            .ok()
+            .flatten()
+            .is_some_and(|l| l.state == hawkeye_store::LockState::PolicyRejected)
+    {
+        return Classification::Unmatched(hawkeye_core::matcher::Unmatched::BadRoll);
+    }
+    c
+}
+
+/// The roll memo (kind 2, this deployment) among `outputs`, if any.
+pub fn roll_memo(p: &Params, outputs: &[CoreTxOut]) -> Option<hawkeye_core::memo::HawkeyeMemo> {
+    outputs.iter().find_map(
+        |o| match hawkeye_core::memo::parse_memo_script(&o.script_pubkey) {
+            Ok(Some(m))
+                if m.kind == hawkeye_core::memo::MemoKind::Roll && m.deployment == p.deployment =>
+            {
+                Some(m)
+            }
+            _ => None,
+        },
+    )
 }
 
 /// Link a matched intent to its burn (and confirm it).
@@ -119,7 +184,6 @@ pub fn apply_unlock(
     confirmed: Option<u32>,
     members: &[PubKey33],
 ) -> Result<(), StoreError> {
-    let mctx = match_context(p, tip);
     for (vout, ip, value) in &obs.intents {
         if ip.tag != TAG_WYEC || ip.set_id != p.set_id || ip.cancel_set_id != p.set_id {
             continue;
@@ -143,17 +207,18 @@ pub fn apply_unlock(
         }
         match rec.state {
             IntentState::Observed | IntentState::Matched | IntentState::Unmatched => {
-                let c = classify_intent(
-                    &mctx,
-                    &ObservedIntent {
+                let c = classify(
+                    t,
+                    p,
+                    &IntentFacts {
                         txid: obs.txid,
                         first_seen: rec.first_seen_height,
                         intent: ip,
                         value: *value,
                         outputs: &obs.outputs,
                         spent_vault: obs.vault_params.as_ref(),
+                        origin: Some(&obs.vault),
                     },
-                    |n| t.matcher_burn(&p.deployment, n).ok().flatten(),
                 );
                 if c == Classification::Foreign {
                     continue;
@@ -179,7 +244,14 @@ pub fn apply_unlock(
 
 /// Spends of the set's vaults and intents by a mined transaction: vault `SPENT`, intent
 /// `CANCELLED` (selector 2) or `RELEASED` (selector 1), and the burn moves with its intent.
-fn apply_spends(t: &Tx<'_>, tx: &Transaction, txid: &Hash32, h: u32) -> Result<(), StoreError> {
+fn apply_spends(
+    t: &Tx<'_>,
+    p: &Params,
+    tx: &Transaction,
+    txid: &Hash32,
+    h: u32,
+) -> Result<(), StoreError> {
+    let is_roll = roll_memo(p, &outputs(tx)).is_some();
     for input in &tx.inputs {
         let op = op_core(&input.prevout);
         if let Some(v) = t.vault(&op)?
@@ -188,8 +260,20 @@ fn apply_spends(t: &Tx<'_>, tx: &Transaction, txid: &Hash32, h: u32) -> Result<(
                 VaultState::Live | VaultState::RollDue | VaultState::Rolling
             )
         {
-            t.vault_spent(&op, VaultState::Spent, txid, h)?;
-            info!(event = "vault_spent", vault = %op, by = %hawkeye_core::bytes::txid_to_display(txid), height = h);
+            if is_roll {
+                // a roll unlock (kind-2 memo): LIVE → ROLL_DUE → ROLLING → ROLLED
+                if v.state == VaultState::Live {
+                    t.transition_vault(&op, VaultState::RollDue, Some(h), Some("rolled"))?;
+                }
+                if v.state != VaultState::Rolling {
+                    t.transition_vault(&op, VaultState::Rolling, Some(h), Some("rolled"))?;
+                }
+                t.vault_spent(&op, VaultState::Rolled, txid, h)?;
+                info!(event = "vault_rolled", vault = %op, by = %hawkeye_core::bytes::txid_to_display(txid), height = h);
+            } else {
+                t.vault_spent(&op, VaultState::Spent, txid, h)?;
+                info!(event = "vault_spent", vault = %op, by = %hawkeye_core::bytes::txid_to_display(txid), height = h);
+            }
         }
         let Some(i) = t.intent(&op)? else {
             continue;
@@ -394,19 +478,23 @@ impl Engine {
             // vaults created here may be spent later in the same block
             self.cache_vault_outputs(&tx, info.txid.0);
             let obs = self.prepare_unlock(&tx, hex.as_slice(), None).await?;
-            txs.push((tx, info.txid.0, obs));
+            let cancels = self.cancel_attributions(&tx, hex.as_slice()).await;
+            txs.push((tx, info.txid.0, obs, cancels));
         }
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
         let members = self.current_member_keys();
-        for (_, _, obs) in &txs {
+        for (_, txid, obs, cancels) in &txs {
             if let Some(o) = obs {
                 self.note_signatures(o).await;
             }
+            for a in cancels {
+                self.note_attribution(a, txid).await;
+            }
         }
         self.ctx.db(|t| {
-            for (tx, txid, obs) in &txs {
-                apply_spends(t, tx, txid, h)?;
+            for (tx, txid, obs, _) in &txs {
+                apply_spends(t, &p, tx, txid, h)?;
                 if let Some(o) = obs {
                     apply_unlock(t, &p, o, tip, h, Some(h), &members)?;
                 }
@@ -437,7 +525,7 @@ impl Engine {
     }
 
     /// The script and value of a set vault (cache; else the ledger's creating block).
-    async fn vault_coin(&mut self, op: &CoreOutPoint) -> Result<Option<(Vec<u8>, u64)>> {
+    pub(crate) async fn vault_coin(&mut self, op: &CoreOutPoint) -> Result<Option<(Vec<u8>, u64)>> {
         if let Some(c) = self.mem.vault_scripts.get(op) {
             return Ok(Some(c.clone()));
         }
@@ -576,54 +664,130 @@ impl Engine {
         Ok(u64::try_from(o.value).unwrap_or(0))
     }
 
-    /// Record the set signatures of an unlock; two different signatures by one key over one
-    /// prevout are an equivocation, submitted at once (§2.3 row 1, §5.3 step 4).
+    /// Record the set signatures of an unlock (see [`Engine::note_attribution`]).
     pub(crate) async fn note_signatures(&mut self, obs: &UnlockObs) {
-        let Some(a) = &obs.attribution else { return };
+        if let Some(a) = obs.attribution.clone() {
+            self.note_attribution(&a, &obs.txid).await;
+        }
+    }
+
+    /// The set signatures of every CANCEL of one of the set's intents in `tx` (selector 2,
+    /// attributed through the intent's script and value).
+    pub(crate) async fn cancel_attributions(
+        &mut self,
+        tx: &Transaction,
+        raw: &[u8],
+    ) -> Vec<Attribution> {
+        let mut out = vec![];
+        for (idx, input) in tx.inputs.iter().enumerate() {
+            let op = op_core(&input.prevout);
+            let known = self.mem.raw_txs.contains_key(&op.txid)
+                || self.ctx.db(|t| t.intent(&op)).ok().flatten().is_some();
+            if !known
+                || parse_selector(TemplateKind::Intent, &input.script_sig)
+                    .map(|s| s.selector)
+                    .ok()
+                    != Some(2)
+            {
+                continue;
+            }
+            let Ok(Some((spk, value))) = self.intent_coin(&op).await else {
+                continue;
+            };
+            match self.ctx.attributor.attribute(
+                raw,
+                idx,
+                &spk,
+                value,
+                hawkeye_core::VAULT_BRANCH_ID,
+            ) {
+                Ok(a) if a.set_id == self.ctx.params.set_id => out.push(a),
+                Ok(_) => {}
+                Err(e) => debug!(event = "attribution_failed", txid = %tx.txid(), error = %e),
+            }
+        }
+        out
+    }
+
+    /// The script and value of an intent output (the unlock cache, else the node).
+    async fn intent_coin(&mut self, op: &CoreOutPoint) -> Result<Option<(Vec<u8>, u64)>> {
+        let raw = match self.mem.raw_txs.get(&op.txid) {
+            Some(r) => r.clone(),
+            None => {
+                let r = self
+                    .ctx
+                    .ycash
+                    .getrawtransaction(&Hash256::from_internal(op.txid))
+                    .await?;
+                r.0
+            }
+        };
+        let tx = Transaction::decode(&raw).map_err(|e| anyhow!("{e}"))?;
+        Ok(tx
+            .outputs
+            .get(op.vout as usize)
+            .map(|o| (o.script_pubkey.clone(), u64::try_from(o.value).unwrap_or(0))))
+    }
+
+    /// Record the set signatures of one template spend, persistently; two different
+    /// `(role, sighash)` signed by one key over one prevout — two unlocks, two cancels, or any
+    /// mix — are an equivocation, submitted at once (§2.3 row 1, §5.3 step 4), once per
+    /// `(prevout, key)`.
+    pub(crate) async fn note_attribution(&mut self, a: &Attribution, txid: &Hash32) {
+        if a.set_id != self.ctx.params.set_id {
+            return;
+        }
         let members = self.current_member_keys();
         let mut proofs = vec![];
-        let seen = self.mem.sigs_seen.entry(a.prevout).or_default();
         for s in &a.signers {
             if !members.contains(&s.pubkey) {
                 continue;
             }
-            let role = a.role.byte();
-            if let Some(prev) = seen
-                .iter()
-                .find(|x| x.key == s.pubkey && (x.role != role || x.sighash != a.sighash))
-            {
-                proofs.push((prev.clone(), role, a.sighash, s.pubkey, s.signature));
-            }
-            if !seen
-                .iter()
-                .any(|x| x.key == s.pubkey && x.role == role && x.sighash == a.sighash)
-            {
-                seen.push(SeenSig {
-                    role,
-                    sighash: a.sighash,
-                    key: s.pubkey,
-                    sig: s.signature,
-                });
+            let seen = SeenSetSig {
+                set_id: a.set_id,
+                prevout: a.prevout,
+                member_key: s.pubkey,
+                role: a.role.byte(),
+                sighash: a.sighash,
+                signature: s.signature,
+                txid: *txid,
+            };
+            match self.ctx.db(|t| t.note_set_sig(&seen)) {
+                Ok(conflicts) => {
+                    if let Some(prev) = conflicts.into_iter().next() {
+                        proofs.push((prev, seen));
+                    }
+                }
+                Err(e) => warn!(event = "set_sig_note_failed", error = %format!("{e:#}")),
             }
         }
-        for (prev, role, sighash, key, sig) in proofs {
-            if !self.mem.equivocations_sent.insert((a.prevout, key)) {
-                continue;
+        for (prev, cur) in proofs {
+            let key = cur.member_key;
+            match self.ctx.db(|t| t.claim_equivocation(&a.prevout, &key)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!(event = "equivocation_claim_failed", error = %format!("{e:#}"));
+                    continue;
+                }
             }
             let proof = hawkeye_ycash::types::Proof {
                 setid: self.ctx.set_hash(),
                 prevout: crate::convert::op_rpc(&a.prevout),
                 rolea: prev.role,
                 sighasha: hawkeye_ycash::Bytes32(prev.sighash),
-                siga: HexBytes(prev.sig.to_vec()),
-                roleb: role,
-                sighashb: hawkeye_ycash::Bytes32(sighash),
-                sigb: HexBytes(sig.to_vec()),
+                siga: HexBytes(prev.signature.to_vec()),
+                roleb: cur.role,
+                sighashb: hawkeye_ycash::Bytes32(cur.sighash),
+                sigb: HexBytes(cur.signature.to_vec()),
             };
             let evidence = serde_json::json!({
                 "fault": "EQUIVOCATION",
                 "set_id": hawkeye_core::bytes::txid_to_display(&self.ctx.params.set_id),
                 "target": hex::encode(key),
+                "prevout": a.prevout.to_string(),
+                "txids": [hawkeye_core::bytes::txid_to_display(&prev.txid),
+                          hawkeye_core::bytes::txid_to_display(&cur.txid)],
                 "proof": proof,
             });
             let tip = self.mem.tip;
@@ -637,11 +801,16 @@ impl Engine {
                 })
             });
             match self.ctx.ycash.set_equivocation(&proof).await {
-                Ok(txid) => {
+                Ok(sent) => {
+                    let _ = self
+                        .ctx
+                        .db(|t| t.equivocation_sent(&a.prevout, &key, &sent.0));
                     warn!(event = "equivocation_submitted", member = %hex::encode(key),
-                          prevout = %a.prevout, txid = %txid)
+                          prevout = %a.prevout, roles = %format!("{}/{}", prev.role, cur.role),
+                          txid = %sent)
                 }
                 Err(e) => {
+                    let _ = self.ctx.db(|t| t.unclaim_equivocation(&a.prevout, &key));
                     warn!(event = "equivocation_failed", member = %hex::encode(key),
                           prevout = %a.prevout, error = %e)
                 }

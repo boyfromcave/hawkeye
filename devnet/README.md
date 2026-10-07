@@ -89,7 +89,7 @@ cargo build --locked -p hawkeye          # target/debug/hawkeye; or HAWKEYE=/pat
 export YCASHD=... YCASH_CLI=...          # the node binaries; default: ycashd / ycash-cli on PATH
 devnet/hawkeye-devnet up [--attestors 3] [--dir devnet/run] [--activation 110] [--interval 2]
 devnet/hawkeye-devnet status [--json]
-devnet/hawkeye-devnet lock 10 [--dest 0x<holder>]       # node0 → WYEC vault + dest OP_RETURN
+devnet/hawkeye-devnet lock 10 [--dest 0x<holder>] [--owner-age N]  # node0 → WYEC vault + dest OP_RETURN
 devnet/hawkeye-devnet burn 4 [--recipient <node0 t-addr>]
 devnet/hawkeye-devnet rogue 1 [--attestor 1]            # drill D-2: an unlock with no burn
 devnet/hawkeye-devnet silence 2 | unsilence 2           # stop / restart attestor2's hawkeye
@@ -101,6 +101,7 @@ devnet/hawkeye-devnet down                              # stop everything, keep 
 devnet/hawkeye-devnet up                                # on a stopped devnet: resume it
 devnet/hawkeye-devnet clean                             # remove the stopped run directory
 devnet/hawkeye-devnet scenario demo [--fresh] [--keep]  # the end-to-end proof, below
+devnet/hawkeye-devnet scenario roll [--fresh] [--keep]  # drill D-13: a vault rolled before ownerHeight (HK-6)
 ```
 
 `--dir` (or `$HAWKEYE_DEVNET_DIR`) works before or after the command. `devnet/run` is gitignored.
@@ -218,6 +219,28 @@ engine makes (plan §5.3):
   intent.
 - `set_buildact remove {"burn": true}` on node2 → `set_signact` on node2 and node3 (2 of 2
   required) → `set_sendact`. Result: attestor1 `removed`, `bondfrozen: true`.
+
+## `scenario roll`: drill D-13 (plan §3.1 HK-6)
+
+```sh
+devnet/hawkeye-devnet scenario roll [--fresh] [--keep] [--timeout 180]
+```
+
+`up` records `[bridge]` overrides in `devnet.json` and writes them into every `attestor<i>.toml`:
+the drill uses `min_owner_age = 20` and `roll_margin = 40` (the other values as above).
+
+1. `up` with those overrides.
+2. `lock 10 --owner-age 400` (far from due); wait for its mint.
+3. `lock 2 --owner-age 30`: policy-OK (30 ≥ 20) and already within `ROLL_MARGIN` (30 ≤ 40); wait
+   for its mint (12 wYEC). Two vaults, so the roll fits the 5000 bps rate limit.
+4. **Roll:** wait until the 2 YEC vault is spent by an unlock carrying an `HKB1` kind-2 memo whose
+   `ref` (the new `ownerHeight`) is above the old one and whose `data` equals the intent's
+   `recipientHash`.
+5. **Release:** wait until the roll intent is spent into a V with `ownerHeight = ref` (a cancel would
+   pay back into the old `ownerHeight`, and fails the drill), and the new vault is in `vault_list`.
+6. No member lost its seat; `wYEC.totalSupply()` (12) ≤ the WYEC value under the set.
+
+A passing run writes `devnet/transcripts/roll-<date>.txt`.
 
 ## Troubleshooting
 

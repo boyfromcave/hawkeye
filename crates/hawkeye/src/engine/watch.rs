@@ -9,7 +9,8 @@ use anyhow::{Result, anyhow};
 use hawkeye_core::IntentParams;
 use hawkeye_core::OutPoint as CoreOutPoint;
 use hawkeye_core::bytes::txid_to_display;
-use hawkeye_core::matcher::{Classification, ObservedIntent, classify_intent};
+use hawkeye_core::matcher::Classification;
+use hawkeye_core::memo::{HawkeyeMemo, MemoKind};
 use hawkeye_core::policy::TxOut as CoreTxOut;
 use hawkeye_core::script::op_return_script;
 use hawkeye_core::template::TAG_WYEC;
@@ -22,7 +23,7 @@ use hawkeye_ycash::tx::Transaction;
 use hawkeye_ycash::types::{TemplateKind as RpcKind, VaultListFilter};
 use tracing::{info, warn};
 
-use super::ycash::{link_burn, match_context};
+use super::ycash::{IntentFacts, classify, link_burn};
 use super::{Engine, block_on};
 use crate::convert::{op_core, op_rpc};
 
@@ -91,6 +92,9 @@ impl Engine {
             if !self.mem.mempool_seen.insert(txid.0) {
                 continue;
             }
+            for a in self.cancel_attributions(&tx, raw.as_slice()).await {
+                self.note_attribution(&a, &txid.0).await;
+            }
             if let Some(obs) = self.prepare_unlock(&tx, raw.as_slice(), None).await? {
                 self.note_signatures(&obs).await;
                 self.ctx
@@ -145,17 +149,21 @@ impl Engine {
         Ok(())
     }
 
-    /// Re-run the matcher over the open intents with the ledger's current burns.
+    /// Re-run the matcher over the open intents with the ledger's current burns. Rolls are
+    /// judged once, when first observed with the V they spend (§4.3), and not re-run here.
     fn reclassify(&mut self) -> Result<()> {
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
-        let mctx = match_context(&p, tip);
         self.ctx.db(|t| {
             let mut open = t.intents_in_state(IntentState::Matched)?;
             open.extend(t.intents_in_state(IntentState::Unmatched)?);
             open.extend(t.intents_in_state(IntentState::Observed)?);
             for i in open {
-                if i.classification.as_deref() == Some("matched-roll") {
+                if i.classification.as_deref() == Some("matched-roll")
+                    || i.memo.as_deref().is_some_and(|m| {
+                        HawkeyeMemo::decode(m).is_ok_and(|m| m.kind == MemoKind::Roll)
+                    })
+                {
                     continue;
                 }
                 let ip = IntentParams {
@@ -175,17 +183,18 @@ impl Engine {
                         script_pubkey: op_return_script(m),
                     })
                     .collect();
-                let c = classify_intent(
-                    &mctx,
-                    &ObservedIntent {
+                let c = classify(
+                    t,
+                    &p,
+                    &IntentFacts {
                         txid: i.outpoint.txid,
                         first_seen: i.first_seen_height,
                         intent: &ip,
                         value: i.value_zat,
                         outputs: &outs,
                         spent_vault: None,
+                        origin: i.origin_vault.as_ref(),
                     },
-                    |n| t.matcher_burn(&p.deployment, n).ok().flatten(),
                 );
                 if c == Classification::Foreign {
                     continue;

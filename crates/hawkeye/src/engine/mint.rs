@@ -15,13 +15,14 @@ use hawkeye_core::recipient::YcashRecipient;
 use hawkeye_eth::bindings::{OptimisticMintBridge, WyecBridge};
 use hawkeye_eth::{BridgeEvent, MintMode, MintSubmitted, U256};
 use hawkeye_store::{
-    BurnKey, BurnState, Chain, FaultKind, LockState, NewBurn, NewSlashCase, StoreError, Tx,
+    BurnKey, BurnState, Chain, FaultKind, LockState, NewBurn, NewSlashCase, PendingMintRecord,
+    StoreError, Tx,
 };
 use hawkeye_ycash::Hash256;
 use hawkeye_ycash::tx::Transaction;
 use tracing::{info, warn};
 
-use super::{Engine, PendingMint};
+use super::Engine;
 use crate::convert::{addr, b256, eth_addr, outputs};
 
 /// Most Ethereum blocks scanned per tick.
@@ -132,7 +133,6 @@ impl Engine {
             .hash;
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
-        let mut deferred = vec![];
         let mut frauds = vec![];
         let mut rotated = false;
         self.ctx.db(|t| {
@@ -195,18 +195,25 @@ impl Engine {
                     } => {
                         let proposal = matches!(ev.event, BridgeEvent::MintProposed { .. });
                         let amount = u64::try_from(*amount).unwrap_or(u64::MAX);
-                        let pm = PendingMint {
+                        let pm = PendingMintRecord {
                             lock_id: lock_id.0,
                             to: eth_addr(to),
                             amount,
                             tx_hash: m.tx_hash.0,
                             block: m.block_number,
-                            since_tip: tip,
+                            since_height: tip,
+                            proposal,
                         };
                         match judge_minted(t, &pm.lock_id, &pm.to, amount, m.block_number, proposal)?
                         {
                             MintVerdict::Ok => {}
-                            MintVerdict::Defer => deferred.push(pm),
+                            MintVerdict::Defer => {
+                                // persisted with the cursor: a restart re-judges it
+                                if t.add_pending_mint(&pm)? {
+                                    info!(event = "mint_check_deferred", lock_id = %lock_hex(&pm.lock_id),
+                                          proposal);
+                                }
+                            }
                             MintVerdict::Fraud(why) => frauds.push((pm, why)),
                         }
                     }
@@ -238,7 +245,6 @@ impl Engine {
         if rotated {
             self.mem.guardian_check_due = true;
         }
-        self.mem.pending_mints.extend(deferred);
         for (pm, why) in frauds {
             self.fraudulent_mint(&pm, &why).await?;
         }
@@ -246,9 +252,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Re-judge deferred `Minted` events; one with still no lock long after is a fraud.
+    /// Re-judge deferred `Minted` / `MintProposed` events (from the ledger, so a restart resumes
+    /// them); one with still no lock long after is a fraud.
     pub(crate) async fn check_pending_mints(&mut self) -> Result<()> {
-        let pending = std::mem::take(&mut self.mem.pending_mints);
+        let pending = self.ctx.db(|t| t.pending_mints())?;
+        if pending.is_empty() {
+            return Ok(());
+        }
         let tip = self.mem.tip;
         let grace = 2 * self.ctx.params.confirmations + 2 * self.ctx.params.takeover + 10;
         let caught_up = self
@@ -256,34 +266,45 @@ impl Engine {
             .db(|t| t.cursor(Chain::Ycash))?
             .is_some_and(|c| c.height >= u64::from(tip));
         for pm in pending {
-            let v = self
-                .ctx
-                .db(|t| judge_minted(t, &pm.lock_id, &pm.to, pm.amount, pm.block, false))?;
-            match v {
-                MintVerdict::Ok => {}
-                MintVerdict::Fraud(why) => self.fraudulent_mint(&pm, &why).await?,
-                MintVerdict::Defer if caught_up && tip >= pm.since_tip + grace => {
-                    self.fraudulent_mint(&pm, "no policy-OK lock behind the lockId")
-                        .await?
+            let v = self.ctx.db(|t| {
+                let v = judge_minted(t, &pm.lock_id, &pm.to, pm.amount, pm.block, pm.proposal)?;
+                if matches!(v, MintVerdict::Ok) {
+                    t.remove_pending_mint(&pm.lock_id, &pm.tx_hash)?;
                 }
-                MintVerdict::Defer => self.mem.pending_mints.push(pm),
-            }
+                Ok(v)
+            })?;
+            let why = match v {
+                MintVerdict::Ok => continue,
+                MintVerdict::Fraud(why) => why,
+                MintVerdict::Defer if caught_up && tip >= pm.since_height + grace => {
+                    "no policy-OK lock behind the lockId".to_owned()
+                }
+                MintVerdict::Defer => continue,
+            };
+            self.fraudulent_mint(&pm, &why).await?;
+            self.ctx
+                .db(|t| t.remove_pending_mint(&pm.lock_id, &pm.tx_hash))?;
         }
         Ok(())
     }
 
     /// A mint with no lock behind it (§2.3 row 3): recover its signers from the transaction's
     /// calldata, open a slash case against each member among them, alarm.
-    async fn fraudulent_mint(&mut self, pm: &PendingMint, why: &str) -> Result<()> {
+    async fn fraudulent_mint(&mut self, pm: &PendingMintRecord, why: &str) -> Result<()> {
         warn!(event = "fraudulent_mint", lock_id = %lock_hex(&pm.lock_id), amount = pm.amount,
-              to = %pm.to.to_checksum(), tx = %format!("0x{}", hex::encode(pm.tx_hash)), reason = why);
+              to = %pm.to.to_checksum(), tx = %format!("0x{}", hex::encode(pm.tx_hash)),
+              proposal = pm.proposal, reason = why);
         self.alarm(
             "fraudulent-mint",
             format!(
-                "mint of lockId {} has no lock: {why}",
+                "{} of lockId {} has no lock: {why}",
+                if pm.proposal { "mint proposal" } else { "mint" },
                 lock_hex(&pm.lock_id)
             ),
         );
+        if pm.proposal {
+            self.challenge(pm).await;
+        }
         let digest = Domain::new(
             self.ctx.params.deployment.chain_id,
             self.ctx.params.deployment.bridge,
@@ -323,6 +344,11 @@ impl Engine {
             else {
                 continue;
             };
+            if *key == self.ctx.me {
+                // this attestor's own signature (a drill, or its own fault): the others judge it
+                warn!(event = "own_fraudulent_mint", lock_id = %lock_hex(&pm.lock_id));
+                continue;
+            }
             let evidence = serde_json::json!({
                 "fault": "FRAUDULENT_MINT",
                 "set_id": hawkeye_core::bytes::txid_to_display(&self.ctx.params.set_id),
@@ -352,6 +378,34 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// CR-W1: challenge a fraudulent proposal while it is still pending (the proposal must be
+    /// the one judged: same amount and recipient). Any one guardian's challenge deletes it, so a
+    /// second attestor finding it gone does nothing.
+    async fn challenge(&mut self, pm: &PendingMintRecord) {
+        if self.ctx.params.mint_mode != MintMode::Optimistic {
+            return;
+        }
+        let id = b256(&pm.lock_id);
+        match self.ctx.eth.proposal(id).await {
+            Ok(Some(p)) if p.amount == U256::from(pm.amount) && p.to == addr(&pm.to) => {
+                match self.ctx.eth.challenge_mint(id).await {
+                    Ok(m) => warn!(event = "mint_challenged", lock_id = %lock_hex(&pm.lock_id),
+                                   proposer = %p.proposer, tx = %m.tx),
+                    Err(e) => warn!(event = "mint_challenge_failed",
+                                    lock_id = %lock_hex(&pm.lock_id), error = %e),
+                }
+            }
+            Ok(Some(_)) => {
+                info!(event = "mint_challenge_skipped", lock_id = %lock_hex(&pm.lock_id),
+                                 reason = "a different proposal is pending")
+            }
+            Ok(None) => info!(event = "mint_challenge_skipped", lock_id = %lock_hex(&pm.lock_id),
+                              reason = "no pending proposal (challenged or executed)"),
+            Err(e) => warn!(event = "mint_challenge_failed", lock_id = %lock_hex(&pm.lock_id),
+                            error = %e),
+        }
     }
 
     /// `SEEN` locks with `C_Y` confirmations: `CONFIRMED`, then the lock policy (§4.1).

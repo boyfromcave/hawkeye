@@ -11,6 +11,7 @@
 //! | [`vaults`] | the set's vault outputs (§3.1) |
 //! | [`signonce`] | sign-once records: EIP-712 `Mint` by `lockId`, Ycash set/act signatures by `(set, prevout)` (HK-7) |
 //! | [`slash`] | slash cases (§2.3, §5.3) |
+//! | [`progress`] | restart state (v2): deferred mint checks, slash votes gathered and given, set signatures seen |
 //! | [`chain`] | chain cursors and reorg rewinds (§5.4) |
 //! | [`events`] | the append-only audit log |
 //!
@@ -36,6 +37,7 @@ mod error;
 pub mod events;
 pub mod intents;
 pub mod locks;
+pub mod progress;
 pub mod schema;
 pub mod signonce;
 pub mod slash;
@@ -48,6 +50,7 @@ pub use error::{Result, SignerError, StoreError};
 pub use events::Event;
 pub use intents::{IntentRecord, NewIntent, classification_code};
 pub use locks::{LockRecord, NewLock};
+pub use progress::{PendingMintRecord, SeenSetSig, SlashProgress, VoteGiven};
 pub use signonce::{MintSignRecord, YcashSignKey, YcashSignRecord};
 pub use slash::{NewSlashCase, SlashCaseRecord};
 pub use state::{

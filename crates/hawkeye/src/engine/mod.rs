@@ -14,9 +14,14 @@
 //! 5. **locks / mint** ([`mint`]) — lock policy after `C_Y`, EIP-712 sign-once, leader submits;
 //! 6. **burns** ([`burn`]) — leader assignment and takeover, rate limit, unlock with the `HKB1`
 //!    memo, release after the delay;
-//! 7. **slash** ([`slash`]) — the case owner builds `SET_REMOVE burn=1`, gathers votes from peers,
-//!    sends it;
-//! 8. **heartbeat**, rolls (alarm only, HK-6 TODO), status and alarms.
+//! 7. **rolls** ([`roll`]) — vaults within `ROLL_MARGIN` of `ownerHeight` are unlocked by the
+//!    roll leader into a fresh V with a kind-2 memo (HK-6), released after the delay;
+//! 8. **slash** ([`slash`]) — the case owner builds `SET_REMOVE burn=1`, gathers votes from peers
+//!    (each verifies the evidence against its own node and ledger), sends it;
+//! 9. **heartbeat**, the supply check, status and alarms.
+//!
+//! What a restart must not lose is in the ledger (schema v2): deferred mint checks, slash votes
+//! gathered and given, set signatures seen (equivocation detection).
 //!
 //! Every action logs one structured line with an `event` field.
 
@@ -42,6 +47,7 @@ use crate::status::{Alarm, Heights, Status, Supply};
 
 pub mod burn;
 pub mod mint;
+pub mod roll;
 pub mod slash;
 pub mod watch;
 pub mod ycash;
@@ -100,26 +106,6 @@ pub struct TickReport {
     pub errors: Vec<String>,
 }
 
-/// A `Minted` (or `MintProposed`) event waiting for this attestor's Ycash view to catch up.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingMint {
-    pub lock_id: Hash32,
-    pub to: hawkeye_core::EthAddress,
-    pub amount: u64,
-    pub tx_hash: Hash32,
-    pub block: u64,
-    pub since_tip: u32,
-}
-
-/// A set signature seen on Ycash (equivocation detection, §2.3 row 1).
-#[derive(Debug, Clone)]
-pub(crate) struct SeenSig {
-    pub role: u8,
-    pub sighash: Hash32,
-    pub key: PubKey33,
-    pub sig: [u8; 65],
-}
-
 /// In-memory working state (everything durable is in the ledger).
 #[derive(Default)]
 pub(crate) struct Memory {
@@ -133,12 +119,10 @@ pub(crate) struct Memory {
     pub mempool_seen: HashSet<Hash32>,
     pub mempool_spent: HashSet<CoreOutPoint>,
     pub raw_txs: HashMap<Hash32, Vec<u8>>,
-    pub sigs_seen: HashMap<CoreOutPoint, Vec<SeenSig>>,
-    pub equivocations_sent: HashSet<(CoreOutPoint, PubKey33)>,
-    pub pending_mints: Vec<PendingMint>,
     pub submitted: HashMap<Hash32, u32>,
     pub release_tried: HashMap<CoreOutPoint, u32>,
-    pub case_hex: HashMap<i64, (String, bool)>,
+    pub roll_logged: HashSet<CoreOutPoint>,
+    pub roll_value_pending: u64,
     pub alarms: BTreeMap<String, Alarm>,
     pub eth_fresh: bool,
     pub eth_finalized: u64,
@@ -207,10 +191,10 @@ impl Engine {
         step!("locks", self.evaluate_locks());
         step!("mint", self.mint());
         step!("burns", self.burns());
+        step!("rolls", self.rolls());
         step!("releases", self.releases());
         step!("slash", self.slash());
         step!("heartbeat", self.heartbeat());
-        step!("rolls", self.rolls());
         step!("supply", self.supply());
         self.publish_status(&report);
         report
@@ -350,59 +334,22 @@ impl Engine {
         Ok(())
     }
 
-    /// HK-6: rolls are not implemented in this round. A vault within `ROLL_MARGIN` of its
-    /// `ownerHeight` is moved to `ROLL_DUE` and raises the `roll-due` alarm.
-    // TODO(HK-6): unlock ROLL_DUE vaults into a fresh V with a kind-2 memo (plan §3.1 item 2).
-    async fn rolls(&mut self) -> Result<()> {
-        let tip = self.mem.tip;
-        let margin = self.ctx.params.roll_margin;
-        let due = self.ctx.db(|t| {
-            let mut due = vec![];
-            for v in t.vaults_in_state(VaultState::Live)? {
-                if v.owner_height <= tip.saturating_add(margin) {
-                    t.transition_vault(
-                        &v.outpoint,
-                        VaultState::RollDue,
-                        Some(tip),
-                        Some("within ROLL_MARGIN"),
-                    )?;
-                    due.push(v);
-                }
-            }
-            let all = t.vaults_in_state(VaultState::RollDue)?;
-            Ok((due, all))
-        })?;
-        for v in &due.0 {
-            warn!(event = "roll_due", vault = %v.outpoint, owner_height = v.owner_height, tip);
-        }
-        if due.1.is_empty() {
-            self.clear_alarm("roll-due");
-        } else {
-            let list: Vec<String> = due
-                .1
-                .iter()
-                .map(|v| format!("{} (ownerHeight {})", v.outpoint, v.owner_height))
-                .collect();
-            self.alarm(
-                "roll-due",
-                format!(
-                    "vaults near ownerHeight, rolls not implemented (HK-6): {}",
-                    list.join(", ")
-                ),
-            );
-        }
-        Ok(())
-    }
-
     async fn supply(&mut self) -> Result<()> {
         let supply = self.ctx.eth.total_supply().await?;
         let supply = u128::try_from(supply).unwrap_or(u128::MAX);
         self.mem.wyec_supply = supply;
-        let locked = self.mem.locked_value;
+        // a roll in its window holds the vault's value in a matched roll intent (HK-6)
+        let locked = self
+            .mem
+            .locked_value
+            .saturating_add(self.mem.roll_value_pending);
         if supply > u128::from(locked) {
             self.alarm(
                 "supply",
-                format!("wYEC totalSupply {supply} > locked WYEC vault value {locked}"),
+                format!(
+                    "wYEC totalSupply {supply} > locked WYEC vault value {locked} (rolls in \
+                     flight included)"
+                ),
             );
         } else {
             self.clear_alarm("supply");

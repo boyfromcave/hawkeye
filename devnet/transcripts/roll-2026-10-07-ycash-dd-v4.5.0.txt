@@ -1,0 +1,53 @@
+14:41:05 removed /home/user/hawkeye/devnet/run
+14:41:05 === hawkeye-devnet scenario roll (plan §8 D-13, HK-6), 2026-10-07 14:41:05 UTC
+14:41:05 ycashd: Ycash Daemon version v4.5.0-dbc1ab0-dirty
+14:41:05 --- step 1: up with MIN_OWNER_AGE 20, ROLL_MARGIN 40
+14:41:05 hawkeye-devnet up: 4 regtest ycashd nodes (node0 user/miner, node1..3 attestors), vault upgrade 6d5b7a31 at height 110, dir /home/user/hawkeye/devnet/run
+14:41:06   nodes up: rpc ports 18401, 18403, 18405, 18407
+14:41:06   mining 211 blocks on node0 (activation 110 + coinbase maturity 100)
+14:41:10   height 211: vault upgrade active (branch 6d5b7a31, activation 110), node0 balance 659.06250000 YEC
+14:41:10   attestor1: member key 03ee05ee9d66a5c33759d82ed3808909080c09e6a423e87fb2b4723feb18a56ce9, eth address 0x371a0C5109bf61b2D2bdEaE3D14595BCCC163B51
+14:41:10   attestor2: member key 02d8e0c159bc32efa620a1f9cdbfd0198144e0df00d072a018d2995cdd51933fdb, eth address 0x6E6b9E9b318f20CAc0951B5cc96719B8F0f826A2
+14:41:10   attestor3: member key 0351c6ea09ddc56761cba43287cddeeacc878ef323f62fcd68aedc663aa772db65, eth address 0x9543B35Cd89cae14196bcf085eb07747f1B5C3f5
+14:41:10   holder (node0's Ethereum persona): 0x815A8D588188fF207F4957062ec6da024Cf1Ca84
+14:41:11   funded attestor wallets: 8 coins x 2.5 YEC each (tx 5c6c941c49597ef3adb38a0b241b45408c2232aa3330d5347dce4f7d26d67670)
+14:41:11   set_create on node0: setid 52f79c1c33885132d4ea2993049286c5f319b008f0340f711f02ef99ce47bbd9 (seats 3, unlock 1, cancel 1, slash 2, rate 5000 bps / 20, liveness 60, maturity 2, bondmin 1)
+14:41:12   anvil up on http://127.0.0.1:18545 (block time 1s, --slots-in-an-epoch 1: finalized = latest - 2)
+14:41:12   forge script script/Deploy.s.sol: guardians 0x371a0C5109bf61b2D2bdEaE3D14595BCCC163B51,0x6E6b9E9b318f20CAc0951B5cc96719B8F0f826A2,0x9543B35Cd89cae14196bcf085eb07747f1B5C3f5, threshold 1
+14:41:14   wYEC deployed: bridge 0x5FbDB2315678afecb367f032d93F642f64180aa3, token 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 (deploy block 1, threshold 1) -> /home/user/hawkeye/devnet/run/deployments/31337.json
+14:41:14   funded 4 Ethereum accounts with 1000 ETH each (anvil_setBalance)
+14:41:14   attestor1 enrolled in node1's wallet (hawkeye enroll: {"eth_address":"0x371a0C5109bf61b2D2bdEaE3D14595BCCC163B51","memberkey":"03ee05ee9d66a5c33759d82ed3808909080c09e6a423e87fb2b4723feb18a56ce9"})
+14:41:14   attestor2 enrolled in node2's wallet (hawkeye enroll: {"eth_address":"0x6E6b9E9b318f20CAc0951B5cc96719B8F0f826A2","memberkey":"02d8e0c159bc32efa620a1f9cdbfd0198144e0df00d072a018d2995cdd51933fdb"})
+14:41:14   attestor3 enrolled in node3's wallet (hawkeye enroll: {"eth_address":"0x9543B35Cd89cae14196bcf085eb07747f1B5C3f5","memberkey":"0351c6ea09ddc56761cba43287cddeeacc878ef323f62fcd68aedc663aa772db65"})
+14:41:14   attestor1 SET_JOIN d8173bf04609be6b8b01f443ef7f837a2c57fc708ea14876f1718a879e61382c (bond 1 YEC at 0a6635be3adcb33852097567e0ae24dd00512ef70fb7abb7ae44e64ed7cd5820:0, bond lock 5214)
+14:41:14   attestor2 SET_JOIN ebde9a27cedf13fb9d38c6e517417f7dd960d54602f7cd7021fcad9b75fe96bd (bond 1 YEC at 4c279bbd35fca2abc9f507e5fe6793cda330cde0e052bf24173e8ec3048399bc:0, bond lock 5214)
+14:41:14   attestor3 SET_JOIN f14c72fa7556bbd9eabfbda0f07247532edb6bba18d7d34752fff19ceee37f54 (bond 1 YEC at f45d3cfe058c9205a459bbffdeb3b693bb91e41dbda45108ca39f6049531cf90:0, bond lock 5214)
+14:41:14   3 members current at height 216; lockedvalue 0E-8
+14:41:15   hawkeye1 running (pid 2871) beside node1: /home/user/hawkeye/devnet/run/attestor1.toml run, log /home/user/hawkeye/devnet/run/attestor1/hawkeye.log
+14:41:15   hawkeye2 running (pid 3640) beside node2: /home/user/hawkeye/devnet/run/attestor2.toml run, log /home/user/hawkeye/devnet/run/attestor2/hawkeye.log
+14:41:16   hawkeye3 running (pid 4317) beside node3: /home/user/hawkeye/devnet/run/attestor3.toml run, log /home/user/hawkeye/devnet/run/attestor3/hawkeye.log
+14:41:16   background miner: node0 mines 1 block every 2.0s (pid 4984; `pause` / `resume`)
+14:41:16 devnet up at height 216; `hawkeye-devnet status`, `hawkeye-devnet down`
+14:41:16 --- step 2: lock 10 YEC with ownerHeight 400 above the tip (far from due) and wait for its mint
+14:41:16 hawkeye lock 10 --dest 0x815A8D588188fF207F4957062ec6da024Cf1Ca84 --owner-age 400: {"amount_zat":1000000000,"lockid":"0x90e3cd578958c0b8c3b2245f09fd1a92c7d816cb3cf3d151cec6fa39481073ed","owner_height":617,"to":"0x815A8D588188fF207F4957062ec6da024Cf1Ca84","txid":"cddee49aa8cb98b20b76fdf54c0943f4bb1d7d6f7a271e90e04f04888a4d1c8d","vout":0}
+14:41:20   ok: holder holds 10 wYEC (4s, height 218)
+14:41:20 --- step 3: lock 2 YEC with ownerHeight 30 above the tip (policy-OK: >= 20; due: <= 40)
+14:41:20 hawkeye lock 2 --dest 0x815A8D588188fF207F4957062ec6da024Cf1Ca84 --owner-age 30: {"amount_zat":200000000,"lockid":"0xcf61a87abce7dc717c66017209dcf3284008f50605cf2001864afd9720710006","owner_height":249,"to":"0x815A8D588188fF207F4957062ec6da024Cf1Ca84","txid":"7039f4f36ab2b72dc4cd5ed60fd6ec09421521293acc393eb79e4b1c7c4cc21d","vout":0}
+14:41:23   ok: lock 7039f4f36ab2b72d confirmed (3s, height 220)
+14:41:23   vault 7039f4f36ab2b72dc4cd5ed60fd6ec09421521293acc393eb79e4b1c7c4cc21d:0: ownerHeight 249 (tip 220)
+14:41:26   ok: holder holds 12 wYEC (the short lock is minted too) (3s, height 222)
+14:41:26 --- step 4: wait for the roll: the vault unlocked into a fresh V, with an HKB1 kind-2 memo
+14:41:26   ok: roll unlock of 7039f4f36ab2b72dc4cd5ed60fd6ec09421521293acc393eb79e4b1c7c4cc21d:0 (0s, height 222)
+14:41:26   roll 6814cee392ca3e0c261586ae904489e4e7b9fdaf9266b8ffd11e5512b7f3005e: memo ref (new ownerHeight) 292, data f259ca96d049a163.., intent 6814cee392ca3e0c261586ae904489e4e7b9fdaf9266b8ffd11e5512b7f3005e:0 of 2.00000000 YEC, recipientHash f259ca96d049a163..
+14:41:26   roll funded by attestor1
+14:41:26 --- step 5: wait for the release into the new vault (not a cancel)
+14:41:39   ok: roll intent released into a V with ownerHeight 292 (12s, height 228)
+14:41:39   release 5520a50ba7422c32dc63c2eed2faf24dca8d55b2a6940b787c81746ee50470c8: new vault 5520a50ba7422c32dc63c2eed2faf24dca8d55b2a6940b787c81746ee50470c8:0, 2.00000000 YEC, ownerHeight 292 (was 249)
+14:41:39 --- step 6: nobody was slashed; the supply invariant holds
+14:41:39   wYEC totalSupply 12 <= WYEC value under the set 12
+14:41:39   attestor1 status: {"alarms": [], "burns": {"ASSIGNED": 0, "CANCELLED": 0, "FINALIZED": 0, "INTENT_CONFIRMED": 0, "INTENT_PENDING": 0, "ORPHANED": 0, "RELEASED": 0, "SEEN": 0, "WAITING_CAP": 0}, "eth_address": "0x371a0C5109bf61b2D2bdEaE3D14595BCCC163B51", "ethereum": {"cursor": 24, "lag": 1, "tip": 25}, "intents": {"C
+14:41:39   attestor2 status: {"alarms": [], "burns": {"ASSIGNED": 0, "CANCELLED": 0, "FINALIZED": 0, "INTENT_CONFIRMED": 0, "INTENT_PENDING": 0, "ORPHANED": 0, "RELEASED": 0, "SEEN": 0, "WAITING_CAP": 0}, "eth_address": "0x6E6b9E9b318f20CAc0951B5cc96719B8F0f826A2", "ethereum": {"cursor": 24, "lag": 1, "tip": 25}, "intents": {"C
+14:41:39   attestor3 status: {"alarms": [], "burns": {"ASSIGNED": 0, "CANCELLED": 0, "FINALIZED": 0, "INTENT_CONFIRMED": 0, "INTENT_PENDING": 0, "ORPHANED": 0, "RELEASED": 0, "SEEN": 0, "WAITING_CAP": 0}, "eth_address": "0x9543B35Cd89cae14196bcf085eb07747f1B5C3f5", "ethereum": {"cursor": 25, "lag": 0, "tip": 25}, "intents": {"C
+14:41:39 === PASS: vault near ownerHeight rolled (kind-2 memo) into a later V, released, not cancelled
+14:41:39 --- down
+14:41:43 devnet down (stopped: miner, hawkeye1, hawkeye2, hawkeye3, anvil, ycashd0, ycashd1, ycashd2, ycashd3); the directory /home/user/hawkeye/devnet/run is kept (`up` resumes, `clean` removes it)

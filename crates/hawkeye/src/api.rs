@@ -1,5 +1,5 @@
 //! The status and peer API (axum): `GET /healthz`, `/status`, `/metrics`, `/locks/{lockId}`,
-//! `/burns/{nonce}`, `POST /slash/sign`.
+//! `/burns/{nonce}`, `POST /slash/sign`, `POST /unlock/sign`.
 
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
@@ -11,8 +11,9 @@ use hawkeye_core::recipient::YcashRecipient;
 use hawkeye_store::BurnKey;
 
 use crate::engine::Ctx;
+use crate::engine::burn::verify_and_sign_unlock;
 use crate::engine::slash::verify_and_sign;
-use crate::peers::{ApiError, BurnView, LockView, SlashSignRequest};
+use crate::peers::{ApiError, BurnView, LockView, SlashSignRequest, UnlockSignRequest};
 use crate::status::render_metrics;
 
 fn err(code: StatusCode, msg: impl Into<String>) -> Response {
@@ -28,6 +29,7 @@ pub fn router(ctx: Ctx) -> Router {
         .route("/locks/{id}", get(lock))
         .route("/burns/{nonce}", get(burn))
         .route("/slash/sign", post(slash_sign))
+        .route("/unlock/sign", post(unlock_sign))
         .with_state(ctx)
 }
 
@@ -97,6 +99,16 @@ async fn slash_sign(State(ctx): State<Ctx>, Json(req): Json<SlashSignRequest>) -
         Ok(r) => Json(r).into_response(),
         Err(e) => {
             tracing::warn!(event = "slash_vote_refused_here", error = %format!("{e:#}"));
+            err(StatusCode::FORBIDDEN, format!("{e:#}"))
+        }
+    }
+}
+
+async fn unlock_sign(State(ctx): State<Ctx>, Json(req): Json<UnlockSignRequest>) -> Response {
+    match verify_and_sign_unlock(&ctx, &req).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => {
+            tracing::warn!(event = "unlock_sign_refused_here", error = %format!("{e:#}"));
             err(StatusCode::FORBIDDEN, format!("{e:#}"))
         }
     }

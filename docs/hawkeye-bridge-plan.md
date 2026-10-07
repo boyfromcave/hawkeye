@@ -424,6 +424,10 @@ hawkeye/                     Cargo workspace, edition 2024, rust-toolchain pinne
 └── config/                  hawkeye.toml samples per network
 ```
 
+**Node requirements.** The attestor's own `ycashd` runs with `txindex=1`: independent slash
+verification (`POST /slash/sign`) fetches the accused unlock with `getrawtransaction`, which without
+the index only works for transactions the attestor's own ledger already saw.
+
 **Interfaces only (workspace rule 2).** `ycashd`: `getblockchaininfo`, `getbestblockhash`,
 `getblock`, `getrawtransaction`, `getrawmempool`, `validateaddress`, `importprivkey`, `listunspent`,
 the 21 `set_*`/`vault_*` RPCs. Ethereum: standard JSON-RPC (`eth_getLogs` with `finalized`,

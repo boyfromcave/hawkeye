@@ -1,5 +1,6 @@
 //! The peer channel v1 (plan §6 "Peer channel"): plain HTTP between known operators' status APIs.
-//! Mint signatures are collected with `GET /locks/<lockId>`, slash votes with `POST /slash/sign`.
+//! Mint signatures are collected with `GET /locks/<lockId>`, slash votes with `POST /slash/sign`,
+//! unlock co-signatures (`unlockThreshold > 1`) with `POST /unlock/sign`.
 //! Every answer is verified by the caller (signatures recover to guardians; acts are checked by
 //! the node), so the channel needs no authentication of its own in v1.
 
@@ -74,6 +75,24 @@ pub struct SlashSignResponse {
     pub required: i32,
 }
 
+/// `POST /unlock/sign` request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnlockSignRequest {
+    /// The unlock transaction (hex) with the set signatures gathered so far.
+    pub hex: String,
+}
+
+/// `POST /unlock/sign` answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnlockSignResponse {
+    /// The unlock with this attestor's node's set signature added.
+    pub hex: String,
+    /// `unlockThreshold` reached.
+    pub complete: bool,
+    /// What the verification matched (`burn <nonce>` or `roll`).
+    pub matched: String,
+}
+
 /// An error answer of the API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiError {
@@ -116,6 +135,30 @@ impl Peers {
             .await?;
         if !r.status().is_success() {
             return Err(anyhow!("{peer}: HTTP {}", r.status()));
+        }
+        Ok(r.json().await?)
+    }
+
+    /// `POST <peer>/unlock/sign`.
+    pub async fn unlock_sign(
+        &self,
+        peer: &str,
+        req: &UnlockSignRequest,
+    ) -> Result<UnlockSignResponse> {
+        let r = self
+            .http
+            .post(format!("{peer}/unlock/sign"))
+            .json(req)
+            .send()
+            .await?;
+        if !r.status().is_success() {
+            let status = r.status();
+            let why = r
+                .json::<ApiError>()
+                .await
+                .map(|e| e.error)
+                .unwrap_or_default();
+            return Err(anyhow!("{peer}: HTTP {status}: {why}"));
         }
         Ok(r.json().await?)
     }
