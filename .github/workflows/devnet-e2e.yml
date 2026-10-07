@@ -36,6 +36,12 @@ jobs:
     name: demo on ${{ matrix.line }}
     runs-on: ubuntu-22.04
     timeout-minutes: 150
+    # Hawkeye and the node are checked out side by side, never one inside the other: the node's
+    # depends step runs `cargo vendor`, which would otherwise find Hawkeye's workspace manifest
+    # (resolver 3) above the node and fail with the node's older cargo.
+    defaults:
+      run:
+        working-directory: hawkeye
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: hawkeye
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,8 +63,10 @@ jobs:
           persist-credentials: false
       - name: node commit
         id: node
-        run: echo "sha=$(git -C node rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        working-directory: node
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: build prerequisites
+        working-directory: .
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libc6-dev m4 g++-multilib \
@@ -100,7 +109,8 @@ jobs:
           key: zcash-params-${{ hashFiles('node/zcutil/fetch-params.sh') }}
       - name: fetch zk parameters
         if: steps.params.outputs.cache-hit != 'true'
-        run: ./node/zcutil/fetch-params.sh
+        working-directory: node
+        run: ./zcutil/fetch-params.sh
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
           version: ${{ env.FOUNDRY_VERSION }}
@@ -110,10 +120,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: devnet
+          workspaces: hawkeye
       - name: build hawkeye
         run: cargo build --locked --bin hawkeye
       - name: contracts
-        working-directory: eth
+        working-directory: hawkeye/eth
         run: |
           npm ci --ignore-scripts
           ./tools/fetch-wyec.sh
@@ -123,8 +134,8 @@ jobs:
           DAEMON: ${{ matrix.daemon }}
           CLI: ${{ matrix.cli }}
         run: |
-          YCASHD="$PWD/node-bin/$(basename "$DAEMON")"
-          YCASH_CLI="$PWD/node-bin/$(basename "$CLI")"
+          YCASHD="$GITHUB_WORKSPACE/node-bin/$(basename "$DAEMON")"
+          YCASH_CLI="$GITHUB_WORKSPACE/node-bin/$(basename "$CLI")"
           export YCASHD YCASH_CLI
           "$YCASHD" -version | head -1
           python3 devnet/hawkeye-devnet scenario demo --fresh
@@ -137,8 +148,8 @@ jobs:
         with:
           name: devnet-${{ matrix.line }}
           path: |
-            devnet/transcripts/
-            devnet/run/transcripts/
-            devnet/run/**/*.log
+            hawkeye/devnet/transcripts/
+            hawkeye/devnet/run/transcripts/
+            hawkeye/devnet/run/**/*.log
           retention-days: 14
           if-no-files-found: warn
