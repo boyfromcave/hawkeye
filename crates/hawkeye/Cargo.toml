@@ -31,7 +31,7 @@ alloy = { version = "=2.5.0", default-features = false, features = [
 ] }
 anyhow = "=1.0.104"
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
-clap = { version = "=4.6.1", features = ["derive"] }
+clap = { version = "=4.6.7", features = ["derive"] }
 hex = "=0.4.3"
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "=1.0.229", features = ["derive"] }
