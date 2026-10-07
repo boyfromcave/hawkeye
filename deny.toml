@@ -1,0 +1,49 @@
+# cargo-deny: advisories (RustSec), licences, duplicate/banned crates, and sources.
+# Run locally with `cargo deny check`; CI runs it on every push.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Each ignore needs an id, a reason, and a date to revisit.
+ignore = [
+    # paste: proc-macro only (compile time), flagged unmaintained, no vulnerability; pulled in by
+    # alloy-primitives with no maintained replacement upstream yet. Revisit at each alloy bump.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro via alloy; no known vulnerability (revisit 2027-01)" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # OpenSSL is never linked: TLS is rustls everywhere.
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

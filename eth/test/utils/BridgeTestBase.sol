@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Test} from "forge-std/Test.sol";
+import {WrappedYcash} from "wyec/WrappedYcash.sol";
+import {IWrappedYcash, WyecBridge} from "wyec/WyecBridge.sol";
+import {WyecEip712} from "./WyecEip712.sol";
+
+/// Shared fixture: a token + bridge deployed in the order of wyec-contract-design.md §8 (bridge
+/// first at the predicted token address), three guardians, threshold 2, signing helpers.
+abstract contract BridgeTestBase is Test {
+    WrappedYcash internal token;
+    WyecBridge internal bridge;
+
+    uint256[] internal guardianKeys;
+    address[] internal guardianAddrs;
+    uint256 internal outsiderKey = 0xBAD;
+
+    address internal alice = makeAddr("alice");
+    address internal bob = makeAddr("bob");
+
+    function setUp() public virtual {
+        guardianKeys.push(0xA11CE);
+        guardianKeys.push(0xB0B);
+        guardianKeys.push(0xCA401);
+        for (uint256 i = 0; i < guardianKeys.length; i++) {
+            guardianAddrs.push(vm.addr(guardianKeys[i]));
+        }
+        (token, bridge) = deployPair(guardianAddrs, 2);
+    }
+
+    function deployPair(address[] memory guardians, uint8 threshold)
+        internal
+        returns (WrappedYcash t, WyecBridge b)
+    {
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
+        b = new WyecBridge(IWrappedYcash(predicted), guardians, threshold);
+        t = new WrappedYcash(address(b));
+        assertEq(address(t), predicted, "token prediction");
+    }
+
+    // ------------------------------------------------------------------ signing
+
+    function domainOf(address b) internal view returns (bytes32) {
+        return WyecEip712.domainSeparator(block.chainid, b);
+    }
+
+    function sign(uint256 pk, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function mintDigest(address b, bytes32 lockId, uint256 amount, address to)
+        internal
+        view
+        returns (bytes32)
+    {
+        return WyecEip712.digest(domainOf(b), WyecEip712.mintStruct(lockId, amount, to));
+    }
+
+    /// Signatures by `pks`, ordered by ascending signer address (the contract's rule, plan §4.4).
+    function signSorted(uint256[] memory pks, bytes32 digest) internal pure returns (bytes[] memory sigs) {
+        uint256[] memory ks = sortByAddress(pks);
+        sigs = new bytes[](ks.length);
+        for (uint256 i = 0; i < ks.length; i++) {
+            sigs[i] = sign(ks[i], digest);
+        }
+    }
+
+    function sortByAddress(uint256[] memory pks) internal pure returns (uint256[] memory ks) {
+        ks = new uint256[](pks.length);
+        for (uint256 i = 0; i < pks.length; i++) {
+            ks[i] = pks[i];
+        }
+        for (uint256 i = 1; i < ks.length; i++) {
+            for (uint256 j = i; j > 0 && vm.addr(ks[j - 1]) > vm.addr(ks[j]); j--) {
+                (ks[j - 1], ks[j]) = (ks[j], ks[j - 1]);
+            }
+        }
+    }
+
+    function keys(uint256 a, uint256 b) internal pure returns (uint256[] memory ks) {
+        ks = new uint256[](2);
+        ks[0] = a;
+        ks[1] = b;
+    }
+
+    function keys(uint256 a) internal pure returns (uint256[] memory ks) {
+        ks = new uint256[](1);
+        ks[0] = a;
+    }
+
+    function guardianPair() internal view returns (uint256[] memory) {
+        return keys(guardianKeys[0], guardianKeys[1]);
+    }
+
+    /// Mint through the threshold path with two guardian signatures.
+    function mintTo(address to, uint256 amount, bytes32 lockId) internal {
+        bridge.mint(
+            lockId, amount, to, signSorted(guardianPair(), mintDigest(address(bridge), lockId, amount, to))
+        );
+    }
+
+    // ------------------------------------------------------------------ admin acts
+
+    function signedSetPaused(bool paused) internal view returns (bytes[] memory) {
+        bytes32 d = WyecEip712.digest(
+            domainOf(address(bridge)), WyecEip712.setPausedStruct(paused, bridge.adminNonce())
+        );
+        return signSorted(guardianPair(), d);
+    }
+}

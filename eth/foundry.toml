@@ -1,0 +1,42 @@
+# Hawkeye's Foundry project (plan §6, §7, phase H3).
+#
+# The contracts under test are wYEC at the commit pinned in tools/fetch-wyec.sh, fetched into
+# vendor/wyec (gitignored) - never copied in as source. Run ./tools/fetch-wyec.sh and `npm ci`
+# first.
+#
+# Compiler: native solc 0.8.37, the version wyec's compile check used (wyec-contract-design.md
+# §8); Foundry downloads it (CI: foundry-toolchain v1.7.1). Opt-in for restricted environments
+# where the native solc download is blocked: the solc-js shim pinned in package.json - same
+# version, same bytecode:
+#
+#     FOUNDRY_SOLC=./tools/solc FOUNDRY_OFFLINE=true forge test
+#
+[profile.default]
+src = "vendor/wyec/contracts"
+test = "test"
+script = "script"
+out = "out"
+libs = ["node_modules"]
+remappings = [
+    "@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+    "forge-std/=node_modules/forge-std/src/",
+    "wyec/=vendor/wyec/contracts/",
+]
+solc_version = "0.8.37"
+# As wyec's compile.js: optimizer on, 200 runs.
+optimizer = true
+optimizer_runs = 200
+evm_version = "prague"
+bytecode_hash = "ipfs"
+# OpenZeppelin 5.6.1 names locals `error`, which solc 0.8.37 warns about.
+ignored_warnings_from = ["node_modules"]
+# Deploy.s.sol writes deployments/, Vectors.s.sol writes vectors/.
+fs_permissions = [
+    { access = "read-write", path = "./deployments" },
+    { access = "read-write", path = "./vectors" },
+]
+
+[fmt]
+line_length = 110
+# Format only Hawkeye's own sources (script/, test/); wyec and the npm packages are not ours.
+ignore = ["vendor/**", "node_modules/**"]

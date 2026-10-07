@@ -1,0 +1,10 @@
+# Local-only outputs (the repository root .gitignore also covers out/, cache/, vendor/,
+# node_modules/ and broadcast/*/31337). Public-network deployments (11155111.json, 1.json) are committed.
+/out/
+/cache/
+/vendor/
+/node_modules/
+/broadcast/*/31337/
+/deployments/31337.json
+/deployments/.test-*.json
+/deployments/.smoke.*/

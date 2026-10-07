@@ -1,7 +1,7 @@
 //! The §5.1 state machines (plan `docs/hawkeye-bridge-plan.md`).
 //!
 //! Every state enum stores as its upper-case name ([`Display`](core::fmt::Display) /
-//! [`FromStr`](core::str::FromStr)), and every machine has one edge table, [`Machine::edge`].
+//! [`FromStr`]), and every machine has one edge table, [`Machine::edge`].
 //! An edge is either [`Edge::Forward`] — what the engine may ask for through the ledger's
 //! `transition` calls — or [`Edge::Rewind`] — taken only by the ledger itself when a Ycash reorg
 //! undoes the block that caused the forward edge (`rewind_ycash_to`).
