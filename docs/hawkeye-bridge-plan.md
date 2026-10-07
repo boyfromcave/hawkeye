@@ -44,7 +44,7 @@ primitive's delayed-release output (§15.3 of the upgrade plan).
    depositor who has sold their wYEC take the YEC back once that height passes; and an intent commits only
    `(recipientHash, value)`, so burn-to-intent matching is ambiguous without a reference.
    Hawkeye answers both: a minimum owner age before it will mint plus vault **rolls** before
-   expiry (HK-6), and a 74-byte **burn-reference memo** in every unlock transaction (HK-4).
+   expiry (HK-6), and a 73-byte **burn-reference memo** in every unlock transaction (HK-4).
 6. **Stack.** Rust (edition 2024, pinned toolchain), `tokio`, `alloy` for Ethereum, a typed
    JSON-RPC client for `ycashd`, SQLite for the attestor's ledger, `k256` for secp256k1; Foundry
    (forge / anvil / cast) for the contracts' local chain, Sepolia for the public integration.
@@ -299,18 +299,22 @@ The recipient script is `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG` or
 address prefixes: mainnet `{0x1C,0x28}` P2PKH / `{0x1C,0x2C}` P2SH; testnet and regtest
 `{0x1C,0x95}` / `{0x1C,0x2A}` (ycash-dd `src/chainparams.cpp:155,157,420,422`).
 
-### 4.3 The Hawkeye memo (`OP_RETURN`, 74 bytes ≤ 80, `MAX_OP_RETURN_RELAY`)
+### 4.3 The Hawkeye memo (`OP_RETURN`, 73 data bytes ≤ 80, script 75 bytes `6a 49 …`, `MAX_OP_RETURN_RELAY`)
 
 ```
 magic    4   "HKB1" (0x48 0x4B 0x42 0x31) — never 0x5956 ("YV"), so never parsed as an act
 kind     1   0x01 burn release | 0x02 roll
 chainId  8   u64 LE, the Ethereum chain id (1 mainnet, 11155111 Sepolia, 31337 anvil)
 bridge  20   the WyecBridge address
-ref      8   u64 LE: kind 1 → the burn nonce; kind 2 → 0
-data    32   kind 1 → the burn's Ethereum txhash; kind 2 → SHA256 of the new V scriptPubKey's
-              parameters as serialised by hawkeye-core (the watcher recomputes the V and checks
-              SHA256(V spk) = the intent's recipientHash)
+ref      8   u64 LE: kind 1 → the burn nonce; kind 2 → the new V's ownerHeight
+data    32   kind 1 → the burn's Ethereum txhash; kind 2 → SHA256(new V scriptPubKey)
 ```
+A roll is checked inside the window from the intent alone: the watcher rebuilds the new V from the
+spent V (same tag, sets, delay, owner key, appHeight 0) with `ownerHeight = ref`, and requires
+`SHA256(new V spk) = data = the intent's recipientHash`, the spent V to match the intent's
+`vaultHash`, and `ref ≥ tip + MIN_OWNER_AGE − ROLL_MARGIN` (revision 1 had `ref = 0` and a parameter
+hash, which a watcher cannot invert before the release reveals the V).
+
 An unlock carries exactly one memo; one burn ↔ one intent (no batching in v1; HK-8). The memo's
 `(chainId, bridge)` must equal the configured deployment, so a memo for another deployment (Sepolia
 replayed on mainnet) is unmatched.
@@ -560,7 +564,7 @@ from the members' compressed keys.
 | HK-1 | The Foundation's model is one permissioned set with `unlockThreshold = cancelThreshold = 1`, `slashThreshold` = a majority of the others |
 | HK-2 | The vault's `cancelSetId` is the attestor set itself; no open challenger set |
 | HK-3 | One `WYEC` V per lock transaction is mintable; others are refused by policy |
-| HK-4 | Every unlock carries the 74-byte `HKB1` memo; one burn pays once |
+| HK-4 | Every unlock carries the 73-byte `HKB1` memo; one burn pays once |
 | HK-5 | `ycashRecipient` = version, kind, 10 zero bytes, hash160; transparent only |
 | HK-6 | Minimum owner age, drain-nearest-expiry, rolls, and a supply alarm answer F-1 |
 | HK-7 | One key on both chains; Ycash signing via the node wallet (its sign-once guard), EIP-712 via Hawkeye with its own sign-once record |
