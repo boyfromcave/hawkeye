@@ -103,6 +103,7 @@ devnet/hawkeye-devnet up                                # on a stopped devnet: r
 devnet/hawkeye-devnet clean                             # remove the stopped run directory
 devnet/hawkeye-devnet scenario demo [--fresh] [--keep]  # the end-to-end proof, below
 devnet/hawkeye-devnet scenario roll [--fresh] [--keep]  # drill D-13: a vault rolled before ownerHeight (HK-6)
+devnet/hawkeye-devnet scenario dormancy|takeover|double|restart|reorg [--fresh]   # drills D-11, D-7, D-3, D-16, D-9/D-10
 ```
 
 `--dir` (or `$HAWKEYE_DEVNET_DIR`) works before or after the command. `devnet/run` is gitignored.
@@ -188,7 +189,7 @@ imported into node0's wallet: the lock's owner key is a fresh node0 wallet key.
 |---|---|---|
 | `lock A [--dest]` | `hawkeye --config node0.toml lock A --dest <addr>` | Builds the WYEC V in Python (the §15.3 template, `ownerHeight = tip+1+min_owner_age+20`) plus the `OP_RETURN` with the ABI `bytes32` destination. Serialises a v4 transaction, then calls `signrawtransaction` and `sendrawtransaction` on node0, and checks the V with `vault_decodescript`. This is bridge-sim's `lock`. |
 | `burn A [--recipient]` | `hawkeye --config node0.toml burn A --recipient <t-addr>` | `cast send <bridge> "burn(uint256,bytes32)"` with the holder key and the §4.2 `ycashRecipient` (`01 00 0…0 hash160`). |
-| `rogue A` | `hawkeye --config attestor1.toml rogue-unlock A` | On node1: `vault_buildunlock` to a fresh node1 address, then `set_signunlock` (attestor1's member key alone meets `unlockthreshold 1`), then `vault_send`. No memo. |
+| `rogue A` | `hawkeye --config attestor1.toml rogue-unlock A` (drill D-3: `rogue-unlock --replay-burn <nonce>`, below) | On node1: `vault_buildunlock` to a fresh node1 address, then `set_signunlock` (attestor1's member key alone meets `unlockthreshold 1`), then `vault_send`. No memo. |
 | enrolment | `hawkeye --config … enroll` | `importprivkey` of the WIF. |
 | key derivation | `hawkeye keys derive --secret <hex>` (cross-checked) | Python secp256k1, plus `cast wallet address`. |
 
@@ -255,6 +256,31 @@ the drill uses `min_owner_age = 20` and `roll_margin = 40` (the other values as 
 
 A passing run writes `devnet/transcripts/roll-<date>-<line>-<version>.txt`.
 
+## The adversarial drills (plan §8)
+
+```sh
+devnet/hawkeye-devnet scenario <dormancy|takeover|double|restart|reorg> [--fresh] [--keep] [--timeout 180]
+```
+
+Each drill is self-contained like the demo: `up` with 3 attestors, act, assert every step with a
+timeout, `down`. A pass writes `devnet/transcripts/<drill>-<date>-<line>-<version>.txt`; a failure
+writes `<run>/transcripts/<drill>-…-FAILED.txt`. Leaders are computed with the daemon's own rule
+(plan §5.2: live members sorted by key; burn `n` → `live[n mod |live|]`, a mint → `lockId mod |live|`).
+
+| Drill | Plan | What it does | Pass condition |
+|---|---|---|---|
+| `dormancy` | D-11, R1 | lock 10, mint; burn 4 and, the moment its intent appears, pause the miner and stop all three Hawkeyes; mine past `livenessWindow` (60) | `set_getinfo` `dormant` and `released`; `hawkeye --config node0.toml recover` spends the remaining vault **and the in-flight intent** with selector 3, node0's wallet gets 10 YEC back less fees; no WYEC output is left under the set. The 6 wYEC still outstanding are **unbacked by design** (the R1 trade-off, stated in the transcript) and every attestor's `hawkeye status` carries the `supply` alarm |
+| `takeover` | D-7 | lock 10, mint; stop the leader of the next burn nonce *before* burning; burn 4 | another attestor logs `burn_takeover` and posts the intent; exactly one intent for the burn; released. The leader is restarted after the release: it catches up, adopts the release (`GET /burns/<n>` `RELEASED` with that intent, `release_adopted`) and logs no `unlock_signed` / `unlock_sent` for the nonce through three takeover rounds; nobody slashed |
+| `double` | D-3 | lock 30, mint; burn 4 and wait for its release; then attestor1 runs `hawkeye rogue-unlock --replay-burn <nonce>`: a second unlock for the released burn, paying its recipient its amount, with the burn's own valid `HKB1` memo, more than `takeover_blocks` after the first | another attestor cancels it in its window; the watchers classify it `unmatched:consumed-burn` (never `benign-race`) and open a slash case; attestor1 `removed`, `bondfrozen`; the recipient was paid once. (30 YEC are locked so the 4 YEC replay fits the 5000 bps rate limit and only the watchers stop it.) |
+| `restart` | D-16 | (A) pause the miner, lock 20, restart the mint leader with crash point `mint_signed` armed; (B) restart the next burn's leader with `unlock_signed` armed, burn 4; (C) burn 3 and `kill -9` its leader the moment it logs `unlock_signed` | (A) the leader aborts after recording its EIP-712 signature and before submitting; after the restart nothing is re-signed, minted once. (B) it aborts after recording the set signature, before broadcasting: no intent anywhere; restarted, it resends the stored bytes (`unlock_resend`), signs nothing again, one intent, released. (C) one intent, released, one `unlock_signed`. No `set-sign-once` refusal, no equivocation, no exposure; every ledger shows locks `MINTED` 1, burns and intents `RELEASED` 2, no slash case, no alarm |
+| `reorg` | D-9, D-10 | anvil with `--slots-in-an-epoch 8` (finalized = latest − 16). (a) Pause the miner; lock 10 (the fallback builder, `nLockTime` = tip, sequence `0xfffffffe`), mine it at 1 confirmation (`C_Y` = 2); `invalidateblock` its *parent* on all nodes, so the lock is not final on the shorter chain and no mempool takes it back; mine a competing chain. Then re-broadcast the same lock. (b) Burn 4, then `anvil_reorg` it out before it is finalized; burn 4 again | (a) every Hawkeye logs `ycash_reorg … locks_deleted=1` and `GET /locks/<id>` is 404; no mint signature, no mint; after re-confirmation exactly one mint (`totalSupply` 10, every ledger `MINTED`). (b) the burn has no receipt, `burnNonce` is back; once finality passes the reorged blocks no ledger holds the nonce and no intent names it; the new burn reuses the nonce, its intent names the *new* tx hash, released once |
+
+`[devnet] drills = true` (refused on mainnet) gates the two drill-only daemon features: the
+`rogue-unlock` command (with `--replay-burn <nonce>` for D-3) and the crash points armed by
+`HAWKEYE_DRILL_CRASH_AT=unlock_signed|mint_signed` (the process aborts right after that signature is
+recorded in the ledger, as a `kill -9` would; the devnet arms it by restarting that Hawkeye with the
+variable set).
+
 ## Troubleshooting
 
 - **`ycashd node<i> exited during start-up`**: read `<run>/ycash<i>/stdout.log`. Usually the zk
@@ -272,5 +298,8 @@ A passing run writes `devnet/transcripts/roll-<date>-<line>-<version>.txt`.
   `anvil-state.json`, the Hawkeyes from their SQLite stores. `clean` starts over.
 - **Logs**: `hawkeye-devnet logs -f` tails the node `debug.log`s, anvil, forge, the miner and
   every `hawkeye.log`.
+- **`corrupted size vs. prev_size` in `<run>/ycash0/stdout.log`** (ycash-dd v4.5.0): a glibc heap
+  abort of node0 while `up` mines its 211 blocks, seen once in about 25 devnet runs of the H6 drill round; the
+  node, not Hawkeye. `up` fails and goes down; run the scenario again.
 - **Orphans**: `down` fails loudly if a recorded pid survives. `pgrep -af 'ycashd|anvil|hawkeye'`
   should print nothing afterwards.

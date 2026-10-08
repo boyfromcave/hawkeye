@@ -15,8 +15,8 @@ use hawkeye_core::policy::TxOut as CoreTxOut;
 use hawkeye_core::script::op_return_script;
 use hawkeye_core::template::TAG_WYEC;
 use hawkeye_store::{
-    FaultKind, IntentRecord, IntentState, NewSlashCase, SignDomain, YcashSignKey,
-    classification_code,
+    BurnKey, BurnState, FaultKind, IntentRecord, IntentState, NewSlashCase, SignDomain,
+    YcashSignKey, classification_code,
 };
 use hawkeye_ycash::HexBytes;
 use hawkeye_ycash::tx::Transaction;
@@ -151,6 +151,12 @@ impl Engine {
 
     /// Re-run the matcher over the open intents with the ledger's current burns. Rolls are
     /// judged once, when first observed with the V they spend (§4.3), and not re-run here.
+    ///
+    /// An intent released while its burn was still unknown here (`MATURED_UNMATCHED` as
+    /// `unmatched:unknown-burn`, with its release recorded) is re-run too: a restart after the
+    /// intent was posted and released by a takeover leader follows those Ycash blocks before it
+    /// scans the burn on Ethereum. If it now matches, the release is adopted (intent and burn
+    /// `RELEASED`), so the burn is never assigned and posted a second time (drill D-7).
     fn reclassify(&mut self) -> Result<()> {
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
@@ -158,6 +164,14 @@ impl Engine {
             let mut open = t.intents_in_state(IntentState::Matched)?;
             open.extend(t.intents_in_state(IntentState::Unmatched)?);
             open.extend(t.intents_in_state(IntentState::Observed)?);
+            open.extend(
+                t.intents_in_state(IntentState::MaturedUnmatched)?
+                    .into_iter()
+                    .filter(|i| {
+                        i.released_txid.is_some()
+                            && i.classification.as_deref() == Some("unmatched:unknown-burn")
+                    }),
+            );
             for i in open {
                 if i.classification.as_deref() == Some("matched-roll")
                     || i.memo.as_deref().is_some_and(|m| {
@@ -197,6 +211,12 @@ impl Engine {
                     },
                 );
                 if c == Classification::Foreign {
+                    continue;
+                }
+                if i.state == IntentState::MaturedUnmatched {
+                    if let Classification::MatchedBurn { nonce } = c {
+                        adopt_release(t, &p, &i, nonce, tip)?;
+                    }
                     continue;
                 }
                 let code = classification_code(&c);
@@ -352,6 +372,46 @@ impl Engine {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Adopt the recorded release of `i` as burn `nonce`'s: intent `MATURED_UNMATCHED → RELEASED`,
+/// the burn `→ INTENT_PENDING → INTENT_CONFIRMED → RELEASED` (from `FINALIZED`, `ASSIGNED` or
+/// `WAITING_CAP`; a burn already past those is left alone).
+fn adopt_release(
+    t: &hawkeye_store::Tx<'_>,
+    p: &crate::config::Params,
+    i: &IntentRecord,
+    nonce: u64,
+    tip: u32,
+) -> Result<(), hawkeye_store::StoreError> {
+    let k = BurnKey::new(p.deployment, nonce);
+    let Some(b) = t.burn(&k)? else {
+        return Ok(());
+    };
+    if !matches!(
+        b.state,
+        BurnState::Finalized | BurnState::Assigned | BurnState::WaitingCap
+    ) {
+        return Ok(());
+    }
+    t.adopt_release(&i.outpoint, &p.deployment, nonce, Some(tip))?;
+    let mined = i.confirmed_height.unwrap_or(tip);
+    link_burn(t, p, nonce, &i.outpoint, true, mined)?;
+    if t.burn(&k)?
+        .is_some_and(|b| b.state == BurnState::IntentConfirmed)
+    {
+        let released = i.released_height.unwrap_or(tip);
+        t.transition_burn(
+            &k,
+            BurnState::Released,
+            Some(released.into()),
+            Some("adopted release"),
+        )?;
+    }
+    info!(event = "release_adopted", nonce, intent = %i.outpoint,
+          release = %i.released_txid.map(|r| txid_to_display(&r)).unwrap_or_default(),
+          "an intent released before this attestor knew its burn pays that burn");
+    Ok(())
 }
 
 /// The sign-once key of a cancel.

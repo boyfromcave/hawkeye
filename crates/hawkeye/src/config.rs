@@ -334,6 +334,33 @@ impl Params {
     }
 }
 
+/// A regtest [`Params`] for unit tests.
+#[cfg(test)]
+pub(crate) fn sample_params(drills: bool, mainnet: bool) -> Params {
+    Params {
+        network: Network::Regtest,
+        mainnet,
+        set_id: [7; 32],
+        deployment: CoreDeployment {
+            chain_id: 31337,
+            bridge: EthAddress([0x5f; 20]),
+        },
+        eth_start_block: 1,
+        delay: 6,
+        confirmations: 2,
+        min_owner_age: 400,
+        roll_margin: 50,
+        takeover: 4,
+        heartbeat_blocks: 10,
+        min_lock: 10_000_000,
+        max_lock: 100_000_000_000,
+        mint_mode: MintMode::Threshold { k: 1 },
+        auto_slash: true,
+        drills,
+        ycash_start_height: None,
+    }
+}
+
 impl Config {
     /// Read and parse a config file.
     pub fn read(path: &Path) -> Result<Self> {

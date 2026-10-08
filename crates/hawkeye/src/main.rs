@@ -64,7 +64,8 @@ enum Cmd {
         #[arg(long)]
         eth_key: Option<String>,
     },
-    /// DRILL ONLY: sign an unlock with no burn behind it.
+    /// DRILL ONLY: sign an unlock with no burn behind it (or, with --replay-burn, a second
+    /// unlock for an already-released burn, carrying its valid memo).
     RogueUnlock {
         /// YEC (also accepted positionally).
         #[arg(long = "amount", value_name = "YEC")]
@@ -72,9 +73,14 @@ enum Cmd {
         /// YEC, positional form.
         #[arg(value_name = "AMOUNT", conflicts_with = "amount")]
         amount_pos: Option<String>,
-        /// The Ycash t-address (default: a new address of this node's wallet).
+        /// The Ycash t-address (default: a new address of this node's wallet; with
+        /// --replay-burn, the burn's own recipient).
         #[arg(long)]
         to: Option<String>,
+        /// Drill D-3: replay finalized burn NONCE from this attestor's ledger (its recipient,
+        /// its amount unless given, its HKB1 memo).
+        #[arg(long, value_name = "NONCE")]
+        replay_burn: Option<u64>,
     },
     /// Owner: vault_ownerspend of every WYEC vault/intent this wallet owns.
     Recover,
@@ -158,7 +164,11 @@ async fn main() -> Result<()> {
             amount,
             amount_pos,
             to,
-        } => cli::rogue_unlock(&s, &need(amount, amount_pos)?, to.as_deref()).await,
+            replay_burn,
+        } => {
+            let amount = amount.clone().or_else(|| amount_pos.clone());
+            cli::rogue_unlock(&s, amount.as_deref(), to.as_deref(), *replay_burn).await
+        }
         Cmd::Recover => cli::recover(&s).await,
         Cmd::Keys { .. } => unreachable!(),
     }

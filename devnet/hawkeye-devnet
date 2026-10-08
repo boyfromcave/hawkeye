@@ -14,7 +14,7 @@ starts `hawkeye run` beside each attestor's own node. Each Hawkeye talks only to
 
 The commands mirror bridge-sim's (ycash-dd contrib/yellowback/devnet/bridge-sim) so the two can be
 compared: up | lock | burn | rogue | silence | unsilence | mine | pause | resume | status | logs |
-cli | down | clean | scenario demo | scenario roll.  Python 3 standard library only; Foundry (anvil, forge, cast)
+cli | down | clean | scenario demo | roll | dormancy | takeover | double | restart | reorg.  Python 3 standard library only; Foundry (anvil, forge, cast)
 on PATH.
 
 Environment:
@@ -265,13 +265,14 @@ def _compact(n):
     return b"\xfe" + n.to_bytes(4, "little")
 
 
-def serialize_tx_v4(vin, vout, lock_time, expiry_height):
+def serialize_tx_v4(vin, vout, lock_time, expiry_height, sequence=0xFFFFFFFF):
     """A transparent-only Sapling v4 transaction (fOverwintered | 4, versionGroupId 0x892F2085).
-    vin: [(txid_display_hex, n)], unsigned; vout: [(zat, script)]."""
+    vin: [(txid_display_hex, n)], unsigned; vout: [(zat, script)]. `sequence` below 0xFFFFFFFF makes
+    `lock_time` binding (drill `reorg`)."""
     r = ((1 << 31) | 4).to_bytes(4, "little") + (0x892F2085).to_bytes(4, "little")
     r += _compact(len(vin))
     for txid, n in vin:
-        r += txid_internal(txid) + n.to_bytes(4, "little") + _compact(0) + (0xFFFFFFFF).to_bytes(4, "little")
+        r += txid_internal(txid) + n.to_bytes(4, "little") + _compact(0) + sequence.to_bytes(4, "little")
     r += _compact(len(vout))
     for value, spk in vout:
         r += value.to_bytes(8, "little", signed=True) + _compact(len(spk)) + spk
@@ -376,7 +377,8 @@ def run_cmd(argv, timeout=120, env=None, cwd=None, check=True):
     except subprocess.TimeoutExpired:
         die("timed out after %ss: %s" % (timeout, " ".join(argv)))
     if check and p.returncode != 0:
-        die("%s exited %d:\n%s%s" % (" ".join(argv), p.returncode, p.stdout[-2000:], p.stderr[-2000:]))
+        err = p.stderr if len(p.stderr) <= 2500 else p.stderr[:1800] + "\n[...]\n" + p.stderr[-600:]
+        die("%s exited %d:\n%s%s" % (" ".join(argv), p.returncode, p.stdout[-2000:], err))
     return p
 
 
@@ -601,7 +603,7 @@ class Devnet:
         return (self.s or {}).get("bridge") or BRIDGE
 
     # ================================================================ up
-    def up(self, attestors, activation, base_port, anvil_port, interval, block_time, bridge=None):
+    def up(self, attestors, activation, base_port, anvil_port, interval, block_time, bridge=None, slots=1):
         old = self.load(required=False)
         if old is not None:
             alive = self.running()
@@ -639,7 +641,7 @@ class Devnet:
         for i in range(attestors + 1):
             self.s["nodes"].append({"index": i, "port": base_port + 2 * i, "rpcport": base_port + 2 * i + 1,
                                     "datadir": self.path("ycash%d" % i), "pid": None})
-        self.s["anvil"] = {"port": anvil_port, "block_time": block_time, "pid": None,
+        self.s["anvil"] = {"port": anvil_port, "block_time": block_time, "pid": None, "slots": slots,
                            "state": self.path("anvil-state.json"), "log": self.path("anvil.log")}
         self.save()
         try:
@@ -910,7 +912,7 @@ class Devnet:
     # ---------------------------------------------------------------- Ethereum
     def start_anvil(self):
         an = self.s["anvil"]
-        argv = ["anvil", "--host", "127.0.0.1", "--port", str(an["port"]), "--slots-in-an-epoch", "1",
+        argv = ["anvil", "--host", "127.0.0.1", "--port", str(an["port"]), "--slots-in-an-epoch", str(an.get("slots", 1)),
                 "--state", an["state"], "--state-interval", "5"]
         if an.get("block_time"):
             argv += ["--block-time", str(an["block_time"])]
@@ -921,8 +923,8 @@ class Devnet:
         while time.time() < deadline:
             p = subprocess.run(["cast", "chain-id", "--rpc-url", self.anvil_url()], capture_output=True, text=True)
             if p.returncode == 0 and p.stdout.strip() == "31337":
-                self.say("  anvil up on %s (block time %ss, --slots-in-an-epoch 1: finalized = latest - 2)"
-                         % (self.anvil_url(), an.get("block_time") or "auto"))
+                self.say("  anvil up on %s (block time %ss, --slots-in-an-epoch %d: finalized = latest - %d)"
+                         % (self.anvil_url(), an.get("block_time") or "auto", an.get("slots", 1), 2 * an.get("slots", 1)))
                 return
             if not proc_alive(an["pid"], "anvil"):
                 die("anvil exited: %s" % open(an["log"], errors="replace").read()[-1500:])
@@ -1024,9 +1026,10 @@ format = "text"
             f.write(text)
         os.chmod(path, 0o600)
 
-    def start_hawkeye(self, a):
+    def start_hawkeye(self, a, env=None):
         hk = self.s["binaries"]["hawkeye"]
-        a["pid"] = spawn([hk, "--config", a["config"], "run"], a["log"], cwd=a["home"])
+        a["pid"] = spawn([hk, "--config", a["config"], "run"], a["log"], cwd=a["home"],
+                         env=dict(os.environ, **env) if env else None)
         time.sleep(0.5)
         if not proc_alive(a["pid"], "hawkeye"):
             die("hawkeye for attestor%d exited at once:\n%s" % (a["index"], open(a["log"], errors="replace").read()[-2000:]))
@@ -1103,7 +1106,7 @@ format = "text"
                     "via": "hawkeye", "output": out}
         return self.lock_fallback(amount, dest, owner_age)
 
-    def lock_fallback(self, amount, dest, owner_age=None):
+    def lock_fallback(self, amount, dest, owner_age=None, lock_time=0, sequence=0xFFFFFFFF):
         n = self.node(0)
         dest_bytes = bytes.fromhex(dest[2:] if dest.startswith("0x") else dest)
         if len(dest_bytes) == 20:
@@ -1137,7 +1140,7 @@ format = "text"
         change = total - value - FEE
         if change > 0:
             vout.append((change, bytes.fromhex(n.validateaddress(n.getnewaddress())["scriptPubKey"])))
-        raw = serialize_tx_v4(vin, vout, 0, tip + 40).hex()
+        raw = serialize_tx_v4(vin, vout, lock_time, tip + 40, sequence).hex()
         signed = n.signrawtransaction(raw)
         if not signed["complete"]:
             die("signrawtransaction incomplete: %s" % jdump(signed.get("errors")))
@@ -1145,9 +1148,10 @@ format = "text"
         decoded = n.vault_decodescript(spk.hex())
         if decoded.get("type") != "vault":
             die("the node does not decode the fallback lock's V: %s" % jdump(decoded))
-        self.say("locked %s YEC (fallback builder): %s:0 WYEC V under %s, ownerHeight %d, owner key %s.., dest %s"
-                 % (amount, txid, self.s["set"]["setid"][:16], owner_height, owner_key.hex()[:16], "0x" + dest_bytes[12:].hex()))
-        return {"txid": txid, "outpoint": "%s:0" % txid, "via": "fallback", "ownerheight": owner_height}
+        self.say("locked %s YEC (fallback builder): %s:0 WYEC V under %s, ownerHeight %d, owner key %s.., dest %s%s"
+                 % (amount, txid, self.s["set"]["setid"][:16], owner_height, owner_key.hex()[:16], "0x" + dest_bytes[12:].hex(),
+                    ", nLockTime %d" % lock_time if sequence != 0xFFFFFFFF else ""))
+        return {"txid": txid, "outpoint": "%s:0" % txid, "via": "fallback", "ownerheight": owner_height, "hex": signed["hex"]}
 
     def burn(self, amount, recipient=None):
         """The holder burns wYEC to a Ycash t-address (plan §4.2 recipient encoding)."""
@@ -1730,8 +1734,798 @@ format = "text"
             print("transcript: %s" % out)
         return 0 if ok else 1
 
+    # ================================================================ drills (plan §8): shared helpers
+    ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+    def step(self, text):
+        self._step = getattr(self, "_step", 0) + 1
+        self.say("--- step %d: %s" % (self._step, text))
+
+    def attestor(self, i):
+        return self.s["attestors"][i - 1]
+
+    def live_sorted(self):
+        """The leader order (plan §5.2, hawkeye-core leader.rs): current and live member keys, sorted
+        bytewise (lowercase hex of equal length sorts the same)."""
+        info = self.node(0).set_getinfo(self.s["set"]["setid"])
+        return sorted(m["key"] for m in info["memberlist"] if m["current"] and m["live"])
+
+    def index_of_key(self, key):
+        for a in self.s["attestors"]:
+            if a["memberkey"] == key:
+                return a["index"]
+        die("member key %s is no attestor of this devnet" % key)
+
+    def burn_leader(self, nonce):
+        """`live[n mod |live|]` at assignment (no takeover yet): the attestor index."""
+        live = self.live_sorted()
+        return self.index_of_key(live[nonce % len(live)])
+
+    def mint_leader(self, lock_id_hex):
+        """The same rule over `lockId mod |live|`, the lockId read big-endian."""
+        live = self.live_sorted()
+        return self.index_of_key(live[int(lock_id_hex, 16) % len(live)])
+
+    def burn_nonce(self):
+        return int(self.eth_call(self.s["eth"]["bridge"], "burnNonce()(uint256)"))
+
+    def wyec_balance(self, who=None):
+        return int(self.eth_call(self.s["eth"]["token"], "balanceOf(address)(uint256)", who or self.s["holder"]["eth_address"]))
+
+    def wyec_supply(self):
+        return int(self.eth_call(self.s["eth"]["token"], "totalSupply()(uint256)"))
+
+    def locked_zat(self):
+        return sum(r["valuezat"] for r in self.node(0).vault_list({"tag": "WYEC", "setid": self.s["set"]["setid"]}))
+
+    def received(self, address):
+        return Decimal(self.node(0).getreceivedbyaddress(address, 1))
+
+    def confirmations(self, txid, i=0):
+        try:
+            return self.node(i).getrawtransaction(txid, 1).get("confirmations", 0)
+        except RPCError:
+            return 0
+
+    def _tx(self, txid):
+        cache = self.__dict__.setdefault("_txcache", {})
+        if txid not in cache:
+            cache[txid] = self.node(0).getrawtransaction(txid, 1)
+        return cache[txid]
+
+    def burn_intents(self, nonce, from_height):
+        """Every unlock on node0's active chain (from `from_height`) or in its mempool that carries an
+        HKB1 kind-1 memo for burn `nonce`: [{txid, outpoint, height, memo}]."""
+        n0 = self.node(0)
+        found = []
+        cands = [(t, None) for t in n0.getrawmempool()]
+        for h in range(from_height, n0.getblockcount() + 1):
+            cands += [(t, h) for t in n0.getblock(n0.getblockhash(h))["tx"]]
+        for t, h in cands:
+            tx = self._tx(t)
+            memo = None
+            for o in tx["vout"]:
+                memo = memo or decode_memo(o["scriptPubKey"]["hex"])
+            if not memo or memo["kind"] != 1 or memo["ref"] != nonce:
+                continue
+            vout = None
+            for o in tx["vout"]:
+                if n0.vault_decodescript(o["scriptPubKey"]["hex"]).get("type") == "intent":
+                    vout = o["n"]
+            found.append({"txid": t, "outpoint": "%s:%s" % (t, vout), "height": h, "memo": memo})
+        return found
+
+    def log_text(self, a, offset=0):
+        try:
+            with open(a["log"], errors="replace") as f:
+                f.seek(offset)
+                return self.ANSI.sub("", f.read())
+        except OSError:
+            return ""
+
+    def log_size(self, a):
+        try:
+            return os.path.getsize(a["log"])
+        except OSError:
+            return 0
+
+    def log_events(self, a, name, offset=0, needle=None, nonce=None):
+        """The attestor's log lines (from byte `offset`) of event `name`, containing `needle`, for burn `nonce`."""
+        pat = re.compile(r'\bevent="?%s"?(\s|$)' % re.escape(name))
+        npat = re.compile(r"\bnonce=%d(\s|$)" % nonce) if nonce is not None else None
+        return [ln for ln in self.log_text(a, offset).splitlines()
+                if pat.search(ln) and (needle is None or needle in ln) and (npat is None or npat.search(ln))]
+
+    def api(self, a, path):
+        """GET http://<attestor api>/<path>: (status code, JSON or None)."""
+        try:
+            with urllib.request.urlopen("http://%s/%s" % (a["api"], path), timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, None
+        except (OSError, ValueError):
+            return None, None
+
+    def hk_status(self, a):
+        p = self.hawkeye(a["config"], "status", "--json", timeout=60, check=False)
+        try:
+            return json.loads(p.stdout)
+        except ValueError:
+            die("hawkeye status for attestor%d: %s" % (a["index"], (p.stdout + p.stderr)[-500:]))
+
+    def kill9(self, a):
+        """SIGKILL the attestor's hawkeye (its whole process group): no shutdown path runs."""
+        pid = a.get("pid")
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        deadline = time.time() + 10
+        while proc_alive(pid) and time.time() < deadline:
+            time.sleep(0.05)
+        _reap(pid)
+        a["pid"] = None
+        self.save()
+
+    def restart_hawkeye(self, a, crash_at=None):
+        """Start the attestor's hawkeye again; `crash_at` arms a drill crash point (HAWKEYE_DRILL_CRASH_AT,
+        honoured only with [devnet] drills = true, never on mainnet)."""
+        a["silenced"] = False
+        self.start_hawkeye(a, {"HAWKEYE_DRILL_CRASH_AT": crash_at} if crash_at else None)
+        self.save()
+        self.say("  hawkeye%d restarted (pid %d)%s" % (a["index"], a["pid"], ", crash point %s armed" % crash_at if crash_at else ""))
+
+    def rearm(self, a, point):
+        """Stop the attestor's hawkeye (SIGTERM) and start it with crash point `point` armed."""
+        stop_group(a.get("pid"), "hawkeye")
+        self.restart_hawkeye(a, point)
+
+    def wait_crash(self, a, point, off, timeout):
+        """The armed hawkeye aborted at `point`: process gone, `drill_crash` logged."""
+        def crashed():
+            if proc_alive(a.get("pid"), "hawkeye"):
+                return None
+            return (self.log_events(a, "drill_crash", off, needle=point) or [None])[0]
+        ln = self.wait_for("attestor%d aborted at crash point %s" % (a["index"], point), crashed, timeout, poll=0.05)
+        _reap(a["pid"])
+        a["pid"] = None
+        self.save()
+        return ln
+
+    def lock_mint(self, amount, total, timeout, owner_age=None):
+        """Lock `amount` with the binary and wait until the holder holds `total` wYEC."""
+        lk = self.lock(amount, self.s["holder"]["eth_address"], owner_age)
+        if not lk.get("txid"):
+            die("the lock printed no txid: %s" % lk)
+        self.wait_for("lock %s confirmed" % lk["txid"][:16], lambda: self.confirmations(lk["txid"]) >= 1, timeout)
+        self.wait_for("holder holds %s wYEC" % yec(total), lambda: self.wyec_balance() == total, timeout)
+        try:
+            lk["lockid"] = json.loads(lk["output"])["lockid"]
+        except (KeyError, ValueError, TypeError):
+            lk["lockid"] = None
+        return lk
+
+    def burn_tracked(self, amount):
+        """Burn `amount` to a fresh node0 address: {nonce, recipient, rhash, out}."""
+        nonce = self.burn_nonce()
+        recipient = self.node(0).getnewaddress()
+        rhash = hashlib.sha256(bytes.fromhex(self.node(0).validateaddress(recipient)["scriptPubKey"])).hexdigest()
+        b = self.burn(amount, recipient)
+        out = {}
+        try:
+            out = json.loads(b.get("output") or "{}")
+        except ValueError:
+            pass
+        if out.get("nonce") not in (None, nonce):
+            die("the burn got nonce %s, expected %d" % (out.get("nonce"), nonce))
+        return {"nonce": nonce, "recipient": recipient, "rhash": rhash, "out": out}
+
+    def wait_burn_intent(self, nonce, from_h, timeout):
+        return self.wait_for("an intent carrying the HKB1 kind-1 memo of burn %d" % nonce,
+                             lambda: (self.burn_intents(nonce, from_h) or [None])[0], timeout)
+
+    def assert_members(self, statuses=("active",), frozen=False):
+        info = self.node(0).set_getinfo(self.s["set"]["setid"])
+        for m in info["memberlist"]:
+            if m["status"] not in statuses or bool(m["bondfrozen"]) != frozen:
+                die("member %s.. is %s (bondfrozen %s)" % (m["key"][:16], m["status"], m["bondfrozen"]))
+        return info
+
+    def scan_logs(self, needles):
+        """Lines in any attestor's hawkeye.log containing one of `needles`."""
+        hits = []
+        for a in self.s["attestors"]:
+            for ln in self.log_text(a).splitlines():
+                if any(n in ln for n in needles):
+                    hits.append("attestor%d: %s" % (a["index"], ln.strip()[:240]))
+        return hits
+
+    def run_drill(self, kind, title, body, args, bridge=None, slots=1):
+        """The frame every drill shares with `scenario demo`: header, `up`, the body, PASS/FAIL, `down`, and
+        the transcript (devnet/transcripts/<kind>-<date>-<line>-<version>.txt on PASS)."""
+        attestors, activation, base_port, anvil_port, interval, block_time, keep, timeout = args
+        started = datetime.datetime.now(datetime.timezone.utc)
+        self._step = 0
+        self.say("=== hawkeye-devnet scenario %s (%s), %s" % (kind, title, started.strftime("%Y-%m-%d %H:%M:%S UTC")))
+        ycashd = self.binaries()[0]
+        if ycashd:
+            line, version, banner = node_line(ycashd)
+            self.say("ycashd: %s (node line %s %s): %s" % (ycashd, line, version, banner))
+        hk = self.binaries()[2]
+        self.say("hawkeye: %s (%s)" % (hk, run_cmd([hk, "--version"], check=False).stdout.strip() if os.access(hk, os.X_OK) else "missing"))
+        ok = False
+        verdict = None
+        try:
+            self.step("up (%d attestors%s%s)" % (attestors, "; [bridge] %s" % jdump(bridge) if bridge else "",
+                                                 "; anvil --slots-in-an-epoch %d" % slots if slots != 1 else ""))
+            self.up(attestors, activation, base_port, anvil_port, interval, block_time, bridge=bridge, slots=slots)
+            if not self.hawkeye_has("run"):
+                die("the hawkeye binary has no `run` subcommand: the drill needs the sidecars")
+            verdict = body(timeout)
+            ok = True
+            self.say("=== PASS: %s" % verdict)
+        except DevnetError as error:
+            self.say("=== FAIL: %s" % error)
+        except Exception as error:      # an RPC or tool error is a failed drill too, and still goes down
+            self.say("=== FAIL: %s: %s" % (type(error).__name__, error))
+        finally:
+            if not keep and self.load(required=False):
+                try:
+                    self.say("--- down")
+                    self.down()
+                except Exception as error:
+                    self.say("down: %s" % error)
+            name = self.transcript_name(kind, started)
+            target = TRANSCRIPTS if ok else self.path("transcripts")
+            os.makedirs(target, exist_ok=True)
+            out = os.path.join(target, name if ok else name.replace(".txt", "-FAILED.txt"))
+            with open(out, "w") as f:
+                f.write("\n".join(self.lines) + "\n")
+            print("transcript: %s" % out)
+        return 0 if ok else 1
+
+    # ================================================================ drill D-11: dormancy (R1)
+    def drill_dormancy(self, timeout):
+        set_id = self.s["set"]["setid"]
+        n0 = self.node(0)
+        params = self.s["set"]["params"]
+        self.step("lock 10 YEC on node0 and wait for its mint")
+        lk = self.lock_mint("10", 10 * COIN, timeout)
+
+        self.step("burn 4 wYEC; the moment its intent appears, pause the miner and stop every attestor's Hawkeye")
+        from_h = self.tip()
+        b = self.burn_tracked("4")
+        it = self.wait_burn_intent(b["nonce"], from_h, timeout)
+        self.pause(True)
+        for a in self.s["attestors"]:
+            self.silence(a["index"], True)
+        if any(proc_alive(a.get("pid"), "hawkeye") for a in self.s["attestors"]):
+            die("a hawkeye survived `silence`")
+        time.sleep(1)
+        if self.confirmations(it["txid"]) < 1:
+            self.mine(1)
+        rows = {r["outpoint"]: r for r in self.intents()}
+        if it["outpoint"] not in rows:
+            die("the in-flight intent %s is not an unspent intent (released or cancelled before the stop)" % it["outpoint"])
+        self.say("  in-flight intent %s (%s YEC to the burner's %s) is unspent, matures at %s; every Hawkeye is down"
+                 % (it["outpoint"], rows[it["outpoint"]]["value"], b["recipient"], rows[it["outpoint"]]["matureheight"]))
+
+        self.step("mine past livenessWindow (%d blocks) with every attestor silent: the set goes DORMANT" % params["livenesswindow"])
+        info = n0.set_getinfo(set_id)
+        last = max(m["lastact"] for m in info["memberlist"])
+        self.say("  height %d: last member act at %d, dormant %s, released %s" % (self.tip(), last, info["dormant"], info["released"]))
+        mined = 0
+        while not (info["dormant"] and info["released"]):
+            if mined > 3 * params["livenesswindow"]:
+                die("the set is not dormant after %d silent blocks: %s" % (mined, jdump({k: info[k] for k in ("dormant", "released")})))
+            self.mine(5)
+            mined += 5
+            info = n0.set_getinfo(set_id)
+        self.say("  ok: height %d (%d blocks after the last act %d): set_getinfo dormant %s, released %s, current %d, lockedvalue %s"
+                 % (self.tip(), self.tip() - last, last, info["dormant"], info["released"], info["current"], info["lockedvalue"]))
+        if self.tip() + 1 - last <= params["livenesswindow"]:
+            die("dormant before livenessWindow elapsed (tip %d, last act %d)" % (self.tip(), last))
+        if any(proc_alive(a.get("pid"), "hawkeye") for a in self.s["attestors"]):
+            die("a hawkeye is running")
+
+        self.step("the depositor recovers: `hawkeye --config node0.toml recover` (vault_ownerspend, selector 3)")
+        mine_rows = n0.vault_list({"tag": "WYEC", "setid": set_id, "mine": True})
+        for r in mine_rows:
+            self.say("  owned by node0's wallet: %s %s %s YEC" % (r["kind"], r["outpoint"], r["value"]))
+        kinds = {r["outpoint"]: r["kind"] for r in mine_rows}
+        if kinds.get(it["outpoint"]) != "intent" or "vault" not in kinds.values():
+            die("node0 does not own both the remaining vault and the in-flight intent: %s" % jdump(kinds))
+        owned_zat = sum(r["valuezat"] for r in mine_rows)
+        out = self.hawkeye(self.s["depositor"]["config"], "recover").stdout.strip()
+        rec = json.loads(out)["recovered"]
+        self.say("  hawkeye recover: %s" % out)
+        if len(rec) != len(mine_rows) or any("txid" not in r or r.get("selector") != 3 for r in rec):
+            die("recover did not spend every owned output with selector 3: %s" % out)
+        self.mine(1)
+        got = 0
+        for r in rec:
+            if self.confirmations(r["txid"]) < 1:
+                die("recover tx %s not confirmed" % r["txid"])
+            tx = n0.getrawtransaction(r["txid"], 1)
+            for o in tx["vout"]:
+                for addr in o["scriptPubKey"].get("addresses", []):
+                    if n0.validateaddress(addr).get("ismine"):
+                        got += zat(o["value"])
+            self.say("  recovered %s (selector %d) by %s, confirmed" % (r["outpoint"], r["selector"], r["txid"]))
+        left = n0.vault_list({"tag": "WYEC", "setid": set_id})
+        if left:
+            die("WYEC outputs remain under the set: %s" % jdump(left))
+        if got < owned_zat - len(rec) * 100_000:
+            die("node0 got back %s YEC of the %s it owned" % (yec(got), yec(owned_zat)))
+        if self.received(b["recipient"]) != 0:
+            die("the burn recipient was paid: the intent was released, not recovered")
+        self.say("  balance check: node0's wallet received %s YEC back of the %s YEC locked (vault %s + in-flight intent %s), "
+                 "fees %s; the burner's %s received 0"
+                 % (yec(got), yec(owned_zat), yec(owned_zat - rows[it["outpoint"]]["valuezat"]),
+                    rows[it["outpoint"]]["value"], yec(owned_zat - got), b["recipient"]))
+        self.say("  the lock %s is back with its owner via the dormancy branch (ownerHeight %s not reached: tip %d)"
+                 % (lk["txid"][:16], json.loads(lk["output"]).get("owner_height"), self.tip()))
+
+        self.step("the supply: wYEC outstanding is now UNBACKED, by design (R1 trade-off); Hawkeye raises the supply alarm")
+        supply = self.wyec_supply()
+        locked = self.locked_zat()
+        self.say("  wYEC totalSupply %s > WYEC value under the set %s" % (yec(supply), yec(locked)))
+        if supply != 6 * COIN or locked != 0:
+            die("expected 6 wYEC outstanding over 0 locked, got %s over %s" % (yec(supply), yec(locked)))
+        self.say("  R1 (plan §1.4): when every attestor is silent for livenessWindow, depositors take their YEC back "
+                 "without the bridge. The 6 wYEC still on Ethereum are now unbacked - the deliberate price of "
+                 "liveness recovery: the Foundation's R1 requirement puts the depositor's exit above the peg.")
+        self.say("  The in-flight burn's intent (%s YEC) went back to the vault's owner as well, not to the burner: "
+                 "a burn not released before dormancy is lost to the wYEC holder (here depositor and holder are one "
+                 "person, so node0 has all 10 YEC back and still holds 6 wYEC)." % rows[it["outpoint"]]["value"])
+        for a in self.s["attestors"]:
+            st = self.hk_status(a)
+            names = [x["name"] for x in st.get("alarms", [])]
+            alarm = next((x for x in st.get("alarms", []) if x["name"] == "supply"), None)
+            if not alarm or st["supply"]["ok"]:
+                die("attestor%d's hawkeye raised no supply alarm: %s" % (a["index"], jdump(st.get("alarms"))))
+            self.say("  attestor%d `hawkeye status`: live members %d, supply ok %s, alarms %s; supply: %s"
+                     % (a["index"], st["live_members"], st["supply"]["ok"], names, alarm["detail"]))
+        return ("all attestors silent -> set DORMANT after livenessWindow -> `hawkeye recover` returned the vault "
+                "and the in-flight intent to the depositor (selector 3); 6 wYEC unbacked by design, supply alarm raised")
+
+    # ================================================================ drill D-7: takeover
+    def drill_takeover(self, timeout):
+        p = self.bridge()
+        self.step("lock 10 YEC and wait for its mint")
+        self.lock_mint("10", 10 * COIN, timeout)
+        nonce = self.burn_nonce()
+        live = self.live_sorted()
+        lead = self.burn_leader(nonce)
+        self.step("stop the leader of the next burn nonce %d before burning: live order %s -> live[%d mod %d] = attestor%d"
+                  % (nonce, ["attestor%d" % self.index_of_key(k) for k in live], nonce, len(live), lead))
+        la = self.attestor(lead)
+        self.silence(lead, True)
+
+        self.step("burn 4 wYEC; another attestor posts the intent after takeover_blocks = %d" % p["takeover_blocks"])
+        from_h = self.tip()
+        b = self.burn_tracked("4")
+        it = self.wait_burn_intent(nonce, from_h, timeout + 60)
+        tx = self.node(0).getrawtransaction(it["txid"], 1)
+        by = self.owner_of_inputs(tx)
+        self.say("  intent %s funded by attestor%s" % (it["outpoint"], ",".join(map(str, by))))
+        if lead in by or not by:
+            die("the intent was not posted by another attestor (funders %s)" % by)
+        takes = [ln for a in self.s["attestors"] if a["index"] != lead
+                 for ln in self.log_events(a, "burn_takeover", nonce=nonce)]
+        if not takes:
+            die("no running attestor logged burn_takeover for nonce %d" % nonce)
+        for ln in takes[:4]:
+            self.say("  %s" % ln.strip()[:220])
+
+        self.step("wait for the release; exactly one intent for burn %d" % nonce)
+        self.wait_for("4 YEC received at %s" % b["recipient"], lambda: self.received(b["recipient"]) == 4, timeout + 60)
+        found = self.burn_intents(nonce, from_h)
+        if len(found) != 1:
+            die("%d intents for burn %d: %s" % (len(found), nonce, jdump(found)))
+
+        self.step("restart the leader attestor%d: it adopts the release, it does not post again" % lead)
+        off = self.log_size(la)
+        self.restart_hawkeye(la)
+
+        def caught_up():
+            code, st = self.api(la, "status")
+            if code != 200 or st["ticks"] < 2:
+                return None
+            if st["ycash"]["lag"] != 0 or st["ethereum"]["lag"] > 1:
+                return None
+            return st
+        st = self.wait_for("attestor%d caught up (ycash and ethereum lag 0)" % lead, caught_up, timeout)
+        target = self.tip() + 3 * p["takeover_blocks"] + 4
+        self.wait_for("%d more blocks pass (3 takeover rounds)" % (target - self.tip()), lambda: self.tip() >= target, timeout)
+        code, bv = self.api(la, "burns/%d" % nonce)
+        self.say("  attestor%d GET /burns/%d: %s %s" % (lead, nonce, code, jdump(bv)))
+        if code != 200 or bv["state"] != "RELEASED" or bv["intent"] != it["outpoint"]:
+            die("the restarted leader did not adopt the release: %s" % jdump(bv))
+        for ln in self.log_events(la, "release_adopted", off, nonce=nonce)[:1]:
+            self.say("  attestor%d: %s" % (lead, ln.strip()[:240]))
+        posted = [ln for ev in ("unlock_signed", "unlock_sent", "unlock_resend")
+                  for ln in self.log_events(la, ev, off, nonce=nonce)]
+        if posted:
+            die("the restarted leader posted again: %s" % posted)
+        found = self.burn_intents(nonce, from_h)
+        if len(found) != 1:
+            die("%d intents for burn %d after the restart: %s" % (len(found), nonce, jdump(found)))
+        self.assert_members()
+        for a in self.s["attestors"]:
+            s2 = self.hk_status(a)
+            if any(s2["slash_cases"].values()):
+                die("attestor%d holds slash cases: %s" % (a["index"], s2["slash_cases"]))
+            self.say("  attestor%d: burns %s, intents %s, alarms %s"
+                     % (a["index"], {k: v for k, v in s2["burns"].items() if v}, {k: v for k, v in s2["intents"].items() if v},
+                        [x["name"] for x in s2["alarms"]]))
+        supply, locked = self.wyec_supply(), self.locked_zat()
+        if supply != 6 * COIN or supply > locked:
+            die("supply %s, locked %s" % (yec(supply), yec(locked)))
+        self.say("  wYEC totalSupply %s <= locked %s; nobody slashed" % (yec(supply), yec(locked)))
+        return ("leader attestor%d down -> takeover after %d blocks -> exactly one intent -> released; the restarted "
+                "leader adopted it (RELEASED, no second unlock)" % (lead, p["takeover_blocks"]))
+
+    # ================================================================ drill D-3: double release
+    def drill_double(self, timeout):
+        set_id = self.s["set"]["setid"]
+        p = self.bridge()
+        self.step("lock 30 YEC, mint; burn 4 wYEC and wait for its release (30 locked: the replay of 4 YEC fits "
+                  "the 5000 bps rate limit, so only the watchers stand in its way)")
+        self.lock_mint("30", 30 * COIN, timeout)
+        from_h = self.tip()
+        b = self.burn_tracked("4")
+        nonce = b["nonce"]
+        first = self.wait_burn_intent(nonce, from_h, timeout)
+        self.wait_for("4 YEC received at %s" % b["recipient"], lambda: self.received(b["recipient"]) == 4, timeout + 60)
+        h_first = self.tip() - self.confirmations(first["txid"]) + 1
+        self.say("  burn %d released through intent %s (mined at %d)" % (nonce, first["outpoint"], h_first))
+
+        rogue = 1
+        ra = self.attestor(rogue)
+        self.step("attestor%d posts a SECOND unlock for burn %d: `rogue-unlock --replay-burn %d` (the burn's valid HKB1 memo)"
+                  % (rogue, nonce, nonce))
+        out = self.hawkeye(ra["config"], "rogue-unlock", "--replay-burn", str(nonce)).stdout.strip()
+        self.say("  hawkeye --config attestor%d.toml rogue-unlock --replay-burn %d: %s" % (rogue, nonce, out))
+        rep = json.loads(out)
+        intent = rep["intent"]
+        self.wait_for("node0 sees the replay %s" % rep["txid"][:16], lambda: self._tx(rep["txid"]), 60, poll=0.2)
+        memo = self.memo_of(rep["txid"])
+        if not memo or memo["kind"] != 1 or memo["ref"] != nonce or memo["data"] != first["memo"]["data"]:
+            die("the replay does not carry burn %d's memo: %s" % (nonce, memo))
+        gap = self.tip() - h_first
+        self.say("  replay intent %s: memo kind 1, nonce %d, burn tx 0x%s (the original's); %d blocks after the first "
+                 "intent, outside the takeover window of %d" % (intent, nonce, memo["data"], gap, p["takeover_blocks"]))
+        if gap <= p["takeover_blocks"]:
+            die("the replay is inside the takeover window; the drill needs it outside")
+
+        self.step("another attestor cancels the replay within its window")
+
+        def cancelled():
+            sp = self.spender_of(intent, from_h)
+            if not sp:
+                return None
+            t, tx = sp
+            types = [self.node(0).vault_decodescript(o["scriptPubKey"]["hex"]).get("type") for o in tx["vout"]]
+            if "vault" not in types:
+                die("the replay %s was spent by %s, which is not a cancel (outputs %s)" % (intent, t, types))
+            return t, tx
+        ctxid, ctx = self.wait_for("replay intent cancelled", cancelled, timeout)
+        by = self.owner_of_inputs(ctx)
+        self.say("  cancel %s funded by attestor%s" % (ctxid, ",".join(map(str, by)) or "?"))
+        if rogue in by:
+            die("the cancel was funded by the rogue itself")
+        self.wait_for("cancel confirmed", lambda: self.confirmations(ctxid) >= 1, 120)
+
+        self.step("the signer is slashed: attestor%d removed, bond frozen" % rogue)
+
+        def slashed():
+            for m in self.node(0).set_getinfo(set_id)["memberlist"]:
+                if m["key"] == ra["memberkey"] and m["status"] == "removed" and m["bondfrozen"]:
+                    return m
+            return None
+        m = self.wait_for("attestor%d status removed, bondfrozen true" % rogue, slashed, timeout + 120)
+        self.say("  member %s..: %s" % (ra["memberkey"][:16], jdump(m)))
+
+        self.step("the watchers classified it as a consumed burn, NOT a benign race")
+        cls = []
+        for a in self.s["attestors"]:
+            if a["index"] == rogue:
+                continue
+            for ln in self.log_events(a, "intent_classified", needle=intent):
+                cls.append((a["index"], ln))
+                if "benign-race" in ln:
+                    die("attestor%d classified the replay as a benign race: %s" % (a["index"], ln))
+            if self.log_events(a, "benign_race", needle=intent):
+                die("attestor%d logged benign_race for the replay" % a["index"])
+        if not any("unmatched:consumed-burn" in ln for _, ln in cls):
+            die("no watcher classified %s as unmatched:consumed-burn: %s" % (intent, cls))
+        for i, ln in cls:
+            self.say("  attestor%d: %s" % (i, ln.strip()[:220]))
+        opened = [ln for a in self.s["attestors"] if a["index"] != rogue
+                  for ln in self.log_events(a, "slash_case_opened", needle=intent)]
+        for ln in opened[:2]:
+            self.say("  %s" % ln.strip()[:220])
+        if not opened:
+            die("no slash case opened for the replay")
+
+        self.step("paid once; the supply invariant holds")
+        if self.received(b["recipient"]) != 4:
+            die("the burn recipient received %s, not 4" % self.received(b["recipient"]))
+        supply, locked = self.wyec_supply(), self.locked_zat()
+        self.say("  burn %d's recipient received 4 YEC once; wYEC totalSupply %s <= locked %s" % (nonce, yec(supply), yec(locked)))
+        if supply != 26 * COIN or supply > locked:
+            die("supply invariant broken (supply %s, locked %s)" % (yec(supply), yec(locked)))
+        return ("second unlock for released burn %d (valid memo, %d blocks later) -> cancelled by another attestor -> "
+                "classified consumed-burn (not a benign race) -> attestor%d removed, bond frozen" % (nonce, gap, rogue))
+
+    # ================================================================ drill D-16: restart / crash mid-flow
+    def drill_restart(self, timeout):
+        """Three crashes, each followed by a restart from the ledger: (A) the mint leader aborts right after
+        recording its EIP-712 signature, before submitting; (B) the burn leader aborts right after recording
+        its set signature on the unlock, before broadcasting it; (C) the burn leader is SIGKILLed once
+        it logs unlock_signed, i.e. after the broadcast and before the intent confirms. (A) and (B) use the
+        drill-only crash point HAWKEYE_DRILL_CRASH_AT (an abort at that exact line, gated by [devnet] drills);
+        (C) is a plain kill -9 from outside."""
+        holder = self.s["holder"]["eth_address"]
+
+        self.step("(A) mint path: pause the miner, lock 20 YEC, arm crash point mint_signed on the mint leader")
+        self.pause(True)
+        time.sleep(2.5)
+        lk = self.lock("20", holder)
+        lock_id = json.loads(lk["output"])["lockid"]
+        lead = self.mint_leader(lock_id)
+        la = self.attestor(lead)
+        self.say("  lockId %s: mint leader live[lockId mod 3] = attestor%d" % (lock_id, lead))
+        off = self.log_size(la)
+        self.rearm(la, "mint_signed")
+        time.sleep(1)
+        self.pause(False)
+        ln = self.wait_crash(la, "mint_signed", off, timeout)
+        signed = self.log_events(la, "mint_signed", off, needle=lock_id[2:18])
+        subm = self.log_events(la, "mint_submitted", off, needle=lock_id[2:18])
+        self.say("  attestor%d: %s" % (lead, signed[0].strip()[:200] if signed else "(no mint_signed line)"))
+        self.say("  attestor%d: %s" % (lead, ln.strip()[:200]))
+        if not signed or subm:
+            die("the crash did not land between mint_signed and mint_submitted (signed %d, submitted %d)" % (len(signed), len(subm)))
+        off = self.log_size(la)
+        self.restart_hawkeye(la)
+        self.wait_for("holder holds 20 wYEC", lambda: self.wyec_balance() == 20 * COIN, timeout)
+        time.sleep(6)
+        if self.wyec_supply() != 20 * COIN:
+            die("totalSupply %s after the mint restart: minted twice?" % yec(self.wyec_supply()))
+        resigned = self.log_events(la, "mint_signed", off, needle=lock_id[2:18])
+        if resigned:
+            die("attestor%d signed the mint again after the restart: %s" % (lead, resigned))
+        self.say("  minted once: totalSupply 20; no second mint_signed after the restart (sign-once record reused)")
+
+        self.step("(B) burn path: arm crash point unlock_signed on the leader of the next burn, burn 4 wYEC")
+        nonce = self.burn_nonce()
+        lead = self.burn_leader(nonce)
+        la = self.attestor(lead)
+        off = self.log_size(la)
+        self.say("  burn nonce %d: leader attestor%d" % (nonce, lead))
+        self.rearm(la, "unlock_signed")
+        from_h = self.tip()
+        b = self.burn_tracked("4")
+        ln = self.wait_crash(la, "unlock_signed", off, timeout)
+        signed = self.log_events(la, "unlock_signed", off, nonce=nonce)
+        sent = self.log_events(la, "unlock_sent", off, nonce=nonce)
+        self.say("  attestor%d: %s" % (lead, signed[0].strip()[:200] if signed else "(no unlock_signed line)"))
+        self.say("  attestor%d: %s" % (lead, ln.strip()[:200]))
+        time.sleep(1)
+        if not signed or sent or self.burn_intents(nonce, from_h):
+            die("the crash did not land between unlock_signed and the broadcast")
+        self.say("  at the crash: the unlock is signed and recorded, not broadcast; no intent for burn %d anywhere" % nonce)
+        off = self.log_size(la)
+        self.restart_hawkeye(la)
+        it = self.wait_burn_intent(nonce, from_h, timeout)
+        self.wait_for("4 YEC received at %s" % b["recipient"], lambda: self.received(b["recipient"]) == 4, timeout + 60)
+        for ln in [x for ev in ("unlock_resend", "unlock_signed", "unlock_sent", "unlock_already_known")
+                   for x in self.log_events(la, ev, off, nonce=nonce)]:
+            self.say("  attestor%d after the restart: %s" % (lead, ln.strip()[:200]))
+        if not self.log_events(la, "unlock_resend", off, nonce=nonce):
+            die("the restarted leader did not resend its stored unlock")
+        if self.log_events(la, "unlock_signed", off, nonce=nonce):
+            die("the restarted leader signed burn %d's unlock again" % nonce)
+        if len(self.burn_intents(nonce, from_h)) != 1:
+            die("%d intents for burn %d" % (len(self.burn_intents(nonce, from_h)), nonce))
+        self.say("  the stored bytes were resent (unlock_resend), not re-signed: one intent %s, released" % it["outpoint"])
+
+        self.step("(C) SIGKILL the leader of the next burn once it logs unlock_signed (after the broadcast, before the intent confirms)")
+        nonce = self.burn_nonce()
+        lead = self.burn_leader(nonce)
+        la = self.attestor(lead)
+        off = self.log_size(la)
+        from_h = self.tip()
+        self.say("  burn nonce %d: leader attestor%d" % (nonce, lead))
+        b = self.burn_tracked("3")
+        ln = self.wait_for("attestor%d logs unlock_signed for nonce %d" % (lead, nonce),
+                           lambda: (self.log_events(la, "unlock_signed", off, nonce=nonce) or [None])[0],
+                           timeout, poll=0.02)
+        self.kill9(la)
+        sent = self.log_events(la, "unlock_sent", off, nonce=nonce)
+        found = self.burn_intents(nonce, from_h)
+        self.say("  SIGKILL attestor%d after: %s" % (lead, ln.strip()[:200]))
+        self.say("  at the kill: unlock %s; intents for burn %d on node0: %d (%d confirmed)"
+                 % ("broadcast (unlock_sent logged)" if sent else "signed, NOT broadcast", nonce, len(found),
+                    len([f for f in found if f["height"]])))
+        time.sleep(2)
+        self.restart_hawkeye(la)
+        it = self.wait_burn_intent(nonce, from_h, timeout)
+        self.wait_for("3 YEC received at %s" % b["recipient"], lambda: self.received(b["recipient"]) == 3, timeout + 60)
+        time.sleep(4)
+        if len(self.burn_intents(nonce, from_h)) != 1:
+            die("%d intents for burn %d" % (len(self.burn_intents(nonce, from_h)), nonce))
+        if len(self.log_events(la, "unlock_signed", off, nonce=nonce)) != 1:
+            die("attestor%d signed the unlock of burn %d more than once" % (lead, nonce))
+        self.say("  one intent %s, released; attestor%d signed it once" % (it["outpoint"], lead))
+
+        self.step("no second set signature anywhere, no equivocation; store events consistent on every attestor")
+        bad = self.scan_logs(["set-sign-once", "equivocation_submitted", "equivocation_claim", "SignOnce", "exposure",
+                              "sign_once conflict"])
+        if bad:
+            die("sign-once / equivocation trouble: %s" % bad[:5])
+        self.say("  no `set-sign-once` refusal from any node, no equivocation, no exposure in any hawkeye.log")
+        info = self.assert_members()
+        self.say("  all %d members active, no bond frozen" % len(info["memberlist"]))
+        for a in self.s["attestors"]:
+            st = self.hk_status(a)
+            want = {"locks": ("MINTED", 1), "burns": ("RELEASED", 2), "intents": ("RELEASED", 2)}
+            for k, (state, n) in want.items():
+                if st[k].get(state) != n or sum(st[k].values()) != n:
+                    die("attestor%d %s: %s" % (a["index"], k, st[k]))
+            if any(st["slash_cases"].values()) or st["alarms"]:
+                die("attestor%d: slash cases %s, alarms %s" % (a["index"], st["slash_cases"], st["alarms"]))
+            self.say("  attestor%d: locks MINTED 1, burns RELEASED 2, intents RELEASED 2, no slash case, no alarm" % a["index"])
+        supply, locked = self.wyec_supply(), self.locked_zat()
+        if supply != 13 * COIN or supply > locked:
+            die("supply %s, locked %s" % (yec(supply), yec(locked)))
+        self.say("  wYEC totalSupply %s <= locked %s" % (yec(supply), yec(locked)))
+        return ("crash after mint_signed, crash after unlock_signed (before broadcast), kill -9 after broadcast: "
+                "minted once, each burn one intent released, every signature made once, store consistent")
+
+    # ================================================================ drill D-9 / D-10: reorgs
+    def drill_reorg(self, timeout):
+        n0 = self.node(0)
+        holder = self.s["holder"]["eth_address"]
+        nodes = range(len(self.s["nodes"]))
+        conf = self.bridge()["confirmations"]
+
+        self.step("(a) Ycash, D-9: pause the miner; lock 10 YEC with nLockTime = tip, mined at 1 confirmation (C_Y = %d)" % conf)
+        self.pause(True)
+        time.sleep(3)
+        self.sync()
+        t = self.tip()
+        lk = self.lock_fallback("10", holder, lock_time=t, sequence=0xFFFFFFFE)
+        txid, outpoint = lk["txid"], lk["outpoint"]
+        lock_id = "0x" + sha256(txid_internal(txid) + (0).to_bytes(4, "little")).hex()
+        self.wait_mempool(txid)
+        self.mine(1)
+        self.say("  lock %s in block %d (1 confirmation); lockId %s" % (outpoint, t + 1, lock_id))
+        for a in self.s["attestors"]:
+            self.wait_for("attestor%d saw the lock" % a["index"],
+                          lambda a=a: self.api(a, "locks/%s" % lock_id)[0] == 200, 60)
+            self.say("  attestor%d GET /locks: %s" % (a["index"], self.api(a, "locks/%s" % lock_id)[1]["state"]))
+        reorg_from = n0.getblockhash(t)
+        self.say("  invalidateblock %s (height %d) on all %d nodes: the lock's block and its parent leave the chain; "
+                 "the lock is not final below height %d, so no mempool takes it back" % (reorg_from[:16], t, len(nodes), t + 1))
+        for i in nodes:
+            self.node(i).invalidateblock(reorg_from)
+        for i in nodes:
+            if self.node(i).getblockcount() != t - 1:
+                die("node%d at %d after invalidateblock" % (i, self.node(i).getblockcount()))
+            if txid in self.node(i).getrawmempool():
+                die("node%d took the lock back into its mempool" % i)
+        self.mine(conf + 3)
+        self.say("  competing chain mined on node0: heights %d..%d, without the lock" % (t, self.tip()))
+        for h in range(t, self.tip() + 1):
+            if txid in n0.getblock(n0.getblockhash(h))["tx"]:
+                die("the competing chain holds the lock")
+        for a in self.s["attestors"]:
+            self.wait_for("attestor%d rewound its ledger (lock gone)" % a["index"],
+                          lambda a=a: self.api(a, "locks/%s" % lock_id)[0] == 404, 60)
+            ev = self.log_events(a, "ycash_reorg")
+            if not ev:
+                die("attestor%d logged no ycash_reorg" % a["index"])
+            self.say("  attestor%d: %s" % (a["index"], ev[-1].strip()[:200]))
+        self.mine(conf + 2)
+        time.sleep(8)
+        if self.wyec_balance() != 0 or self.wyec_supply() != 0:
+            die("minted for a lock that left the chain: supply %s" % yec(self.wyec_supply()))
+        signed = [ln for a in self.s["attestors"] for ln in self.log_events(a, "mint_signed", needle=lock_id[2:18])]
+        if signed:
+            die("a mint signature was given for the reorged lock: %s" % signed)
+        self.say("  no mint, no mint signature, wYEC totalSupply 0, %d blocks past the fork" % (self.tip() - t + 1))
+
+        self.step("(a) re-broadcast the same lock (now final) and let it re-confirm: a single mint")
+        if n0.sendrawtransaction(lk["hex"]) != txid:
+            die("re-broadcast gave another txid")
+        self.pause(False)
+        self.wait_for("lock re-confirmed", lambda: self.confirmations(txid) >= 1, timeout)
+        self.wait_for("holder holds 10 wYEC", lambda: self.wyec_balance() == 10 * COIN, timeout)
+        time.sleep(6)
+        if self.wyec_supply() != 10 * COIN:
+            die("totalSupply %s: more than one mint" % yec(self.wyec_supply()))
+        for a in self.s["attestors"]:
+            self.wait_for("attestor%d's ledger: lock MINTED (the Minted event, finalized)" % a["index"],
+                          lambda a=a: (self.api(a, "locks/%s" % lock_id)[1] or {}).get("state") == "MINTED", timeout)
+        if self.wyec_supply() != 10 * COIN:
+            die("totalSupply %s: more than one mint" % yec(self.wyec_supply()))
+        self.say("  single mint of lockId %s: totalSupply 10; every ledger MINTED" % lock_id[:18])
+        alarms = [x for a in self.s["attestors"] for x in (self.api(a, "status")[1] or {}).get("alarms", [])
+                  if x["name"] == "exposure"]
+        if alarms:
+            die("exposure alarm: %s" % alarms)
+
+        self.step("(b) Ethereum, D-10: burn 4 wYEC, then reorg it out with anvil_reorg before it is finalized")
+        nonce = self.burn_nonce()
+        from_h = self.tip()
+        b = self.burn_tracked("4")
+        bblock = b["out"].get("block")
+        latest = int(self.cast("block-number", "--rpc-url", self.anvil_url()))
+        fin = int(self.cast("block", "finalized", "--field", "number", "--rpc-url", self.anvil_url()))
+        if bblock is None or fin >= bblock:
+            die("the burn (block %s) is already finalized (%d)" % (bblock, fin))
+        depth = latest - bblock + 1
+        self.eth_rpc("anvil_reorg", str(depth), "[]")
+        self.say("  burn nonce %d tx %s in block %d; latest %d, finalized %d; anvil_reorg depth %d"
+                 % (nonce, b["out"].get("txhash"), bblock, latest, fin, depth))
+        rc = self.eth_rpc("eth_getTransactionReceipt", b["out"]["txhash"])
+        if rc not in ("null", ""):
+            die("the burn survived the reorg: %s" % rc[:200])
+        if self.burn_nonce() != nonce or self.wyec_balance() != 10 * COIN:
+            die("the reorg did not undo the burn (nonce %d, balance %s)" % (self.burn_nonce(), yec(self.wyec_balance())))
+        self.say("  the burn left the chain: no receipt, burnNonce back to %d, holder holds 10 wYEC again" % nonce)
+        target = bblock + depth + 2
+        self.wait_for("ethereum finalized past block %d" % target,
+                      lambda: int(self.cast("block", "finalized", "--field", "number", "--rpc-url", self.anvil_url())) >= target,
+                      timeout)
+        for a in self.s["attestors"]:
+            self.wait_for("attestor%d scanned past block %d" % (a["index"], target),
+                          lambda a=a: (self.api(a, "status")[1] or {}).get("ethereum", {}).get("cursor", 0) >= target, 60)
+            code, _ = self.api(a, "burns/%d" % nonce)
+            if code != 404:
+                die("attestor%d's ledger holds burn %d of the reorged chain (%s)" % (a["index"], nonce, code))
+        time.sleep(6)
+        if self.burn_intents(nonce, from_h):
+            die("an intent was posted for the reorged burn: %s" % self.burn_intents(nonce, from_h))
+        if self.received(b["recipient"]) != 0:
+            die("the reorged burn's recipient was paid")
+        self.say("  no ledger row for burn %d, no intent, nothing paid to %s" % (nonce, b["recipient"]))
+
+        self.step("(b) burn again: nonce %d is reused by a new burn transaction, released once" % nonce)
+        from_h = self.tip()
+        b2 = self.burn_tracked("4")
+        if b2["nonce"] != nonce:
+            die("the new burn got nonce %d" % b2["nonce"])
+        it = self.wait_burn_intent(nonce, from_h, timeout + 60)
+        if "0x" + it["memo"]["data"] != b2["out"]["txhash"].lower():
+            die("the intent names burn tx 0x%s, not the new %s" % (it["memo"]["data"], b2["out"]["txhash"]))
+        self.wait_for("4 YEC received at %s" % b2["recipient"], lambda: self.received(b2["recipient"]) == 4, timeout + 60)
+        if len(self.burn_intents(nonce, from_h)) != 1:
+            die("more than one intent for burn %d" % nonce)
+        self.say("  intent %s names the new burn tx %s; released" % (it["outpoint"], b2["out"]["txhash"]))
+        supply, locked = self.wyec_supply(), self.locked_zat()
+        if supply != 6 * COIN or supply > locked:
+            die("supply %s, locked %s" % (yec(supply), yec(locked)))
+        self.assert_members()
+        self.say("  wYEC totalSupply %s <= locked %s; nobody slashed" % (yec(supply), yec(locked)))
+        return ("Ycash reorg before C_Y: ledger rewound, no mint, single mint after re-confirmation; Ethereum reorg "
+                "below finality: no ledger row, no intent; the reused nonce released once")
+
 
 # ====================================================================== CLI
+
+# `scenario <name>` drills beyond demo and roll: (title, Devnet method, run_drill overrides).
+DRILLS = {
+    "dormancy": ("plan §8 D-11, R1: all attestors silent", "drill_dormancy", {}),
+    "takeover": ("plan §8 D-7: leader down", "drill_takeover", {}),
+    "double": ("plan §8 D-3: double release", "drill_double", {}),
+    "restart": ("plan §8 D-16: crash mid-flow", "drill_restart", {}),
+    # finalized = latest - 16 on anvil, so a burn can be reorged out below finality (D-10)
+    "reorg": ("plan §8 D-9 + D-10: Ycash and Ethereum reorgs", "drill_reorg", {"slots": 8}),
+}
 
 def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)        # `hawkeye-devnet logs | head`
@@ -1780,7 +2574,7 @@ def main():
     sub.add_parser("down", help="stop everything, keep the directory")
     sub.add_parser("clean", help="remove the (stopped) run directory")
     p = sub.add_parser("scenario", help="scripted end-to-end scenarios")
-    p.add_argument("name", choices=["demo", "roll"])
+    p.add_argument("name", choices=["demo", "roll"] + sorted(DRILLS))
     up_args(p)
     p.add_argument("--keep", action="store_true", help="leave the devnet up afterwards")
     p.add_argument("--fresh", action="store_true", help="clean a stopped devnet in --dir first")
@@ -1833,9 +2627,13 @@ def main():
                     die("%s holds a stopped devnet; the demo starts from a fresh one: `clean` first or pass --fresh" % dv.dir)
                 dv.clean()
                 dv.s = None
+            drill_args = (args.attestors, args.activation, args.base_port, args.anvil_port, args.interval,
+                          args.block_time, args.keep, args.timeout)
+            if args.name in DRILLS:
+                title, method, overrides = DRILLS[args.name]
+                return dv.run_drill(args.name, title, getattr(dv, method), drill_args, **overrides)
             run = dv.scenario_roll if args.name == "roll" else dv.scenario_demo
-            return run(args.attestors, args.activation, args.base_port, args.anvil_port, args.interval,
-                       args.block_time, args.keep, args.timeout)
+            return run(*drill_args)
         elif args.command == "_miner":
             dv.miner_loop()
     except DevnetError as error:

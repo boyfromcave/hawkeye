@@ -343,7 +343,10 @@ states! {
     /// evidence, or the losing side of a benign race); `MATCHED → UNMATCHED` (re-classified:
     /// another intent consumed the burn first); `UNMATCHED → MATCHED` (re-classified before a
     /// cancel was sent, e.g. this attestor's Ethereum view lagged the burn's finality);
-    /// `UNMATCHED → CANCELLED` (another attestor's cancel was mined first). Rewind edges:
+    /// `UNMATCHED → CANCELLED` (another attestor's cancel was mined first);
+    /// `MATURED_UNMATCHED → RELEASED` (a release mined while this attestor did not yet know the
+    /// intent's burn — a restart, or a lagging Ethereum view — adopted once the burn is known,
+    /// so the burn is not posted again). Rewind edges:
     /// `CANCELLED → CANCEL_SENT | MATCHED | UNMATCHED`, `RELEASED → MATCHED`.
     IntentState: "intent";
     /// Seen, not yet classified.
@@ -386,7 +389,8 @@ impl Machine for IntentState {
             | (Unmatched, Cancelled)
             | (Unmatched, MaturedUnmatched)
             | (CancelSent, Cancelled)
-            | (CancelSent, MaturedUnmatched) => Some(Edge::Forward),
+            | (CancelSent, MaturedUnmatched)
+            | (MaturedUnmatched, Released) => Some(Edge::Forward),
             (Cancelled, CancelSent)
             | (Cancelled, Matched)
             | (Cancelled, Unmatched)
@@ -654,7 +658,8 @@ mod tests {
         assert!(!LockState::Minted.is_terminal()); // → REORGED (exposure)
         assert!(BurnState::Orphaned.is_terminal());
         assert!(BurnState::Released.is_terminal());
-        assert!(IntentState::MaturedUnmatched.is_terminal());
+        // → RELEASED: a release recorded while the burn was unknown here is adopted later
+        assert!(!IntentState::MaturedUnmatched.is_terminal());
         assert!(IntentState::Released.is_terminal());
         assert!(VaultState::Rolled.is_terminal());
         assert!(VaultState::Spent.is_terminal());

@@ -774,6 +774,67 @@ async fn e_leader_takeover() {
     assert_eq!(live_vaults.len(), 1, "the re-lock remainder");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2_leader_back_after_the_release_adopts_it() {
+    // Devnet drill D-7 found this: the leader is down while another attestor takes the burn over
+    // AND the intent is released. On restart it follows those Ycash blocks before it scans the
+    // burn on Ethereum, so the intent first looks unmatched (unknown burn) and its release
+    // "matured unmatched"; once the burn is scanned the leader must adopt that release, not
+    // assign the burn to itself and post a second unlock.
+    let Some(env) = setup().await else { return };
+    let mut engines = vec![
+        env.engine(0).await,
+        env.engine(1).await,
+        env.engine(2).await,
+    ];
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x56; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let mut live: Vec<[u8; 33]> = (0..3).map(|i| env.key_of_index(i)).collect();
+    hawkeye_core::keys::sort_members(&mut live);
+    let leader = live[(nonce % 3) as usize];
+    let leader_idx = (0..3).find(|i| env.key_of_index(*i) == leader).unwrap();
+    let others: Vec<usize> = (0..3).filter(|i| *i != leader_idx).collect();
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    // the leader is down through the takeover, the intent's delay and its release
+    for _ in 0..(TAKEOVER + u32::from(DELAY) + 4) {
+        for &i in &others {
+            engines[i].tick().await;
+        }
+        env.mine(1);
+    }
+    for &i in &others {
+        engines[i].tick().await;
+        let b = engines[i].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert_eq!(b.state, BurnState::Released, "released by the takeover");
+    }
+    assert_eq!(env.mock.state().calls_to("set_signunlock").len(), 1);
+    // the leader comes back
+    for _ in 0..(3 * TAKEOVER) {
+        let rep = engines[leader_idx].tick().await;
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        env.mine(1);
+    }
+    assert_eq!(
+        env.mock.state().calls_to("set_signunlock").len(),
+        1,
+        "the returning leader posted the burn again"
+    );
+    let e = &engines[leader_idx];
+    let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    assert_eq!(b.state, BurnState::Released, "the release is adopted");
+    let intent = e
+        .ctx()
+        .db(|t| t.intent(&b.intent.unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.state, IntentState::Released);
+    assert_eq!(intent.classification.as_deref(), Some("matched-burn"));
+    assert!(intent.released_txid.is_some());
+    assert!(open_cases(e).is_empty(), "nobody to blame");
+}
+
 // ------------------------------------------------------------------------------------------
 // helpers for (f)–(k)
 

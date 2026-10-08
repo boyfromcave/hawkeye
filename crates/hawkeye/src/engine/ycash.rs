@@ -293,14 +293,17 @@ fn apply_spends(
                         t.transition_burn(&b.key, BurnState::Released, Some(h.into()), None)?;
                         info!(event = "burn_released", nonce = b.key.nonce, intent = %op);
                     }
-                } else if matches!(i.state, IntentState::Unmatched | IntentState::CancelSent) {
-                    t.transition_intent(
-                        &op,
-                        IntentState::MaturedUnmatched,
-                        Some(h),
-                        Some("released unmatched"),
-                    )?;
-                    warn!(event = "intent_matured_unmatched", intent = %op, height = h);
+                } else if matches!(
+                    i.state,
+                    IntentState::Unmatched
+                        | IntentState::CancelSent
+                        | IntentState::MaturedUnmatched
+                ) {
+                    // recorded with its release: adopted later if its burn was merely unknown
+                    // here (watch.rs, reclassify)
+                    t.intent_released_unmatched(&op, txid, h)?;
+                    warn!(event = "intent_matured_unmatched", intent = %op, height = h,
+                          classification = ?i.classification);
                 }
             }
             Some(2) => {

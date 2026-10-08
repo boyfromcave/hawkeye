@@ -398,6 +398,77 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// `UNMATCHED | CANCEL_SENT → MATURED_UNMATCHED` by a release (`release_txid` mined at
+    /// `height`): the window passed without a cancel. The release is recorded, so the intent can
+    /// still be adopted ([`Tx::adopt_release`]) if its burn becomes known here later. An intent
+    /// already `MATURED_UNMATCHED` (its window was missed earlier) only gets the release recorded.
+    pub fn intent_released_unmatched(
+        &self,
+        op: &OutPoint,
+        release_txid: &Hash32,
+        height: u32,
+    ) -> Result<()> {
+        let detail = format!(
+            "released unmatched by {}",
+            hawkeye_core::bytes::txid_to_display(release_txid)
+        );
+        if self.require_intent(op)?.state != IntentState::MaturedUnmatched {
+            self.intent_edge(
+                op,
+                IntentState::MaturedUnmatched,
+                Some(height),
+                Some(&detail),
+            )?;
+        }
+        self.conn().execute(
+            "UPDATE intents SET released_txid = ?3, released_height = ?4
+             WHERE txid = ?1 AND vout = ?2",
+            params![op.txid, op.vout, release_txid, height],
+        )?;
+        Ok(())
+    }
+
+    /// `MATURED_UNMATCHED → RELEASED`: an intent released while its burn was unknown to this
+    /// ledger (classified `unmatched:unknown-burn`) matches finalized burn `nonce` of
+    /// `deployment` after all; the recorded release becomes the burn's. Refused unless the
+    /// release was recorded ([`Tx::intent_released_unmatched`]).
+    pub fn adopt_release(
+        &self,
+        op: &OutPoint,
+        deployment: &Deployment,
+        nonce: u64,
+        height: Option<u32>,
+    ) -> Result<()> {
+        let old = self.require_intent(op)?;
+        if old.state != IntentState::MaturedUnmatched {
+            return Err(StoreError::Invalid(format!(
+                "intent {op} is {}: only a MATURED_UNMATCHED release is adopted",
+                old.state
+            )));
+        }
+        let Some(release) = old.released_txid else {
+            return Err(StoreError::Invalid(format!(
+                "intent {op} has no recorded release to adopt"
+            )));
+        };
+        let k = BurnKey::new(*deployment, nonce);
+        if self.require_burn(&k)?.state == crate::BurnState::Seen {
+            return Err(StoreError::Invalid(format!(
+                "burn {k} is not finalized: an intent cannot match it"
+            )));
+        }
+        let detail = format!(
+            "adopted: release {} pays burn {nonce}",
+            hawkeye_core::bytes::txid_to_display(&release)
+        );
+        self.intent_edge(op, IntentState::Released, height, Some(&detail))?;
+        self.conn().execute(
+            "UPDATE intents SET classification = ?3, matched_burn = ?4 WHERE txid = ?1 AND vout = ?2",
+            params![op.txid, op.vout, "matched-burn", self.burn_rowid(&k)?],
+        )?;
+        Ok(())
+    }
+
     /// Move an intent along a forward edge that carries no payload (`MATURED_UNMATCHED`);
     /// returns the state it left. The other targets have their own calls.
     pub fn transition_intent(

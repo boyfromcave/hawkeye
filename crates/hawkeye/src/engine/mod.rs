@@ -97,6 +97,30 @@ pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
 
+/// The environment variable that arms a drill crash point (drill D-16).
+pub const DRILL_CRASH_ENV: &str = "HAWKEYE_DRILL_CRASH_AT";
+
+/// Whether crash point `point` is armed: `[devnet] drills = true`, not mainnet, and `armed` (the
+/// value of [`DRILL_CRASH_ENV`]) names it.
+pub fn drill_crash_armed(p: &Params, point: &str, armed: Option<&str>) -> bool {
+    p.drills && !p.mainnet && armed == Some(point)
+}
+
+/// Drill D-16: abort the process at `point` when [`drill_crash_armed`] — a crash at the exact
+/// moment a signature is recorded in the ledger and not yet used (`unlock_signed`: before the
+/// unlock is broadcast; `mint_signed`: before the mint is submitted). `abort` runs no
+/// destructor and flushes nothing, as `kill -9` would. Never armed on mainnet.
+pub(crate) fn drill_crash_point(p: &Params, point: &str) {
+    let armed = std::env::var(DRILL_CRASH_ENV).ok();
+    if drill_crash_armed(p, point, armed.as_deref()) {
+        warn!(
+            event = "drill_crash",
+            point, "aborting at an armed drill crash point"
+        );
+        std::process::abort();
+    }
+}
+
 /// The result of one tick.
 #[derive(Debug, Default, Clone)]
 pub struct TickReport {
@@ -504,4 +528,37 @@ pub async fn guardian_mismatch(ctx: &Ctx, members: &[Member]) -> Result<Option<S
         missing.join(", "),
         extra.join(", ")
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::sample_params;
+
+    #[test]
+    fn drill_crash_points_arm_only_on_a_drill_devnet() {
+        let p = sample_params(true, false);
+        assert!(drill_crash_armed(
+            &p,
+            "unlock_signed",
+            Some("unlock_signed")
+        ));
+        assert!(!drill_crash_armed(&p, "unlock_signed", Some("mint_signed")));
+        assert!(!drill_crash_armed(&p, "unlock_signed", None));
+        // drills off, or mainnet: never armed, whatever the environment says
+        let off = sample_params(false, false);
+        assert!(!drill_crash_armed(
+            &off,
+            "unlock_signed",
+            Some("unlock_signed")
+        ));
+        let main = sample_params(true, true);
+        assert!(!drill_crash_armed(
+            &main,
+            "mint_signed",
+            Some("mint_signed")
+        ));
+        // unarmed in the test environment: a crash point is a no-op
+        drill_crash_point(&p, "a point nobody arms");
+    }
 }

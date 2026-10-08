@@ -1,0 +1,60 @@
+05:16:49 removed /home/user/hawkeye/devnet/run
+05:16:49 === hawkeye-devnet scenario double (plan §8 D-3: double release), 2026-10-08 05:16:49 UTC
+05:16:49 ycashd: /tmp/claude-0/-home-user/7955eb24-32de-557e-89dd-f1a98a49fa54/scratchpad/ycash-build/src/ycashd (node line ycash-dd v4.5.0): Ycash Daemon version v4.5.0-dbc1ab0-dirty
+05:16:49 hawkeye: /home/user/hawkeye/target/debug/hawkeye (hawkeye 0.1.0)
+05:16:49 --- step 1: up (3 attestors)
+05:16:49 hawkeye-devnet up: 4 regtest ycashd nodes (node0 user/miner, node1..3 attestors), vault upgrade 6d5b7a31 at height 110, dir /home/user/hawkeye/devnet/run
+05:16:49   node line ycash-dd v4.5.0 (Ycash Daemon version v4.5.0-dbc1ab0-dirty); extra start-up args: none
+05:16:51   nodes up: rpc ports 18401, 18403, 18405, 18407
+05:16:51   mining 211 blocks on node0 (activation 110 + coinbase maturity 100)
+05:16:54   height 211: vault upgrade active (branch 6d5b7a31, activation 110), node0 balance 659.06250000 YEC
+05:16:54   attestor1: member key 03796ba3fefdad1b8cae5838fe06a5610a7e34ca936a137163620f636f1f7c8776, eth address 0xC3229C67974b63Aa31bDdfA1EaDdEbAa420a7e54
+05:16:55   attestor2: member key 03fef47d4ec514fa3edf62e982b80aa831bd97dc25cf2d9abb80cdc139ba154ce9, eth address 0x7E5EC0cC4331044eF8c799739663d493e17D8dCF
+05:16:55   attestor3: member key 02615dc1d4915180264b9c8a619fc6763919426c0e34c1c9bbf1311311b88ba4e1, eth address 0xC330d94A3D3ebaf3E40D75367058Ea6cBCcDB86c
+05:16:55   holder (node0's Ethereum persona): 0x10e35559ccB1f45409f79CD644f0b6c9EB129D23
+05:16:56   funded attestor wallets: 8 coins x 2.5 YEC each (tx 9e2e31fbfa0ec0f5b36c257fff5e9c0ed7e820a55651a0f1a03d27b4a4eab96c)
+05:16:56   set_create on node0: setid c5d9e66f5ec183de3d2407915a09f5a6985d38fa4696688fef1df7a429111168 (seats 3, unlock 1, cancel 1, slash 2, rate 5000 bps / 20, liveness 60, maturity 2, bondmin 1)
+05:16:56   anvil up on http://127.0.0.1:18545 (block time 1s, --slots-in-an-epoch 1: finalized = latest - 2)
+05:16:56   forge script script/Deploy.s.sol: guardians 0xC3229C67974b63Aa31bDdfA1EaDdEbAa420a7e54,0x7E5EC0cC4331044eF8c799739663d493e17D8dCF,0xC330d94A3D3ebaf3E40D75367058Ea6cBCcDB86c, threshold 1
+05:16:58   wYEC deployed: bridge 0x5FbDB2315678afecb367f032d93F642f64180aa3, token 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 (deploy block 1, threshold 1) -> /home/user/hawkeye/devnet/run/deployments/31337.json
+05:16:59   funded 4 Ethereum accounts with 1000 ETH each (anvil_setBalance)
+05:16:59   attestor1 enrolled in node1's wallet (hawkeye enroll: {"eth_address":"0xC3229C67974b63Aa31bDdfA1EaDdEbAa420a7e54","memberkey":"03796ba3fefdad1b8cae5838fe06a5610a7e34ca936a137163620f636f1f7c8776"})
+05:16:59   attestor2 enrolled in node2's wallet (hawkeye enroll: {"eth_address":"0x7E5EC0cC4331044eF8c799739663d493e17D8dCF","memberkey":"03fef47d4ec514fa3edf62e982b80aa831bd97dc25cf2d9abb80cdc139ba154ce9"})
+05:16:59   attestor3 enrolled in node3's wallet (hawkeye enroll: {"eth_address":"0xC330d94A3D3ebaf3E40D75367058Ea6cBCcDB86c","memberkey":"02615dc1d4915180264b9c8a619fc6763919426c0e34c1c9bbf1311311b88ba4e1"})
+05:16:59   attestor1 SET_JOIN 297c44cc6ef7d95f3979fbcf10771d5de2cfe0436497ab1fa7d67e4de7e1e1f4 (bond 1 YEC at 3b7bef8258d9bcae00956433a26eb08a95b12bd2926906d15e7ccb6297321b63:0, bond lock 5214)
+05:16:59   attestor2 SET_JOIN c8bc3d3a1c159405b2c819b84df5eba7e18d4a0a005f7c04e20b0ea2b4e736e3 (bond 1 YEC at 4f752293ba39da728faeee362bfc8e6c37b310a1b342f86c1c9c14e13f005876:0, bond lock 5214)
+05:16:59   attestor3 SET_JOIN 7e8627a178f86fb448ea703b8a6a416a8e7447f800b2525c47a708408fff3a85 (bond 1 YEC at 1e22e7a7e284ddb5afd268e7553d27e22286abcfa7b38082463ca64cf8b4788b:0, bond lock 5214)
+05:16:59   3 members current at height 216; lockedvalue 0E-8
+05:17:00   hawkeye1 running (pid 16269) beside node1: /home/user/hawkeye/devnet/run/attestor1.toml run, log /home/user/hawkeye/devnet/run/attestor1/hawkeye.log
+05:17:00   hawkeye2 running (pid 16274) beside node2: /home/user/hawkeye/devnet/run/attestor2.toml run, log /home/user/hawkeye/devnet/run/attestor2/hawkeye.log
+05:17:01   hawkeye3 running (pid 16279) beside node3: /home/user/hawkeye/devnet/run/attestor3.toml run, log /home/user/hawkeye/devnet/run/attestor3/hawkeye.log
+05:17:01   background miner: node0 mines 1 block every 2.0s (pid 16284; `pause` / `resume`)
+05:17:01 devnet up at height 216; `hawkeye-devnet status`, `hawkeye-devnet down`
+05:17:01 --- step 2: lock 30 YEC, mint; burn 4 wYEC and wait for its release (30 locked: the replay of 4 YEC fits the 5000 bps rate limit, so only the watchers stand in its way)
+05:17:01 hawkeye lock 30 --dest 0x10e35559ccB1f45409f79CD644f0b6c9EB129D23: {"amount_zat":3000000000,"lockid":"0x91f834d392b038fc45936efd7689c970dfa02aa40ba8ada357cf326aacab3405","owner_height":677,"to":"0x10e35559ccB1f45409f79CD644f0b6c9EB129D23","txid":"62c9cff40e651fe98a4fe9d57d86a076816155cf864cb1a35c7c85b0b58416d1","vout":0}
+05:17:02   ok: lock 62c9cff40e651fe9 confirmed (1s, height 217)
+05:17:05   ok: holder holds 30 wYEC (3s, height 218)
+05:17:05 hawkeye burn 4 --recipient smXN68HTP27b2gZrhYY9Qd2L8JcfKV3LA5L: {"block":9,"nonce":0,"txhash":"0x978cea3f9dddc6e4e42a0dcf4b99809cce383344c6d705fc5b159c6d35504fda"}
+05:17:08   ok: an intent carrying the HKB1 kind-1 memo of burn 0 (3s, height 220)
+05:17:22   ok: 4 YEC received at smXN68HTP27b2gZrhYY9Qd2L8JcfKV3LA5L (14s, height 227)
+05:17:22   burn 0 released through intent 90dcb67da7ca798fc338a5e63a4e639613489a8c7f5ab1ddbedd5ff7a820b585:0 (mined at 221)
+05:17:22 --- step 3: attestor1 posts a SECOND unlock for burn 0: `rogue-unlock --replay-burn 0` (the burn's valid HKB1 memo)
+05:17:22   hawkeye --config attestor1.toml rogue-unlock --replay-burn 0: {"intent":"d146da69fca7265d8c2855b7da9a80b0b9e10ae2b1cf160021ca51e2056251e0:0","replay_burn":0,"txid":"d146da69fca7265d8c2855b7da9a80b0b9e10ae2b1cf160021ca51e2056251e0","vault":"90dcb67da7ca798fc338a5e63a4e639613489a8c7f5ab1ddbedd5ff7a820b585:1"}
+05:17:23   ok: node0 sees the replay d146da69fca7265d (0s, height 227)
+05:17:23   replay intent d146da69fca7265d8c2855b7da9a80b0b9e10ae2b1cf160021ca51e2056251e0:0: memo kind 1, nonce 0, burn tx 0x978cea3f9dddc6e4e42a0dcf4b99809cce383344c6d705fc5b159c6d35504fda (the original's); 6 blocks after the first intent, outside the takeover window of 4
+05:17:23 --- step 4: another attestor cancels the replay within its window
+05:17:24   ok: replay intent cancelled (1s, height 228)
+05:17:24   cancel 2fc6f0e2cc2f7b3f6743fc3f66db5cc5373f72bc2c7b087990c92500a777c133 funded by attestor2
+05:17:24   ok: cancel confirmed (0s, height 228)
+05:17:24 --- step 5: the signer is slashed: attestor1 removed, bond frozen
+05:17:40   ok: attestor1 status removed, bondfrozen true (16s, height 236)
+05:17:40   member 03796ba3fefdad1b..: {"bondfrozen": true, "bondlocktime": 5214, "bondoutpoint": "297c44cc6ef7d95f3979fbcf10771d5de2cfe0436497ab1fa7d67e4de7e1e1f4:0", "bondvalue": "1.00000000", "current": false, "joinheight": 214, "key": "03796ba3fefdad1b8cae5838fe06a5610a7e34ca936a137163620f636f1f7c8776", "lastact": 236, "live": false, "status": "removed", "wallet": false}
+05:17:40 --- step 6: the watchers classified it as a consumed burn, NOT a benign race
+05:17:40   attestor2: 2026-10-08T05:17:23.423038Z  INFO event="intent_classified" intent=d146da69fca7265d8c2855b7da9a80b0b9e10ae2b1cf160021ca51e2056251e0:0 classification=unmatched:consumed-burn
+05:17:40   attestor3: 2026-10-08T05:17:23.880684Z  INFO event="intent_classified" intent=d146da69fca7265d8c2855b7da9a80b0b9e10ae2b1cf160021ca51e2056251e0:0 classification=unmatched:consumed-burn
+05:17:40   2026-10-08T05:17:23.436757Z  WARN event="slash_case_opened" case=1 fault="FRAUDULENT_INTENT" target=03796ba3fefdad1b8cae5838fe06a5610a7e34ca936a137163620f636f1f7c8776 intent=d146da69fca7265d8c2855b7da9a80b0b9e10ae2b1cf16
+05:17:40 --- step 7: paid once; the supply invariant holds
+05:17:40   burn 0's recipient received 4 YEC once; wYEC totalSupply 26 <= locked 26
+05:17:40 === PASS: second unlock for released burn 0 (valid memo, 6 blocks later) -> cancelled by another attestor -> classified consumed-burn (not a benign race) -> attestor1 removed, bond frozen
+05:17:40 --- down
+05:17:44 devnet down (stopped: miner, hawkeye1, hawkeye2, hawkeye3, anvil, ycashd0, ycashd1, ycashd2, ycashd3); the directory /home/user/hawkeye/devnet/run is kept (`up` resumes, `clean` removes it)

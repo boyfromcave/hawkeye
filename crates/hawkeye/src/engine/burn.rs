@@ -198,6 +198,7 @@ impl Engine {
                 })?;
                 info!(event = "unlock_signed", nonce, vault = %vault.outpoint, amount = b.amount,
                       recipient = %encode_address(&recipient, p.network), complete = complete.get());
+                super::drill_crash_point(&p, "unlock_signed");
                 match self.complete_unlock(&rec.signed_hex).await? {
                     Some(h) => h,
                     None => return Ok(()),

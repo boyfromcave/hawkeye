@@ -87,6 +87,7 @@ fn intent_forward() -> Vec<(IntentState, IntentState)> {
         (Unmatched, MaturedUnmatched),
         (CancelSent, Cancelled),
         (CancelSent, MaturedUnmatched),
+        (MaturedUnmatched, Released),
     ]
 }
 
@@ -590,6 +591,52 @@ fn burn_payloads_are_stored_and_cleared() {
             t.burn_intent_pending(&k, &op(0x77, 1), 131),
             Err(StoreError::NotFound { .. })
         ));
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_release_matured_unmatched_is_recorded_then_adopted() {
+    let mut s = store();
+    s.tx(|t| {
+        t.insert_burn(&new_burn(4, 20, true))?;
+        let o = t.insert_intent(&new_intent(1, 300, Some(301)))?.outpoint;
+        t.classify_intent(&o, &DEP, &unmatched(), Some(301))?;
+        // adoption needs a matured-unmatched intent with a recorded release
+        assert!(matches!(
+            t.adopt_release(&o, &DEP, 4, Some(305)),
+            Err(StoreError::Invalid(_))
+        ));
+        t.intent_released_unmatched(&o, &h(0xee, 1), 307)?;
+        let rec = t.intent(&o)?.unwrap();
+        assert_eq!(rec.state, IntentState::MaturedUnmatched);
+        assert_eq!(rec.released_txid, Some(h(0xee, 1)));
+        assert_eq!(rec.released_height, Some(307));
+        // recording again on a matured intent only refreshes the release, no edge
+        let n = t.events_for(ObjectKind::Intent, &o.to_string())?.len();
+        t.intent_released_unmatched(&o, &h(0xee, 1), 307)?;
+        assert_eq!(t.events_for(ObjectKind::Intent, &o.to_string())?.len(), n);
+        // an unknown or unfinalized burn is refused
+        assert!(t.adopt_release(&o, &DEP, 9, Some(308)).is_err());
+        t.insert_burn(&new_burn(5, 21, false))?;
+        assert!(matches!(
+            t.adopt_release(&o, &DEP, 5, Some(308)),
+            Err(StoreError::Invalid(_))
+        ));
+        t.adopt_release(&o, &DEP, 4, Some(308))?;
+        let rec = t.intent(&o)?.unwrap();
+        assert_eq!(rec.state, IntentState::Released);
+        assert_eq!(rec.classification.as_deref(), Some("matched-burn"));
+        assert_eq!(rec.matched_burn, Some(burn_key(4)));
+        let last = t
+            .events_for(ObjectKind::Intent, &o.to_string())?
+            .pop()
+            .unwrap();
+        assert_eq!(last.from.as_deref(), Some("MATURED_UNMATCHED"));
+        assert_eq!(last.to, "RELEASED");
+        // once released, it is no longer adoptable
+        assert!(t.adopt_release(&o, &DEP, 4, Some(309)).is_err());
         Ok::<_, StoreError>(())
     })
     .unwrap();

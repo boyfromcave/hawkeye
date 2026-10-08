@@ -30,7 +30,7 @@ PASS on both. Transcripts: `devnet/transcripts/*-ycash-dd-v4.5.0.txt`, `*-ycash6
 | H3 Ethereum adapter + `eth/` Foundry | done (Sepolia deploy prepared, not run: no Sepolia access from the build host) |
 | H4 store + engine | done, incl. independent slash verification, persisted progress, rolls, equivocation |
 | H5 daemon | done (CLI, API, metrics) |
-| H6 devnet + drills | D-1, D-2, D-13 on both lines; D-3..D-12, D-14..D-16 covered in engine tests, not yet as devnet drills |
+| H6 devnet + drills | D-1, D-2, D-3, D-7, D-9, D-10, D-11, D-13, D-16 as devnet drills on both lines (`scenario demo`, `roll`, `double`, `takeover`, `reorg`, `dormancy`, `restart`); D-4..D-6, D-8, D-12, D-14, D-15 covered in engine tests, not yet as devnet drills. D-7 found a defect, fixed: a leader restarted after a takeover's release adopts it instead of posting the burn again (§5.1) |
 | H7 Sepolia | open (owner runbook §9) |
 | H8 audit/release | open; CR-W1 (optimistic mint in wyec) outstanding |
 
@@ -377,6 +377,9 @@ Burn:   SEEN(unfinalized) → FINALIZED → (ORPHANED | ASSIGNED(leader, deadlin
         FINALIZED → WAITING_CAP(epoch) when S-3 would refuse
 Intent (any, seen on Ycash): OBSERVED → MATCHED(burn | roll) | UNMATCHED → CANCEL_SENT →
         CANCELLED | MATURED_UNMATCHED (alarm: the window was missed)
+        MATURED_UNMATCHED → RELEASED (adopted: released while its burn was unknown here, e.g. a
+              restart that follows Ycash before it scans Ethereum; matched once the burn is known,
+              so the burn is never posted twice — drill D-7)
 Vault:  LIVE → ROLL_DUE → ROLLING → ROLLED ; LIVE → SPENT
 SlashCase: OPENED(evidence) → VOTED(mine) → SUBMITTED → SLASHED | EXPIRED
 ```

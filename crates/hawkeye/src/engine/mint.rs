@@ -484,6 +484,7 @@ impl Engine {
             })?;
             info!(event = "mint_signed", lock_id = %lock_hex(&l.lock_id), amount = l.value_zat,
                   to = %to.to_checksum(), signer = %key.eth_address().to_checksum());
+            super::drill_crash_point(&p, "mint_signed");
         }
         let tip = self.mem.tip;
         let mut candidates = self.ctx.db(|t| t.locks_in_state(LockState::Signed))?;

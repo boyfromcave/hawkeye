@@ -1,0 +1,65 @@
+05:06:03 removed /home/user/hawkeye/devnet/run
+05:06:03 === hawkeye-devnet scenario dormancy (plan §8 D-11, R1: all attestors silent), 2026-10-08 05:06:03 UTC
+05:06:03 ycashd: /tmp/claude-0/-home-user/7955eb24-32de-557e-89dd-f1a98a49fa54/scratchpad/ycash6-build/src/ycashd (node line ycash6 v6.22.0-rc1): Ycash Daemon version v6.22.0-rc1-2997007-dirty
+05:06:03 hawkeye: /home/user/hawkeye/target/debug/hawkeye (hawkeye 0.1.0)
+05:06:03 --- step 1: up (3 attestors)
+05:06:03 hawkeye-devnet up: 4 regtest ycashd nodes (node0 user/miner, node1..3 attestors), vault upgrade 6d5b7a31 at height 110, dir /home/user/hawkeye/devnet/run
+05:06:03   node line ycash6 v6.22.0-rc1 (Ycash Daemon version v6.22.0-rc1-2997007-dirty); extra start-up args: -i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025
+05:06:18   nodes up: rpc ports 18401, 18403, 18405, 18407
+05:06:18   mining 211 blocks on node0 (activation 110 + coinbase maturity 100)
+05:06:20   height 211: vault upgrade active (branch 6d5b7a31, activation 110), node0 balance 659.06250000 YEC
+05:06:20   attestor1: member key 03f69bc3115383f38f06e70d26d2df840210d94f068e53d7e075f54fdb0150eb68, eth address 0x78C615D9B533deD9E9B1cD2cC478dD52b33fA58B
+05:06:20   attestor2: member key 03475a16ec305626f67db777e22163b43c1898c95053bc8301e5d54c448c89e597, eth address 0x82d1D488AB11D32BE6612Cf406485003D03BdC54
+05:06:20   attestor3: member key 02459fa7068d1c5b5fb854396634b6349c975eb98ac13bf4f4d506d08a4d8af1b3, eth address 0x8f3417bDe0C1FC73C29C58719387D0E60351E48c
+05:06:20   holder (node0's Ethereum persona): 0x386049FFFDE582b63b3db27237Eb148535f1C26e
+05:06:21   funded attestor wallets: 8 coins x 2.5 YEC each (tx 9f34c174afaf57fc74662c9f1b4f436f8550fa07a0861c11cebdc844f3fdb895)
+05:06:21   set_create on node0: setid 03a94b5bdcbecdac01e504f830301a55733994a109128cd393c1142aa68e5058 (seats 3, unlock 1, cancel 1, slash 2, rate 5000 bps / 20, liveness 60, maturity 2, bondmin 1)
+05:06:21   anvil up on http://127.0.0.1:18545 (block time 1s, --slots-in-an-epoch 1: finalized = latest - 2)
+05:06:21   forge script script/Deploy.s.sol: guardians 0x78C615D9B533deD9E9B1cD2cC478dD52b33fA58B,0x82d1D488AB11D32BE6612Cf406485003D03BdC54,0x8f3417bDe0C1FC73C29C58719387D0E60351E48c, threshold 1
+05:06:23   wYEC deployed: bridge 0x5FbDB2315678afecb367f032d93F642f64180aa3, token 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 (deploy block 1, threshold 1) -> /home/user/hawkeye/devnet/run/deployments/31337.json
+05:06:23   funded 4 Ethereum accounts with 1000 ETH each (anvil_setBalance)
+05:06:24   attestor1 enrolled in node1's wallet (hawkeye enroll: {"eth_address":"0x78C615D9B533deD9E9B1cD2cC478dD52b33fA58B","memberkey":"03f69bc3115383f38f06e70d26d2df840210d94f068e53d7e075f54fdb0150eb68"})
+05:06:24   attestor2 enrolled in node2's wallet (hawkeye enroll: {"eth_address":"0x82d1D488AB11D32BE6612Cf406485003D03BdC54","memberkey":"03475a16ec305626f67db777e22163b43c1898c95053bc8301e5d54c448c89e597"})
+05:06:24   attestor3 enrolled in node3's wallet (hawkeye enroll: {"eth_address":"0x8f3417bDe0C1FC73C29C58719387D0E60351E48c","memberkey":"02459fa7068d1c5b5fb854396634b6349c975eb98ac13bf4f4d506d08a4d8af1b3"})
+05:06:24   attestor1 SET_JOIN 0caaba578e2c20e07215a29f232b6c3796b41f806736d85bafba3d576f9fc282 (bond 1 YEC at 0ec14393c012380a613cd2cac2c4ce570741a0bf500d092bc20aceb75b3d2d43:0, bond lock 5214)
+05:06:24   attestor2 SET_JOIN a0a8ad48afa6a5164bea9882ea7dc31f2af56e4306bf6cffb03287487e41e257 (bond 1 YEC at 6e75e17d9571aa0de827a00c978509b1bd3cc134d1ea155ce4aa6b6999ef2d62:0, bond lock 5214)
+05:06:24   attestor3 SET_JOIN dbb982a11dfd8d3e77b39304264aae96b8e44db218c43d7a5819aa6efd434f9e (bond 1 YEC at ab68b1409f96a1d49abb2e2747715b73ae4170ff9b0fb30f0daa62d462ea896a:0, bond lock 5214)
+05:06:25   3 members current at height 216; lockedvalue 0E-8
+05:06:26   hawkeye1 running (pid 12002) beside node1: /home/user/hawkeye/devnet/run/attestor1.toml run, log /home/user/hawkeye/devnet/run/attestor1/hawkeye.log
+05:06:26   hawkeye2 running (pid 12007) beside node2: /home/user/hawkeye/devnet/run/attestor2.toml run, log /home/user/hawkeye/devnet/run/attestor2/hawkeye.log
+05:06:27   hawkeye3 running (pid 12012) beside node3: /home/user/hawkeye/devnet/run/attestor3.toml run, log /home/user/hawkeye/devnet/run/attestor3/hawkeye.log
+05:06:27   background miner: node0 mines 1 block every 2.0s (pid 12017; `pause` / `resume`)
+05:06:27 devnet up at height 216; `hawkeye-devnet status`, `hawkeye-devnet down`
+05:06:27 --- step 2: lock 10 YEC on node0 and wait for its mint
+05:06:27 hawkeye lock 10 --dest 0x386049FFFDE582b63b3db27237Eb148535f1C26e: {"amount_zat":1000000000,"lockid":"0xe592c0f8cfe9e35eaf0d49971bdb39f076f93357e7233f6d9f1ce0855a7e1edd","owner_height":677,"to":"0x386049FFFDE582b63b3db27237Eb148535f1C26e","txid":"ea29df2ca66f191a7f10f7e5c104f2407b79cd186f475a9e904a761386f9a0a5","vout":0}
+05:06:28   ok: lock ea29df2ca66f191a confirmed (1s, height 217)
+05:06:31   ok: holder holds 10 wYEC (3s, height 218)
+05:06:31 --- step 3: burn 4 wYEC; the moment its intent appears, pause the miner and stop every attestor's Hawkeye
+05:06:31 hawkeye burn 4 --recipient smNBmzC5wS1Bjhs9zKXFXK5NQ2JXPcWY7Ci: {"block":10,"nonce":0,"txhash":"0x7e8d0711c92471218cbd783053b9237137374de901a16df785f01b120aeaa776"}
+05:06:35   ok: an intent carrying the HKB1 kind-1 memo of burn 0 (4s, height 221)
+05:06:35 background miner paused at height 221
+05:06:35 attestor1's hawkeye stopped
+05:06:36 attestor2's hawkeye stopped
+05:06:36 attestor3's hawkeye stopped
+05:06:37   in-flight intent 0504a66aafd67bbcdf8d747262ce4dacd960d95fffe9e346fabecc293633d569:0 (4.00000000 YEC to the burner's smNBmzC5wS1Bjhs9zKXFXK5NQ2JXPcWY7Ci) is unspent, matures at 228; every Hawkeye is down
+05:06:37 --- step 4: mine past livenessWindow (60 blocks) with every attestor silent: the set goes DORMANT
+05:06:37   height 222: last member act at 216, dormant False, released False
+05:06:41   ok: height 277 (61 blocks after the last act 216): set_getinfo dormant True, released True, current 3, lockedvalue 6.00000000
+05:06:41 --- step 5: the depositor recovers: `hawkeye --config node0.toml recover` (vault_ownerspend, selector 3)
+05:06:41   owned by node0's wallet: intent 0504a66aafd67bbcdf8d747262ce4dacd960d95fffe9e346fabecc293633d569:0 4.00000000 YEC
+05:06:41   owned by node0's wallet: vault 0504a66aafd67bbcdf8d747262ce4dacd960d95fffe9e346fabecc293633d569:1 6.00000000 YEC
+05:06:41   hawkeye recover: {"recovered":[{"outpoint":"0504a66aafd67bbcdf8d747262ce4dacd960d95fffe9e346fabecc293633d569:0","selector":3,"txid":"ae0c776fa7e4121fb6619fefa725a4d7a26cb4f5cc52758a730c128f0c41fa69","value_zat":400000000},{"outpoint":"0504a66aafd67bbcdf8d747262ce4dacd960d95fffe9e346fabecc293633d569:1","selector":3,"txid":"0b112d22e8e8cd63c5504efb1c8e1dc121b8f80a583c2670c2876df54d4d4ab3","value_zat":600000000}]}
+05:06:41   recovered 0504a66aafd67bbcdf8d747262ce4dacd960d95fffe9e346fabecc293633d569:0 (selector 3) by ae0c776fa7e4121fb6619fefa725a4d7a26cb4f5cc52758a730c128f0c41fa69, confirmed
+05:06:41   recovered 0504a66aafd67bbcdf8d747262ce4dacd960d95fffe9e346fabecc293633d569:1 (selector 3) by 0b112d22e8e8cd63c5504efb1c8e1dc121b8f80a583c2670c2876df54d4d4ab3, confirmed
+05:06:41   balance check: node0's wallet received 9.9998 YEC back of the 10 YEC locked (vault 6 + in-flight intent 4.00000000), fees 0.0002; the burner's smNBmzC5wS1Bjhs9zKXFXK5NQ2JXPcWY7Ci received 0
+05:06:41   the lock ea29df2ca66f191a is back with its owner via the dormancy branch (ownerHeight 677 not reached: tip 278)
+05:06:41 --- step 6: the supply: wYEC outstanding is now UNBACKED, by design (R1 trade-off); Hawkeye raises the supply alarm
+05:06:41   wYEC totalSupply 6 > WYEC value under the set 0
+05:06:41   R1 (plan §1.4): when every attestor is silent for livenessWindow, depositors take their YEC back without the bridge. The 6 wYEC still on Ethereum are now unbacked - the deliberate price of liveness recovery: the Foundation's R1 requirement puts the depositor's exit above the peg.
+05:06:41   The in-flight burn's intent (4.00000000 YEC) went back to the vault's owner as well, not to the burner: a burn not released before dormancy is lost to the wYEC holder (here depositor and holder are one person, so node0 has all 10 YEC back and still holds 6 wYEC).
+05:06:41   attestor1 `hawkeye status`: live members 0, supply ok False, alarms ['supply']; supply: wYEC totalSupply 600000000 > locked WYEC vault value 0 (rolls in flight included)
+05:06:41   attestor2 `hawkeye status`: live members 0, supply ok False, alarms ['supply']; supply: wYEC totalSupply 600000000 > locked WYEC vault value 0 (rolls in flight included)
+05:06:41   attestor3 `hawkeye status`: live members 0, supply ok False, alarms ['supply']; supply: wYEC totalSupply 600000000 > locked WYEC vault value 0 (rolls in flight included)
+05:06:41 === PASS: all attestors silent -> set DORMANT after livenessWindow -> `hawkeye recover` returned the vault and the in-flight intent to the depositor (selector 3); 6 wYEC unbacked by design, supply alarm raised
+05:06:41 --- down
+05:06:45 devnet down (stopped: miner, anvil, ycashd0, ycashd1, ycashd2, ycashd3); the directory /home/user/hawkeye/devnet/run is kept (`up` resumes, `clean` removes it)

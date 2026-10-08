@@ -1,0 +1,59 @@
+05:15:29 removed /home/user/hawkeye/devnet/run
+05:15:29 === hawkeye-devnet scenario takeover (plan §8 D-7: leader down), 2026-10-08 05:15:29 UTC
+05:15:29 ycashd: /tmp/claude-0/-home-user/7955eb24-32de-557e-89dd-f1a98a49fa54/scratchpad/ycash-build/src/ycashd (node line ycash-dd v4.5.0): Ycash Daemon version v4.5.0-dbc1ab0-dirty
+05:15:29 hawkeye: /home/user/hawkeye/target/debug/hawkeye (hawkeye 0.1.0)
+05:15:29 --- step 1: up (3 attestors)
+05:15:29 hawkeye-devnet up: 4 regtest ycashd nodes (node0 user/miner, node1..3 attestors), vault upgrade 6d5b7a31 at height 110, dir /home/user/hawkeye/devnet/run
+05:15:29   node line ycash-dd v4.5.0 (Ycash Daemon version v4.5.0-dbc1ab0-dirty); extra start-up args: none
+05:15:31   nodes up: rpc ports 18401, 18403, 18405, 18407
+05:15:31   mining 211 blocks on node0 (activation 110 + coinbase maturity 100)
+05:15:35   height 211: vault upgrade active (branch 6d5b7a31, activation 110), node0 balance 659.06250000 YEC
+05:15:35   attestor1: member key 02667eba21c8fa0d57f3718d2eb8d7cf55e59d9e49a7d82517116aadc1c0f0f8a8, eth address 0xdb99c51076130B6271194BED66e9BB63dF358B77
+05:15:35   attestor2: member key 02a6ee23e88f317c9721c4abdf6fc9e534321a97778cbc1dcc603e933a02526b71, eth address 0x3c2B2c85f33610dB34298e070B87170C708A7a92
+05:15:35   attestor3: member key 039de0c5d52f67f557cb756e26d71463ecf7730e63c9c965449560962f03cee767, eth address 0x85fc1aB620B6E52DF4025D4A44895D68851d4927
+05:15:35   holder (node0's Ethereum persona): 0xcB50C25b31BEF51F9A98A52ae8027B34ba0756c1
+05:15:36   funded attestor wallets: 8 coins x 2.5 YEC each (tx d18921cb0b765d418e3f3580c66794935b2abc94f151b5527b8ee6aea1d31fa4)
+05:15:36   set_create on node0: setid 9915a9863aaca2d4dfb5234f76c373dae606355318aaa6042d7b942a0e65a570 (seats 3, unlock 1, cancel 1, slash 2, rate 5000 bps / 20, liveness 60, maturity 2, bondmin 1)
+05:15:36   anvil up on http://127.0.0.1:18545 (block time 1s, --slots-in-an-epoch 1: finalized = latest - 2)
+05:15:36   forge script script/Deploy.s.sol: guardians 0xdb99c51076130B6271194BED66e9BB63dF358B77,0x3c2B2c85f33610dB34298e070B87170C708A7a92,0x85fc1aB620B6E52DF4025D4A44895D68851d4927, threshold 1
+05:15:38   wYEC deployed: bridge 0x5FbDB2315678afecb367f032d93F642f64180aa3, token 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 (deploy block 1, threshold 1) -> /home/user/hawkeye/devnet/run/deployments/31337.json
+05:15:39   funded 4 Ethereum accounts with 1000 ETH each (anvil_setBalance)
+05:15:39   attestor1 enrolled in node1's wallet (hawkeye enroll: {"eth_address":"0xdb99c51076130B6271194BED66e9BB63dF358B77","memberkey":"02667eba21c8fa0d57f3718d2eb8d7cf55e59d9e49a7d82517116aadc1c0f0f8a8"})
+05:15:39   attestor2 enrolled in node2's wallet (hawkeye enroll: {"eth_address":"0x3c2B2c85f33610dB34298e070B87170C708A7a92","memberkey":"02a6ee23e88f317c9721c4abdf6fc9e534321a97778cbc1dcc603e933a02526b71"})
+05:15:39   attestor3 enrolled in node3's wallet (hawkeye enroll: {"eth_address":"0x85fc1aB620B6E52DF4025D4A44895D68851d4927","memberkey":"039de0c5d52f67f557cb756e26d71463ecf7730e63c9c965449560962f03cee767"})
+05:15:39   attestor1 SET_JOIN 69272e7db07a8bb6cce4f5ef4510a3baf21eb02c3dd4326833c24ffba6b0fa21 (bond 1 YEC at 6afe337d234a284767d54db8337f94c797554423ccfe14c2959e76692e7588cd:0, bond lock 5214)
+05:15:39   attestor2 SET_JOIN 68b4b6d43b378b9124eb0e9b3560114b424c6a210674488468a5470b616a90d2 (bond 1 YEC at e903807aa178caf4c84a191443e1e339e681365c2361b13ccefaefdc137f8420:0, bond lock 5214)
+05:15:39   attestor3 SET_JOIN 9ea567b02120275a6701173e68c9b45a6effba887edcff67b6cea686e6cfc51a (bond 1 YEC at 7447d563917cf109e9933b9fc74930aaa4108ce681a3425143fab2a2a40e22d0:0, bond lock 5214)
+05:15:39   3 members current at height 216; lockedvalue 0E-8
+05:15:40   hawkeye1 running (pid 15836) beside node1: /home/user/hawkeye/devnet/run/attestor1.toml run, log /home/user/hawkeye/devnet/run/attestor1/hawkeye.log
+05:15:40   hawkeye2 running (pid 15841) beside node2: /home/user/hawkeye/devnet/run/attestor2.toml run, log /home/user/hawkeye/devnet/run/attestor2/hawkeye.log
+05:15:41   hawkeye3 running (pid 15846) beside node3: /home/user/hawkeye/devnet/run/attestor3.toml run, log /home/user/hawkeye/devnet/run/attestor3/hawkeye.log
+05:15:41   background miner: node0 mines 1 block every 2.0s (pid 15852; `pause` / `resume`)
+05:15:41 devnet up at height 216; `hawkeye-devnet status`, `hawkeye-devnet down`
+05:15:41 --- step 2: lock 10 YEC and wait for its mint
+05:15:41 hawkeye lock 10 --dest 0xcB50C25b31BEF51F9A98A52ae8027B34ba0756c1: {"amount_zat":1000000000,"lockid":"0x0b602532e3eb9beccdc025d8678cc04bc093041cfb51b539347ebdbad84d253e","owner_height":677,"to":"0xcB50C25b31BEF51F9A98A52ae8027B34ba0756c1","txid":"0ec274918da5804ae9fee9bcf23d2e6d346f33abd7b3c54019ca8b8c9552bea5","vout":0}
+05:15:42   ok: lock 0ec274918da5804a confirmed (1s, height 217)
+05:15:45   ok: holder holds 10 wYEC (3s, height 218)
+05:15:45 --- step 3: stop the leader of the next burn nonce 0 before burning: live order ['attestor1', 'attestor2', 'attestor3'] -> live[0 mod 3] = attestor1
+05:15:45 attestor1's hawkeye stopped
+05:15:45 --- step 4: burn 4 wYEC; another attestor posts the intent after takeover_blocks = 4
+05:15:45 hawkeye burn 4 --recipient smHfuuP2ekTkJ9oK8Pm6GrsjGtLJ7bG9Kvh: {"block":9,"nonce":0,"txhash":"0xcd8b4b995ebd861d66a5f2054f34241a1b7682fa2b6ec43d0a4a46db8d7368f1"}
+05:15:56   ok: an intent carrying the HKB1 kind-1 memo of burn 0 (11s, height 224)
+05:15:56   intent dfca9875d7c24a8ef7b21e2d551bb6f1e9868a6ed2af1b65643d43c28f5641d5:0 funded by attestor2
+05:15:56   2026-10-08T05:15:56.086658Z  WARN event="burn_takeover" nonce=0 from=02667eba21c8fa0d57f3718d2eb8d7cf55e59d9e49a7d82517116aadc1c0f0f8a8 to=02a6ee23e88f317c9721c4abdf6fc9e534321a97778cbc1dcc603e933a02526b71 mine=true
+05:15:56   2026-10-08T05:15:55.701147Z  WARN event="burn_takeover" nonce=0 from=02667eba21c8fa0d57f3718d2eb8d7cf55e59d9e49a7d82517116aadc1c0f0f8a8 to=02a6ee23e88f317c9721c4abdf6fc9e534321a97778cbc1dcc603e933a02526b71 mine=false
+05:15:56 --- step 5: wait for the release; exactly one intent for burn 0
+05:16:11   ok: 4 YEC received at smHfuuP2ekTkJ9oK8Pm6GrsjGtLJ7bG9Kvh (14s, height 231)
+05:16:11 --- step 6: restart the leader attestor1: it adopts the release, it does not post again
+05:16:11   hawkeye1 restarted (pid 15931)
+05:16:12   ok: attestor1 caught up (ycash and ethereum lag 0) (1s, height 232)
+05:16:44   ok: 16 more blocks pass (3 takeover rounds) (32s, height 248)
+05:16:44   attestor1 GET /burns/0: 200 {"amount": 400000000, "intent": "dfca9875d7c24a8ef7b21e2d551bb6f1e9868a6ed2af1b65643d43c28f5641d5:0", "leader": null, "nonce": 0, "recipient": "0x01000000000000000000000032c3cfdd28c341b1daf78cd22ed7fab700f6886d", "recipient_address": "smHfuuP2ekTkJ9oK8Pm6GrsjGtLJ7bG9Kvh", "state": "RELEASED", "tx_hash": "0xcd8b4b995ebd861d66a5f2054f34241a1b7682fa2b6ec43d0a4a46db8d7368f1"}
+05:16:44   attestor1: 2026-10-08T05:16:11.211480Z  INFO an intent released before this attestor knew its burn pays that burn event="release_adopted" nonce=0 intent=dfca9875d7c24a8ef7b21e2d551bb6f1e9868a6ed2af1b65643d43c28f5641d5:0 release=8ab812767ca8c9fdd7eed8f
+05:16:44   attestor1: burns {'RELEASED': 1}, intents {'RELEASED': 1}, alarms []
+05:16:44   attestor2: burns {'RELEASED': 1}, intents {'RELEASED': 1}, alarms []
+05:16:44   attestor3: burns {'RELEASED': 1}, intents {'RELEASED': 1}, alarms []
+05:16:44   wYEC totalSupply 6 <= locked 6; nobody slashed
+05:16:44 === PASS: leader attestor1 down -> takeover after 4 blocks -> exactly one intent -> released; the restarted leader adopted it (RELEASED, no second unlock)
+05:16:44 --- down
+05:16:49 devnet down (stopped: miner, hawkeye1, hawkeye2, hawkeye3, anvil, ycashd0, ycashd1, ycashd2, ycashd3); the directory /home/user/hawkeye/devnet/run is kept (`up` resumes, `clean` removes it)

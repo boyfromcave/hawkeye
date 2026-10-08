@@ -255,20 +255,84 @@ pub async fn burn(
     }))
 }
 
-/// `hawkeye rogue-unlock` (drill D-2 only): this attestor signs an unlock with no burn and no
-/// memo behind it.
-pub async fn rogue_unlock(s: &Settings, amount: &str, to: Option<&str>) -> Result<()> {
+/// The drill gate: a drill command needs `[devnet] drills = true` and is refused on mainnet.
+pub fn drill_gate(p: &crate::config::Params, command: &str) -> Result<()> {
     ensure!(
-        s.params.drills && !s.params.mainnet,
-        "rogue-unlock is a drill: needs [devnet] drills = true, never on mainnet"
+        p.drills && !p.mainnet,
+        "{command} is a drill: needs [devnet] drills = true, never on mainnet"
     );
-    let value = zat(amount)?;
-    let node = Arc::new(ycash(s)?);
-    let to = match to {
-        Some(t) => t.to_owned(),
-        None => node.getnewaddress().await?,
+    Ok(())
+}
+
+/// What `rogue-unlock --replay-burn <nonce>` (drill D-3) posts: a second unlock for a burn this
+/// attestor's ledger holds, paying the burn's own recipient its own amount (unless overridden),
+/// with the burn's valid `HKB1` kind-1 memo — the double release a watcher must cancel and slash
+/// outside the takeover window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayPlan {
+    /// The recipient script (the burn's `ycashRecipient`).
+    pub recipient_script: Vec<u8>,
+    /// The intent value in zatoshi.
+    pub amount: u64,
+    /// The 73-byte `HKB1` memo naming the burn.
+    pub memo: Vec<u8>,
+}
+
+/// The [`ReplayPlan`] for burn `nonce` from the ledger; `amount` overrides the burn's amount.
+pub fn replay_plan(
+    t: &hawkeye_store::Tx<'_>,
+    p: &crate::config::Params,
+    nonce: u64,
+    amount: Option<u64>,
+) -> Result<ReplayPlan> {
+    let b = t
+        .burn(&hawkeye_store::BurnKey::new(p.deployment, nonce))?
+        .ok_or_else(|| anyhow!("burn {nonce} is not in this attestor's ledger"))?;
+    ensure!(
+        b.state != hawkeye_store::BurnState::Seen,
+        "burn {nonce} is not finalized"
+    );
+    let r = hawkeye_core::recipient::YcashRecipient::from_bytes32(&b.recipient)
+        .map_err(|e| anyhow!("burn {nonce} recipient: {e}"))?;
+    Ok(ReplayPlan {
+        recipient_script: r.script(),
+        amount: amount.unwrap_or(b.amount),
+        memo: hawkeye_core::memo::HawkeyeMemo::burn_release(p.deployment, nonce, b.tx_hash)
+            .encode()
+            .to_vec(),
+    })
+}
+
+/// `hawkeye rogue-unlock` (drills D-2, D-3 only): this attestor signs an unlock with no burn and
+/// no memo behind it, or, with `replay_burn`, a second unlock for an already-released burn that
+/// carries that burn's valid memo.
+pub async fn rogue_unlock(
+    s: &Settings,
+    amount: Option<&str>,
+    to: Option<&str>,
+    replay_burn: Option<u64>,
+) -> Result<()> {
+    drill_gate(&s.params, "rogue-unlock")?;
+    let value = amount.map(zat).transpose()?;
+    let mut store = Store::open(&s.store_path)?;
+    let replay = match replay_burn {
+        Some(n) => {
+            let over = value.map(u64::try_from).transpose()?;
+            Some(store.tx(|t| replay_plan(t, &s.params, n, over))?)
+        }
+        None => None,
     };
-    let to = to.as_str();
+    let value = match (&replay, value) {
+        (Some(r), _) => i64::try_from(r.amount)?,
+        (None, Some(v)) => v,
+        (None, None) => bail!("give the amount: --amount <YEC> (or --replay-burn <nonce>)"),
+    };
+    let node = Arc::new(ycash(s)?);
+    let recipient = match (&replay, to) {
+        (_, Some(t)) => Recipient::address(t, Amount::from_zat(value)),
+        (Some(r), None) => Recipient::script(r.recipient_script.clone(), Amount::from_zat(value)),
+        (None, None) => Recipient::address(&node.getnewaddress().await?, Amount::from_zat(value)),
+    };
     let rows = node
         .vault_list(Some(&VaultListFilter {
             tag: Some("WYEC".into()),
@@ -277,7 +341,6 @@ pub async fn rogue_unlock(s: &Settings, amount: &str, to: Option<&str>) -> Resul
             ..VaultListFilter::default()
         }))
         .await?;
-    let mut store = Store::open(&s.store_path)?;
     let mut chosen = None;
     for r in rows.iter().filter_map(|r| r.as_vault()) {
         if r.valuezat < value {
@@ -295,19 +358,26 @@ pub async fn rogue_unlock(s: &Settings, amount: &str, to: Option<&str>) -> Resul
     }
     let (vault, key) = chosen.ok_or_else(|| anyhow!("no unsigned WYEC vault holds {value} zat"))?;
     let built = node
-        .vault_buildunlock(&vault, &[Recipient::address(to, Amount::from_zat(value))])
+        .vault_buildunlock(&vault, std::slice::from_ref(&recipient))
         .await?;
     let vout = built.intents.first().map_or(0, |i| i.vout);
+    let unsigned = match &replay {
+        Some(r) => hawkeye_ycash::tx::insert_op_return(&built.hex.to_string(), &r.memo)
+            .map_err(|e| anyhow!("memo: {e}"))?,
+        None => built.hex.to_string(),
+    };
     let n2 = node.clone();
-    let rec = store.sign_once_ycash(&key, &built.hex.to_string(), |h| {
+    let rec = store.sign_once_ycash(&key, &unsigned, |h| {
         let hex: HexBytes = h.parse().map_err(|e| format!("{e}"))?;
         let r = block_on(n2.set_signunlock(&hex)).map_err(|e| e.to_string())?;
         Ok::<_, String>((r.hex.to_string(), r.sighash.0))
     })?;
     let txid = node.vault_send(&rec.signed_hex.parse()?).await?;
-    info!(event = "rogue_unlock_sent", txid = %txid, vault = %vault, amount = value, to);
+    info!(event = "rogue_unlock_sent", txid = %txid, vault = %vault, amount = value,
+          replay_burn = ?replay_burn);
     print(
-        &json!({"txid": txid.to_string(), "intent": format!("{txid}:{vout}"), "vault": vault.to_string()}),
+        &json!({"txid": txid.to_string(), "intent": format!("{txid}:{vout}"),
+                  "vault": vault.to_string(), "replay_burn": replay_burn}),
     )
 }
 
@@ -339,4 +409,84 @@ pub async fn recover(s: &Settings) -> Result<()> {
         }
     }
     print(&json!({"recovered": out}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Params;
+    use hawkeye_core::memo::{HawkeyeMemo, MemoKind};
+    use hawkeye_core::recipient::YcashRecipient;
+    use hawkeye_store::{BurnKey, NewBurn};
+
+    fn params(drills: bool, mainnet: bool) -> Params {
+        crate::config::sample_params(drills, mainnet)
+    }
+
+    #[test]
+    fn drill_gate_needs_drills_and_refuses_mainnet() {
+        assert!(drill_gate(&params(true, false), "rogue-unlock").is_ok());
+        let off = drill_gate(&params(false, false), "rogue-unlock").unwrap_err();
+        assert!(off.to_string().contains("[devnet] drills = true"), "{off}");
+        assert!(drill_gate(&params(true, true), "rogue-unlock").is_err());
+    }
+
+    #[test]
+    fn replay_plan_carries_the_burns_memo_recipient_and_amount() {
+        let p = params(true, false);
+        let mut store = Store::open_in_memory().unwrap();
+        let r = YcashRecipient::p2pkh([0x11; 20]);
+        store
+            .tx(|t| {
+                t.insert_burn(&NewBurn {
+                    key: BurnKey::new(p.deployment, 3),
+                    tx_hash: [0xab; 32],
+                    block_number: 9,
+                    block_hash: [1; 32],
+                    from: EthAddress([2; 20]),
+                    amount: 400_000_000,
+                    recipient: r.to_bytes32(),
+                    finalized: true,
+                })
+            })
+            .unwrap();
+        let plan = store.tx(|t| replay_plan(t, &p, 3, None)).unwrap();
+        assert_eq!(plan.recipient_script, r.script());
+        assert_eq!(plan.amount, 400_000_000);
+        let memo = HawkeyeMemo::decode(&plan.memo).unwrap();
+        assert_eq!(memo.kind, MemoKind::BurnRelease);
+        assert_eq!(memo.reference, 3);
+        assert_eq!(memo.data, [0xab; 32]);
+        assert_eq!(memo.deployment, p.deployment);
+        // an amount override; an unknown nonce
+        let plan = store.tx(|t| replay_plan(t, &p, 3, Some(5))).unwrap();
+        assert_eq!(plan.amount, 5);
+        let e = store.tx(|t| replay_plan(t, &p, 4, None)).unwrap_err();
+        assert!(
+            e.to_string().contains("not in this attestor's ledger"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn replay_plan_refuses_an_unfinalized_burn() {
+        let p = params(true, false);
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .tx(|t| {
+                t.insert_burn(&NewBurn {
+                    key: BurnKey::new(p.deployment, 0),
+                    tx_hash: [0xab; 32],
+                    block_number: 9,
+                    block_hash: [1; 32],
+                    from: EthAddress([2; 20]),
+                    amount: 1,
+                    recipient: YcashRecipient::p2pkh([0x11; 20]).to_bytes32(),
+                    finalized: false,
+                })
+            })
+            .unwrap();
+        let e = store.tx(|t| replay_plan(t, &p, 0, None)).unwrap_err();
+        assert!(e.to_string().contains("not finalized"), "{e}");
+    }
 }
