@@ -1,5 +1,6 @@
 # Hawkeye beside a real node, on both node lines (ycash-dd v4.5.0, ycash6 6.2x): build the node
 # from the line's upgrade/vault branch, start the devnet (regtest nodes + anvil with wYEC + one Hawkeye per attestor) and run `scenario demo`
+# and the optimistic-mint drill `scenario rogue-mint`
 # (lock -> mint, burn -> HKB1 intent -> release, rogue -> cancel -> slash, supply invariant).
 # This is the plan's §9 success criterion as a repeatable job; the mock never counts toward it.
 #
@@ -150,6 +151,7 @@ jobs:
           export YCASHD YCASH_CLI
           "$YCASHD" -version | head -1
           python3 devnet/hawkeye-devnet scenario demo --fresh
+          python3 devnet/hawkeye-devnet scenario rogue-mint --fresh
       - name: stop the devnet
         if: always()
         run: python3 devnet/hawkeye-devnet down || true

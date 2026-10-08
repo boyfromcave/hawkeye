@@ -523,6 +523,10 @@ impl FaultKind {
 pub enum SignDomain {
     /// EIP-712 `Mint(lockId, amount, to)`, keyed by `lockId`.
     Eip712Mint,
+    /// EIP-712 `Challenge(lockId, proposalId)`, keyed by `(lockId, proposalId)`.
+    Eip712Challenge,
+    /// EIP-712 `Mint` of the `rogue-mint` drill (no lock behind it), keyed by `lockId`.
+    Eip712DrillMint,
     /// A Ycash set signature in role unlock (`set_signunlock`).
     YcashUnlock,
     /// A Ycash set signature in role cancel (`set_signcancel`).
@@ -536,6 +540,8 @@ impl SignDomain {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Eip712Mint => "eip712-mint",
+            Self::Eip712Challenge => "eip712-challenge",
+            Self::Eip712DrillMint => "eip712-drill-mint",
             Self::YcashUnlock => "ycash-unlock",
             Self::YcashCancel => "ycash-cancel",
             Self::YcashAct => "ycash-act",
@@ -557,6 +563,8 @@ impl FromStr for SignDomain {
     fn from_str(s: &str) -> Result<Self, StoreError> {
         [
             Self::Eip712Mint,
+            Self::Eip712Challenge,
+            Self::Eip712DrillMint,
             Self::YcashUnlock,
             Self::YcashCancel,
             Self::YcashAct,

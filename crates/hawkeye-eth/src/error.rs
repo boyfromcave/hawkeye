@@ -26,7 +26,8 @@ pub enum Error {
     #[error("this client has no signer: it is read-only")]
     ReadOnly,
     /// The call would revert (or did, in a mined transaction); `reason` is the decoded custom
-    /// error of WyecBridge, WrappedYcash or the optimistic double when it could be decoded.
+    /// error of WyecBridge or WrappedYcash when it could be decoded (`Name(Name { .. })`, see
+    /// [`Error::is_revert`]).
     #[error("reverted: {reason}")]
     Reverted { reason: String, tx: Option<TxHash> },
     /// A signature is not 65 bytes `r ‖ s ‖ v` with `v ∈ {27, 28}`, is high-S, or fails to recover.
@@ -38,9 +39,16 @@ pub enum Error {
     /// Fewer signatures than the mode's threshold.
     #[error("{got} signatures, threshold needs {need}")]
     TooFewSignatures { got: usize, need: usize },
-    /// The mint mode is not allowed on this chain (plan §3.3: mainnet needs optimistic or k ≥ 2).
+    /// The mint mode is not allowed on this chain (plan §3.3: on mainnet the threshold mint needs
+    /// k ≥ 2 in every mode).
     #[error("mint mode {0} is not allowed on chain {1}")]
     ModeNotAllowed(String, u64),
+    /// The contract's threshold is below the mainnet minimum (plan §3.3): at threshold 1 one key
+    /// mints through `mint` at once, so the optimistic window protects nothing.
+    #[error(
+        "the bridge's threshold is {0}: mainnet needs >= 2 in every mint mode (one key would skip the challenge window)"
+    )]
+    ThresholdTooLow(u8),
     /// The node has no `finalized` block and no fallback depth is configured.
     #[error("the node reports no finalized block and no fallback confirmation depth is configured")]
     NoFinalized,
@@ -69,6 +77,15 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether this is a revert with the contract's custom error `name` (e.g. `"ProposerVetoed"`,
+    /// `"ProposalPending"`, `"LockConsumed"`).
+    pub fn is_revert(&self, name: &str) -> bool {
+        matches!(self, Error::Reverted { reason, .. }
+            if reason.strip_prefix(name).is_some_and(|r| r.is_empty() || r.starts_with('(')))
+    }
+}
 
 impl From<alloy::transports::TransportError> for Error {
     fn from(e: alloy::transports::TransportError) -> Self {

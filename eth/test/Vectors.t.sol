@@ -10,16 +10,17 @@ import {WyecEip712} from "./utils/WyecEip712.sol";
 
 /// Generates (WRITE_VECTORS=true) or checks (default) vectors/eip712.json: EIP-712 domain
 /// separators, struct hashes, digests and signatures for fixed keys and inputs, consumed by
-/// hawkeye-core (plan §4.4, §7). Every signing case is also *accepted by the pinned WyecBridge*:
-/// the test deploys the bridge at the case's verifyingContract on the case's chain id with the
-/// case's signer as a 1-of-1 guardian and submits the signature. Format: vectors/README.md.
+/// hawkeye-core and hawkeye-eth (plan §4.4, §7). Every signing case is also *accepted by the pinned
+/// WyecBridge*: the test deploys the bridge at the case's verifyingContract on the case's chain id
+/// with the case's signer as a 1-of-1 guardian and submits the signature (a Challenge case against
+/// a proposal given the case's proposalId). Format: vectors/README.md.
 ///
 ///   WRITE_VECTORS=true forge test --mc Eip712VectorsTest     # regenerate
 contract Eip712VectorsTest is Test {
     using stdStorage for StdStorage;
 
     string constant PATH = "vectors/eip712.json";
-    string constant WYEC_COMMIT = "d2e382beeea11c9f9b43675ae49d6d52334c46d6";
+    string constant WYEC_COMMIT = "cad126a415bdb5e0ae9cf7d05f6bd1b512267efb";
     address constant BRIDGE = 0x5FbDB2315678afecb367f032d93F642f64180aa3; // anvil's first CREATE
     address constant NEW_BRIDGE = 0x00000000000000000000000000000000DeaDBeef;
 
@@ -52,6 +53,12 @@ contract Eip712VectorsTest is Test {
             setPausedCase(cid, 1, true, 0);
             setPausedCase(cid, 1, false, 1);
             setBridgeCase(cid, 2, NEW_BRIDGE, 3);
+            setMintLimitCase(cid, 0, 1000e8, 86400, 2);
+            setMintLimitCase(cid, 1, 0, 0, 7);
+            for (uint256 m = 0; m < 3; m++) {
+                (bytes32 lockId,,) = mintInput(m);
+                challengeCase(cid, m, lockId, challengeId(m));
+            }
         }
 
         string memory body = "";
@@ -103,6 +110,13 @@ contract Eip712VectorsTest is Test {
             return (lockId, 21_000_000 * 1e8, 0xabCDeF0123456789AbcdEf0123456789aBCDEF01);
         }
         return (bytes32(type(uint256).max), 1, 0x0000000000000000000000000000000000000001);
+    }
+
+    /// Proposal ids: the first ever, an ordinary one, and the largest a uint96 counter reaches.
+    function challengeId(uint256 m) internal pure returns (uint256) {
+        if (m == 0) return 1;
+        if (m == 1) return 42;
+        return type(uint96).max;
     }
 
     // ------------------------------------------------------------------ cases
@@ -227,7 +241,77 @@ contract Eip712VectorsTest is Test {
         cases.push(entry);
     }
 
+    function setMintLimitCase(uint256 cid, uint256 k, uint256 cap, uint256 window, uint256 adminNonce)
+        internal
+    {
+        uint256 snap = vm.snapshotState();
+        bytes32 sh = WyecEip712.setMintLimitStruct(cap, window, adminNonce);
+        bytes32 d = WyecEip712.digest(WyecEip712.domainSeparator(cid, BRIDGE), sh);
+        bytes memory sig = signLowS(pks[k], d);
+        WyecBridge b = deployAt(cid, vm.addr(pks[k]));
+        setAdminNonce(b, adminNonce);
+        b.setMintLimit(cap, window, one(sig));
+        assertEq(b.mintCap(), cap);
+        assertEq(b.capWindow(), window);
+        assertEq(b.adminNonce(), adminNonce + 1);
+        string memory t = tail(sh, d, k, sig);
+        string memory entry = string.concat(
+            '{"kind": "SetMintLimit", ',
+            head(cid),
+            ', "mintCap": "',
+            vm.toString(cap),
+            '", "capWindow": "',
+            vm.toString(window),
+            '", "adminNonce": "',
+            vm.toString(adminNonce),
+            '", ',
+            t,
+            "}"
+        );
+        vm.revertToState(snap); // forget the throwaway deployment, keep the entry
+        cases.push(entry);
+    }
+
+    /// The challenge is submitted against a real proposal with the case's id: the counter is set
+    /// to id - 1, the signer proposes (amount 1 to 0x..01), then challenges with the case's
+    /// signature.
+    function challengeCase(uint256 cid, uint256 k, bytes32 lockId, uint256 proposalId) internal {
+        uint256 snap = vm.snapshotState();
+        bytes32 sh = WyecEip712.challengeStruct(lockId, proposalId);
+        bytes32 d = WyecEip712.digest(WyecEip712.domainSeparator(cid, BRIDGE), sh);
+        bytes memory sig = signLowS(pks[k], d);
+        submitChallenge(cid, k, lockId, proposalId, sig);
+        string memory t = tail(sh, d, k, sig);
+        string memory entry = string.concat(
+            '{"kind": "Challenge", ',
+            head(cid),
+            ', "lockId": "',
+            vm.toString(lockId),
+            '", "proposalId": "',
+            vm.toString(proposalId),
+            '", ',
+            t,
+            "}"
+        );
+        vm.revertToState(snap); // forget the throwaway deployment, keep the entry
+        cases.push(entry);
+    }
+
     // ------------------------------------------------------------------ helpers
+
+    function submitChallenge(uint256 cid, uint256 k, bytes32 lockId, uint256 proposalId, bytes memory sig)
+        internal
+    {
+        WyecBridge b = deployAt(cid, vm.addr(pks[k]));
+        stdstore.target(address(b)).sig("proposalCount()").checked_write(proposalId - 1);
+        bytes32 md = WyecEip712.digest(
+            WyecEip712.domainSeparator(cid, BRIDGE), WyecEip712.mintStruct(lockId, 1, address(1))
+        );
+        assertEq(b.proposeMint(lockId, 1, address(1), signLowS(pks[k], md)), proposalId);
+        b.challengeMint(lockId, proposalId, sig);
+        assertEq(b.getProposal(lockId).id, 0);
+        assertTrue(b.vetoed(lockId, vm.addr(pks[k])));
+    }
 
     function guardiansFields(address[] memory g, uint8 threshold, uint256 adminNonce)
         internal
@@ -290,13 +374,18 @@ contract Eip712VectorsTest is Test {
         sigs[0] = sig;
     }
 
-    /// A fresh token + bridge with the bridge at BRIDGE on chain `cid`, `guardian` as 1-of-1.
+    /// A fresh token + bridge with the bridge at BRIDGE on chain `cid`, `guardian` as 1-of-1, a
+    /// 60-second challenge window, no rate limit.
     function deployAt(uint256 cid, address guardian) internal returns (WyecBridge) {
         vm.chainId(cid);
         WrappedYcash t = new WrappedYcash(BRIDGE);
         address[] memory g = new address[](1);
         g[0] = guardian;
-        deployCodeTo("WyecBridge.sol:WyecBridge", abi.encode(t, g, uint8(1)), BRIDGE);
+        deployCodeTo(
+            "WyecBridge.sol:WyecBridge",
+            abi.encode(t, g, uint8(1), uint64(60), uint256(0), uint256(0)),
+            BRIDGE
+        );
         return WyecBridge(BRIDGE);
     }
 

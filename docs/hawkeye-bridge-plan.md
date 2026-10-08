@@ -1,11 +1,13 @@
 # Hawkeye — the wYEC bridge attestor sidecar: development plan
 
-**Revision 1, 2026-10-07.** Status: plan of record for the `hawkeye` repository. Builds on the
+**Revision 2, 2026-10-08** (revision 1, 2026-10-07; revision 2: CR-W1/W2/W3 shipped in wyec @
+`cad126a`, the optimistic mint is the default mode, the mainnet rule is threshold ≥ 2 in every mode,
+§3.3). Status: plan of record for the `hawkeye` repository. Builds on the
 workspace's [vault upgrade plan](https://github.com/boyfromcave/yellowback/blob/harden/yellowback/docs/plans/yellowback-upgrade-plan.md)
 ("the upgrade plan", revision 2: §3 the primitive, §4 the bridge, §15 the implementation spec,
 findings (1)–(93)), the node's [`doc/vault-rpc.md`](https://github.com/boyfromcave/ycash-dd/blob/upgrade/vault/doc/vault-rpc.md)
 and the [wYEC contract design](https://github.com/boyfromcave/wyec/blob/main/docs/wyec-contract-design.md)
-(`wyec` @ `d2e382b`). Decisions here are numbered **HK-\***, change requests to other repositories
+(`wyec` @ `cad126a`, §4.5 the optimistic mint). Decisions here are numbered **HK-\***, change requests to other repositories
 **CR-\***, open questions for the owner and the Foundation **Q-\***, and phases **H0–H8**.
 
 Naming: **Hawkeye** is the software. An **attestor** is a Ycash participant who runs it and holds a
@@ -15,27 +17,37 @@ primitive's delayed-release output (§15.3 of the upgrade plan).
 
 ---
 
-## Execution status (2026-10-07)
+## Execution status (2026-10-08)
 
 **Round success criterion met on both node lines** (§9): `scenario demo` PASS on real regtest nodes
 of ycash-dd `upgrade/vault` v4.5.0 (`dbc1ab0`) and ycash6 `upgrade/vault` v6.22.0-rc1 (`2997007`),
 each with three Hawkeyes beside their own nodes, anvil and wYEC at the pinned commit; `scenario roll`
 PASS on both. Transcripts: `devnet/transcripts/*-ycash-dd-v4.5.0.txt`, `*-ycash6-v6.22.0-rc1.txt`.
 
+**2026-10-08: on the real optimistic mint.** wyec#1 merged (`cad126a`: CR-W1, CR-W2, CR-W3); the
+pin moved there and Hawkeye's CR-W1 test double is gone. The devnet deploys the bridge with
+threshold 2 and a 12 s challenge window and runs `mint_mode = optimistic` by default
+(`--mint-mode threshold` kept). Every devnet scenario was re-run on both lines in that mode and
+PASSes — `demo`, `roll`, `dormancy`, `takeover`, `double`, `restart`, `reorg` — plus the new
+`rogue-mint` drill (D-5): attestor1 proposes 5 wYEC for a lockId with no lock, another attestor
+challenges it 5–6 s before `eta`, no wYEC is minted, attestor1 is `vetoed` on the lock and removed
+on Ycash with its bond frozen.
+
 | Phase | State |
 |---|---|
 | H0 plan + skeleton | done |
-| H1 core (encodings, templates, EIP-712, ZIP-243 attribution) | done; node and Foundry vectors pass |
+| H1 core (encodings, templates, EIP-712, ZIP-243 attribution) | done; node and Foundry vectors pass (EIP-712 now incl. `Challenge`, `SetMintLimit`) |
 | H2 Ycash adapter | done |
-| H3 Ethereum adapter + `eth/` Foundry | done (Sepolia deploy prepared, not run: no Sepolia access from the build host) |
-| H4 store + engine | done, incl. independent slash verification, persisted progress, rolls, equivocation |
-| H5 daemon | done (CLI, API, metrics) |
-| H6 devnet + drills | D-1, D-2, D-3, D-7, D-9, D-10, D-11, D-13, D-16 as devnet drills on both lines (`scenario demo`, `roll`, `double`, `takeover`, `reorg`, `dormancy`, `restart`); D-4..D-6, D-8, D-12, D-14, D-15 covered in engine tests, not yet as devnet drills. D-7 found a defect, fixed: a leader restarted after a takeover's release adopts it instead of posting the burn again (§5.1) |
-| H7 Sepolia | open (owner runbook §9) |
-| H8 audit/release | open; CR-W1 (optimistic mint in wyec) outstanding |
+| H3 Ethereum adapter + `eth/` Foundry | done against wyec `cad126a` (both mint paths, challenge by signature, rate limit; Sepolia deploy prepared, not run: no Sepolia access from the build host) |
+| H4 store + engine | done, incl. independent slash verification, persisted progress, rolls, equivocation; schema v3: sign-once `Challenge` records; the optimistic engine (propose, challenge in every mode, re-propose after a veto, execute) |
+| H5 daemon | done (CLI, API, metrics); mainnet refuses a threshold < 2 in every mode (config and live contract) |
+| H6 devnet + drills | D-1, D-2, D-3, D-5, D-7, D-9, D-10, D-11, D-13, D-16 as devnet drills on both lines (`scenario demo`, `rogue-mint`, `double`, `takeover`, `reorg`, `dormancy`, `roll`, `restart`), optimistic mode; D-4, D-6, D-8, D-12, D-14, D-15 covered in engine tests, not yet as devnet drills. D-7 found a defect, fixed: a leader restarted after a takeover's release adopts it instead of posting the burn again (§5.1) |
+| H7 Sepolia | open (owner runbook §9; now threshold 2, optimistic) |
+| H8 audit/release | open; CR-W1 done (wyec#1); the contract audit (P5) now covers the optimistic path |
 
 CI: lint, fmt, clippy, tests (anvil), rustdoc, cargo-deny, coverage (≥ 90 % on core), release build,
-contracts; `devnet-e2e` builds both node lines on GitHub and runs the demo (nightly, on demand).
+contracts; `devnet-e2e` builds both node lines on GitHub and runs the demo and `rogue-mint` (nightly,
+on demand).
 
 ## 0. The answer in one page
 
@@ -56,11 +68,15 @@ contracts; `devnet-e2e` builds both node lines on GitHub and runs the demo (nigh
    majority of the *other* members, who burn a fraudulent member's bond with `SET_REMOVE burn=1`.
    This sidesteps upgrade-plan finding (26) — a one-seat relayer set cannot be slashed by a separate
    challenger set — without touching consensus.
-4. **The Ethereum mint side needs one contract change for the same model** (CR-W1). Today's
-   `WyecBridge.mint` is immediate under a k-of-n threshold; with `k = 1` one stolen key mints to
-   the cap with no window. Hawkeye's mainnet configuration therefore requires either `k ≥ 2`
-   (immediate) or the optimistic mint of CR-W1 (`proposeMint` by one attestor → challenge window →
-   `executeMint`; any attestor challenges). Sepolia development runs on today's contract at `k = 1`.
+4. **The Ethereum mint side has the same model since wyec `cad126a`** (CR-W1, done: wyec#1).
+   `WyecBridge` keeps the immediate k-of-n `mint` and adds the optimistic mint: `proposeMint` with
+   one attestor's EIP-712 `Mint` signature → `challengeWindow` → `executeMint` by anyone; any one
+   attestor's EIP-712 `Challenge(lockId, proposalId)` signature deletes a proposal during the
+   window and bars its proposer from that lock. **The Foundation's model — and the default of
+   `Deploy.s.sol` and the devnet — is `mint_mode = optimistic`** (one attestation + window for
+   routine mints; a quorum ≥ 2, immediate, for overrides and admin acts). **The mainnet rule is
+   threshold ≥ 2 in every mode** (§3.3): at threshold 1 one key would skip the window through
+   `mint`.
 5. **Two bridge-safety findings that Hawkeye enforces by policy** (§3): an unconditional
    owner-recovery height on bridge vaults (`ownerHeight = lockHeight + BRIDGE_MAX_AGE`) lets a
    depositor who has sold their wYEC take the YEC back once that height passes; and an intent commits only
@@ -253,10 +269,35 @@ Until CR-N2 lands, Hawkeye inserts the memo into `vault_buildunlock`'s unsigned 
 inputs are unsigned and no set signature exists yet), which needs a v4 transparent transaction
 codec in `hawkeye-ycash` (§6).
 
-### 3.3 F-3: the Ethereum mint has no window at k = 1 (CR-W1)
+### 3.3 F-3: the Ethereum mint has no window at k = 1 (CR-W1, done in wyec `cad126a`)
 
-See §0 item 4 and CR-W1. Hawkeye implements both mint modes behind one trait; the configured
-mode must satisfy `mode = optimistic ∨ k ≥ 2` on mainnet (enforced at start-up).
+wyec's `WyecBridge` (wyec#1, `cad126a`; wyec-contract-design.md §4.5) has two mint paths over one
+signed message, `Mint(lockId, amount, to)`: the threshold `mint` (k signatures, immediate) and the
+optimistic `proposeMint` (one signature) → `challengeWindow` seconds → `executeMint` (anyone), with
+`challengeMint(lockId, proposalId, sig)` by any one guardian's `Challenge` signature deleting the
+proposal and setting `vetoed[lockId][proposer]`. A rate limit (`mintCap` per `capWindow`, an admin
+act) bounds both paths at execute time.
+
+**The mainnet rule: the bridge's threshold is ≥ 2 in every mode**, and `mint_mode = optimistic` is
+the Foundation's model. The threshold path cannot be switched off, so at threshold 1 a single key
+mints at once and skips the window; no mode choice repairs that. Enforced three times: wyec's and
+Hawkeye's `Deploy.s.sol` refuse `THRESHOLD < 2` on chain 1; `hawkeye.toml` on mainnet refuses
+`mint_threshold < 2` and a deployment file with `threshold < 2` whatever `mint_mode` says; the
+daemon reads the live `threshold()` at start-up and refuses below 2 on mainnet (warns elsewhere).
+
+Conversely, **the optimistic path cannot be switched off either**: any one guardian key can
+`proposeMint` whatever Hawkeye's mode. So every Hawkeye watches and challenges proposals in every
+mode (§5.3 step 2); `mint_mode` only decides how *honest* mints are made:
+
+| `mint_mode` | honest mint | who submits | window |
+|---|---|---|---|
+| `optimistic` (the Foundation's model; `Deploy.s.sol` and devnet default) | the mint leader (§5.2, over the members not `vetoed` for the lock) calls `proposeMint` with its own sign-once `Mint` signature; after `eta` the leader (anyone, a further window later) calls `executeMint` | any account (the attestor's) | `challengeWindow` |
+| `threshold` | the leader gathers `k` signatures from the peers' APIs and calls `mint` | any account | none |
+
+A challenged *matching* proposal (griefing, or a watcher that could not decide in time) is not
+lost: the challenged proposer is barred from that lock, the next eligible attestor re-proposes the
+same signed `(amount, to)` with a fresh id, and the alarm `matching-proposal-challenged` names the
+challenger. If every live member were barred, a threshold `mint` is the override.
 
 ### 3.4 F-4: recipient bytes are opaque on both chains (HK-5)
 
@@ -348,9 +389,14 @@ replayed on mainnet) is unmatched.
 Domain `{name: "WyecBridge", version: "1", chainId, verifyingContract: bridge}`; types exactly as
 `WyecBridge.sol` (`Mint(bytes32 lockId,uint256 amount,address to)`, `SetGuardians(address[]
 guardians,uint8 threshold,uint256 adminNonce)`, `SetPaused(bool paused,uint256 adminNonce)`,
-`SetBridge(address newBridge,uint256 adminNonce)`). Signatures are 65-byte `r‖s‖v`, low-S, sorted by
-recovered address ascending in `sigs[]` (the contract's distinctness rule). Vectors are generated
-by Foundry against the pinned wyec commit and checked by `hawkeye-core` (§7).
+`SetBridge(address newBridge,uint256 adminNonce)`, and since `cad126a` `Challenge(bytes32 lockId,
+uint256 proposalId)` and `SetMintLimit(uint256 mintCap,uint256 capWindow,uint256 adminNonce)`).
+Signatures are 65-byte `r‖s‖v`, low-S, sorted by recovered address ascending in `sigs[]` (the
+contract's distinctness rule). Vectors (`eth/vectors/eip712.json`, 40 cases incl. 6 `Challenge`)
+are generated by Foundry against the pinned wyec commit, every signing case accepted by the
+contract, and reproduced byte for byte by `hawkeye-core` and `hawkeye-eth` (§7); one `Challenge`
+digest is also pinned from `cast`. Sign-once covers every one of them: `Mint` per `lockId`,
+`Challenge` per `(lockId, proposalId)` (ledger schema v3).
 
 ### 4.5 Set-signature attribution
 
@@ -370,7 +416,8 @@ both lines.
 Lock:   SEEN → CONFIRMED → POLICY_OK | POLICY_REJECTED
         POLICY_OK → SIGNED → (MINT_SUBMITTED | PROPOSED → CHALLENGED | EXECUTED) → MINTED
         any → REORGED (the lock left the active chain: signatures already given are recorded as
-              exposure; with CR-W1 the proposal is challenged)
+              exposure; a pending proposal for it is challenged by the watchers)
+        CHALLENGED → PROPOSED (re-proposed by the next eligible attestor, §3.3)
 Burn:   SEEN(unfinalized) → FINALIZED → (ORPHANED | ASSIGNED(leader, deadline))
         ASSIGNED → INTENT_PENDING(intent) → INTENT_CONFIRMED → RELEASED
         INTENT_* → CANCELLED (by a watcher; the burn returns to FINALIZED for reassignment)
@@ -399,8 +446,17 @@ takeover overlap are a benign race: the later one is cancelled, nobody is slashe
    decoded locally), classify (§3.2), and cancel unmatched ones at once: `vault_buildcancel` →
    `set_signcancel` → `vault_send`. One cancel per intent per attestor (the node returns the same
    cancel while its fee inputs are unspent, finding (65)); Hawkeye never re-funds a cancel.
-2. On every finalized Ethereum block: list `Minted` (and, with CR-W1, `MintProposed`) events,
-   check each against a policy-OK lock; challenge unmatched proposals at once.
+2. On every finalized Ethereum block: list `Minted` and `MintProposed` events and check each
+   against a policy-OK lock, **in every mint mode** (§3.3). A proposal that does not match is
+   challenged with a sign-once EIP-712 `Challenge(lockId, proposalId)` signature, sent from the
+   attestor's account (any account may): a definite mismatch (policy-rejected lock, other amount or
+   recipient) at once; an undecided one (lock not judged here, or absent) when the lock is still
+   absent `C_Y` Ycash blocks after the proposal was first judged with the follower caught up, and
+   at the latest when a quarter of the window is left. A proposal matching a policy-OK lock is never
+   challenged (the ledger refuses to sign it); a recorded challenge whose proposal is still live is
+   re-sent with the recorded bytes. A Hawkeye leaves a proposal it made deliberately (the
+   `rogue-mint` drill) to the others, as it does its own deliberate intents. The window must exceed
+   Ethereum finality plus `C_Y` Ycash blocks plus submission (wyec-contract-design.md §4.5.3).
 3. Each fault opens a `SlashCase` with a self-contained evidence bundle (transactions, signatures,
    the recovered key, the reason). The case is gossiped to other Hawkeyes over the authenticated peer
    channel (H5, §6) or exchanged out of band; each Hawkeye **verifies independently**, then
@@ -482,9 +538,9 @@ rpc-types), `k256` (ecdsa, recoverable), `sha2`, `sha3`, `rusqlite` (bundled), `
 | Layer | Tool | What it proves |
 |---|---|---|
 | Encodings | `cargo test` + golden vectors: node `vault_vectors.json` (templates, set-sig messages, signatures), Foundry-generated EIP-712 vectors, Hawkeye's own memo/recipient vectors | byte-exact agreement with both node lines and the contract |
-| Contract assumptions | `forge test` in `eth/` against wyec @ pinned commit | `lockId` replay, ascending signers, `BurnToYcash` shape, predicted-address deploy, guardian rotation, pause |
+| Contract assumptions | `forge test` in `eth/` against wyec @ pinned commit | `lockId` replay, ascending signers, `BurnToYcash` shape, predicted-address deploy, guardian rotation, pause; the optimistic path: any-submitter propose / challenge / execute, one live proposal per lock, `vetoed`, `Void` after rotation, threshold override, rate limit at execute, event layouts |
 | Ycash adapter | mock ycashd answering per `vault-rpc-contract.json`; recorded fixtures | request shapes, error-reason mapping (−26 `bad-vault-*`, `set-sign-once`, …) |
-| Ethereum adapter | anvil (local, instant finality via `--slots-in-an-epoch 1`) | scanning `finalized`, mint submission, both modes (CR-W1 via a test double until wyec ships it) |
+| Ethereum adapter | anvil (local, instant finality via `--slots-in-an-epoch 1`) | scanning `finalized`, mint submission in both modes against the real `WyecBridge`, challenges by signature, rate limit |
 | Engine | deterministic simulation: fake chains, injected faults | every state machine edge, reorgs, races, takeover |
 | End to end | anvil + regtest `ycashd` (`-nuparams=6d5b7a31:<h>`), 3 Hawkeyes | the flows of §1 and the drills of §8 on both node lines |
 | Public | Sepolia + a public Ycash devnet (or testnet once it has the upgrade) | real finality, real gas, real operators |
@@ -504,7 +560,7 @@ installer and the native `solc` download are blocked, Foundry's npm packages
 | D-2 | Rogue intent (a member signs an unlock with no burn) | cancelled within the window by ≥ 1 other Hawkeye; slash case reaches `SET_REMOVE burn=1` |
 | D-3 | Double release (second intent for a consumed burn) | cancelled; slashed (outside the race window) |
 | D-4 | Wrong amount / wrong recipient intent | cancelled; slashed |
-| D-5 | Rogue mint (k = 1 today; proposal with CR-W1) | today: detected and alarmed, slash case opened; CR-W1: challenged before execute |
+| D-5 | Rogue mint: one member proposes a mint with no lock behind it (`rogue-mint`) | another attestor challenges it before `eta`; no wYEC minted, the proposer `vetoed`; slash case → `SET_REMOVE burn=1` (removed, bond frozen) |
 | D-6 | Equivocation (one key, two unlocks of one vault) | `set_equivocation` submitted automatically; member ejected |
 | D-7 | Leader down | takeover after `TAKEOVER` blocks; exactly one release |
 | D-8 | Rate limit exhausted | burns wait FIFO for the next epoch; none lost |
@@ -554,9 +610,10 @@ Hawkeye never patches the node.
 ```
 cd eth && ./tools/fetch-wyec.sh            # wyec @ pinned commit into eth/vendor/wyec (gitignored)
 export SEPOLIA_RPC_URL=... DEPLOYER_KEY=... ETHERSCAN_API_KEY=...
-GUARDIANS=0x..,0x..,0x.. THRESHOLD=1 forge script script/Deploy.s.sol \
+GUARDIANS=0x..,0x..,0x.. THRESHOLD=2 CHALLENGE_WINDOW=1800 forge script script/Deploy.s.sol \
     --rpc-url $SEPOLIA_RPC_URL --private-key $DEPLOYER_KEY --broadcast --verify
-# writes deployments/11155111.json {chainId, bridge, token, deployBlock, guardians, threshold, mintMode, challengeWindow}
+# writes deployments/11155111.json {chainId, bridge, token, deployBlock, guardians, threshold, mintMode,
+#   challengeWindow, mintCap, capWindow}; THRESHOLD = 2 and mint_mode = optimistic rehearse mainnet
 hawkeye --config config/sepolia.toml status
 ```
 Guardian addresses come from the Ycash set: `hawkeye keys eth-address --set <setid>` derives them
@@ -568,9 +625,9 @@ from the members' compressed keys.
 
 | # | Repo | Change | Why | Blocking? |
 |---|---|---|---|---|
-| CR-W1 | wyec | Optimistic mint: `proposeMint(lockId, amount, to, sig)` by one guardian → `MINT_CHALLENGE_WINDOW` → `executeMint(lockId)` by anyone; `challengeMint(lockId, sig)` by any guardian's **signature** (EIP-712 `Challenge(lockId)`, submittable by anyone, so guardian keys need no ETH) deletes the proposal (re-proposable); events `MintProposed`, `MintChallenged`; optional mint `RateLimiter` (E-6); keep the k-of-n `mint`. Hawkeye's test double (`eth/test/mocks/OptimisticMintBridge.sol`) implements the sender-based variant | the Foundation's model on the mint side (§3.3) | mainnet at k = 1 only |
-| CR-W2 | wyec | Foundry project (replacing `compile.js`), `Deploy.s.sol` with the predicted-address assertion, ABI artefacts committed | Hawkeye binds the ABI; Sepolia deploy | no (Hawkeye's `eth/` carries it meanwhile) |
-| CR-W3 | wyec | Document §4.2's recipient encoding in the contract's NatSpec | one definition | no |
+| CR-W1 | wyec | **Done** (wyec#1, `cad126a`). Optimistic mint: `proposeMint(lockId, amount, to, sig)` by one guardian's signature → `challengeWindow` (immutable) → `executeMint(lockId)` by anyone; `challengeMint(lockId, proposalId, sig)` by any guardian's EIP-712 `Challenge(bytes32 lockId,uint256 proposalId)` signature, submittable by anyone, deletes the proposal and bars its proposer from the lock (`vetoed`); events `MintProposed(lockId, proposalId, proposer, to, amount, eta)`, `MintChallenged(lockId, proposalId, challenger)`; fixed-window mint rate limit (`setMintLimit`, E-6); the k-of-n `mint` kept. Hawkeye binds it (its test double is gone) | the Foundation's model on the mint side (§3.3) | done |
+| CR-W2 | wyec | **Done** (wyec#1, `cad126a`). Foundry project (replacing `compile.js`), `Deploy.s.sol` with the predicted-address assertion and the mainnet threshold rule | Hawkeye binds the ABI; Sepolia deploy | done (Hawkeye keeps its own `eth/script/Deploy.s.sol`, the same checks plus `mintMode`, and exports the ABI from the pinned build) |
+| CR-W3 | wyec | **Done** (wyec#1, `cad126a`). §4.2's recipient encoding in `burn`'s NatSpec | one definition | done |
 | CR-N1 | ycash-dd, ycash6 | `vault_lock` `"data"` parameter (finding (73)) | wallets write the destination without hand-built transactions | no |
 | CR-N2 | ycash-dd, ycash6 | `vault_buildunlock` `"data"` parameter (an OP_RETURN output) | the memo without a tx codec in Hawkeye | no |
 | CR-N3 | ycash-dd, ycash6 | cross-set `SET_REMOVE` (finding (26)) | only if the Foundation insists on an open challenger set (§2.1) | no |
@@ -585,8 +642,8 @@ from the members' compressed keys.
 |---|---|---|
 | Q-1 | Mainnet row of §2 (seats, `delay`, cap, `bondMin`, `livenessWindow`, `C_Y`, `MIN_OWNER_AGE`) | `yb-calibration` derives it with O-13; §2's column is a starting point |
 | Q-2 | Should a supply-invariant breach auto-pause the bridge? | alarm only in v1; pause needs `k` signatures anyway |
-| Q-3 | Refunds for orphaned burns | threshold mint with the synthetic `lockId`; never at k = 1 |
-| Q-4 | Bridge fee (O-2 "bps fee") and who pays Ethereum gas | v1: none; attestors absorb fees; revisit with CR-W1 |
+| Q-3 | Refunds for orphaned burns | threshold mint (or an optimistic proposal) with the synthetic `lockId`; never at threshold 1 |
+| Q-4 | Bridge fee (O-2 "bps fee") and who pays Ethereum gas | v1: none; attestors absorb fees (a proposal ~111k gas, an execute ~107k, a challenge ~38k: wyec-contract-design.md §4.5.5); revisit before mainnet |
 | Q-5 | Who may be an attestor (Foundation-chosen operators?) and the admission key's custody | the Foundation picks the first set; `admitKey` retires once `slashThreshold` members are current |
 | Q-6 | Ethereum L1 only (O-4) or also an L2 | L1 first; the memo's `chainId` keeps deployments apart |
 

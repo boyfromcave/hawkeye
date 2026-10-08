@@ -7,7 +7,9 @@ against wyec at the commit pinned in `../tools/fetch-wyec.sh`. Consumers: `hawke
 **Every signing case is accepted by the real contract**: the generator
 (`../test/Vectors.t.sol`) deploys `WyecBridge` at the case's `verifyingContract` on the case's
 `chainId`, with the case's signer as a 1-of-1 guardian (and `adminNonce` set to the case's), and
-submits the signature. So a digest here is the contract's digest, not only Hawkeye's.
+submits the signature; a `Challenge` case is submitted against a real proposal carrying the case's
+`proposalId` (the counter set to `proposalId − 1`, the signer proposes, then challenges). So a
+digest here is the contract's digest, not only Hawkeye's.
 
 ```
 forge test --mc Eip712VectorsTest                       # check: fails if the file is stale
@@ -19,7 +21,7 @@ WRITE_VECTORS=true forge test --mc Eip712VectorsTest    # regenerate (re-pin, co
 ```jsonc
 {
   "description": "...",
-  "wyecCommit": "d2e382beeea11c9f9b43675ae49d6d52334c46d6",   // the pinned wyec commit
+  "wyecCommit": "cad126a415bdb5e0ae9cf7d05f6bd1b512267efb",   // the pinned wyec commit
   "cases": [ Case, ... ]
 }
 ```
@@ -28,20 +30,22 @@ Every case has:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `kind` | string | `"Domain"`, `"Mint"`, `"SetGuardians"`, `"SetPaused"`, `"SetBridge"` |
+| `kind` | string | `"Domain"`, `"Mint"`, `"Challenge"`, `"SetGuardians"`, `"SetPaused"`, `"SetMintLimit"`, `"SetBridge"` |
 | `chainId` | number | EIP-712 domain `chainId` (31337 anvil, 11155111 Sepolia) |
 | `verifyingContract` | string | EIP-712 domain `verifyingContract`, the bridge (EIP-55 checksummed) |
 | `digest` | string | `Domain`: the domain separator. Others: the EIP-712 digest `keccak256(0x1901 ‖ domainSeparator ‖ structHash)`, i.e. what is signed |
 
 `Domain` adds `name` (`"WyecBridge"`) and `version` (`"1"`).
 
-The four signing kinds add their struct fields (EIP-712 names, as in `WyecBridge.sol`):
+The six signing kinds add their struct fields (EIP-712 names, as in `WyecBridge.sol`):
 
 | Kind | Fields | EIP-712 type |
 |---|---|---|
 | `Mint` | `lockId` (bytes32 hex), `amount` (decimal string), `to` (address) | `Mint(bytes32 lockId,uint256 amount,address to)` |
+| `Challenge` | `lockId` (bytes32 hex), `proposalId` (decimal string; the contract's `uint96` counter) | `Challenge(bytes32 lockId,uint256 proposalId)` |
 | `SetGuardians` | `guardians` (address array, order as signed: **order matters**), `threshold` (number, uint8), `adminNonce` (decimal string) | `SetGuardians(address[] guardians,uint8 threshold,uint256 adminNonce)` |
 | `SetPaused` | `paused` (bool), `adminNonce` (decimal string) | `SetPaused(bool paused,uint256 adminNonce)` |
+| `SetMintLimit` | `mintCap`, `capWindow`, `adminNonce` (decimal strings) | `SetMintLimit(uint256 mintCap,uint256 capWindow,uint256 adminNonce)` |
 | `SetBridge` | `newBridge` (address), `adminNonce` (decimal string) | `SetBridge(address newBridge,uint256 adminNonce)` |
 
 and the signing fields:
@@ -55,11 +59,11 @@ and the signing fields:
 | `signature` | 65-byte hex | `r ‖ s ‖ v`, `v ∈ {27, 28}`, low-S. Deterministic (RFC 6979, as Foundry's `vm.sign` and k256 / alloy `signer-local` both are), so a Rust signer with the same key reproduces it byte for byte |
 
 Conventions: hex is `0x`-prefixed and lowercase, except addresses, which are EIP-55 checksummed
-(compare case-insensitively). Integers that can exceed 2^53 (`amount`, `adminNonce`) are decimal
-strings; `chainId` and `threshold` are JSON numbers. `SetGuardians.guardians` is hashed as
+(compare case-insensitively). Integers that can exceed 2^53 (`amount`, `proposalId`, `mintCap`,
+`capWindow`, `adminNonce`) are decimal strings; `chainId` and `threshold` are JSON numbers. `SetGuardians.guardians` is hashed as
 `keccak256` of the concatenated 32-byte left-padded addresses, in the order given.
 
-## Contents (30 cases)
+## Contents (40 cases)
 
 For each of chain ids 31337 and 11155111, with `verifyingContract`
 `0x5FbDB2315678afecb367f032d93F642f64180aa3` (the address anvil's first deployment from its first
@@ -73,4 +77,14 @@ dev account gets, i.e. the `Deploy.s.sol` bridge on a fresh anvil):
 - 2 `SetGuardians` (threshold 2 at `adminNonce` 0, threshold 3 at `adminNonce` 5; the guardian
   list deliberately not in address order);
 - 2 `SetPaused` (`true` at nonce 0, `false` at nonce 1);
-- 1 `SetBridge` (`0x…DeaDBeef` at nonce 3).
+- 1 `SetBridge` (`0x…DeaDBeef` at nonce 3);
+- 2 `SetMintLimit` (1000 wYEC per 86,400 s at nonce 2 by key 0; no limit, `0`/`0`, at nonce 7 by
+  key 1);
+- 3 `Challenge`, one per key: the three `Mint` lockIds with proposal ids 1 (the first ever), 42,
+  and `2^96 − 1` (the largest the counter reaches).
+
+Consumers: `hawkeye-eth/tests/vectors.rs` (alloy's EIP-712) and `hawkeye-core/tests/eip712.rs`
+(`eth_vectors`, Hawkeye's own encoder and RFC 6979 signer) reproduce every digest and signature
+byte for byte; `hawkeye-core`'s `challenge_digest_and_signature` also pins one `Challenge` digest and
+two signatures computed independently with `cast` (`cast abi-encode`/`keccak`, `cast wallet sign
+--data`).

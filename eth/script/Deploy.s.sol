@@ -4,23 +4,29 @@ pragma solidity ^0.8.24;
 import {Script, console} from "forge-std/Script.sol";
 import {WrappedYcash} from "wyec/WrappedYcash.sol";
 import {IWrappedYcash, WyecBridge} from "wyec/WyecBridge.sol";
-import {OptimisticMintBridge} from "../test/mocks/OptimisticMintBridge.sol";
 
 /// Deploys wYEC in the order of wyec-contract-design.md §8: the bridge first, constructed with the
 /// token address predicted from the deployer's next nonce, then the token in the very next
 /// transaction from the same deployer. The prediction is asserted before and after.
 ///
+/// The same checks as wyec's own script/Deploy.s.sol (at the pinned commit), plus the mint mode
+/// the attestors are configured for, recorded in the deployment file for their configs. One
+/// WyecBridge serves both modes: the mode is how Hawkeye mints (plan §3.3), not a contract variant.
+///
 /// Environment:
 ///   GUARDIANS          comma-separated guardian addresses (required)
-///   THRESHOLD          k of the k-of-n mint and admin threshold (required)
-///   MINT_MODE          "threshold" (default: wyec's WyecBridge) or "optimistic" (the CR-W1 TEST
-///                      DOUBLE test/mocks/OptimisticMintBridge.sol; refused unless chain id 31337)
-///   CHALLENGE_WINDOW   seconds, optimistic mode only (default 60)
+///   THRESHOLD          k of the threshold mint and every admin act (required; >= 2 on mainnet in
+///                      every mode: at k = 1 one key mints through `mint` and skips the window)
+///   CHALLENGE_WINDOW   optimistic-mint challenge window in seconds (required, > 0; immutable)
+///   MINT_CAP           mint rate limit in wYEC base units per CAP_WINDOW (default 0 = no limit)
+///   CAP_WINDOW         rate-limit window in seconds (default 0; > 0 when MINT_CAP > 0)
+///   MINT_MODE          "optimistic" (default: proposeMint + window, the Foundation's model) or
+///                      "threshold" (k-of-n mint), recorded as mintMode
 ///   DEPLOYMENT_FILE    output path (default deployments/<chainid>.json)
 ///
-/// Output: {chainId, bridge, token, deployBlock, guardians, threshold, mintMode, challengeWindow}.
-/// deployBlock is the first block the deployment can be in (head + 1 at script time): exact on an
-/// automining anvil, a safe lower bound for a log scanner elsewhere.
+/// Output: {chainId, bridge, token, deployBlock, guardians, threshold, mintMode, challengeWindow,
+/// mintCap, capWindow}. deployBlock is the first block the deployment can be in (head + 1 at
+/// script time): exact on an automining anvil, a safe lower bound for a log scanner elsewhere.
 contract Deploy is Script {
     struct Result {
         address bridge;
@@ -31,8 +37,10 @@ contract Deploy is Script {
     struct Config {
         address[] guardians;
         uint256 threshold;
-        bool optimistic;
-        uint64 challengeWindow;
+        uint256 challengeWindow;
+        uint256 mintCap;
+        uint256 capWindow;
+        string mintMode;
         string file;
     }
 
@@ -40,13 +48,10 @@ contract Deploy is Script {
         Config memory c;
         c.guardians = vm.envAddress("GUARDIANS", ",");
         c.threshold = vm.envUint("THRESHOLD");
-        string memory mode = vm.envOr("MINT_MODE", string("threshold"));
-        c.optimistic = keccak256(bytes(mode)) == keccak256("optimistic");
-        require(
-            c.optimistic || keccak256(bytes(mode)) == keccak256("threshold"),
-            "MINT_MODE: threshold|optimistic"
-        );
-        c.challengeWindow = uint64(vm.envOr("CHALLENGE_WINDOW", uint256(60)));
+        c.challengeWindow = vm.envUint("CHALLENGE_WINDOW");
+        c.mintCap = vm.envOr("MINT_CAP", uint256(0));
+        c.capWindow = vm.envOr("CAP_WINDOW", uint256(0));
+        c.mintMode = vm.envOr("MINT_MODE", string("optimistic"));
         c.file = vm.envOr(
             "DEPLOYMENT_FILE",
             string.concat(vm.projectRoot(), "/deployments/", vm.toString(block.chainid), ".json")
@@ -55,27 +60,36 @@ contract Deploy is Script {
     }
 
     function deploy(Config memory c) public returns (Result memory r) {
-        address[] memory guardians = c.guardians;
-        uint256 threshold = c.threshold;
         require(
-            threshold > 0 && threshold <= guardians.length && threshold <= type(uint8).max, "bad THRESHOLD"
+            c.threshold > 0 && c.threshold <= c.guardians.length && c.threshold <= type(uint8).max,
+            "bad THRESHOLD"
         );
-        bool optimistic = c.optimistic;
-        require(!optimistic || block.chainid == 31337, "the optimistic bridge is a test double: anvil only");
-        uint64 window = c.challengeWindow;
-        string memory mode = optimistic ? "optimistic" : "threshold";
+        // With k = 1 one key mints immediately through `mint`, bypassing the optimistic window
+        // (wyec-contract-design.md §4.5.2, plan §3.3): never on mainnet, whatever the mode.
+        require(block.chainid != 1 || c.threshold >= 2, "THRESHOLD must be >= 2 on mainnet");
+        require(c.challengeWindow > 0 && c.challengeWindow <= type(uint64).max, "bad CHALLENGE_WINDOW");
+        require(c.mintCap == 0 || c.capWindow > 0, "CAP_WINDOW must be > 0 when MINT_CAP > 0");
+        bytes32 mode = keccak256(bytes(c.mintMode));
+        require(
+            mode == keccak256("optimistic") || mode == keccak256("threshold"),
+            "MINT_MODE: optimistic|threshold"
+        );
 
         r.deployBlock = block.number + 1;
         vm.startBroadcast();
         (, address deployer,) = vm.readCallers();
-        uint64 nonce = vm.getNonce(deployer);
-        address predicted = vm.computeCreateAddress(deployer, nonce + 1);
+        address predicted = vm.computeCreateAddress(deployer, vm.getNonce(deployer) + 1);
 
-        // casting to uint8 is safe: threshold <= type(uint8).max is required above.
+        // casting is safe: both bounds are required above.
         // forge-lint: disable-next-item(unsafe-typecast)
-        WyecBridge bridge = optimistic
-            ? new OptimisticMintBridge(IWrappedYcash(predicted), guardians, uint8(threshold), window)
-            : new WyecBridge(IWrappedYcash(predicted), guardians, uint8(threshold));
+        WyecBridge bridge = new WyecBridge(
+            IWrappedYcash(predicted),
+            c.guardians,
+            uint8(c.threshold),
+            uint64(c.challengeWindow),
+            c.mintCap,
+            c.capWindow
+        );
         WrappedYcash token = new WrappedYcash(address(bridge));
         vm.stopBroadcast();
 
@@ -91,17 +105,19 @@ contract Deploy is Script {
         vm.serializeAddress(o, "bridge", r.bridge);
         vm.serializeAddress(o, "token", r.token);
         vm.serializeUint(o, "deployBlock", r.deployBlock);
-        vm.serializeAddress(o, "guardians", guardians);
-        vm.serializeUint(o, "threshold", threshold);
-        vm.serializeUint(o, "challengeWindow", optimistic ? uint256(window) : 0);
-        string memory json = vm.serializeString(o, "mintMode", mode);
+        vm.serializeAddress(o, "guardians", c.guardians);
+        vm.serializeUint(o, "threshold", c.threshold);
+        vm.serializeString(o, "mintMode", c.mintMode);
+        vm.serializeUint(o, "challengeWindow", c.challengeWindow);
+        vm.serializeUint(o, "mintCap", c.mintCap);
+        string memory json = vm.serializeUint(o, "capWindow", c.capWindow);
+        vm.writeJson(json, c.file);
 
-        string memory path = c.file;
-        vm.writeJson(json, path);
         console.log("deployer   ", deployer);
         console.log("bridge     ", r.bridge);
         console.log("token      ", r.token);
         console.log("deployBlock", r.deployBlock);
-        console.log("written    ", path);
+        console.log("mintMode   ", c.mintMode);
+        console.log("written    ", c.file);
     }
 }

@@ -11,8 +11,10 @@ import {IWrappedYcash, WyecBridge} from "wyec/WyecBridge.sol";
 import {BridgeTestBase} from "./utils/BridgeTestBase.sol";
 import {WyecEip712} from "./utils/WyecEip712.sol";
 
-/// Hawkeye's assumptions about wyec at the pinned commit (plan §7 "Contract assumptions"). Each test
-/// names the assumption; a failure here means Hawkeye's model of the contract is wrong.
+/// Hawkeye's assumptions about wyec at the pinned commit (plan §7 "Contract assumptions"): the
+/// deployment, the threshold mint, burn, pause, rotation and hand-off. The optimistic path is in
+/// OptimisticMint.t.sol. Each test names the assumption; a failure here means Hawkeye's model of the
+/// contract is wrong.
 contract WyecBridgeTest is BridgeTestBase {
     bytes32 constant LOCK = keccak256("lock-1");
     uint256 constant AMOUNT = 5e8;
@@ -21,6 +23,7 @@ contract WyecBridgeTest is BridgeTestBase {
     event BurnToYcash(uint256 indexed nonce, address indexed from, uint256 amount, bytes32 ycashRecipient);
     event GuardiansChanged(address[] guardians, uint8 threshold);
     event BridgeChanged(address indexed previousBridge, address indexed newBridge);
+    event MintLimitChanged(uint256 mintCap, uint256 capWindow);
 
     // ------------------------------------------------------------------ deployment
 
@@ -56,16 +59,38 @@ contract WyecBridgeTest is BridgeTestBase {
         address[] memory g = new address[](2);
         g[0] = address(1);
         g[1] = address(2);
+        IWrappedYcash t = IWrappedYcash(address(token));
         vm.expectRevert(WyecBridge.BadGuardianSet.selector);
-        new WyecBridge(IWrappedYcash(address(token)), g, 0);
+        new WyecBridge(t, g, 0, WINDOW, 0, 0);
         vm.expectRevert(WyecBridge.BadGuardianSet.selector);
-        new WyecBridge(IWrappedYcash(address(token)), g, 3);
+        new WyecBridge(t, g, 3, WINDOW, 0, 0);
         g[1] = address(1);
         vm.expectRevert(WyecBridge.BadGuardianSet.selector);
-        new WyecBridge(IWrappedYcash(address(token)), g, 1);
+        new WyecBridge(t, g, 1, WINDOW, 0, 0);
         g[1] = address(0);
         vm.expectRevert(WyecBridge.BadGuardianSet.selector);
-        new WyecBridge(IWrappedYcash(address(token)), g, 1);
+        new WyecBridge(t, g, 1, WINDOW, 0, 0);
+    }
+
+    /// The constructor's optimistic parameters (Deploy.s.sol checks the same before broadcasting):
+    /// a zero challenge window and a cap without a window are refused; the window is immutable and
+    /// readable, and the constructor emits MintLimitChanged.
+    function test_Constructor_WindowAndMintLimit() public {
+        IWrappedYcash t = IWrappedYcash(address(token));
+        vm.expectRevert(WyecBridge.ZeroChallengeWindow.selector);
+        new WyecBridge(t, guardianAddrs, 2, 0, 0, 0);
+        vm.expectRevert(WyecBridge.BadMintLimit.selector);
+        new WyecBridge(t, guardianAddrs, 2, WINDOW, 1, 0);
+        vm.expectEmit(false, false, false, true);
+        emit MintLimitChanged(5e8, 86400);
+        WyecBridge b = new WyecBridge(t, guardianAddrs, 2, 12, 5e8, 86400);
+        assertEq(b.challengeWindow(), 12);
+        assertEq(b.mintCap(), 5e8);
+        assertEq(b.capWindow(), 86400);
+        assertEq(bridge.challengeWindow(), WINDOW);
+        assertEq(bridge.mintCap(), 0);
+        assertEq(bridge.mintAvailable(), type(uint256).max);
+        assertEq(bridge.proposalCount(), 0);
     }
 
     // ------------------------------------------------------------------ mint
@@ -448,7 +473,7 @@ contract WyecBridgeTest is BridgeTestBase {
         bridge.setBridge(address(0), sigs);
     }
 
-    /// One adminNonce is shared by setGuardians, setPaused and setBridge.
+    /// One adminNonce is shared by setGuardians, setPaused, setMintLimit and setBridge.
     function test_AdminNonce_SharedAcrossActs() public {
         bridge.setPaused(true, signedSetPaused(true));
         bytes32 d =
@@ -457,5 +482,12 @@ contract WyecBridgeTest is BridgeTestBase {
         assertEq(bridge.adminNonce(), 2);
         bridge.setPaused(false, signedSetPaused(false));
         assertEq(bridge.adminNonce(), 3);
+        d = WyecEip712.digest(domainOf(address(bridge)), WyecEip712.setMintLimitStruct(7, 60, 3));
+        vm.expectEmit(false, false, false, true, address(bridge));
+        emit MintLimitChanged(7, 60);
+        bridge.setMintLimit(7, 60, signSorted(guardianPair(), d));
+        assertEq(bridge.adminNonce(), 4);
+        assertEq(bridge.mintCap(), 7);
+        assertEq(bridge.capWindow(), 60);
     }
 }

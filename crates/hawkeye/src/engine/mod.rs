@@ -6,12 +6,15 @@
 //! 1. **set** — `set_getinfo`: live members (leader schedule, §5.2), this attestor's standing;
 //! 2. **ycash** ([`ycash`]) — follow the active chain block by block (reorgs rewind the ledger,
 //!    §5.4): `WYEC` vaults, new locks, intents created, cancelled and released;
-//! 3. **eth** ([`mint`]) — finalized `BurnToYcash` / `Minted` events; every `Minted` must match a
-//!    policy-OK lock (watcher, §5.3 step 2);
+//! 3. **eth** ([`mint`]) — finalized `BurnToYcash` / `Minted` / `MintProposed` events; every
+//!    `Minted` and every optimistic proposal must match a policy-OK lock (watcher, §5.3 step 2):
+//!    a proposal that does not is challenged within the contract's window (sign-once), in every
+//!    mint mode;
 //! 4. **watch** ([`watch`]) — every intent of the set (blocks, `vault_list`, mempool) classified
 //!    (§3.2); unmatched ones cancelled once (sign-once) and their signer put in a slash case;
 //!    equivocations submitted;
-//! 5. **locks / mint** ([`mint`]) — lock policy after `C_Y`, EIP-712 sign-once, leader submits;
+//! 5. **locks / mint** ([`mint`]) — lock policy after `C_Y`, EIP-712 sign-once; the leader mints
+//!    (threshold mode) or proposes and later executes (optimistic mode);
 //! 6. **burns** ([`burn`]) — leader assignment and takeover, rate limit, unlock with the `HKB1`
 //!    memo, release after the delay;
 //! 7. **rolls** ([`roll`]) — vaults within `ROLL_MARGIN` of `ownerHeight` are unlocked by the
@@ -157,6 +160,15 @@ pub(crate) struct Memory {
     pub no_vault_logged: HashSet<u64>,
     pub own_logged: HashSet<CoreOutPoint>,
     pub wyec_supply: u128,
+    /// The bridge's challenge window (read once).
+    pub challenge_window: Option<u64>,
+    /// Challenges known submitted or moot (their proposal is gone).
+    pub challenges_done: mint::ProposalKeys,
+    /// Own deliberate (drill) proposals already logged as left to the others.
+    pub own_proposals_logged: mint::ProposalKeys,
+    /// Once-only warnings about a lock's proposals (a mismatching one holding it, no eligible
+    /// proposer, the rate limit).
+    pub squat_logged: mint::ProposalKeys,
 }
 
 /// The engine.

@@ -3,11 +3,10 @@
 //! at the commit pinned in `eth/tools/fetch-wyec.sh`; `export-abi.sh --check` proves they are
 //! current. Nothing here is hand-written ABI.
 //!
-//! - [`WyecBridge`]: the bridge of record (k-of-n `mint`, `burn`, admin acts).
+//! - [`WyecBridge`]: the bridge of record: the threshold `mint`, the optimistic `proposeMint` /
+//!   `challengeMint` / `executeMint` (wyec-contract-design.md §4.5), the mint rate limit, `burn`,
+//!   admin acts.
 //! - [`WrappedYcash`]: the wYEC token (ERC-20 + ERC-7802, 8 decimals, capped).
-//! - [`OptimisticMintBridge`]: Hawkeye's **test double** for change request CR-W1
-//!   (`eth/test/mocks/OptimisticMintBridge.sol`): WyecBridge plus `proposeMint` /
-//!   `challengeMint` / `executeMint`. Not a contract of record; anvil only.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -27,23 +26,11 @@ sol!(
     "abi/WrappedYcash.json"
 );
 
-sol!(
-    #[sol(rpc)]
-    #[derive(Debug, PartialEq, Eq)]
-    OptimisticMintBridge,
-    "abi/OptimisticMintBridge.json"
-);
-
 /// Decodes a revert into the custom error's name and fields, trying the bridge's own errors, the
-/// optimistic double's, the token's (they bubble up through `crosschainMint`/`crosschainBurn`) and
-/// a plain `Error(string)`. `None` when the error carries no revert data at all.
+/// token's (they bubble up through `crosschainMint`/`crosschainBurn`) and a plain `Error(string)`.
+/// `None` when the error carries no revert data at all.
 pub fn decode_revert(e: &alloy::contract::Error) -> Option<String> {
     if let Some(err) = e.as_decoded_interface_error::<WyecBridge::WyecBridgeErrors>() {
-        return Some(format!("{err:?}"));
-    }
-    if let Some(err) =
-        e.as_decoded_interface_error::<OptimisticMintBridge::OptimisticMintBridgeErrors>()
-    {
         return Some(format!("{err:?}"));
     }
     if let Some(err) = e.as_decoded_interface_error::<WrappedYcash::WrappedYcashErrors>() {

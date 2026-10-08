@@ -1,7 +1,8 @@
 //! Integration tests against a local anvil (plan §7 "Ethereum adapter"): deploy wYEC from the
 //! forge-built artifacts in the predicted-address order, mint with 1-of-1 and 2-of-3 EIP-712
-//! signatures made by this crate, burn and scan as finalized, and the CR-W1 optimistic flow on the
-//! test double. Each test spawns its own anvil with `--slots-in-an-epoch 1` (so `finalized` is
+//! signatures made by this crate, burn and scan as finalized, and the optimistic flow
+//! (`proposeMint` → `challengeMint` → re-proposal → `executeMint`) with the challenge as an EIP-712
+//! signature submitted by an account that is not a guardian. Each test spawns its own anvil with `--slots-in-an-epoch 1` (so `finalized` is
 //! `latest − 2`) and is skipped, not failed, when `anvil` is not on PATH — unless
 //! `HAWKEYE_REQUIRE_ANVIL=1` (CI), which turns a missing anvil into a failure.
 
@@ -11,8 +12,9 @@ use alloy::node_bindings::{Anvil, AnvilInstance};
 use alloy::providers::{DynProvider, Provider};
 use hawkeye_eth::eip712;
 use hawkeye_eth::{
-    Address, B256, BridgeEvent, Bytes, Deployment, Error, EthClient, EthConfig, Finality, MintMode,
-    MintSubmitted, PrivateKeySigner, Scanner, U256, deploy, wallet_provider,
+    Address, B256, BridgeEvent, Bytes, DeployParams, Deployment, Error, EthClient, EthConfig,
+    Finality, MintMode, MintSubmitted, PrivateKeySigner, ProposalStatus, Scanner, U256, deploy,
+    wallet_provider,
 };
 
 struct Env {
@@ -34,7 +36,7 @@ fn key(anvil: &AnvilInstance, i: usize) -> PrivateKeySigner {
     PrivateKeySigner::from_bytes(&B256::from_slice(&anvil.keys()[i].to_bytes())).unwrap()
 }
 
-/// anvil + a deployment with guardians = anvil accounts 1..=n (funded, so they can challenge).
+/// anvil + a deployment with guardians = anvil accounts 1..=n and a 60 s challenge window.
 async fn setup(n: usize, k: u8, mode: MintMode) -> Option<Env> {
     if !on_path("anvil") {
         assert!(
@@ -52,9 +54,13 @@ async fn setup(n: usize, k: u8, mode: MintMode) -> Option<Env> {
     let guardians: Vec<PrivateKeySigner> = (1..=n).map(|i| key(&anvil, i)).collect();
     let addrs: Vec<Address> = guardians.iter().map(|g| g.address()).collect();
     let p = wallet_provider(&anvil.endpoint(), deployer.clone()).unwrap();
-    let dep = deploy(&p, deployer.address(), &addrs, k, mode, 60)
-        .await
-        .expect("deploy");
+    let dep = deploy(
+        &p,
+        deployer.address(),
+        &DeployParams::new(&addrs, k, 60, mode),
+    )
+    .await
+    .expect("deploy");
     assert_eq!(
         dep.bridge,
         deployer.address().create(0),
@@ -263,14 +269,15 @@ async fn burn_is_scanned_once_finalized() {
         .iter()
         .map(|e| match e.event {
             BridgeEvent::GuardiansChanged { .. } => "guardians",
+            BridgeEvent::MintLimitChanged { .. } => "limit",
             BridgeEvent::Minted { .. } => "minted",
             BridgeEvent::Burn { .. } => "burn",
             _ => "other",
         })
         .collect();
-    assert_eq!(kinds, ["guardians", "minted", "burn"]);
+    assert_eq!(kinds, ["guardians", "limit", "minted", "burn"]);
     assert_eq!(
-        all[1].event,
+        all[2].event,
         BridgeEvent::Minted {
             lock_id: lock(9),
             to: holder,
@@ -289,21 +296,35 @@ async fn burn_is_scanned_once_finalized() {
     );
 }
 
+async fn warp(p: &DynProvider, seconds: u64) {
+    let _: serde_json::Value = p
+        .raw_request(Cow::Borrowed("evm_increaseTime"), (U256::from(seconds),))
+        .await
+        .unwrap();
+    mine(p, 1).await;
+}
+
 #[tokio::test]
 async fn optimistic_propose_challenge_execute() {
     let Some(env) = setup(3, 2, MintMode::Optimistic).await else {
         return;
     };
+    // The deployer's client submits everything: guardians only sign (they need no ETH).
     let c = &env.client;
     let g = &env.guardians;
     assert_eq!(c.challenge_window().await.unwrap(), 60);
+    assert_eq!(c.proposal_count().await.unwrap(), 0);
     let to = Address::repeat_byte(0x55);
     let amount = U256::from(42u64);
     let d = c.mint_digest(lock(5), amount, to);
     let mut scanner = Scanner::new(env.dep.deploy_block);
 
-    // One guardian's signature opens a proposal.
-    let MintSubmitted::Proposed { executable_at, .. } = c
+    // One guardian's Mint signature opens proposal 1.
+    let MintSubmitted::Proposed {
+        proposal_id: id1,
+        eta: eta1,
+        ..
+    } = c
         .submit_mint(
             MintMode::Optimistic,
             lock(5),
@@ -316,44 +337,77 @@ async fn optimistic_propose_challenge_execute() {
     else {
         panic!("expected a proposal")
     };
+    assert_eq!(id1, 1);
     let prop = c.proposal(lock(5)).await.unwrap().unwrap();
     assert_eq!(
-        (prop.amount, prop.to, prop.proposer),
-        (amount, to, g[0].address())
+        (prop.id, prop.amount, prop.to, prop.proposer, prop.eta),
+        (1, amount, to, g[0].address(), eta1)
     );
-    assert_eq!(prop.executable_at, executable_at);
+    assert_eq!(
+        c.proposal_status(lock(5)).await.unwrap(),
+        ProposalStatus::Pending
+    );
+    // A second (matching) proposal by another guardian: ProposalPending.
+    let e = c
+        .propose_mint(lock(5), amount, to, &sigs(&[&g[1]], d)[0])
+        .await
+        .unwrap_err();
+    assert!(e.is_revert("ProposalPending"), "{e}");
 
-    // Another guardian challenges it from its own account.
-    let challenger = connect(&env.anvil, &env.dep, Some(g[1].clone())).await;
-    challenger.challenge_mint(lock(5)).await.unwrap();
+    // g1 challenges proposal 1 by signature; the deployer submits it.
+    let cd = c.challenge_digest(lock(5), id1);
+    let veto = eip712::sign_digest(&g[1], cd).unwrap();
+    // a non-guardian's challenge signature is refused by the contract
+    let outsider = eip712::sign_digest(&PrivateKeySigner::random(), cd).unwrap();
+    let e = c.challenge_mint(lock(5), id1, &outsider).await.unwrap_err();
+    assert!(e.is_revert("NotGuardian"), "{e}");
+    c.challenge_mint(lock(5), id1, &veto).await.unwrap();
     assert_eq!(c.proposal(lock(5)).await.unwrap(), None);
-    // A non-guardian cannot.
-    assert!(reason(c.challenge_mint(lock(5)).await.unwrap_err()).contains("NotGuardian"));
+    assert!(c.vetoed(lock(5), g[0].address()).await.unwrap());
+    assert!(!c.consumed(lock(5)).await.unwrap());
+    // gone: a second challenge of the same proposal reverts NoProposal
+    let e = c.challenge_mint(lock(5), id1, &veto).await.unwrap_err();
+    assert!(e.is_revert("NoProposal"), "{e}");
+    // the challenged proposer's (public) signature cannot be replayed: ProposerVetoed
+    let e = c
+        .propose_mint(lock(5), amount, to, &sigs(&[&g[0]], d)[0])
+        .await
+        .unwrap_err();
+    assert!(e.is_revert("ProposerVetoed"), "{e}");
 
-    // Re-proposed (by another guardian's signature); too early to execute.
-    let (_, at) = c
+    // Re-proposed by another guardian: a fresh id; the old challenge cannot touch it.
+    let MintSubmitted::Proposed {
+        proposal_id: id2,
+        eta: eta2,
+        ..
+    } = c
         .propose_mint(lock(5), amount, to, &sigs(&[&g[2]], d)[0])
         .await
-        .unwrap();
-    assert!(reason(c.execute_mint(lock(5)).await.unwrap_err()).contains("ChallengeWindowOpen"));
+        .unwrap()
+    else {
+        panic!("expected a proposal")
+    };
+    assert_eq!(id2, 2);
+    let e = c.challenge_mint(lock(5), id1, &veto).await.unwrap_err();
+    assert!(e.is_revert("NoProposal"), "{e}");
+    let e = c.execute_mint(lock(5)).await.unwrap_err();
+    assert!(e.is_revert("ChallengeWindowOpen"), "{e}");
 
     let p = c.provider();
-    let _: serde_json::Value = p
-        .raw_request(Cow::Borrowed("evm_increaseTime"), (U256::from(60),))
-        .await
-        .unwrap();
-    mine(p, 1).await;
-    let now = p
-        .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
-        .await
-        .unwrap()
-        .unwrap()
-        .header
-        .timestamp;
-    assert!(now >= at);
+    warp(p, 60).await;
+    assert!(c.latest_timestamp().await.unwrap() >= eta2);
+    assert_eq!(
+        c.proposal_status(lock(5)).await.unwrap(),
+        ProposalStatus::Ready
+    );
+    // anyone executes: a read-write client of an account that is no guardian at all
     c.execute_mint(lock(5)).await.unwrap();
     assert_eq!(c.balance_of(to).await.unwrap(), amount);
     assert!(c.consumed(lock(5)).await.unwrap());
+    assert_eq!(
+        c.proposal_status(lock(5)).await.unwrap(),
+        ProposalStatus::None
+    );
 
     mine(p, 2).await;
     let events: Vec<BridgeEvent> = scanner
@@ -363,29 +417,36 @@ async fn optimistic_propose_challenge_execute() {
         .events
         .into_iter()
         .map(|e| e.event)
-        .filter(|e| !matches!(e, BridgeEvent::GuardiansChanged { .. }))
+        .filter(|e| {
+            !matches!(
+                e,
+                BridgeEvent::GuardiansChanged { .. } | BridgeEvent::MintLimitChanged { .. }
+            )
+        })
         .collect();
     assert_eq!(
         events,
         vec![
             BridgeEvent::MintProposed {
                 lock_id: lock(5),
+                proposal_id: 1,
+                proposer: g[0].address(),
                 to,
                 amount,
-                proposer: g[0].address(),
-                executable_at
+                eta: eta1
             },
             BridgeEvent::MintChallenged {
                 lock_id: lock(5),
+                proposal_id: 1,
                 challenger: g[1].address(),
-                proposer: g[0].address()
             },
             BridgeEvent::MintProposed {
                 lock_id: lock(5),
+                proposal_id: 2,
+                proposer: g[2].address(),
                 to,
                 amount,
-                proposer: g[2].address(),
-                executable_at: at
+                eta: eta2
             },
             BridgeEvent::Minted {
                 lock_id: lock(5),
@@ -394,6 +455,52 @@ async fn optimistic_propose_challenge_execute() {
             },
         ]
     );
+}
+
+/// The rate limit (an admin act) applies at execute: a proposal over the remaining budget stays
+/// Ready, `executeMint` reverts `MintRateLimited`, and it executes in the next window.
+#[tokio::test]
+async fn optimistic_rate_limit_at_execute() {
+    let Some(env) = setup(3, 2, MintMode::Optimistic).await else {
+        return;
+    };
+    let c = &env.client;
+    let g = &env.guardians;
+    assert_eq!(
+        c.mint_limit().await.unwrap(),
+        (U256::ZERO, U256::ZERO),
+        "no limit at deploy"
+    );
+    assert_eq!(c.mint_available().await.unwrap(), U256::MAX);
+    let n = c.admin_nonce().await.unwrap();
+    let ld =
+        eip712::set_mint_limit_digest(31337, env.dep.bridge, U256::from(10), U256::from(3600), n);
+    c.set_mint_limit(U256::from(10), U256::from(3600), &sigs(&[&g[0], &g[1]], ld))
+        .await
+        .unwrap();
+    assert_eq!(c.mint_available().await.unwrap(), U256::from(10));
+
+    let to = Address::repeat_byte(0x66);
+    let d = c.mint_digest(lock(7), U256::from(11), to);
+    c.propose_mint(lock(7), U256::from(11), to, &sigs(&[&g[0]], d)[0])
+        .await
+        .unwrap();
+    warp(c.provider(), 60).await;
+    let e = c.execute_mint(lock(7)).await.unwrap_err();
+    assert!(e.is_revert("MintRateLimited"), "{e}");
+    assert_eq!(
+        c.proposal_status(lock(7)).await.unwrap(),
+        ProposalStatus::Ready
+    );
+    // a smaller one fits
+    let d8 = c.mint_digest(lock(8), U256::from(10), to);
+    c.propose_mint(lock(8), U256::from(10), to, &sigs(&[&g[1]], d8)[0])
+        .await
+        .unwrap();
+    warp(c.provider(), 60).await;
+    c.execute_mint(lock(8)).await.unwrap();
+    assert_eq!(c.balance_of(to).await.unwrap(), U256::from(10));
+    assert_eq!(c.mint_available().await.unwrap(), U256::ZERO);
 }
 
 #[tokio::test]

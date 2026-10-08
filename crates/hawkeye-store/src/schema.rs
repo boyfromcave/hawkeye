@@ -4,7 +4,7 @@
 //! a released migration is never edited; a change is a new entry.
 
 /// Every migration, in order. Entry `i` takes `user_version` from `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// Version 1: the H4 ledger.
 const V1: &str = r#"
@@ -265,4 +265,45 @@ CREATE TABLE equivocations_sent (
     at            INTEGER NOT NULL,
     PRIMARY KEY (prevout_txid, prevout_vout, member_key)
 ) WITHOUT ROWID;
+"#;
+
+/// Version 3: sign-once records for the optimistic mint's other EIP-712 signatures (wyec @
+/// `cad126a`, wyec-contract-design.md §4.5): `Challenge(lockId, proposalId)` vetoes, and the
+/// `Mint` signatures of the `rogue-mint` drill (no lock behind them, so not in `sign_once_mint`).
+const V3: &str = r#"
+-- Sign-once, EIP-712 Challenge: one signature per (lockId, proposalId), ever. proposal_id is the
+-- contract's uint96 counter as a decimal string (it exceeds SQLite's INTEGER). The proposal
+-- judged (proposer, amount, recipient) is kept with it: what was vetoed and why.
+CREATE TABLE sign_once_challenge (
+    lock_id      BLOB    NOT NULL CHECK (length(lock_id) = 32),
+    proposal_id  TEXT    NOT NULL CHECK (proposal_id GLOB '[1-9]*' AND proposal_id NOT GLOB '*[^0-9]*'
+                                         AND length(proposal_id) <= 29),
+    proposer     BLOB    NOT NULL CHECK (length(proposer) = 20),
+    amount       INTEGER NOT NULL CHECK (amount >= 0),
+    recipient    BLOB    NOT NULL CHECK (length(recipient) = 20),
+    reason       TEXT    NOT NULL,
+    digest       BLOB    NOT NULL CHECK (length(digest) = 32),
+    signature    BLOB    NOT NULL CHECK (length(signature) = 65),
+    signed_at    INTEGER NOT NULL,
+    PRIMARY KEY (lock_id, proposal_id)
+) WITHOUT ROWID;
+
+-- Sign-once, the drill-only rogue Mint (drill D-5, `hawkeye rogue-mint`): one per lockId.
+CREATE TABLE sign_once_drill_mint (
+    lock_id    BLOB    PRIMARY KEY CHECK (length(lock_id) = 32),
+    amount     INTEGER NOT NULL CHECK (amount >= 0),
+    recipient  BLOB    NOT NULL CHECK (length(recipient) = 20),
+    digest     BLOB    NOT NULL CHECK (length(digest) = 32),
+    signature  BLOB    NOT NULL CHECK (length(signature) = 65),
+    signed_at  INTEGER NOT NULL
+) WITHOUT ROWID;
+
+CREATE TRIGGER sign_once_challenge_immutable_update BEFORE UPDATE ON sign_once_challenge
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_challenge_immutable_delete BEFORE DELETE ON sign_once_challenge
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_drill_mint_immutable_update BEFORE UPDATE ON sign_once_drill_mint
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_drill_mint_immutable_delete BEFORE DELETE ON sign_once_drill_mint
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
 "#;

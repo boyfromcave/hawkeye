@@ -10,7 +10,7 @@ use alloy::rpc::types::TransactionReceipt;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::transports::http::reqwest::Url;
 
-use crate::bindings::{OptimisticMintBridge, WrappedYcash, WyecBridge};
+use crate::bindings::{WrappedYcash, WyecBridge};
 use crate::eip712;
 use crate::scanner::Finality;
 use crate::{Error, MintMode, Result};
@@ -22,7 +22,7 @@ pub struct EthConfig {
     pub url: String,
     /// The chain id the endpoint must report (`eth_chainId`); a mismatch refuses to connect.
     pub chain_id: u64,
-    /// The `WyecBridge` (or, on anvil, the optimistic double).
+    /// The `WyecBridge`.
     pub bridge: Address,
     /// The wYEC token; when set it must equal `bridge.token()` and have `bridge()` == `bridge`.
     pub token: Option<Address>,
@@ -63,14 +63,30 @@ pub struct Burned {
     pub nonce: U256,
 }
 
-/// A pending optimistic proposal (CR-W1 double).
+/// An optimistic proposal as the contract holds it (`getProposal`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proposal {
+    /// The contract's unique, non-zero proposal id (a `uint96` counter).
+    pub id: u128,
     pub amount: U256,
     pub to: Address,
+    /// The guardian whose `Mint` signature opened it.
     pub proposer: Address,
-    /// Unix seconds from which `executeMint` succeeds.
-    pub executable_at: u64,
+    /// Unix seconds from which `executeMint` succeeds (`proposal time + challengeWindow`).
+    pub eta: u64,
+}
+
+/// What `executeMint(lockId)` would find now (`proposalStatus`; pause and rate limit aside).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProposalStatus {
+    /// No proposal for the lockId.
+    None,
+    /// Inside the challenge window.
+    Pending,
+    /// The window has passed and the proposer is still a guardian: executable.
+    Ready,
+    /// The proposer left the guardian set: not executable; any current guardian may re-propose.
+    Void,
 }
 
 /// What [`EthClient::submit_mint`] did.
@@ -78,8 +94,12 @@ pub struct Proposal {
 pub enum MintSubmitted {
     /// `mint` with k signatures: minted.
     Minted(Mined),
-    /// `proposeMint`: the proposal is open until `executable_at`.
-    Proposed { mined: Mined, executable_at: u64 },
+    /// `proposeMint`: proposal `proposal_id` is open until `eta`.
+    Proposed {
+        mined: Mined,
+        proposal_id: u128,
+        eta: u64,
+    },
 }
 
 /// The guardian set as the contract holds it now.
@@ -189,16 +209,17 @@ impl EthClient {
     pub fn token(&self) -> WrappedYcash::WrappedYcashInstance<DynProvider> {
         WrappedYcash::new(self.token, self.provider.clone())
     }
-    /// The bridge as the CR-W1 optimistic double (calls fail on the real WyecBridge).
-    pub fn optimistic(&self) -> OptimisticMintBridge::OptimisticMintBridgeInstance<DynProvider> {
-        OptimisticMintBridge::new(self.bridge, self.provider.clone())
-    }
 
     // ------------------------------------------------------------------ digests
 
     /// The EIP-712 Mint digest for this deployment.
     pub fn mint_digest(&self, lock_id: B256, amount: U256, to: Address) -> B256 {
         eip712::mint_digest(self.chain_id, self.bridge, lock_id, amount, to)
+    }
+
+    /// The EIP-712 Challenge digest for proposal `proposal_id` of `lock_id` on this deployment.
+    pub fn challenge_digest(&self, lock_id: B256, proposal_id: u128) -> B256 {
+        eip712::challenge_digest(self.chain_id, self.bridge, lock_id, U256::from(proposal_id))
     }
 
     // ------------------------------------------------------------------ reads
@@ -254,20 +275,64 @@ impl EthClient {
         Ok(self.token().balanceOf(who).call().await?)
     }
 
-    /// The pending optimistic proposal for `lockId`, if any (CR-W1 double).
+    /// The live or void optimistic proposal for `lockId`, if any (`getProposal`).
     pub async fn proposal(&self, lock_id: B256) -> Result<Option<Proposal>> {
-        let p = self.optimistic().proposals(lock_id).call().await?;
-        Ok((p.proposer != Address::ZERO).then_some(Proposal {
+        let p = self.bridge().getProposal(lock_id).call().await?;
+        let id: u128 = p.id.to();
+        Ok((id != 0).then_some(Proposal {
+            id,
             amount: p.amount,
             to: p.to,
             proposer: p.proposer,
-            executable_at: p.executableAt,
+            eta: p.eta,
         }))
     }
 
-    /// The optimistic double's challenge window, seconds.
+    /// `proposalStatus(lockId)`.
+    pub async fn proposal_status(&self, lock_id: B256) -> Result<ProposalStatus> {
+        let s: u8 = self.bridge().proposalStatus(lock_id).call().await?;
+        Ok(match s {
+            0 => ProposalStatus::None,
+            1 => ProposalStatus::Pending,
+            2 => ProposalStatus::Ready,
+            3 => ProposalStatus::Void,
+            other => return Err(Error::Rpc(format!("proposalStatus {other} out of range"))),
+        })
+    }
+
+    /// The bridge's immutable challenge window, seconds.
     pub async fn challenge_window(&self) -> Result<u64> {
-        Ok(self.optimistic().challengeWindow().call().await?)
+        Ok(self.bridge().challengeWindow().call().await?)
+    }
+
+    /// Whether `who`'s proposal for `lockId` was challenged (it may not propose that lock again).
+    pub async fn vetoed(&self, lock_id: B256, who: Address) -> Result<bool> {
+        Ok(self.bridge().vetoed(lock_id, who).call().await?)
+    }
+
+    /// The last proposal id issued (0 = none yet).
+    pub async fn proposal_count(&self) -> Result<u128> {
+        Ok(self.bridge().proposalCount().call().await?.to())
+    }
+
+    /// `(mintCap, capWindow)`; a cap of 0 means no limit.
+    pub async fn mint_limit(&self) -> Result<(U256, U256)> {
+        let b = self.bridge();
+        Ok((b.mintCap().call().await?, b.capWindow().call().await?))
+    }
+
+    /// Base units mintable now under the rate limit (`U256::MAX` without one).
+    pub async fn mint_available(&self) -> Result<U256> {
+        Ok(self.bridge().mintAvailable().call().await?)
+    }
+
+    /// The latest block's timestamp (the clock `eta` is compared with).
+    pub async fn latest_timestamp(&self) -> Result<u64> {
+        Ok(self
+            .provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await?
+            .map_or(0, |b| b.header.timestamp))
     }
 
     // ------------------------------------------------------------------ mint
@@ -290,7 +355,8 @@ impl EthClient {
     }
 
     /// Submits a mint the configured way: `Threshold { k }` needs at least `k` signatures and
-    /// calls `mint`; `Optimistic` calls `proposeMint` with the first signature.
+    /// calls `mint`; `Optimistic` calls `proposeMint` with the first signature (the caller's own,
+    /// from its sign-once record).
     pub async fn submit_mint<S: AsRef<[u8]>>(
         &self,
         mode: MintMode,
@@ -311,50 +377,68 @@ impl EthClient {
                 self.mint(lock_id, amount, to, sigs).await?,
             )),
             MintMode::Optimistic => {
-                let (mined, executable_at) = self
-                    .propose_mint(lock_id, amount, to, sigs[0].as_ref())
-                    .await?;
-                Ok(MintSubmitted::Proposed {
-                    mined,
-                    executable_at,
-                })
+                self.propose_mint(lock_id, amount, to, sigs[0].as_ref())
+                    .await
             }
         }
     }
 
-    /// `proposeMint(lockId, amount, to, sig)` (CR-W1 double). Returns the proposal's
-    /// `executableAt` from its `MintProposed` log.
+    /// `proposeMint(lockId, amount, to, sig)`: one guardian's `Mint` signature opens a proposal.
+    /// The sender only pays gas; the proposer is the signer. Returns the id and `eta` from the
+    /// `MintProposed` log. Reverts (see [`Error::is_revert`]): `ProposalPending` (a live proposal
+    /// exists, possibly a matching one), `ProposerVetoed` (this signer's proposal for the lock was
+    /// challenged), `LockConsumed`, `NotGuardian`, `EnforcedPause`.
     pub async fn propose_mint(
         &self,
         lock_id: B256,
         amount: U256,
         to: Address,
         sig: &[u8],
-    ) -> Result<(Mined, u64)> {
+    ) -> Result<MintSubmitted> {
         eip712::recover(self.mint_digest(lock_id, amount, to), sig)?;
         let r = self
             .send(
-                self.optimistic()
+                self.bridge()
                     .proposeMint(lock_id, amount, to, Bytes::copy_from_slice(sig)),
             )
             .await?;
         let ev = r
-            .decoded_log::<OptimisticMintBridge::MintProposed>()
+            .decoded_log::<WyecBridge::MintProposed>()
             .ok_or(Error::MissingLog {
                 event: "MintProposed",
                 tx: r.transaction_hash,
             })?;
-        Ok((mined(&r)?, ev.data.executableAt))
+        Ok(MintSubmitted::Proposed {
+            mined: mined(&r)?,
+            proposal_id: ev.data.proposalId.to(),
+            eta: ev.data.eta,
+        })
     }
 
-    /// `challengeMint(lockId)` (CR-W1 double): the sender must be a guardian.
-    pub async fn challenge_mint(&self, lock_id: B256) -> Result<Mined> {
-        mined(&self.send(self.optimistic().challengeMint(lock_id)).await?)
+    /// `challengeMint(lockId, proposalId, sig)`: `sig` is a guardian's EIP-712 `Challenge`
+    /// signature (from the caller's sign-once record); the sender only pays gas. Works while
+    /// paused. Reverts `NoProposal` if the proposal is gone (executed, challenged, replaced).
+    pub async fn challenge_mint(
+        &self,
+        lock_id: B256,
+        proposal_id: u128,
+        sig: &[u8],
+    ) -> Result<Mined> {
+        eip712::recover(self.challenge_digest(lock_id, proposal_id), sig)?;
+        let bridge = self.bridge();
+        let call = bridge.challengeMint(
+            lock_id,
+            U256::from(proposal_id),
+            Bytes::copy_from_slice(sig),
+        );
+        mined(&self.send(call).await?)
     }
 
-    /// `executeMint(lockId)` (CR-W1 double): anyone, after the window.
+    /// `executeMint(lockId)`: anyone, once the window has passed. Reverts
+    /// `ChallengeWindowOpen(eta)`, `ProposerNotGuardian` (void), `MintRateLimited` (retry in a
+    /// later window), `NoProposal`.
     pub async fn execute_mint(&self, lock_id: B256) -> Result<Mined> {
-        mined(&self.send(self.optimistic().executeMint(lock_id)).await?)
+        mined(&self.send(self.bridge().executeMint(lock_id)).await?)
     }
 
     // ------------------------------------------------------------------ burn (CLI / devnet)
@@ -406,6 +490,25 @@ impl EthClient {
                     self.bridge()
                         .setGuardians(guardians.to_vec(), threshold, sigs),
                 )
+                .await?,
+        )
+    }
+
+    /// `setMintLimit(mintCap, capWindow, sigs)`; `sigs` over [`eip712::set_mint_limit_digest`] at
+    /// the current `adminNonce`, sorted here.
+    pub async fn set_mint_limit<S: AsRef<[u8]>>(
+        &self,
+        mint_cap: U256,
+        cap_window: U256,
+        sigs: &[S],
+    ) -> Result<Mined> {
+        let nonce = self.admin_nonce().await?;
+        let d =
+            eip712::set_mint_limit_digest(self.chain_id, self.bridge, mint_cap, cap_window, nonce);
+        let sigs = sorted_bytes(d, sigs)?;
+        mined(
+            &self
+                .send(self.bridge().setMintLimit(mint_cap, cap_window, sigs))
                 .await?,
         )
     }

@@ -6,7 +6,9 @@ use std::cell::Cell;
 
 use common::*;
 use hawkeye_core::EthAddress;
-use hawkeye_store::{LockState, ObjectKind, SignDomain, Store, StoreError, YcashSignKey};
+use hawkeye_store::{
+    ChallengedProposal, LockState, ObjectKind, SignDomain, Store, StoreError, YcashSignKey,
+};
 
 #[test]
 fn mint_identical_call_returns_stored_signature_without_signing() {
@@ -289,4 +291,158 @@ fn sign_once_rows_are_immutable_in_sqlite() {
     );
     assert!(raw.execute("DELETE FROM events", []).is_err());
     assert!(raw.execute("UPDATE events SET to_state = 'X'", []).is_err());
+}
+
+fn proposal(lock_id: [u8; 32], id: u128, amount: u64, to: EthAddress) -> ChallengedProposal {
+    ChallengedProposal {
+        lock_id,
+        proposal_id: id,
+        proposer: EthAddress([0xee; 20]),
+        amount,
+        to,
+    }
+}
+
+#[test]
+fn challenge_signs_once_per_lock_and_proposal_id() {
+    let mut s = store();
+    let fake = [0xcd; 32];
+    let calls = Cell::new(0);
+    let signer = |d: &[u8; 32]| {
+        calls.set(calls.get() + 1);
+        fake_sig(d)
+    };
+    let big = u128::from(u64::MAX) * 1000; // a uint96 id beyond SQLite's INTEGER
+    let p = proposal(fake, big, 5, DEST);
+    let first = s
+        .tx(|t| t.sign_once_challenge(&p, "no lock", &[9; 32], signer))
+        .unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        (first.proposal_id, first.amount, first.reason.as_str()),
+        (big, 5, "no lock")
+    );
+    // the same (lockId, proposalId): the stored bytes, the signer not called
+    let again = s
+        .tx(|t| {
+            t.sign_once_challenge(
+                &p,
+                "retry",
+                &[9; 32],
+                |_: &[u8; 32]| -> Result<[u8; 65], StoreError> { panic!("signer called twice") },
+            )
+        })
+        .unwrap();
+    assert_eq!(again, first);
+    // another digest for the same key: conflict, never signed
+    let e = s
+        .tx(|t| {
+            t.sign_once_challenge(
+                &p,
+                "x",
+                &[8; 32],
+                |_: &[u8; 32]| -> Result<[u8; 65], StoreError> { panic!("never") },
+            )
+        })
+        .unwrap_err();
+    assert!(
+        matches!(e, StoreError::SignOnceConflict { domain, .. } if domain == SignDomain::Eip712Challenge.as_str())
+    );
+    // a re-proposal (new id) of the same lock is a new record
+    s.tx(|t| {
+        t.sign_once_challenge(
+            &proposal(fake, big + 1, 5, DEST),
+            "no lock",
+            &[7; 32],
+            fake_sig,
+        )
+    })
+    .unwrap();
+    let all = s.tx(|t| t.challenge_signatures()).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0], first);
+    // id 0 is no proposal
+    assert!(matches!(
+        s.tx(|t| t.sign_once_challenge(&proposal(fake, 0, 5, DEST), "x", &[1; 32], fake_sig)),
+        Err(StoreError::Invalid(_))
+    ));
+}
+
+#[test]
+fn a_matching_proposal_is_never_challenged() {
+    let mut s = store();
+    let id = s
+        .tx(|t| Ok::<_, StoreError>(policy_ok_lock(t, 3, 100)))
+        .unwrap();
+    let amount = new_lock(3, 100).value_zat;
+    let never = |_: &[u8; 32]| -> Result<[u8; 65], StoreError> { panic!("signed a match") };
+    let e = s
+        .tx(|t| t.sign_once_challenge(&proposal(id, 1, amount, DEST), "x", &[1; 32], never))
+        .unwrap_err();
+    assert!(e.to_string().contains("never challenged"), "{e}");
+    // ... in every policy-OK state (here SIGNED)
+    s.sign_once_mint(&id, amount, &DEST, &[2; 32], fake_sig)
+        .unwrap();
+    assert!(
+        s.tx(|t| t.sign_once_challenge(&proposal(id, 1, amount, DEST), "x", &[1; 32], never))
+            .is_err()
+    );
+    // a wrong amount or recipient for the same real lock is challengeable
+    s.tx(|t| {
+        t.sign_once_challenge(
+            &proposal(id, 2, amount + 1, DEST),
+            "amount",
+            &[3; 32],
+            fake_sig,
+        )
+    })
+    .unwrap();
+    s.tx(|t| {
+        t.sign_once_challenge(
+            &proposal(id, 3, amount, EthAddress([1; 20])),
+            "to",
+            &[4; 32],
+            fake_sig,
+        )
+    })
+    .unwrap();
+}
+
+#[test]
+fn drill_mint_only_for_unknown_locks_and_once() {
+    let mut s = store();
+    let fake = [0xab; 32];
+    let first = s
+        .tx(|t| t.sign_once_drill_mint(&fake, 7, &DEST, &[5; 32], fake_sig))
+        .unwrap();
+    let again = s
+        .tx(|t| {
+            t.sign_once_drill_mint(
+                &fake,
+                7,
+                &DEST,
+                &[5; 32],
+                |_: &[u8; 32]| -> Result<[u8; 65], StoreError> { panic!("twice") },
+            )
+        })
+        .unwrap();
+    assert_eq!(again, first);
+    assert!(matches!(
+        s.tx(|t| t.sign_once_drill_mint(&fake, 8, &DEST, &[5; 32], fake_sig)),
+        Err(StoreError::SignOnceConflict { .. })
+    ));
+    // never for a lock this ledger holds
+    let id = s
+        .tx(|t| Ok::<_, StoreError>(policy_ok_lock(t, 4, 100)))
+        .unwrap();
+    assert!(matches!(
+        s.tx(|t| t.sign_once_drill_mint(&id, 7, &DEST, &[6; 32], fake_sig)),
+        Err(StoreError::Invalid(_))
+    ));
+    // and it never counts as the lock's real Mint signature
+    s.tx(|t| {
+        assert!(t.mint_signature(&fake)?.is_none());
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
 }

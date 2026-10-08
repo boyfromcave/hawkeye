@@ -112,9 +112,11 @@ pub struct BridgeSection {
     pub min_lock: String,
     /// `MAX_LOCK` in YEC.
     pub max_lock: String,
-    /// `threshold` or `optimistic`.
+    /// `optimistic` (the Foundation's model: one attestor proposes, any attestor challenges
+    /// within the contract's window, anyone executes) or `threshold` (k-of-n `mint`, immediate).
     pub mint_mode: String,
-    /// `k` for `threshold`.
+    /// `k` for `threshold` (default: the deployment's threshold). Also the floor the contract's
+    /// threshold is held to: on mainnet it must be ≥ 2 in every mode (plan §3.3).
     pub mint_threshold: Option<u8>,
 }
 
@@ -442,8 +444,19 @@ impl Config {
         mint_mode
             .check_allowed(chain_id)
             .map_err(|e| anyhow!("bridge.mint_mode: {e} (plan §3.3)"))?;
-        if mainnet && matches!(mint_mode, MintMode::Threshold { k } if k < 2) {
-            bail!("mainnet refuses mint_mode threshold with k < 2 (plan §3.3)");
+        if mainnet {
+            // Plan §3.3: the contract's threshold path mints at once, so with k = 1 one key would
+            // skip the optimistic window. Refused whatever the mode; the live contract is checked
+            // again at start-up.
+            if let Some(k) = self.bridge.mint_threshold
+                && k < hawkeye_eth::mode::MAINNET_MIN_THRESHOLD
+            {
+                bail!(
+                    "mainnet refuses bridge.mint_threshold {k} < 2 in every mint mode (plan §3.3)"
+                );
+            }
+            hawkeye_eth::mode::check_contract_threshold(chain_id, deployment.threshold)
+                .map_err(|e| anyhow!("eth.deployment: {e} (plan §3.3)"))?;
         }
         let key = match (&self.keys.secret_hex, &self.keys.keystore) {
             (Some(h), None) => {
@@ -639,6 +652,60 @@ format = "text"
         let c = Config::parse(&sample("mainnet", "")).unwrap();
         let e = c.settings(d.path()).unwrap_err().to_string();
         assert!(e.contains("mint_mode") || e.contains("secret_hex"), "{e}");
+    }
+
+    /// Plan §3.3: on mainnet the threshold must be ≥ 2 in every mode — the configured
+    /// `mint_threshold` and the deployment's (contract) threshold alike.
+    #[test]
+    fn mainnet_threshold_rule_in_every_mode() {
+        let d = tempfile::tempdir().unwrap();
+        let dep = |threshold: u8| {
+            std::fs::write(
+                d.path().join("31337.json"),
+                DEPLOYMENT.replace(r#""threshold":1"#, &format!(r#""threshold":{threshold}"#)),
+            )
+            .unwrap();
+        };
+        let mainnet = |mode: &str, k: Option<u8>| {
+            let text = sample("mainnet", "")
+                .replace(
+                    "mint_mode = \"threshold\"",
+                    &format!("mint_mode = \"{mode}\""),
+                )
+                .replace(
+                    "mint_threshold = 1\n",
+                    &k.map_or(String::new(), |k| format!("mint_threshold = {k}\n")),
+                )
+                .replace(
+                    &format!("secret_hex = \"{}\"", "01".repeat(32)),
+                    "keystore = \"k.json\"",
+                )
+                .replace("drills = true", "drills = false");
+            Config::parse(&text).unwrap().settings(d.path())
+        };
+        dep(2);
+        let s = mainnet("optimistic", None).unwrap();
+        assert_eq!(s.params.mint_mode, MintMode::Optimistic);
+        assert!(s.params.mainnet);
+        mainnet("threshold", Some(2)).unwrap();
+        // a configured k of 1 is refused in both modes
+        let e = mainnet("optimistic", Some(1)).unwrap_err().to_string();
+        assert!(e.contains("mint_threshold 1 < 2 in every mint mode"), "{e}");
+        assert!(mainnet("threshold", Some(1)).is_err());
+        // a bridge deployed at threshold 1 is refused in both modes
+        dep(1);
+        let e = format!("{:#}", mainnet("optimistic", None).unwrap_err());
+        assert!(e.contains("threshold is 1"), "{e}");
+        assert!(mainnet("threshold", Some(2)).is_err());
+        // off mainnet both are allowed (development)
+        let s = Config::parse(
+            &sample("regtest", "")
+                .replace("mint_mode = \"threshold\"", "mint_mode = \"optimistic\""),
+        )
+        .unwrap()
+        .settings(d.path())
+        .unwrap();
+        assert_eq!(s.params.mint_mode, MintMode::Optimistic);
     }
 
     #[test]

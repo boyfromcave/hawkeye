@@ -1,8 +1,8 @@
 #!/bin/sh
 # Export the forge-built artifacts the Rust adapter binds (crates/hawkeye-eth/abi/*.json):
-# ABI, creation bytecode and runtime bytecode of wYEC @ the pinned commit and of the CR-W1 test
-# double. Run after any re-pin or compiler change, then commit the result; `--check` fails if the
-# committed files differ from a fresh build (what CI runs).
+# ABI, creation bytecode and runtime bytecode of wYEC (bridge and token) @ the pinned commit. Run
+# after any re-pin or compiler change, then commit the result; `--check` fails if the committed
+# files differ from a fresh build (what CI runs).
 #
 #   ./tools/export-abi.sh            # rebuild and rewrite
 #   ./tools/export-abi.sh --check    # rebuild and compare
@@ -16,7 +16,7 @@ forge build --quiet
 check=0
 [ "${1:-}" = "--check" ] && check=1
 status=0
-for spec in WyecBridge.sol:WyecBridge WrappedYcash.sol:WrappedYcash OptimisticMintBridge.sol:OptimisticMintBridge; do
+for spec in WyecBridge.sol:WyecBridge WrappedYcash.sol:WrappedYcash; do
     file=${spec%%:*}
     name=${spec##*:}
     out=$(jq --sort-keys '{abi: .abi, bytecode: {object: .bytecode.object}, deployedBytecode: {object: .deployedBytecode.object}}' \

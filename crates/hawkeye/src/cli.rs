@@ -1,4 +1,5 @@
-//! The one-shot commands: `enroll`, `status`, `lock`, `burn`, `rogue-unlock`, `recover`.
+//! The one-shot commands: `enroll`, `status`, `lock`, `burn`, `rogue-unlock`, `rogue-mint`,
+//! `recover`.
 //! Each prints one JSON document on stdout (logs go to stderr).
 
 use std::sync::Arc;
@@ -381,6 +382,95 @@ pub async fn rogue_unlock(
     )
 }
 
+/// The lockId `rogue-mint` invents when none is given: `sha256("hawkeye/rogue-mint/" ‖ signer ‖
+/// nanos)`, a value no vault output's `sha256(txid ‖ vout)` will ever collide with in practice.
+pub fn invented_lock_id(signer: &EthAddress, nanos: u128) -> [u8; 32] {
+    let mut pre = b"hawkeye/rogue-mint/".to_vec();
+    pre.extend_from_slice(&signer.0);
+    pre.extend_from_slice(&nanos.to_be_bytes());
+    hawkeye_core::bytes::sha256(&pre)
+}
+
+/// `hawkeye rogue-mint` (drill D-5 only): this attestor signs `Mint(lockId, amount, to)` for a
+/// lockId with no lock behind it (sign-once, `eip712-drill-mint`) and opens an optimistic
+/// proposal with it (`proposeMint`, gas from its own account) — the fraud the other attestors
+/// must challenge within the window and slash on Ycash.
+pub async fn rogue_mint(
+    s: &Settings,
+    amount: &str,
+    to: Option<&str>,
+    lock_id: Option<&str>,
+) -> Result<()> {
+    drill_gate(&s.params, "rogue-mint")?;
+    let value = u64::try_from(zat(amount)?)?;
+    let key = s.load_key()?;
+    let me = key.eth_address();
+    let to = match to {
+        Some(t) => EthAddress::parse(t).map_err(|e| anyhow!("--to: {e}"))?,
+        None => me,
+    };
+    ensure!(to != EthAddress::ZERO, "--to is the zero address");
+    let lock_id: [u8; 32] = match lock_id {
+        Some(h) => hawkeye_core::bytes::from_hex_array("--lock-id", h)
+            .map_err(|e| anyhow!("--lock-id: {e}"))?,
+        None => invented_lock_id(
+            &me,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+        ),
+    };
+    let mut ec = EthConfig::new(
+        s.eth_url.clone(),
+        s.deployment.chain_id,
+        s.deployment.bridge,
+    );
+    ec.token = Some(s.deployment.token);
+    let eth = EthClient::connect(&ec, Some(eth_signer(&key)?))
+        .await
+        .map_err(|e| anyhow!("ethereum: {e}"))?;
+    let digest = hawkeye_core::eip712::Domain::new(
+        s.deployment.chain_id,
+        EthAddress(s.deployment.bridge.0.0),
+    )
+    .mint_digest(&lock_id, value, &to);
+    let mut store = Store::open(&s.store_path)?;
+    let rec = store.tx(|t| {
+        t.sign_once_drill_mint(&lock_id, value, &to, &digest, |d| {
+            hawkeye_core::eth::sign_digest(&key, d)
+        })
+    })?;
+    let out = eth
+        .propose_mint(
+            B256::from(lock_id),
+            U256::from(value),
+            crate::convert::addr(&to),
+            &rec.signature,
+        )
+        .await
+        .map_err(|e| anyhow!("proposeMint: {e}"))?;
+    let hawkeye_eth::MintSubmitted::Proposed {
+        mined,
+        proposal_id,
+        eta,
+    } = out
+    else {
+        bail!("proposeMint returned no proposal");
+    };
+    info!(event = "rogue_mint_proposed", lock_id = %format!("0x{}", hex::encode(lock_id)),
+          proposal_id, amount = value, to = %to.to_checksum(), tx = %mined.tx, eta);
+    print(&json!({
+        "lockid": format!("0x{}", hex::encode(lock_id)),
+        "proposal_id": proposal_id.to_string(),
+        "proposer": me.to_checksum(),
+        "amount_zat": value,
+        "to": to.to_checksum(),
+        "eta": eta,
+        "txhash": mined.tx.to_string(),
+        "block": mined.block_number,
+    }))
+}
+
 /// `hawkeye recover`: `vault_ownerspend` of every `WYEC` vault and intent of the set this
 /// wallet owns (selector 2 after `ownerHeight`, 3 once the set is released).
 pub async fn recover(s: &Settings) -> Result<()> {
@@ -424,7 +514,21 @@ mod tests {
     }
 
     #[test]
+    fn invented_lock_ids_are_distinct() {
+        let a = EthAddress([1; 20]);
+        assert_ne!(invented_lock_id(&a, 1), invented_lock_id(&a, 2));
+        assert_ne!(
+            invented_lock_id(&a, 1),
+            invented_lock_id(&EthAddress([2; 20]), 1)
+        );
+        assert_eq!(invented_lock_id(&a, 7), invented_lock_id(&a, 7));
+    }
+
+    #[test]
     fn drill_gate_needs_drills_and_refuses_mainnet() {
+        assert!(drill_gate(&params(true, false), "rogue-mint").is_ok());
+        assert!(drill_gate(&params(true, true), "rogue-mint").is_err());
+        assert!(drill_gate(&params(false, false), "rogue-mint").is_err());
         assert!(drill_gate(&params(true, false), "rogue-unlock").is_ok());
         let off = drill_gate(&params(false, false), "rogue-unlock").unwrap_err();
         assert!(off.to_string().contains("[devnet] drills = true"), "{off}");

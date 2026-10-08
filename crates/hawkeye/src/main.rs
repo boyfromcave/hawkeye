@@ -82,6 +82,22 @@ enum Cmd {
         #[arg(long, value_name = "NONCE")]
         replay_burn: Option<u64>,
     },
+    /// DRILL ONLY (D-5): sign a Mint for a lockId with no lock behind it and open an optimistic
+    /// proposal with it (proposeMint), for the other attestors to challenge and slash.
+    RogueMint {
+        /// YEC (also accepted positionally).
+        #[arg(long = "amount", value_name = "YEC")]
+        amount: Option<String>,
+        /// YEC, positional form.
+        #[arg(value_name = "AMOUNT", conflicts_with = "amount")]
+        amount_pos: Option<String>,
+        /// The Ethereum recipient (default: this attestor's own address).
+        #[arg(long)]
+        to: Option<String>,
+        /// The lockId, 32 bytes hex (default: an invented one no lock has).
+        #[arg(long)]
+        lock_id: Option<String>,
+    },
     /// Owner: vault_ownerspend of every WYEC vault/intent this wallet owns.
     Recover,
 }
@@ -168,6 +184,20 @@ async fn main() -> Result<()> {
         } => {
             let amount = amount.clone().or_else(|| amount_pos.clone());
             cli::rogue_unlock(&s, amount.as_deref(), to.as_deref(), *replay_burn).await
+        }
+        Cmd::RogueMint {
+            amount,
+            amount_pos,
+            to,
+            lock_id,
+        } => {
+            cli::rogue_mint(
+                &s,
+                &need(amount, amount_pos)?,
+                to.as_deref(),
+                lock_id.as_deref(),
+            )
+            .await
         }
         Cmd::Recover => cli::recover(&s).await,
         Cmd::Keys { .. } => unreachable!(),

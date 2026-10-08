@@ -9,7 +9,7 @@
 //! | [`burns`] | `BurnToYcash` events (§1.3), the matcher's burn lookup |
 //! | [`intents`] | intents seen on Ycash and their classification (§3.2, §5.3) |
 //! | [`vaults`] | the set's vault outputs (§3.1) |
-//! | [`signonce`] | sign-once records: EIP-712 `Mint` by `lockId`, Ycash set/act signatures by `(set, prevout)` (HK-7) |
+//! | [`signonce`] | sign-once records: EIP-712 `Mint` by `lockId`, `Challenge` by `(lockId, proposalId)`, the drill's rogue `Mint`, Ycash set/act signatures by `(set, prevout)` (HK-7) |
 //! | [`slash`] | slash cases (§2.3, §5.3) |
 //! | [`progress`] | restart state (v2): deferred mint checks, slash votes gathered and given, set signatures seen |
 //! | [`chain`] | chain cursors and reorg rewinds (§5.4) |
@@ -51,7 +51,9 @@ pub use events::Event;
 pub use intents::{IntentRecord, NewIntent, classification_code};
 pub use locks::{LockRecord, NewLock};
 pub use progress::{PendingMintRecord, SeenSetSig, SlashProgress, VoteGiven};
-pub use signonce::{MintSignRecord, YcashSignKey, YcashSignRecord};
+pub use signonce::{
+    ChallengeSignRecord, ChallengedProposal, MintSignRecord, YcashSignKey, YcashSignRecord,
+};
 pub use slash::{NewSlashCase, SlashCaseRecord};
 pub use state::{
     BurnState, Chain, Edge, FaultKind, IntentState, LockState, Machine, ObjectKind, SignDomain,

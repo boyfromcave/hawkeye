@@ -15,6 +15,8 @@ const TABLES: &[&str] = &[
     "locks",
     "pending_mints",
     "set_sigs_seen",
+    "sign_once_challenge",
+    "sign_once_drill_mint",
     "sign_once_mint",
     "sign_once_ycash",
     "slash_cases",
@@ -93,6 +95,34 @@ fn a_v1_ledger_migrates_to_v2_keeping_its_rows() {
         t.record_slash_vote(cases[0].id, "http://peer", 2, true)?;
         assert_eq!(t.slash_voters(cases[0].id)?, vec!["http://peer".to_owned()]);
         assert_eq!(t.slash_progress(cases[0].id)?.unwrap().signatures, 1);
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_v2_ledger_migrates_to_v3_keeping_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    {
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch(MIGRATIONS[0]).unwrap();
+        raw.execute_batch(MIGRATIONS[1]).unwrap();
+        raw.pragma_update(None, "user_version", 2).unwrap();
+        raw.execute(
+            "INSERT INTO pending_mints (lock_id, tx_hash, recipient, amount, block, since_height,
+                                        proposal, created_at)
+             VALUES (?1, ?2, ?3, 5, 7, 9, 1, 0)",
+            (vec![1u8; 32], vec![2u8; 32], vec![3u8; 20]),
+        )
+        .unwrap();
+    }
+    let mut s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(tables(&path), TABLES);
+    s.tx(|t| {
+        assert_eq!(t.pending_mints()?.len(), 1);
+        assert!(t.challenge_signatures()?.is_empty());
         Ok::<_, StoreError>(())
     })
     .unwrap();

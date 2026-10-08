@@ -1,13 +1,14 @@
 //! The bridge's EIP-712 encoding (plan §4.4) and the attestor's Ethereum signature.
 //!
-//! Domain `{name: "WyecBridge", version: "1", chainId, verifyingContract: bridge}`; the four types
-//! exactly as `WyecBridge.sol` declares them. Signatures are 65-byte `r ‖ s ‖ v`, `v ∈ {27, 28}`,
+//! Domain `{name: "WyecBridge", version: "1", chainId, verifyingContract: bridge}`; the six types
+//! exactly as `WyecBridge.sol` declares them (`Mint`, `Challenge`, and the four admin acts). Signatures are 65-byte `r ‖ s ‖ v`, `v ∈ {27, 28}`,
 //! low-S (OpenZeppelin's `ECDSA.recover` rejects anything else), and a `sigs[]` array is ordered by
 //! strictly ascending recovered address (the contract's distinctness rule).
 //!
 //! **Sign once (AGENTS.md rule 7).** [`sign_digest`] is a pure function. The engine must record the
-//! bytes it signed for a `lockId` (one `(amount, to)` ever) in the sign-once store *before*
-//! releasing them, and a retry must reuse the recorded bytes, never call this again.
+//! bytes it signed for a `lockId` (one `(amount, to)` ever), and for a `(lockId, proposalId)`
+//! challenge, in the sign-once store *before* releasing them, and a retry must reuse the recorded
+//! bytes, never call this again.
 
 use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::signers::SignerSync;
@@ -24,6 +25,22 @@ sol! {
         bytes32 lockId;
         uint256 amount;
         address to;
+    }
+
+    /// `Challenge(bytes32 lockId,uint256 proposalId)`: a guardian's veto of one optimistic
+    /// proposal (the id binds it, so a challenge never deletes a later re-proposal).
+    #[derive(Debug, PartialEq, Eq)]
+    struct Challenge {
+        bytes32 lockId;
+        uint256 proposalId;
+    }
+
+    /// `SetMintLimit(uint256 mintCap,uint256 capWindow,uint256 adminNonce)`
+    #[derive(Debug, PartialEq, Eq)]
+    struct SetMintLimit {
+        uint256 mintCap;
+        uint256 capWindow;
+        uint256 adminNonce;
     }
 
     /// `SetGuardians(address[] guardians,uint8 threshold,uint256 adminNonce)`
@@ -77,6 +94,31 @@ pub fn mint_digest(
         lockId: lock_id,
         amount,
         to,
+    }
+    .eip712_signing_hash(&domain(chain_id, bridge))
+}
+
+/// The digest a guardian signs to challenge optimistic proposal `proposal_id` of `lock_id`.
+pub fn challenge_digest(chain_id: u64, bridge: Address, lock_id: B256, proposal_id: U256) -> B256 {
+    Challenge {
+        lockId: lock_id,
+        proposalId: proposal_id,
+    }
+    .eip712_signing_hash(&domain(chain_id, bridge))
+}
+
+/// The digest for `setMintLimit(mintCap, capWindow, ...)` at `admin_nonce`.
+pub fn set_mint_limit_digest(
+    chain_id: u64,
+    bridge: Address,
+    mint_cap: U256,
+    cap_window: U256,
+    admin_nonce: U256,
+) -> B256 {
+    SetMintLimit {
+        mintCap: mint_cap,
+        capWindow: cap_window,
+        adminNonce: admin_nonce,
     }
     .eip712_signing_hash(&domain(chain_id, bridge))
 }
@@ -203,6 +245,14 @@ mod tests {
                 to: Address::ZERO
             }),
             keccak256("Mint(bytes32 lockId,uint256 amount,address to)")
+        );
+        assert_eq!(
+            Challenge::eip712_encode_type(),
+            "Challenge(bytes32 lockId,uint256 proposalId)"
+        );
+        assert_eq!(
+            SetMintLimit::eip712_encode_type(),
+            "SetMintLimit(uint256 mintCap,uint256 capWindow,uint256 adminNonce)"
         );
         assert_eq!(
             SetGuardians::eip712_encode_type(),

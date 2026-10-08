@@ -30,7 +30,7 @@ fn dec(c: &Value, k: &str) -> U256 {
 #[test]
 fn eip712_vectors() {
     let cases = vectors();
-    assert_eq!(cases.len(), 30);
+    assert_eq!(cases.len(), 40);
     let mut kinds = std::collections::BTreeMap::<String, usize>::new();
     for c in &cases {
         let kind = s(c, "kind");
@@ -63,6 +63,16 @@ fn eip712_vectors() {
                 let t = u8::try_from(c["threshold"].as_u64().unwrap()).unwrap();
                 eip712::set_guardians_digest(chain_id, vc, &g, t, dec(c, "adminNonce"))
             }
+            "Challenge" => {
+                eip712::challenge_digest(chain_id, vc, b256(c, "lockId"), dec(c, "proposalId"))
+            }
+            "SetMintLimit" => eip712::set_mint_limit_digest(
+                chain_id,
+                vc,
+                dec(c, "mintCap"),
+                dec(c, "capWindow"),
+                dec(c, "adminNonce"),
+            ),
             "SetPaused" => eip712::set_paused_digest(
                 chain_id,
                 vc,
@@ -93,10 +103,12 @@ fn eip712_vectors() {
         assert_eq!(eip712::recover(digest, &sig).unwrap(), key.address());
     }
     let want: Vec<(String, usize)> = [
+        ("Challenge", 6),
         ("Domain", 2),
         ("Mint", 18),
         ("SetBridge", 2),
         ("SetGuardians", 4),
+        ("SetMintLimit", 4),
         ("SetPaused", 4),
     ]
     .into_iter()

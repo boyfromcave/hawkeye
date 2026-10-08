@@ -1,9 +1,14 @@
 //! Sign-once records (plan §3.5, HK-7; AGENTS.md rule 7).
 //!
-//! Two record kinds:
+//! The record kinds:
 //!
 //! - **EIP-712 `Mint`** (`eip712-mint`), keyed by `lockId`: one `(amount, to, digest)` ever.
 //!   Hawkeye signs these itself, so this record *is* the guard.
+//! - **EIP-712 `Challenge`** (`eip712-challenge`, schema v3), keyed by `(lockId, proposalId)`: the
+//!   optimistic mint's veto. Refused outright when the ledger holds a policy-OK lock matching the
+//!   proposal: a matching proposal is never challenged.
+//! - **EIP-712 drill `Mint`** (`eip712-drill-mint`, schema v3), keyed by `lockId`: the
+//!   `rogue-mint` drill's signature over a lock that does not exist (refused for a known lock).
 //! - **Ycash set and act signatures** (`ycash-unlock`, `ycash-cancel`, `ycash-act`), keyed by
 //!   `(domain, setId, prevout)`: the transaction the node built and the signed bytes it
 //!   returned. The node's own guard (upgrade finding (70)) protects the key; this record mirrors
@@ -20,6 +25,55 @@ use hawkeye_core::{EthAddress, OutPoint};
 use rusqlite::params;
 
 use crate::state::{LockState, SignDomain};
+
+/// Lock states in which a `(amount, to)` match means the lock is a real, policy-OK mint.
+const MINTABLE: &[LockState] = &[
+    LockState::PolicyOk,
+    LockState::Signed,
+    LockState::MintSubmitted,
+    LockState::Proposed,
+    LockState::Challenged,
+    LockState::Executed,
+    LockState::Minted,
+];
+
+/// A stored EIP-712 `Challenge` signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeSignRecord {
+    /// The `lockId` of the proposal.
+    pub lock_id: Hash32,
+    /// The contract's proposal id.
+    pub proposal_id: u128,
+    /// The proposal's proposer (its signer).
+    pub proposer: EthAddress,
+    /// The proposal's amount.
+    pub amount: u64,
+    /// The proposal's recipient.
+    pub to: EthAddress,
+    /// Why it was challenged.
+    pub reason: String,
+    /// The EIP-712 digest signed.
+    pub digest: Hash32,
+    /// The 65-byte `r ‖ s ‖ v` signature.
+    pub signature: [u8; 65],
+    /// Unix seconds.
+    pub signed_at: i64,
+}
+
+/// The proposal a challenge is about (what [`Tx::sign_once_challenge`] judges and records).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChallengedProposal {
+    /// The `lockId`.
+    pub lock_id: Hash32,
+    /// The contract's proposal id (non-zero).
+    pub proposal_id: u128,
+    /// The proposer.
+    pub proposer: EthAddress,
+    /// The proposed amount.
+    pub amount: u64,
+    /// The proposed recipient.
+    pub to: EthAddress,
+}
 use crate::{Result, SignerError, StoreError, Tx, hx};
 
 /// A stored EIP-712 `Mint` signature.
@@ -147,6 +201,194 @@ impl Tx<'_> {
         )?;
         self.mint_signature(lock_id)?
             .ok_or_else(|| StoreError::corrupt("sign-once record vanished"))
+    }
+
+    /// Sign `Challenge(lockId, proposalId)` at most once.
+    ///
+    /// - Refused ([`StoreError::Invalid`], `sign` not called) when the ledger holds this lock in a
+    ///   policy-OK state with the proposal's `(amount, to)`: a matching proposal is never
+    ///   challenged.
+    /// - First call: `sign(digest)` is called and the record stored with the proposal and
+    ///   `reason`, in this transaction.
+    /// - Later call with the same `digest`: the stored record, `sign` not called.
+    /// - A different `digest` for the same `(lockId, proposalId)` (another deployment):
+    ///   [`StoreError::SignOnceConflict`].
+    pub fn sign_once_challenge<F, E>(
+        &self,
+        p: &ChallengedProposal,
+        reason: &str,
+        digest: &Hash32,
+        sign: F,
+    ) -> Result<ChallengeSignRecord>
+    where
+        F: FnOnce(&Hash32) -> core::result::Result<[u8; 65], E>,
+        E: Into<SignerError>,
+    {
+        if p.proposal_id == 0 {
+            return Err(StoreError::Invalid("proposal id 0 is no proposal".into()));
+        }
+        if let Some(old) = self.challenge_signature(&p.lock_id, p.proposal_id)? {
+            return if old.digest == *digest {
+                Ok(old)
+            } else {
+                Err(StoreError::SignOnceConflict {
+                    domain: SignDomain::Eip712Challenge.as_str(),
+                    key: format!("{}/{}", hx(&p.lock_id), p.proposal_id),
+                    detail: format!("digest {} != stored {}", hx(digest), hx(&old.digest)),
+                })
+            };
+        }
+        if let Some(l) = self.lock(&p.lock_id)?
+            && MINTABLE.contains(&l.state)
+            && l.value_zat == p.amount
+            && l.destination == Some(p.to)
+        {
+            return Err(StoreError::Invalid(format!(
+                "proposal {} of lock {} matches the {} lock ({} to {}): never challenged",
+                p.proposal_id,
+                hx(&p.lock_id),
+                l.state,
+                p.amount,
+                p.to
+            )));
+        }
+        let signature = sign(digest).map_err(|e| StoreError::Signer(e.into()))?;
+        self.conn().execute(
+            "INSERT INTO sign_once_challenge (lock_id, proposal_id, proposer, amount, recipient,
+                                              reason, digest, signature, signed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                p.lock_id,
+                p.proposal_id.to_string(),
+                p.proposer.0,
+                p.amount,
+                p.to.0,
+                reason,
+                digest,
+                signature,
+                self.now()
+            ],
+        )?;
+        self.challenge_signature(&p.lock_id, p.proposal_id)?
+            .ok_or_else(|| StoreError::corrupt("sign-once record vanished"))
+    }
+
+    /// The stored `Challenge` signature for `(lockId, proposalId)`.
+    pub fn challenge_signature(
+        &self,
+        lock_id: &Hash32,
+        proposal_id: u128,
+    ) -> Result<Option<ChallengeSignRecord>> {
+        self.one(
+            "SELECT proposer, amount, recipient, reason, digest, signature, signed_at
+             FROM sign_once_challenge WHERE lock_id = ?1 AND proposal_id = ?2",
+            params![lock_id, proposal_id.to_string()],
+            |r| {
+                Ok(ChallengeSignRecord {
+                    lock_id: *lock_id,
+                    proposal_id,
+                    proposer: EthAddress(r.get(0)?),
+                    amount: r.get(1)?,
+                    to: EthAddress(r.get(2)?),
+                    reason: r.get(3)?,
+                    digest: r.get(4)?,
+                    signature: r.get(5)?,
+                    signed_at: r.get(6)?,
+                })
+            },
+        )
+    }
+
+    /// Every stored `Challenge` signature, oldest first.
+    pub fn challenge_signatures(&self) -> Result<Vec<ChallengeSignRecord>> {
+        self.all(
+            "SELECT lock_id, proposal_id, proposer, amount, recipient, reason, digest, signature,
+                    signed_at
+             FROM sign_once_challenge ORDER BY signed_at, lock_id, proposal_id",
+            [],
+            |r| {
+                let id: String = r.get(1)?;
+                Ok(ChallengeSignRecord {
+                    lock_id: r.get(0)?,
+                    proposal_id: id.parse().map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            "proposal id".into(),
+                        )
+                    })?,
+                    proposer: EthAddress(r.get(2)?),
+                    amount: r.get(3)?,
+                    to: EthAddress(r.get(4)?),
+                    reason: r.get(5)?,
+                    digest: r.get(6)?,
+                    signature: r.get(7)?,
+                    signed_at: r.get(8)?,
+                })
+            },
+        )
+    }
+
+    /// Drill D-5 only (`hawkeye rogue-mint`): sign a `Mint` for a `lockId` this ledger knows
+    /// nothing about, at most once. Refused for a known lock; an identical later call returns the
+    /// stored record; a different `(amount, to, digest)` is a [`StoreError::SignOnceConflict`].
+    pub fn sign_once_drill_mint<F, E>(
+        &self,
+        lock_id: &Hash32,
+        amount: u64,
+        to: &EthAddress,
+        digest: &Hash32,
+        sign: F,
+    ) -> Result<MintSignRecord>
+    where
+        F: FnOnce(&Hash32) -> core::result::Result<[u8; 65], E>,
+        E: Into<SignerError>,
+    {
+        if let Some(old) = self.drill_mint_signature(lock_id)? {
+            return if (old.amount, old.to, old.digest) == (amount, *to, *digest) {
+                Ok(old)
+            } else {
+                Err(StoreError::SignOnceConflict {
+                    domain: SignDomain::Eip712DrillMint.as_str(),
+                    key: hx(lock_id),
+                    detail: "a different drill Mint was already signed for this lockId".into(),
+                })
+            };
+        }
+        if self.lock(lock_id)?.is_some() || self.mint_signature(lock_id)?.is_some() {
+            return Err(StoreError::Invalid(format!(
+                "lock {} is in this ledger: the rogue-mint drill signs only unknown lockIds",
+                hx(lock_id)
+            )));
+        }
+        let signature = sign(digest).map_err(|e| StoreError::Signer(e.into()))?;
+        self.conn().execute(
+            "INSERT INTO sign_once_drill_mint (lock_id, amount, recipient, digest, signature,
+                                               signed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![lock_id, amount, to.0, digest, signature, self.now()],
+        )?;
+        self.drill_mint_signature(lock_id)?
+            .ok_or_else(|| StoreError::corrupt("sign-once record vanished"))
+    }
+
+    /// The stored drill `Mint` signature for a `lockId`.
+    pub fn drill_mint_signature(&self, lock_id: &Hash32) -> Result<Option<MintSignRecord>> {
+        self.one(
+            "SELECT lock_id, amount, recipient, digest, signature, signed_at
+             FROM sign_once_drill_mint WHERE lock_id = ?1",
+            [lock_id],
+            |r| {
+                Ok(MintSignRecord {
+                    lock_id: r.get(0)?,
+                    amount: r.get(1)?,
+                    to: EthAddress(r.get(2)?),
+                    digest: r.get(3)?,
+                    signature: r.get(4)?,
+                    signed_at: r.get(5)?,
+                })
+            },
+        )
     }
 
     /// The stored `Mint` signature for a `lockId`.

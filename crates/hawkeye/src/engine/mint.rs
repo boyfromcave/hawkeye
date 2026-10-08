@@ -1,5 +1,23 @@
-//! The mint side (plan §1.2, §4.1, §5.3 step 2): lock policy after `C_Y`, the EIP-712 `Mint`
-//! signature (sign-once), leader submission, the finalized event scan, and the mint watcher.
+//! The mint side (plan §1.2, §3.3, §4.1, §5.3 step 2): lock policy after `C_Y`, the EIP-712
+//! `Mint` signature (sign-once), submission in the configured mode, the finalized event scan, and
+//! the mint watcher.
+//!
+//! **Optimistic mode** (wyec-contract-design.md §4.5, the Foundation's model): the mint leader
+//! (§5.2, over the members the contract has not `vetoed` for the lock) calls `proposeMint` with its
+//! own sign-once `Mint` signature; once the window has passed the leader (any attestor, after a
+//! further window) calls `executeMint`. A challenged proposal is re-proposed by the next eligible
+//! attestor: the challenged proposer is barred from that lock.
+//!
+//! **The watcher runs in every mode**: the contract's optimistic path cannot be switched off, so a
+//! single key can propose whatever Hawkeye's own mode is. Every finalized `MintProposed` is judged
+//! against this ledger's policy-OK locks; one that does not match is challenged with a sign-once
+//! EIP-712 `Challenge(lockId, proposalId)` signature (definite fraud at once; an undecided one when
+//! the lock is still absent `C_Y` blocks later, or at the latest when a quarter of the window is
+//! left). A proposal matching a policy-OK lock is never challenged (the ledger refuses to sign it).
+//! The proposer of a fraudulent proposal gets a `FRAUDULENT_MINT` slash case, as a fraudulent
+//! threshold mint's signers do.
+
+use std::collections::HashSet;
 
 use alloy::consensus::Transaction as _;
 use alloy::eips::BlockNumberOrTag;
@@ -12,11 +30,11 @@ use hawkeye_core::eip712::Domain;
 use hawkeye_core::leader::mint_leader_for;
 use hawkeye_core::policy::LockFacts;
 use hawkeye_core::recipient::YcashRecipient;
-use hawkeye_eth::bindings::{OptimisticMintBridge, WyecBridge};
-use hawkeye_eth::{BridgeEvent, MintMode, MintSubmitted, U256};
+use hawkeye_eth::bindings::WyecBridge;
+use hawkeye_eth::{BridgeEvent, MintMode, MintSubmitted, Proposal, ProposalStatus, U256};
 use hawkeye_store::{
-    BurnKey, BurnState, Chain, FaultKind, LockState, NewBurn, NewSlashCase, PendingMintRecord,
-    StoreError, Tx,
+    BurnKey, BurnState, Chain, ChallengedProposal, FaultKind, LockRecord, LockState, NewBurn,
+    NewSlashCase, PendingMintRecord, StoreError, Tx,
 };
 use hawkeye_ycash::Hash256;
 use hawkeye_ycash::tx::Transaction;
@@ -40,6 +58,23 @@ enum MintVerdict {
 
 fn lock_hex(id: &Hash32) -> String {
     format!("0x{}", hex::encode(id))
+}
+
+/// Whether an undecided proposal (§5.3 step 2) must be challenged now: at the latest when a
+/// quarter of the challenge window is left (`now + window/4 ≥ eta`), and earlier when the lock is
+/// still absent from this ledger `C_Y` Ycash blocks after the proposal was first judged with the
+/// follower caught up (a lock a legitimate proposer saw with `C_Y` confirmations would be here).
+pub fn challenge_due(
+    lock_absent: bool,
+    caught_up: bool,
+    blocks_since: u32,
+    confirmations: u32,
+    now: u64,
+    eta: u64,
+    window: u64,
+) -> bool {
+    let margin = (window / 4).max(1);
+    now.saturating_add(margin) >= eta || (lock_absent && caught_up && blocks_since >= confirmations)
 }
 
 /// Judge a `Minted(lockId, to, amount)` against the ledger and, if it matches, move the lock to
@@ -67,9 +102,10 @@ fn judge_minted(
     }
     if l.value_zat != amount || l.destination != Some(*to) {
         return Ok(MintVerdict::Fraud(format!(
-            "lock is {} zat to {:?}, minted {amount} to {to}",
+            "lock is {} zat to {:?}, {} {amount} to {to}",
             l.value_zat,
-            l.destination.map(|d| d.to_checksum())
+            l.destination.map(|d| d.to_checksum()),
+            if proposal { "proposed" } else { "minted" }
         )));
     }
     if l.state == Reorged {
@@ -99,7 +135,7 @@ fn judge_minted(
 
 impl Engine {
     /// Scan finalized Ethereum blocks: burns into the ledger (orphans held, §3.4), `Minted` /
-    /// `MintProposed` checked against locks.
+    /// `MintProposed` checked against locks, challenges and limit changes logged.
     pub(crate) async fn scan_eth(&mut self) -> Result<()> {
         self.mem.eth_fresh = false;
         let fin = self
@@ -134,6 +170,7 @@ impl Engine {
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
         let mut frauds = vec![];
+        let mut griefed = vec![];
         let mut rotated = false;
         self.ctx.db(|t| {
             for ev in &events {
@@ -204,6 +241,17 @@ impl Engine {
                             since_height: tip,
                             proposal,
                         };
+                        if let BridgeEvent::MintProposed {
+                            proposal_id,
+                            proposer,
+                            eta,
+                            ..
+                        } = &ev.event
+                        {
+                            info!(event = "mint_proposal_observed", lock_id = %lock_hex(&pm.lock_id),
+                                  proposal_id, proposer = %proposer, amount, to = %pm.to.to_checksum(),
+                                  eta, block = m.block_number);
+                        }
                         match judge_minted(t, &pm.lock_id, &pm.to, amount, m.block_number, proposal)?
                         {
                             MintVerdict::Ok => {}
@@ -217,14 +265,25 @@ impl Engine {
                             MintVerdict::Fraud(why) => frauds.push((pm, why)),
                         }
                     }
-                    BridgeEvent::MintChallenged { lock_id, .. } => {
-                        if t.lock(&lock_id.0)?.is_some_and(|l| l.state == LockState::Proposed) {
+                    BridgeEvent::MintChallenged {
+                        lock_id,
+                        proposal_id,
+                        challenger,
+                    } => {
+                        let l = t.lock(&lock_id.0)?;
+                        info!(event = "mint_challenge_observed", lock_id = %lock_hex(&lock_id.0),
+                              proposal_id, challenger = %challenger,
+                              lock_state = ?l.as_ref().map(|l| l.state.to_string()));
+                        if l.is_some_and(|l| l.state == LockState::Proposed) {
+                            // the lock's own (matching) proposal was challenged: re-proposed by
+                            // the next eligible attestor; the challenge is attributable
                             t.transition_lock(
                                 &lock_id.0,
                                 LockState::Challenged,
                                 None,
-                                Some("challenged"),
+                                Some(&format!("proposal {proposal_id} challenged by {challenger}")),
                             )?;
+                            griefed.push((lock_id.0, *proposal_id, *challenger));
                         }
                     }
                     BridgeEvent::GuardiansChanged {
@@ -233,6 +292,12 @@ impl Engine {
                     } => {
                         info!(event = "guardians_changed", count = guardians.len(), threshold);
                         rotated = true;
+                    }
+                    BridgeEvent::MintLimitChanged {
+                        mint_cap,
+                        cap_window,
+                    } => {
+                        info!(event = "mint_limit_changed", mint_cap = %mint_cap, cap_window = %cap_window);
                     }
                     BridgeEvent::Paused { paused, account } => {
                         warn!(event = "bridge_paused", paused, by = %account);
@@ -245,6 +310,15 @@ impl Engine {
         if rotated {
             self.mem.guardian_check_due = true;
         }
+        for (lock_id, id, by) in griefed {
+            self.alarm(
+                "matching-proposal-challenged",
+                format!(
+                    "proposal {id} of policy-OK lock {} was challenged by {by}; it is re-proposed",
+                    lock_hex(&lock_id)
+                ),
+            );
+        }
         for (pm, why) in frauds {
             self.fraudulent_mint(&pm, &why).await?;
         }
@@ -253,7 +327,8 @@ impl Engine {
     }
 
     /// Re-judge deferred `Minted` / `MintProposed` events (from the ledger, so a restart resumes
-    /// them); one with still no lock long after is a fraud.
+    /// them): an undecided proposal is challenged when [`challenge_due`]; one with still no lock
+    /// long after is a fraud (slash case).
     pub(crate) async fn check_pending_mints(&mut self) -> Result<()> {
         let pending = self.ctx.db(|t| t.pending_mints())?;
         if pending.is_empty() {
@@ -266,12 +341,12 @@ impl Engine {
             .db(|t| t.cursor(Chain::Ycash))?
             .is_some_and(|c| c.height >= u64::from(tip));
         for pm in pending {
-            let v = self.ctx.db(|t| {
+            let (v, absent) = self.ctx.db(|t| {
                 let v = judge_minted(t, &pm.lock_id, &pm.to, pm.amount, pm.block, pm.proposal)?;
                 if matches!(v, MintVerdict::Ok) {
                     t.remove_pending_mint(&pm.lock_id, &pm.tx_hash)?;
                 }
-                Ok(v)
+                Ok((v, t.lock(&pm.lock_id)?.is_none()))
             })?;
             let why = match v {
                 MintVerdict::Ok => continue,
@@ -279,7 +354,12 @@ impl Engine {
                 MintVerdict::Defer if caught_up && tip >= pm.since_height + grace => {
                     "no policy-OK lock behind the lockId".to_owned()
                 }
-                MintVerdict::Defer => continue,
+                MintVerdict::Defer => {
+                    if pm.proposal {
+                        self.challenge_if_due(&pm, absent, caught_up).await;
+                    }
+                    continue;
+                }
             };
             self.fraudulent_mint(&pm, &why).await?;
             self.ctx
@@ -288,8 +368,59 @@ impl Engine {
         Ok(())
     }
 
-    /// A mint with no lock behind it (§2.3 row 3): recover its signers from the transaction's
-    /// calldata, open a slash case against each member among them, alarm.
+    /// An undecided proposal: challenge it once [`challenge_due`] says so.
+    async fn challenge_if_due(&mut self, pm: &PendingMintRecord, absent: bool, caught_up: bool) {
+        let id = b256(&pm.lock_id);
+        let (live, now, window) = match (
+            self.ctx.eth.proposal(id).await,
+            self.ctx.eth.latest_timestamp().await,
+            self.challenge_window().await,
+        ) {
+            (Ok(Some(p)), Ok(now), Ok(w)) => (p, now, w),
+            (Ok(None), _, _) => return,
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                warn!(event = "mint_challenge_failed", lock_id = %lock_hex(&pm.lock_id), error = %e);
+                return;
+            }
+        };
+        let blocks = self.mem.tip.saturating_sub(pm.since_height);
+        if !challenge_due(
+            absent,
+            caught_up,
+            blocks,
+            self.ctx.params.confirmations,
+            now,
+            live.eta,
+            window,
+        ) {
+            return;
+        }
+        let why = if absent {
+            format!(
+                "no lock with this lockId on this attestor's chain ({blocks} blocks after the proposal)"
+            )
+        } else {
+            format!(
+                "the lock is not policy-OK here {}s before the proposal's eta",
+                live.eta.saturating_sub(now)
+            )
+        };
+        self.challenge(pm, &why).await;
+    }
+
+    /// The contract's challenge window (read once).
+    async fn challenge_window(&mut self) -> hawkeye_eth::Result<u64> {
+        if let Some(w) = self.mem.challenge_window {
+            return Ok(w);
+        }
+        let w = self.ctx.eth.challenge_window().await?;
+        self.mem.challenge_window = Some(w);
+        Ok(w)
+    }
+
+    /// A mint or proposal with no lock behind it (§2.3 row 3): a proposal is challenged first
+    /// (the window is running), then its signers — recovered from the transaction's calldata —
+    /// get a slash case each, and an alarm is raised.
     async fn fraudulent_mint(&mut self, pm: &PendingMintRecord, why: &str) -> Result<()> {
         warn!(event = "fraudulent_mint", lock_id = %lock_hex(&pm.lock_id), amount = pm.amount,
               to = %pm.to.to_checksum(), tx = %format!("0x{}", hex::encode(pm.tx_hash)),
@@ -303,7 +434,7 @@ impl Engine {
             ),
         );
         if pm.proposal {
-            self.challenge(pm).await;
+            self.challenge(pm, why).await;
         }
         let digest = Domain::new(
             self.ctx.params.deployment.chain_id,
@@ -321,7 +452,7 @@ impl Engine {
                 let input = tx.input();
                 if let Ok(c) = WyecBridge::mintCall::abi_decode(input) {
                     c.sigs.into_iter().map(|b| b.to_vec()).collect()
-                } else if let Ok(c) = OptimisticMintBridge::proposeMintCall::abi_decode(input) {
+                } else if let Ok(c) = WyecBridge::proposeMintCall::abi_decode(input) {
                     vec![c.sig.to_vec()]
                 } else {
                     vec![]
@@ -359,6 +490,7 @@ impl Engine {
                 "to": pm.to.to_checksum(),
                 "eth_tx": format!("0x{}", hex::encode(pm.tx_hash)),
                 "eth_block": pm.block,
+                "proposal": pm.proposal,
                 "signer": a.to_checksum(),
                 "signature": format!("0x{}", hex::encode(&sig)),
                 "reason": why,
@@ -380,32 +512,144 @@ impl Engine {
         Ok(())
     }
 
-    /// CR-W1: challenge a fraudulent proposal while it is still pending (the proposal must be
-    /// the one judged: same amount and recipient). Any one guardian's challenge deletes it, so a
-    /// second attestor finding it gone does nothing.
-    async fn challenge(&mut self, pm: &PendingMintRecord) {
-        if self.ctx.params.mint_mode != MintMode::Optimistic {
+    /// Challenge the live proposal for `pm`'s lock if it is the one judged (same amount and
+    /// recipient): sign `Challenge(lockId, proposalId)` once (the ledger refuses a proposal that
+    /// matches a policy-OK lock), submit it from this attestor's account. Any one guardian's
+    /// challenge deletes the proposal, so another attestor finding it gone does nothing. A
+    /// proposal this attestor made deliberately (the `rogue-mint` drill) is left to the others.
+    async fn challenge(&mut self, pm: &PendingMintRecord, why: &str) {
+        if !self.is_current_member() {
             return;
         }
         let id = b256(&pm.lock_id);
-        match self.ctx.eth.proposal(id).await {
-            Ok(Some(p)) if p.amount == U256::from(pm.amount) && p.to == addr(&pm.to) => {
-                match self.ctx.eth.challenge_mint(id).await {
-                    Ok(m) => warn!(event = "mint_challenged", lock_id = %lock_hex(&pm.lock_id),
-                                   proposer = %p.proposer, tx = %m.tx),
-                    Err(e) => warn!(event = "mint_challenge_failed",
-                                    lock_id = %lock_hex(&pm.lock_id), error = %e),
-                }
-            }
-            Ok(Some(_)) => {
+        let live = match self.ctx.eth.proposal(id).await {
+            Ok(Some(p)) if p.amount == U256::from(pm.amount) && p.to == addr(&pm.to) => p,
+            Ok(Some(p)) => {
                 info!(event = "mint_challenge_skipped", lock_id = %lock_hex(&pm.lock_id),
-                                 reason = "a different proposal is pending")
+                      proposal_id = p.id, reason = "a different proposal is live (judged on its own)");
+                return;
             }
-            Ok(None) => info!(event = "mint_challenge_skipped", lock_id = %lock_hex(&pm.lock_id),
-                              reason = "no pending proposal (challenged or executed)"),
-            Err(e) => warn!(event = "mint_challenge_failed", lock_id = %lock_hex(&pm.lock_id),
-                            error = %e),
+            Ok(None) => {
+                info!(event = "mint_challenge_skipped", lock_id = %lock_hex(&pm.lock_id),
+                      reason = "no live proposal (challenged, executed or overridden)");
+                return;
+            }
+            Err(e) => {
+                warn!(event = "mint_challenge_failed", lock_id = %lock_hex(&pm.lock_id), error = %e);
+                return;
+            }
+        };
+        let me = self.ctx.key.eth_address();
+        if live.proposer == addr(&me) {
+            let deliberate = self
+                .ctx
+                .db(|t| t.drill_mint_signature(&pm.lock_id))
+                .map(|r| r.is_some())
+                .unwrap_or(false);
+            if deliberate {
+                if self.mem.own_proposals_logged.insert((pm.lock_id, live.id)) {
+                    warn!(event = "own_fraudulent_proposal", lock_id = %lock_hex(&pm.lock_id),
+                          proposal_id = live.id,
+                          "signed here (drill); left to the other watchers");
+                }
+                return;
+            }
+            warn!(event = "own_key_proposal", lock_id = %lock_hex(&pm.lock_id),
+                  proposal_id = live.id, "a proposal under this attestor's key that it never signed");
         }
+        self.submit_challenge(pm.lock_id, &live, why).await;
+    }
+
+    /// Sign (once) and submit the challenge of `live`.
+    async fn submit_challenge(&mut self, lock_id: Hash32, live: &Proposal, why: &str) {
+        let digest = Domain::new(
+            self.ctx.params.deployment.chain_id,
+            self.ctx.params.deployment.bridge,
+        )
+        .challenge_digest(&lock_id, live.id);
+        let key = self.ctx.key.clone();
+        let rec = self.ctx.db(|t| {
+            t.sign_once_challenge(
+                &ChallengedProposal {
+                    lock_id,
+                    proposal_id: live.id,
+                    proposer: eth_addr(&live.proposer),
+                    amount: u64::try_from(live.amount).unwrap_or(u64::MAX),
+                    to: eth_addr(&live.to),
+                },
+                why,
+                &digest,
+                |d| hawkeye_core::eth::sign_digest(&key, d),
+            )
+        });
+        let rec = match rec {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(event = "mint_challenge_refused", lock_id = %lock_hex(&lock_id),
+                      proposal_id = live.id, error = %format!("{e:#}"));
+                return;
+            }
+        };
+        match self
+            .ctx
+            .eth
+            .challenge_mint(b256(&lock_id), live.id, &rec.signature)
+            .await
+        {
+            Ok(m) => {
+                warn!(event = "mint_challenged", lock_id = %lock_hex(&lock_id), proposal_id = live.id,
+                      proposer = %live.proposer, tx = %m.tx, reason = why);
+                self.mem.challenges_done.insert((lock_id, live.id));
+            }
+            Err(e) if e.is_revert("NoProposal") => {
+                info!(event = "mint_challenge_skipped", lock_id = %lock_hex(&lock_id),
+                      proposal_id = live.id, reason = "already gone (another attestor challenged first)");
+                self.mem.challenges_done.insert((lock_id, live.id));
+            }
+            Err(e) => warn!(event = "mint_challenge_failed", lock_id = %lock_hex(&lock_id),
+                            proposal_id = live.id, error = %e),
+        }
+    }
+
+    /// Re-submit recorded challenges whose proposal is still live (a failed submission, a
+    /// restart): the recorded bytes, never a new signature.
+    pub(crate) async fn resubmit_challenges(&mut self) -> Result<()> {
+        let recs = self.ctx.db(|t| t.challenge_signatures())?;
+        for r in recs {
+            if self
+                .mem
+                .challenges_done
+                .contains(&(r.lock_id, r.proposal_id))
+            {
+                continue;
+            }
+            match self.ctx.eth.proposal(b256(&r.lock_id)).await {
+                Ok(Some(p)) if p.id == r.proposal_id => {
+                    match self
+                        .ctx
+                        .eth
+                        .challenge_mint(b256(&r.lock_id), r.proposal_id, &r.signature)
+                        .await
+                    {
+                        Ok(m) => {
+                            warn!(event = "mint_challenged", lock_id = %lock_hex(&r.lock_id),
+                                  proposal_id = r.proposal_id, proposer = %p.proposer, tx = %m.tx,
+                                  reason = %r.reason, resubmitted = true);
+                            self.mem.challenges_done.insert((r.lock_id, r.proposal_id));
+                        }
+                        Err(e) => warn!(event = "mint_challenge_failed",
+                                        lock_id = %lock_hex(&r.lock_id),
+                                        proposal_id = r.proposal_id, error = %e),
+                    }
+                }
+                Ok(_) => {
+                    self.mem.challenges_done.insert((r.lock_id, r.proposal_id));
+                }
+                Err(e) => warn!(event = "mint_challenge_failed", lock_id = %lock_hex(&r.lock_id),
+                                error = %e),
+            }
+        }
+        Ok(())
     }
 
     /// `SEEN` locks with `C_Y` confirmations: `CONFIRMED`, then the lock policy (§4.1).
@@ -465,8 +709,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Sign every policy-OK lock once; the mint leader collects `k` signatures and submits.
+    /// Sign every policy-OK lock once; then mint the configured way. Recorded challenges whose
+    /// proposal is still live are re-submitted first (any mode).
     pub(crate) async fn mint(&mut self) -> Result<()> {
+        if self.is_current_member() {
+            self.resubmit_challenges().await?;
+        }
         if self.signing_paused() || !self.is_current_member() {
             return Ok(());
         }
@@ -486,6 +734,16 @@ impl Engine {
                   to = %to.to_checksum(), signer = %key.eth_address().to_checksum());
             super::drill_crash_point(&p, "mint_signed");
         }
+        match p.mint_mode {
+            MintMode::Threshold { .. } => self.mint_threshold().await,
+            MintMode::Optimistic => self.mint_optimistic().await,
+        }
+    }
+
+    /// Threshold mode: the mint leader collects `k` signatures and calls `mint`.
+    async fn mint_threshold(&mut self) -> Result<()> {
+        let p = self.ctx.params.clone();
+        let domain = Domain::new(p.deployment.chain_id, p.deployment.bridge);
         let tip = self.mem.tip;
         let mut candidates = self.ctx.db(|t| t.locks_in_state(LockState::Signed))?;
         candidates.extend(
@@ -494,26 +752,14 @@ impl Engine {
         );
         for l in candidates {
             let Some(to) = l.destination else { continue };
-            let confirmed_at = l.block_height + p.confirmations - 1;
-            let since = tip.saturating_sub(confirmed_at);
+            let since = tip.saturating_sub(l.block_height + p.confirmations - 1);
             let Some(leader) = mint_leader_for(&l.lock_id, self.live(), since, p.takeover) else {
                 continue;
             };
-            if *leader != self.ctx.me {
+            if *leader != self.ctx.me || self.recently_submitted(&l.lock_id) {
                 continue;
             }
-            if let Some(at) = self.mem.submitted.get(&l.lock_id)
-                && tip < at + p.takeover.max(1)
-            {
-                continue;
-            }
-            if self
-                .ctx
-                .eth
-                .consumed(b256(&l.lock_id))
-                .await
-                .map_err(|e| anyhow!("consumed: {e}"))?
-            {
+            if self.consumed(&l.lock_id).await? {
                 continue;
             }
             let digest = domain.mint_digest(&l.lock_id, l.value_zat, &to);
@@ -547,27 +793,203 @@ impl Engine {
                         })?;
                     }
                 }
-                Ok(MintSubmitted::Proposed {
-                    mined,
-                    executable_at,
-                }) => {
-                    info!(event = "mint_proposed", lock_id = %lock_hex(&l.lock_id),
-                          tx = %mined.tx, executable_at);
-                    if l.state == LockState::Signed {
-                        self.ctx.db(|t| {
-                            t.transition_lock(&l.lock_id, LockState::Proposed, Some(tip), None)
-                        })?;
-                    }
-                }
+                Ok(MintSubmitted::Proposed { .. }) => {}
                 Err(e) => {
                     warn!(event = "mint_submit_failed", lock_id = %lock_hex(&l.lock_id), error = %e)
                 }
             }
         }
-        if p.mint_mode == MintMode::Optimistic {
-            self.execute_proposals().await?;
+        Ok(())
+    }
+
+    /// Optimistic mode, per signed lock: nothing live → the eligible leader proposes with its own
+    /// sign-once signature; a matching live proposal → executed once ready (by the leader at
+    /// `eta`, by anyone a further window later); a different live proposal → the watcher's
+    /// business, the lock waits; a void one (proposer rotated out) is replaced.
+    async fn mint_optimistic(&mut self) -> Result<()> {
+        let mut locks = vec![];
+        for s in [
+            LockState::Signed,
+            LockState::Proposed,
+            LockState::Challenged,
+        ] {
+            locks.extend(self.ctx.db(|t| t.locks_in_state(s))?);
+        }
+        if locks.is_empty() {
+            return Ok(());
+        }
+        let now = self
+            .ctx
+            .eth
+            .latest_timestamp()
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        let window = self
+            .challenge_window()
+            .await
+            .map_err(|e| anyhow!("challenge window: {e}"))?;
+        for l in locks {
+            let Some(to) = l.destination else { continue };
+            if self.consumed(&l.lock_id).await? {
+                continue; // the Minted event moves the lock
+            }
+            let id = b256(&l.lock_id);
+            let live = self
+                .ctx
+                .eth
+                .proposal(id)
+                .await
+                .map_err(|e| anyhow!("proposal: {e}"))?;
+            let status = match live {
+                Some(_) => self
+                    .ctx
+                    .eth
+                    .proposal_status(id)
+                    .await
+                    .map_err(|e| anyhow!("proposal status: {e}"))?,
+                None => ProposalStatus::None,
+            };
+            match (live, status) {
+                (Some(p), ProposalStatus::Pending | ProposalStatus::Ready)
+                    if p.amount == U256::from(l.value_zat) && p.to == addr(&to) =>
+                {
+                    if status == ProposalStatus::Ready {
+                        self.execute(&l, &p, now, window).await?;
+                    }
+                }
+                (Some(p), ProposalStatus::Pending | ProposalStatus::Ready) => {
+                    if self.mem.squat_logged.insert((l.lock_id, p.id)) {
+                        warn!(event = "mint_proposal_mismatch", lock_id = %lock_hex(&l.lock_id),
+                              proposal_id = p.id, proposer = %p.proposer,
+                              "a different proposal holds the lock; waiting for its challenge");
+                    }
+                }
+                _ => self.propose(&l, &to).await?,
+            }
         }
         Ok(())
+    }
+
+    /// Propose `l` if this attestor is the mint leader among the live members the contract has
+    /// not barred from the lock (`vetoed`).
+    async fn propose(&mut self, l: &LockRecord, to: &EthAddress) -> Result<()> {
+        let p = self.ctx.params.clone();
+        let tip = self.mem.tip;
+        if self.recently_submitted(&l.lock_id) {
+            return Ok(());
+        }
+        let mut eligible = Vec::with_capacity(self.live().len());
+        for k in self.live().to_vec() {
+            let a = hawkeye_core::eth::address_from_pubkey(&k).map_err(|e| anyhow!("{e}"))?;
+            let barred = self
+                .ctx
+                .eth
+                .vetoed(b256(&l.lock_id), addr(&a))
+                .await
+                .map_err(|e| anyhow!("vetoed: {e}"))?;
+            if !barred {
+                eligible.push(k);
+            }
+        }
+        let since = tip.saturating_sub(l.block_height + p.confirmations - 1);
+        let Some(leader) = mint_leader_for(&l.lock_id, &eligible, since, p.takeover) else {
+            if self.mem.squat_logged.insert((l.lock_id, 0)) {
+                warn!(event = "mint_no_eligible_proposer", lock_id = %lock_hex(&l.lock_id),
+                      "every live member is barred from this lock: a threshold mint is needed");
+            }
+            return Ok(());
+        };
+        if *leader != self.ctx.me {
+            return Ok(());
+        }
+        let own = self
+            .ctx
+            .db(|t| t.mint_signature(&l.lock_id))?
+            .ok_or_else(|| anyhow!("no own signature"))?;
+        self.mem.submitted.insert(l.lock_id, tip);
+        let res = self
+            .ctx
+            .eth
+            .propose_mint(
+                b256(&l.lock_id),
+                U256::from(l.value_zat),
+                addr(to),
+                &own.signature,
+            )
+            .await;
+        match res {
+            Ok(MintSubmitted::Proposed {
+                mined,
+                proposal_id,
+                eta,
+            }) => {
+                info!(event = "mint_proposed", lock_id = %lock_hex(&l.lock_id), proposal_id,
+                      amount = l.value_zat, to = %to.to_checksum(), tx = %mined.tx, eta,
+                      reproposal = l.state == LockState::Challenged);
+                if matches!(l.state, LockState::Signed | LockState::Challenged) {
+                    self.ctx.db(|t| {
+                        t.transition_lock(&l.lock_id, LockState::Proposed, Some(tip), None)
+                    })?;
+                }
+            }
+            Ok(MintSubmitted::Minted(_)) => {}
+            Err(e) if e.is_revert("ProposalPending") || e.is_revert("LockConsumed") => {
+                info!(event = "mint_propose_skipped", lock_id = %lock_hex(&l.lock_id), reason = %e)
+            }
+            Err(e) => {
+                warn!(event = "mint_submit_failed", lock_id = %lock_hex(&l.lock_id), error = %e)
+            }
+        }
+        Ok(())
+    }
+
+    /// `executeMint` of a ready, matching proposal: the current mint leader at once, every other
+    /// attestor once a further window has passed (anyone may; this only spreads the gas).
+    async fn execute(&mut self, l: &LockRecord, p: &Proposal, now: u64, window: u64) -> Result<()> {
+        let params = self.ctx.params.clone();
+        let since = self
+            .mem
+            .tip
+            .saturating_sub(l.block_height + params.confirmations - 1);
+        let leader = mint_leader_for(&l.lock_id, self.live(), since, params.takeover);
+        let mine = leader == Some(&self.ctx.me)
+            || p.proposer == addr(&self.ctx.key.eth_address())
+            || now >= p.eta.saturating_add(window);
+        if !mine {
+            return Ok(());
+        }
+        match self.ctx.eth.execute_mint(b256(&l.lock_id)).await {
+            Ok(m) => {
+                info!(event = "mint_executed", lock_id = %lock_hex(&l.lock_id), proposal_id = p.id,
+                      tx = %m.tx)
+            }
+            Err(e) if e.is_revert("MintRateLimited") => {
+                if self.mem.squat_logged.insert((l.lock_id, u128::MAX)) {
+                    warn!(event = "mint_rate_limited", lock_id = %lock_hex(&l.lock_id),
+                          proposal_id = p.id, error = %e, "retried every tick until a window opens");
+                }
+            }
+            Err(e) if e.is_revert("NoProposal") => {}
+            Err(e) => {
+                warn!(event = "mint_execute_failed", lock_id = %lock_hex(&l.lock_id), error = %e)
+            }
+        }
+        Ok(())
+    }
+
+    fn recently_submitted(&self, lock_id: &Hash32) -> bool {
+        self.mem
+            .submitted
+            .get(lock_id)
+            .is_some_and(|at| self.mem.tip < at + self.ctx.params.takeover.max(1))
+    }
+
+    async fn consumed(&self, lock_id: &Hash32) -> Result<bool> {
+        self.ctx
+            .eth
+            .consumed(b256(lock_id))
+            .await
+            .map_err(|e| anyhow!("consumed: {e}"))
     }
 
     /// Own signature plus peers' (`GET /locks/<id>`), each recovered to a current member's
@@ -615,44 +1037,31 @@ impl Engine {
         }
         Ok(sigs)
     }
+}
 
-    /// CR-W1 double: execute this attestor's matured proposals.
-    async fn execute_proposals(&mut self) -> Result<()> {
-        let proposed = self.ctx.db(|t| t.locks_in_state(LockState::Proposed))?;
-        if proposed.is_empty() {
-            return Ok(());
-        }
-        let now = self
-            .ctx
-            .eth
-            .provider()
-            .get_block_by_number(BlockNumberOrTag::Latest)
-            .await?
-            .map_or(0, |b| b.header.timestamp);
-        for l in proposed {
-            let Some(prop) = self
-                .ctx
-                .eth
-                .proposal(b256(&l.lock_id))
-                .await
-                .map_err(|e| anyhow!("{e}"))?
-            else {
-                continue;
-            };
-            if prop.executable_at > now
-                || prop.proposer != crate::convert::addr(&self.ctx.key.eth_address())
-            {
-                continue;
-            }
-            match self.ctx.eth.execute_mint(b256(&l.lock_id)).await {
-                Ok(m) => {
-                    info!(event = "mint_executed", lock_id = %lock_hex(&l.lock_id), tx = %m.tx)
-                }
-                Err(e) => {
-                    warn!(event = "mint_execute_failed", lock_id = %lock_hex(&l.lock_id), error = %e)
-                }
-            }
-        }
-        Ok(())
+/// Keys of `(lockId, proposalId)` pairs the engine remembers in memory.
+pub(crate) type ProposalKeys = HashSet<(Hash32, u128)>;
+
+#[cfg(test)]
+mod tests {
+    use super::challenge_due;
+
+    #[test]
+    fn challenge_deadline() {
+        // window 12 s, eta 112: due at 109 at the latest (a quarter left)
+        assert!(!challenge_due(false, true, 0, 2, 100, 112, 12));
+        assert!(challenge_due(false, false, 0, 2, 109, 112, 12));
+        assert!(challenge_due(false, true, 99, 2, 200, 112, 12), "past eta");
+        // an absent lock: C_Y blocks after it was first judged, with the follower caught up
+        assert!(!challenge_due(true, true, 1, 2, 100, 112, 12));
+        assert!(challenge_due(true, true, 2, 2, 100, 112, 12));
+        assert!(
+            !challenge_due(true, false, 5, 2, 100, 112, 12),
+            "lagging: wait"
+        );
+        // a lock that is here but not judged yet waits for the deadline only
+        assert!(!challenge_due(false, true, 50, 2, 100, 112, 12));
+        // a one-second window still has a margin of one second
+        assert!(challenge_due(false, true, 0, 2, 100, 101, 1));
     }
 }

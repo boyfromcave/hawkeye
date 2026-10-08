@@ -7,8 +7,11 @@ import {IWrappedYcash, WyecBridge} from "wyec/WyecBridge.sol";
 import {WyecEip712} from "./WyecEip712.sol";
 
 /// Shared fixture: a token + bridge deployed in the order of wyec-contract-design.md §8 (bridge
-/// first at the predicted token address), three guardians, threshold 2, signing helpers.
+/// first at the predicted token address), three guardians, threshold 2, a `WINDOW`-second
+/// challenge window, no rate limit; signing helpers for both mint paths.
 abstract contract BridgeTestBase is Test {
+    uint64 internal constant WINDOW = 3600;
+
     WrappedYcash internal token;
     WyecBridge internal bridge;
 
@@ -33,8 +36,18 @@ abstract contract BridgeTestBase is Test {
         internal
         returns (WrappedYcash t, WyecBridge b)
     {
+        return deployPair(guardians, threshold, WINDOW, 0, 0);
+    }
+
+    function deployPair(
+        address[] memory guardians,
+        uint8 threshold,
+        uint64 window,
+        uint256 mintCap,
+        uint256 capWindow
+    ) internal returns (WrappedYcash t, WyecBridge b) {
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
-        b = new WyecBridge(IWrappedYcash(predicted), guardians, threshold);
+        b = new WyecBridge(IWrappedYcash(predicted), guardians, threshold, window, mintCap, capWindow);
         t = new WrappedYcash(address(b));
         assertEq(address(t), predicted, "token prediction");
     }
@@ -56,6 +69,10 @@ abstract contract BridgeTestBase is Test {
         returns (bytes32)
     {
         return WyecEip712.digest(domainOf(b), WyecEip712.mintStruct(lockId, amount, to));
+    }
+
+    function challengeDigest(address b, bytes32 lockId, uint256 proposalId) internal view returns (bytes32) {
+        return WyecEip712.digest(domainOf(b), WyecEip712.challengeStruct(lockId, proposalId));
     }
 
     /// Signatures by `pks`, ordered by ascending signer address (the contract's rule, plan §4.4).
@@ -99,6 +116,17 @@ abstract contract BridgeTestBase is Test {
         bridge.mint(
             lockId, amount, to, signSorted(guardianPair(), mintDigest(address(bridge), lockId, amount, to))
         );
+    }
+
+    /// The optimistic path: guardian `pk`'s Mint signature, submitted by whoever calls.
+    function propose(uint256 pk, bytes32 lockId, uint256 amount, address to) internal returns (uint256) {
+        return
+            bridge.proposeMint(lockId, amount, to, sign(pk, mintDigest(address(bridge), lockId, amount, to)));
+    }
+
+    /// Guardian `pk`'s Challenge signature over proposal `id`, submitted by whoever calls.
+    function challenge(uint256 pk, bytes32 lockId, uint256 id) internal {
+        bridge.challengeMint(lockId, id, sign(pk, challengeDigest(address(bridge), lockId, id)));
     }
 
     // ------------------------------------------------------------------ admin acts

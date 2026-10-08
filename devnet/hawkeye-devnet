@@ -13,9 +13,14 @@ Ethereum addresses as guardians (eth/script/Deploy.s.sol), writes one hawkeye.to
 starts `hawkeye run` beside each attestor's own node. Each Hawkeye talks only to its own node.
 
 The commands mirror bridge-sim's (ycash-dd contrib/yellowback/devnet/bridge-sim) so the two can be
-compared: up | lock | burn | rogue | silence | unsilence | mine | pause | resume | status | logs |
-cli | down | clean | scenario demo | roll | dormancy | takeover | double | restart | reorg.  Python 3 standard library only; Foundry (anvil, forge, cast)
-on PATH.
+compared: up | lock | burn | rogue | rogue-mint | silence | unsilence | mine | pause | resume | status |
+logs | cli | down | clean | scenario demo | roll | dormancy | takeover | double | restart | reorg |
+rogue-mint.  Python 3 standard library only; Foundry (anvil, forge, cast) on PATH.
+
+The bridge (wyec @ the pin in eth/tools/fetch-wyec.sh) is deployed with threshold 2 and a 12 s
+challenge window, and the attestors run mint_mode = optimistic (the Foundation's model: one attestor
+proposes, any attestor challenges within the window, anyone executes); `--mint-mode threshold`
+runs the k-of-n mint instead (k = 2), `--challenge-window N` changes the window.
 
 Environment:
   YCASHD, YCASH_CLI   the node binaries, built from ycash-dd `upgrade/vault` (devnet/README.md);
@@ -73,9 +78,11 @@ ANVIL_DEPLOYER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7b
 ETH_FUNDING = hex(1000 * 10**18)
 
 # Hawkeye's [bridge] section for the devnet (plan §2 regtest column, §3.1); also used by the fallbacks.
+# mint_threshold is the contract's threshold (Deploy.s.sol THRESHOLD) and, in threshold mode, k; >= 2 so no
+# single key can skip the optimistic window through the threshold path (plan §3.3, the mainnet rule).
 BRIDGE = {"delay": 6, "confirmations": 2, "min_owner_age": 400, "roll_margin": 50, "takeover_blocks": 4,
-          "heartbeat_blocks": 10, "min_lock": "0.1", "max_lock": "1000", "mint_mode": "threshold",
-          "mint_threshold": 1}
+          "heartbeat_blocks": 10, "min_lock": "0.1", "max_lock": "1000", "mint_mode": "optimistic",
+          "mint_threshold": 2, "challenge_window": 12}
 # Bonds stay locked this many blocks past the join (>= bondlockmin), so a slashed bond is still frozen in place.
 BOND_LOCK = 5000
 # The fallback lock's ownerHeight slack above min_owner_age, so the lock still passes L-policy item 2
@@ -457,6 +464,7 @@ class Devnet:
         self.s = None
         self.lines = []        # the transcript (scenario)
         self._help_cache = {}
+        self.bridge_overrides = {}  # from the command line (--mint-mode, --challenge-window), applied by `up`
 
     # ---------------------------------------------------------------- output
     def say(self, text=""):
@@ -637,7 +645,7 @@ class Devnet:
                   "node_line": line, "node_version": version, "node_banner": banner,
                   "attestor_count": attestors, "base_port": base_port, "interval": interval,
                   "nodes": [], "attestors": [], "binaries": {"ycashd": ycashd, "ycash_cli": cli, "hawkeye": hawkeye},
-                  "bridge": dict(BRIDGE, **(bridge or {}))}
+                  "bridge": dict(BRIDGE, **dict(self.bridge_overrides, **(bridge or {})))}
         for i in range(attestors + 1):
             self.s["nodes"].append({"index": i, "port": base_port + 2 * i, "rpcport": base_port + 2 * i + 1,
                                     "datadir": self.path("ycash%d" % i), "pid": None})
@@ -938,9 +946,12 @@ class Devnet:
             env["FOUNDRY_SOLC"] = "./tools/solc"
             env["FOUNDRY_OFFLINE"] = "true"
         tmp = os.path.join(ETH, "deployments", ".test-devnet-%d.json" % os.getpid())   # gitignored; fs_permissions
+        b = self.bridge()
         env.update({"GUARDIANS": ",".join(a["eth_address"] for a in self.s["attestors"]),
-                    "THRESHOLD": str(self.bridge()["mint_threshold"]), "DEPLOYMENT_FILE": tmp})
-        self.say("  forge script script/Deploy.s.sol: guardians %s, threshold %d" % (env["GUARDIANS"], self.bridge()["mint_threshold"]))
+                    "THRESHOLD": str(b["mint_threshold"]), "CHALLENGE_WINDOW": str(b["challenge_window"]),
+                    "MINT_MODE": b["mint_mode"], "DEPLOYMENT_FILE": tmp})
+        self.say("  forge script script/Deploy.s.sol: guardians %s, threshold %d, challenge window %ds, mint mode %s"
+                 % (env["GUARDIANS"], b["mint_threshold"], b["challenge_window"], b["mint_mode"]))
         log = self.path("forge-deploy.log")
         p = run_cmd(["forge", "script", "script/Deploy.s.sol", "--rpc-url", self.anvil_url(), "--private-key",
                      ANVIL_DEPLOYER_KEY, "--broadcast", "--slow"], timeout=900, env=env, cwd=ETH, check=False)
@@ -957,10 +968,13 @@ class Devnet:
             die("guardianCount %s" % got)
         if self.eth_call(d["token"], "bridge()(address)").lower() != d["bridge"].lower():
             die("token.bridge() mismatch")
+        window = int(self.eth_call(d["bridge"], "challengeWindow()(uint64)"))
+        if window != self.bridge()["challenge_window"] or int(self.eth_call(d["bridge"], "threshold()(uint8)")) != d["threshold"]:
+            die("bridge challengeWindow %d / threshold do not match the deployment" % window)
         self.s["eth"] = {"bridge": d["bridge"], "token": d["token"], "deployBlock": d["deployBlock"]}
         self.save()
-        self.say("  wYEC deployed: bridge %s, token %s (deploy block %s, threshold %s) -> %s"
-                 % (d["bridge"], d["token"], d["deployBlock"], d["threshold"], dest))
+        self.say("  wYEC deployed: bridge %s, token %s (deploy block %s, threshold %s, challengeWindow %ss, mintMode %s) -> %s"
+                 % (d["bridge"], d["token"], d["deployBlock"], d["threshold"], window, d.get("mintMode"), dest))
 
     # ---------------------------------------------------------------- Hawkeye
     def write_config(self, path, node_index, secret_hex, home, api, peers):
@@ -1198,6 +1212,19 @@ format = "text"
         self.say("rogue intent %s (fallback): %s YEC from vault %s to %s, signed by attestor%d's member key, no memo, "
                  "no burn" % (intent, amount, vault["outpoint"], thief, attestor))
         return {"intent": intent, "txid": txid, "vault": vault["outpoint"], "recipient": thief, "via": "fallback"}
+
+    def rogue_mint(self, amount, attestor=1, to=None):
+        """A member proposes an optimistic mint for a lockId with no lock behind it (drill D-5): `hawkeye
+        rogue-mint` (drill-only, [devnet] drills = true). Returns its JSON {lockid, proposal_id, proposer, eta,
+        txhash, block, ...}."""
+        self.load()
+        a = self.s["attestors"][attestor - 1]
+        if not self.hawkeye_has("rogue-mint"):
+            die("the hawkeye binary has no `rogue-mint` subcommand")
+        args = ["rogue-mint", str(amount)] + (["--to", to] if to else [])
+        out = self.hawkeye(a["config"], *args).stdout.strip()
+        self.say("hawkeye --config attestor%d.toml %s: %s" % (attestor, " ".join(args), out))
+        return json.loads(out)
 
     def join_confirmed(self, a):
         txid = a.get("join_txid")
@@ -1490,10 +1517,14 @@ format = "text"
                 self.wait_for("lock %s confirmed" % lk["txid"][:16],
                               lambda: self.node(0).getrawtransaction(lk["txid"], 1).get("confirmations", 0) >= 1, timeout)
 
-            self.say("--- step 3: wait for the mint (wYEC.balanceOf(holder) == 10e8)")
+            b = self.bridge()
+            self.say("--- step 3: wait for the mint (wYEC.balanceOf(holder) == 10e8; mint mode %s%s)"
+                     % (b["mint_mode"], ": proposeMint -> %ds challenge window -> executeMint" % b["challenge_window"]
+                        if b["mint_mode"] == "optimistic" else ", k = %d" % b["mint_threshold"]))
             self.wait_for("holder holds 10 wYEC",
                           lambda: int(self.eth_call(token, "balanceOf(address)(uint256)", holder)) == 10 * COIN, timeout)
             self.say("  wYEC totalSupply %s" % yec(int(self.eth_call(token, "totalSupply()(uint256)"))))
+            self.report_mint_path()
 
             recipient = self.node(0).getnewaddress()
             spk = self.node(0).validateaddress(recipient)["scriptPubKey"]
@@ -2259,6 +2290,126 @@ format = "text"
         return ("second unlock for released burn %d (valid memo, %d blocks later) -> cancelled by another attestor -> "
                 "classified consumed-burn (not a benign race) -> attestor%d removed, bond frozen" % (nonce, gap, rogue))
 
+    # ================================================================ drill D-5: rogue mint (optimistic proposal)
+    def report_mint_path(self):
+        """The transcript lines of how the mint went: proposals (by whom), challenges, executes."""
+        bridge = self.s["eth"]["bridge"]
+        try:
+            count = int(self.eth_call(bridge, "proposalCount()(uint96)"))
+        except Exception:
+            return
+        self.say("  bridge: proposalCount %d, threshold %s, challengeWindow %ss"
+                 % (count, self.eth_call(bridge, "threshold()(uint8)"), self.eth_call(bridge, "challengeWindow()(uint64)")))
+        for a in self.s["attestors"]:
+            for name in ("mint_proposed", "mint_executed", "mint_challenged", "mint_submitted"):
+                for ln in self.log_events(a, name):
+                    self.say("  attestor%d: %s" % (a["index"], ln.strip()[:230]))
+
+    def eth_timestamp(self, block="latest"):
+        return int(self.cast("block", str(block), "--field", "timestamp", "--rpc-url", self.anvil_url()))
+
+    def drill_rogue_mint(self, timeout):
+        set_id = self.s["set"]["setid"]
+        bridge, token = self.s["eth"]["bridge"], self.s["eth"]["token"]
+        b = self.bridge()
+        if b["mint_mode"] != "optimistic":
+            self.say("  (mint mode %s: the honest mint is k-of-n; the watchers challenge proposals in every mode)" % b["mint_mode"])
+        window = int(self.eth_call(bridge, "challengeWindow()(uint64)"))
+        self.step("lock 10 YEC; the honest mint (%s; threshold %s, challenge window %ds): nobody challenges it"
+                  % (b["mint_mode"], self.eth_call(bridge, "threshold()(uint8)"), window))
+        self.lock_mint("10", 10 * COIN, timeout)
+        self.report_mint_path()
+        if self.scan_logs(["event=mint_challenged"]):
+            die("an honest proposal was challenged: %s" % self.scan_logs(["event=mint_challenged"]))
+
+        rogue = 1
+        ra = self.attestor(rogue)
+        self.step("attestor%d proposes 5 wYEC for a lockId with no lock behind it: `hawkeye rogue-mint 5` (one Mint "
+                  "signature, drill sign-once record; proposeMint from its own account)" % rogue)
+        before = self.wyec_supply()
+        rm = self.rogue_mint("5", rogue)
+        lock_id, pid, eta = rm["lockid"], int(rm["proposal_id"]), int(rm["eta"])
+        if rm["proposer"].lower() != ra["eth_address"].lower():
+            die("the proposal's proposer %s is not attestor%d (%s)" % (rm["proposer"], rogue, ra["eth_address"]))
+        prop_ts = self.eth_timestamp(rm["block"])
+        self.say("  proposal %d of lockId %s.. in block %d (t=%d), eta %d (= t + %ds); status %s (1 = Pending)"
+                 % (pid, lock_id[:18], rm["block"], prop_ts, eta, eta - prop_ts,
+                    self.eth_call(bridge, "proposalStatus(bytes32)(uint8)", lock_id)))
+
+        self.step("another attestor challenges it inside the window (an EIP-712 Challenge(lockId, %d) signature)" % pid)
+
+        def challenged():
+            out = self.cast("logs", "--rpc-url", self.anvil_url(), "--from-block", str(rm["block"]), "--address", bridge,
+                            "--json", "MintChallenged(bytes32,uint256,address)", lock_id)
+            for log in json.loads(out or "[]"):
+                if int(log["topics"][2], 16) == pid:
+                    return log
+            return None
+        log = self.wait_for("MintChallenged(%s.., %d)" % (lock_id[:18], pid), challenged, window + 30, poll=0.5)
+        challenger = "0x" + log["topics"][3][-40:]
+        cblock = int(log["blockNumber"], 16)
+        cts = self.eth_timestamp(cblock)
+        by = [a["index"] for a in self.s["attestors"] if a["eth_address"].lower() == challenger.lower()]
+        self.say("  MintChallenged in block %d (t=%d, %ds before eta) by %s (attestor%s); tx %s"
+                 % (cblock, cts, eta - cts, challenger, ",".join(map(str, by)) or "?", log["transactionHash"]))
+        if not by:
+            die("the challenger %s is not an attestor" % challenger)
+        if rogue in by:
+            die("the rogue challenged its own proposal; the drill needs another attestor")
+        if cts >= eta:
+            die("challenged at t=%d, not before eta %d" % (cts, eta))
+        for a in self.s["attestors"]:
+            for ln in self.log_events(a, "mint_challenged", needle=lock_id[2:18]) or self.log_events(a, "mint_challenged"):
+                self.say("  attestor%d: %s" % (a["index"], ln.strip()[:230]))
+            for ln in self.log_events(a, "own_fraudulent_proposal"):
+                self.say("  attestor%d: %s" % (a["index"], ln.strip()[:230]))
+
+        self.step("the window passes: no wYEC for the rogue lockId; the proposer is barred from it")
+        self.wait_for("chain time past eta %d" % eta, lambda: self.eth_timestamp() > eta + 1, window + 30, poll=0.5)
+        status = int(self.eth_call(bridge, "proposalStatus(bytes32)(uint8)", lock_id))
+        consumed = self.eth_call(bridge, "consumed(bytes32)(bool)", lock_id)
+        vetoed = self.eth_call(bridge, "vetoed(bytes32,address)(bool)", lock_id, ra["eth_address"])
+        ex = run_cmd(["cast", "call", "--rpc-url", self.anvil_url(), bridge, "executeMint(bytes32)", lock_id], check=False)
+        exec_err = (ex.stdout + ex.stderr).strip().splitlines()[-1:] if ex.returncode != 0 else ["SUCCEEDED"]
+        replay = run_cmd(["cast", "call", "--rpc-url", self.anvil_url(), bridge, "proposalCount()(uint96)"], check=False)
+        self.say("  proposalStatus %d (0 = None), consumed %s, vetoed[lockId][attestor%d] %s; executeMint would: %s"
+                 % (status, consumed, rogue, vetoed, exec_err[0][:160] if exec_err else "?"))
+        if status != 0 or consumed != "false" or vetoed != "true" or ex.returncode == 0:
+            die("the rogue proposal is not dead: status %d consumed %s vetoed %s" % (status, consumed, vetoed))
+        supply, bal = self.wyec_supply(), self.wyec_balance(rm["to"])
+        self.say("  wYEC totalSupply %s (before the rogue proposal %s); balance of the rogue recipient %s: %s; "
+                 "proposalCount %s" % (yec(supply), yec(before), rm["to"], yec(bal), replay.stdout.strip()))
+        if supply != before or bal != 0:
+            die("wYEC was minted for the rogue lockId")
+
+        self.step("the proposer is slashed on Ycash: attestor%d removed, bond frozen" % rogue)
+
+        def slashed():
+            for m in self.node(0).set_getinfo(set_id)["memberlist"]:
+                if m["key"] == ra["memberkey"] and m["status"] == "removed" and m["bondfrozen"]:
+                    return m
+            return None
+        m = self.wait_for("attestor%d status removed, bondfrozen true" % rogue, slashed, timeout + 120)
+        self.say("  member %s..: %s" % (ra["memberkey"][:16], jdump(m)))
+        opened = [ln for a in self.s["attestors"] if a["index"] != rogue
+                  for ln in self.log_events(a, "slash_case_opened", needle="FRAUDULENT_MINT")]
+        for ln in opened[:2]:
+            self.say("  %s" % ln.strip()[:230])
+        if not opened:
+            die("no FRAUDULENT_MINT slash case opened by another attestor")
+        for a in self.s["attestors"]:
+            for ln in self.log_events(a, "slash_submitted"):
+                self.say("  attestor%d: %s" % (a["index"], ln.strip()[:230]))
+
+        self.step("the supply invariant holds")
+        supply, locked = self.wyec_supply(), self.locked_zat()
+        self.say("  wYEC totalSupply %s <= WYEC value under the set %s" % (yec(supply), yec(locked)))
+        if supply != 10 * COIN or supply > locked:
+            die("supply invariant broken (supply %s, locked %s)" % (yec(supply), yec(locked)))
+        return ("honest lock -> proposal -> execute (unchallenged); rogue proposal %d for a lockId with no lock -> "
+                "challenged by attestor%s %ds before eta -> no wYEC, proposer vetoed -> attestor%d removed, bond frozen"
+                % (pid, ",".join(map(str, by)), eta - cts, rogue))
+
     # ================================================================ drill D-16: restart / crash mid-flow
     def drill_restart(self, timeout):
         """Three crashes, each followed by a restart from the ledger: (A) the mint leader aborts right after
@@ -2525,6 +2676,7 @@ DRILLS = {
     "restart": ("plan §8 D-16: crash mid-flow", "drill_restart", {}),
     # finalized = latest - 16 on anvil, so a burn can be reorged out below finality (D-10)
     "reorg": ("plan §8 D-9 + D-10: Ycash and Ethereum reorgs", "drill_reorg", {"slots": 8}),
+    "rogue-mint": ("plan §8 D-5: rogue mint, an optimistic proposal with no lock", "drill_rogue_mint", {}),
 }
 
 def main():
@@ -2546,6 +2698,10 @@ def main():
         p.add_argument("--anvil-port", type=int, default=18545)
         p.add_argument("--interval", type=float, default=2.0, help="background miner: seconds per block (0: off)")
         p.add_argument("--block-time", type=int, default=1, help="anvil block time in seconds (0: automine)")
+        p.add_argument("--mint-mode", choices=["optimistic", "threshold"], default=BRIDGE["mint_mode"],
+                       help="the attestors' mint mode (default optimistic; threshold = k-of-n mint with k = 2)")
+        p.add_argument("--challenge-window", type=int, default=BRIDGE["challenge_window"],
+                       help="the bridge's optimistic challenge window in seconds (default %d)" % BRIDGE["challenge_window"])
 
     up_args(sub.add_parser("up", help="start the devnet (or resume a stopped one)"))
     p = sub.add_parser("lock", help="node0 locks YEC under the set (to the holder by default)")
@@ -2558,6 +2714,10 @@ def main():
     p = sub.add_parser("rogue", help="attestor1 signs an unlock with no burn (drill D-2)")
     p.add_argument("amount")
     p.add_argument("--attestor", type=int, default=1)
+    p = sub.add_parser("rogue-mint", help="attestor1 proposes a mint for a lockId with no lock (drill D-5)")
+    p.add_argument("amount")
+    p.add_argument("--attestor", type=int, default=1)
+    p.add_argument("--to")
     sub.add_parser("silence", help="stop attestor N's hawkeye").add_argument("n", type=int)
     sub.add_parser("unsilence", help="start attestor N's hawkeye again").add_argument("n", type=int)
     sub.add_parser("mine", help="node0 mines N blocks now").add_argument("n", type=int)
@@ -2583,6 +2743,8 @@ def main():
     args = parser.parse_args()
 
     dv = Devnet(getattr(args, "dir", None) or os.environ.get("HAWKEYE_DEVNET_DIR") or DEFAULT_DIR)
+    if hasattr(args, "mint_mode"):
+        dv.bridge_overrides = {"mint_mode": args.mint_mode, "challenge_window": args.challenge_window}
     try:
         if args.command == "up":
             dv.up(args.attestors, args.activation, args.base_port, args.anvil_port, args.interval, args.block_time)
@@ -2592,6 +2754,8 @@ def main():
             dv.burn(args.amount, args.recipient)
         elif args.command == "rogue":
             dv.rogue(args.amount, args.attestor)
+        elif args.command == "rogue-mint":
+            dv.rogue_mint(args.amount, args.attestor, args.to)
         elif args.command in ("silence", "unsilence"):
             dv.silence(args.n, args.command == "silence")
         elif args.command == "mine":

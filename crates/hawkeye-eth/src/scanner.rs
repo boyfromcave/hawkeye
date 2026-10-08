@@ -2,8 +2,9 @@
 //!
 //! Hawkeye acts only on burns in **finalized** Ethereum blocks. The scanner reads the bridge's logs
 //! in `[from, finalized]` in chunks with `eth_getLogs`, decodes `BurnToYcash`, `Minted`,
-//! `GuardiansChanged`, `Paused`/`Unpaused` and the CR-W1 double's `MintProposed`/`MintChallenged`,
-//! and returns them in chain order with their position.
+//! `MintProposed` / `MintChallenged` (the optimistic path), `GuardiansChanged`,
+//! `MintLimitChanged` and `Paused`/`Unpaused`, and returns them in chain order with their
+//! position.
 //!
 //! "Finalized" is the node's `finalized` tag. A node without one (some dev chains and L2s answer
 //! the tag with an error or nothing) falls back to `latest − fallback_depth` when a fallback is
@@ -19,7 +20,7 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use serde::{Deserialize, Serialize};
 
-use crate::bindings::{OptimisticMintBridge, WyecBridge};
+use crate::bindings::WyecBridge;
 use crate::client::EthClient;
 use crate::{Error, Result};
 
@@ -74,20 +75,25 @@ pub enum BridgeEvent {
     },
     /// `Paused(account)` / `Unpaused(account)`.
     Paused { paused: bool, account: Address },
-    /// CR-W1 double: `MintProposed(lockId, to, amount, proposer, executableAt)`.
+    /// `MintProposed(lockId, proposalId, proposer, to, amount, eta)`: an optimistic proposal,
+    /// executable from `eta` unless challenged.
     MintProposed {
         lock_id: B256,
+        proposal_id: u128,
+        proposer: Address,
         to: Address,
         amount: U256,
-        proposer: Address,
-        executable_at: u64,
+        eta: u64,
     },
-    /// CR-W1 double: `MintChallenged(lockId, challenger, proposer)`.
+    /// `MintChallenged(lockId, proposalId, challenger)`: the proposal is deleted and its proposer
+    /// barred from the lock (`vetoed`).
     MintChallenged {
         lock_id: B256,
+        proposal_id: u128,
         challenger: Address,
-        proposer: Address,
     },
+    /// `MintLimitChanged(mintCap, capWindow)` (also emitted by the constructor).
+    MintLimitChanged { mint_cap: U256, cap_window: U256 },
 }
 
 /// An event and where it is.
@@ -105,8 +111,9 @@ pub fn topics() -> Vec<B256> {
         WyecBridge::GuardiansChanged::SIGNATURE_HASH,
         WyecBridge::Paused::SIGNATURE_HASH,
         WyecBridge::Unpaused::SIGNATURE_HASH,
-        OptimisticMintBridge::MintProposed::SIGNATURE_HASH,
-        OptimisticMintBridge::MintChallenged::SIGNATURE_HASH,
+        WyecBridge::MintProposed::SIGNATURE_HASH,
+        WyecBridge::MintChallenged::SIGNATURE_HASH,
+        WyecBridge::MintLimitChanged::SIGNATURE_HASH,
     ]
 }
 
@@ -156,27 +163,44 @@ pub fn decode_log(log: &Log) -> Result<Option<ScannedEvent>> {
             paused: false,
             account: decode::<WyecBridge::Unpaused>(log, "Unpaused")?.account,
         },
-        OptimisticMintBridge::MintProposed::SIGNATURE_HASH => {
-            let e = decode::<OptimisticMintBridge::MintProposed>(log, "MintProposed")?;
+        WyecBridge::MintProposed::SIGNATURE_HASH => {
+            let e = decode::<WyecBridge::MintProposed>(log, "MintProposed")?;
             BridgeEvent::MintProposed {
                 lock_id: e.lockId,
+                proposal_id: proposal_id(e.proposalId, log)?,
+                proposer: e.proposer,
                 to: e.to,
                 amount: e.amount,
-                proposer: e.proposer,
-                executable_at: e.executableAt,
+                eta: e.eta,
             }
         }
-        OptimisticMintBridge::MintChallenged::SIGNATURE_HASH => {
-            let e = decode::<OptimisticMintBridge::MintChallenged>(log, "MintChallenged")?;
+        WyecBridge::MintChallenged::SIGNATURE_HASH => {
+            let e = decode::<WyecBridge::MintChallenged>(log, "MintChallenged")?;
             BridgeEvent::MintChallenged {
                 lock_id: e.lockId,
+                proposal_id: proposal_id(e.proposalId, log)?,
                 challenger: e.challenger,
-                proposer: e.proposer,
+            }
+        }
+        WyecBridge::MintLimitChanged::SIGNATURE_HASH => {
+            let e = decode::<WyecBridge::MintLimitChanged>(log, "MintLimitChanged")?;
+            BridgeEvent::MintLimitChanged {
+                mint_cap: e.mintCap,
+                cap_window: e.capWindow,
             }
         }
         _ => return Ok(None),
     };
     Ok(Some(ScannedEvent { meta, event }))
+}
+
+/// Proposal ids are the contract's `uint96` counter, logged as `uint256`.
+fn proposal_id(id: U256, log: &Log) -> Result<u128> {
+    u128::try_from(id).map_err(|_| Error::BadLog {
+        event: "MintProposed/MintChallenged",
+        tx: log.transaction_hash,
+        reason: format!("proposalId {id} exceeds uint96"),
+    })
 }
 
 fn pending_log(what: &str) -> Error {

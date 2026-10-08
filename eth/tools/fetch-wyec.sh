@@ -13,7 +13,9 @@
 # files under crates/hawkeye-eth/abi/, and say so in the commit message.
 set -eu
 
-WYEC_COMMIT=d2e382beeea11c9f9b43675ae49d6d52334c46d6
+# wyec main at the merge of PR #1 (CR-W1 optimistic mint + rate limit, CR-W2 Foundry project,
+# CR-W3 recipient NatSpec). Was d2e382b (threshold mint only).
+WYEC_COMMIT=cad126a415bdb5e0ae9cf7d05f6bd1b512267efb
 WYEC_URL=${WYEC_URL:-https://github.com/boyfromcave/wyec.git}
 
 here=$(cd "$(dirname "$0")/.." && pwd)

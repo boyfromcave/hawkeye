@@ -47,7 +47,8 @@ pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributo
 }
 
 /// The start-up checks: the node's network, the set exists, this key is a current member, the
-/// guardian set matches the members (refused on mainnet, warned elsewhere).
+/// guardian set matches the members (refused on mainnet, warned elsewhere), and the live bridge's
+/// threshold is ≥ 2 on mainnet in every mint mode (plan §3.3; warned elsewhere when it is 1).
 pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
     let info = ctx.ycash.getblockchaininfo().await.context("ycashd")?;
     let want = match ctx.network_name.as_str() {
@@ -84,9 +85,35 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
         }
         warn!(event = "startup_guardian_mismatch", detail = %d);
     }
+    let threshold = ctx
+        .eth
+        .threshold()
+        .await
+        .map_err(|e| anyhow!("bridge threshold: {e}"))?;
+    let window = ctx
+        .eth
+        .challenge_window()
+        .await
+        .map_err(|e| anyhow!("bridge challengeWindow (is it the wyec CR-W1 bridge?): {e}"))?;
+    let chain = if ctx.params.mainnet {
+        hawkeye_eth::mode::MAINNET
+    } else {
+        ctx.eth.chain_id()
+    };
+    if let Err(e) = hawkeye_eth::mode::check_contract_threshold(chain, threshold) {
+        bail!("{e} (plan §3.3)");
+    }
+    if threshold < hawkeye_eth::mode::MAINNET_MIN_THRESHOLD {
+        warn!(
+            event = "startup_bridge_threshold_one",
+            threshold,
+            "one key can mint through the threshold path and skip the challenge window: development only"
+        );
+    }
     info!(event = "startup_ok", set = %ctx.set_hash(), member = %hex::encode(ctx.me),
           eth = %ctx.key.eth_address().to_checksum(), chain = %info.chain, tip = info.blocks,
-          mint_mode = %ctx.params.mint_mode);
+          mint_mode = %ctx.params.mint_mode, bridge_threshold = threshold,
+          challenge_window = window);
     Ok(())
 }
 

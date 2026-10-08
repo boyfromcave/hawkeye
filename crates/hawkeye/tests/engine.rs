@@ -9,8 +9,13 @@
 //! (g) restart resumes a slash case and a deferred mint check without re-asking or re-signing;
 //! (h) two cancels of one intent by one key → `SET_EQUIVOCATION`; (i) rolls (HK-6): a vault near
 //! `ownerHeight` is rolled into a later one, not cancelled; an invalid roll is cancelled and
-//! slashed; (j) an optimistic proposal with no lock is challenged and its proposer faces a case;
-//! (k) `POST /unlock/sign` co-signs only a burn ↔ memo match, once.
+//! slashed; (j) an optimistic proposal with no lock is challenged and its proposer faces a case,
+//! in optimistic and (j2) threshold mode alike; (k) `POST /unlock/sign` co-signs only a burn ↔
+//! memo match, once; (l) optimistic happy path: the leader proposes, nobody challenges, the leader
+//! executes after the window; (m) a matching proposal challenged anyway (griefing) is re-proposed
+//! by another attestor (the challenged proposer is `vetoed`) and executed; (n) a wrong-amount
+//! proposal squatting a real lock is challenged, its proposer faces a case, and the right mint
+//! follows.
 //!
 //! Skipped without `anvil` on PATH unless `HAWKEYE_REQUIRE_ANVIL=1`.
 
@@ -33,8 +38,8 @@ use hawkeye_core::setsig::Role;
 use hawkeye_core::template::{TAG_WYEC, VaultParams};
 use hawkeye_core::{Deployment as CoreDeployment, EthAddress, OutPoint as CoreOutPoint, SecretKey};
 use hawkeye_eth::{
-    Address, B256, Deployment, EthClient, EthConfig, MintMode, PrivateKeySigner, U256, deploy,
-    wallet_provider,
+    Address, B256, DeployParams, Deployment, EthClient, EthConfig, MintMode, PrivateKeySigner,
+    U256, deploy, wallet_provider,
 };
 use hawkeye_store::{BurnKey, BurnState, IntentState, LockState, SlashState, Store, VaultState};
 use hawkeye_ycash::mock::{KnownScript, MockState, MockYcashd};
@@ -101,6 +106,9 @@ impl Attributor for MockAttributor {
 }
 
 const DELAY: u16 = 6;
+/// The bridge's challenge window in these tests, seconds (time is advanced with
+/// `evm_increaseTime`).
+const WINDOW: u64 = 3600;
 const C_Y: u32 = 2;
 const TAKEOVER: u32 = 4;
 
@@ -184,13 +192,15 @@ async fn setup_with(opts: Opts) -> Option<Env> {
         .map(|k| hawkeye::convert::addr(&k.eth_address()))
         .collect();
     let provider = wallet_provider(&anvil.endpoint(), deployer.clone()).unwrap();
+    // threshold mode deploys at its k; optimistic mode at 2 (the mainnet rule, plan §3.3)
+    let threshold = match opts.mode {
+        MintMode::Threshold { k } => k,
+        MintMode::Optimistic => 2,
+    };
     let dep = deploy(
         &provider,
         deployer.address(),
-        &guardians,
-        1,
-        opts.mode,
-        3600,
+        &DeployParams::new(&guardians, threshold, WINDOW, opts.mode),
     )
     .await
     .unwrap();
@@ -286,6 +296,16 @@ impl Env {
 
     fn mine(&self, n: u32) {
         self.mock.state().mine(n);
+    }
+
+    /// Advance anvil's clock by `seconds` and mine a block.
+    async fn warp(&self, seconds: u64) {
+        let _: serde_json::Value = self
+            .provider
+            .raw_request(Cow::Borrowed("evm_increaseTime"), (U256::from(seconds),))
+            .await
+            .unwrap();
+        self.eth_mine(1).await;
     }
 
     async fn eth_mine(&self, n: u64) {
@@ -1545,4 +1565,243 @@ async fn k_unlock_cosign_endpoint() {
         .await
         .unwrap_err();
     assert!(format!("{e:#}").contains("sign-once conflict"), "{e:#}");
+}
+
+// ------------------------------------------------------------------------------------------
+// optimistic mode (wyec @ cad126a, plan §3.3)
+
+fn opt() -> Opts {
+    Opts {
+        mode: MintMode::Optimistic,
+        ..Opts::default()
+    }
+}
+
+fn challenges(e: &Engine) -> Vec<hawkeye_store::ChallengeSignRecord> {
+    e.ctx().db(|t| t.challenge_signatures()).unwrap()
+}
+
+/// Ticks with Ethereum blocks mined in between (finality = latest − 2), no Ycash blocks.
+async fn eth_rounds(env: &Env, engines: &mut [Engine], n: usize) {
+    for _ in 0..n {
+        tick_all(engines).await;
+        env.eth_mine(3).await;
+    }
+    tick_all(engines).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l_optimistic_propose_window_execute() {
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    let mut engines = three(&env).await;
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let lock_id = drive_mint(&env, &mut engines, &op).await;
+    let c = env.eth(&env.holder).await;
+    let p = c
+        .proposal(B256::from(lock_id))
+        .await
+        .unwrap()
+        .expect("proposed");
+    assert_eq!(
+        (p.id, p.amount, p.to),
+        (1, U256::from(1_000_000_000u64), hawkeye::convert::addr(&to))
+    );
+    assert!(
+        (0..3).any(|i| hawkeye::convert::addr(&env.keys[i].eth_address()) == p.proposer),
+        "an attestor proposed"
+    );
+    for e in &engines {
+        let l = e.ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap();
+        assert_eq!(
+            l.state,
+            LockState::Proposed,
+            "every attestor sees the proposal"
+        );
+        assert!(
+            challenges(e).is_empty(),
+            "a matching proposal is never challenged"
+        );
+    }
+    // nothing executes inside the window
+    eth_rounds(&env, &mut engines, 2).await;
+    assert_eq!(c.total_supply().await.unwrap(), U256::ZERO);
+    // after it, the leader executes and everyone observes the Minted event
+    env.warp(WINDOW).await;
+    eth_rounds(&env, &mut engines, 3).await;
+    assert_eq!(
+        c.balance_of(hawkeye::convert::addr(&to)).await.unwrap(),
+        U256::from(1_000_000_000u64)
+    );
+    assert_eq!(c.proposal_count().await.unwrap(), 1, "proposed once");
+    for e in &engines {
+        let l = e.ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap();
+        assert_eq!(l.state, LockState::Minted);
+        assert!(e.alarms().is_empty(), "{:?}", e.alarms());
+        assert!(challenges(e).is_empty());
+        assert!(open_cases(e).is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m_challenged_matching_proposal_is_reproposed_by_another() {
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    let mut engines = three(&env).await;
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let lock_id = drive_mint(&env, &mut engines, &op).await;
+    let c = env.eth(&env.holder).await;
+    let first = c.proposal(B256::from(lock_id)).await.unwrap().unwrap();
+    // one guardian challenges the correct proposal anyway (griefing); the holder submits it
+    let griefer = (0..3)
+        .find(|i| hawkeye::convert::addr(&env.keys[*i].eth_address()) != first.proposer)
+        .unwrap();
+    let digest = hawkeye_core::eip712::Domain::new(31337, EthAddress(env.dep.bridge.0.0))
+        .challenge_digest(&lock_id, first.id);
+    let sig = hawkeye_core::eth::sign_digest(&env.keys[griefer], &digest).unwrap();
+    c.challenge_mint(B256::from(lock_id), first.id, &sig)
+        .await
+        .unwrap();
+    assert!(c.vetoed(B256::from(lock_id), first.proposer).await.unwrap());
+    eth_rounds(&env, &mut engines, 3).await;
+    let second = c
+        .proposal(B256::from(lock_id))
+        .await
+        .unwrap()
+        .expect("re-proposed");
+    assert_eq!(second.id, 2);
+    assert_ne!(
+        second.proposer, first.proposer,
+        "the barred proposer stood aside"
+    );
+    for e in &engines {
+        assert!(
+            e.alarms()
+                .iter()
+                .any(|a| a.name == "matching-proposal-challenged"),
+            "{:?}",
+            e.alarms()
+        );
+        assert!(
+            challenges(e).is_empty(),
+            "nobody challenges the re-proposal"
+        );
+    }
+    env.warp(WINDOW).await;
+    eth_rounds(&env, &mut engines, 3).await;
+    assert_eq!(
+        c.balance_of(hawkeye::convert::addr(&to)).await.unwrap(),
+        U256::from(1_000_000_000u64)
+    );
+    for e in &engines {
+        assert_eq!(
+            e.ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap().state,
+            LockState::Minted
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n_wrong_amount_proposal_on_a_real_lock_challenged() {
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    let mut engines = three(&env).await;
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let lock_id = hawkeye_core::lock::lock_id(&op);
+    env.mine(C_Y);
+    // before any attestor acts, member r proposes the real lockId with a wrong amount
+    let r = 1;
+    let digest = hawkeye_core::eip712::Domain::new(31337, EthAddress(env.dep.bridge.0.0))
+        .mint_digest(&lock_id, 9_000_000_000, &to);
+    let sig = hawkeye_core::eth::sign_digest(&env.keys[r], &digest).unwrap();
+    let c = env.eth(&env.holder).await;
+    c.propose_mint(
+        B256::from(lock_id),
+        U256::from(9_000_000_000u64),
+        hawkeye::convert::addr(&to),
+        &sig,
+    )
+    .await
+    .unwrap();
+    env.eth_mine(3).await;
+    eth_rounds(&env, &mut engines, 4).await;
+    // challenged (by someone), a correct proposal follows from an attestor other than r
+    let p = c
+        .proposal(B256::from(lock_id))
+        .await
+        .unwrap()
+        .expect("the correct proposal");
+    assert_eq!(p.amount, U256::from(1_000_000_000u64));
+    assert_ne!(
+        p.proposer,
+        hawkeye::convert::addr(&env.keys[r].eth_address())
+    );
+    let challenged: usize = engines.iter().map(|e| challenges(e).len()).sum();
+    assert!(challenged >= 1);
+    for (i, e) in engines.iter().enumerate() {
+        for ch in challenges(e) {
+            assert_eq!(
+                ch.amount, 9_000_000_000,
+                "only the wrong proposal is challenged"
+            );
+        }
+        if i != r {
+            assert!(
+                open_cases(e)
+                    .iter()
+                    .any(|c| c.fault == hawkeye_store::FaultKind::FraudulentMint
+                        && c.target_key == env.key_of_index(r)),
+                "attestor {i}"
+            );
+        }
+    }
+    env.warp(WINDOW).await;
+    eth_rounds(&env, &mut engines, 3).await;
+    assert_eq!(
+        c.total_supply().await.unwrap(),
+        U256::from(1_000_000_000u64)
+    );
+}
+
+/// The contract's optimistic path cannot be switched off: in threshold mode the watchers still
+/// challenge a one-key proposal with no lock behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn j2_threshold_mode_watchers_still_challenge_proposals() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    let r = 0;
+    let fake = [0xce; 32];
+    let to = env.holder.eth_address();
+    let digest = hawkeye_core::eip712::Domain::new(31337, EthAddress(env.dep.bridge.0.0))
+        .mint_digest(&fake, 300_000_000, &to);
+    let sig = hawkeye_core::eth::sign_digest(&env.keys[r], &digest).unwrap();
+    let rogue = env.eth(&env.keys[r]).await;
+    rogue
+        .propose_mint(
+            B256::from(fake),
+            U256::from(300_000_000u64),
+            hawkeye::convert::addr(&to),
+            &sig,
+        )
+        .await
+        .unwrap();
+    env.eth_mine(3).await;
+    for _ in 0..C_Y + 1 {
+        tick_all(&mut engines).await;
+        env.mine(1);
+    }
+    tick_all(&mut engines).await;
+    assert!(
+        rogue.proposal(B256::from(fake)).await.unwrap().is_none(),
+        "challenged C_Y blocks after it was judged, long before the window ends"
+    );
+    env.warp(WINDOW).await;
+    tick_all(&mut engines).await;
+    assert_eq!(rogue.total_supply().await.unwrap(), U256::ZERO);
 }

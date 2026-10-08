@@ -1,6 +1,7 @@
-//! EIP-712 digests exactly as `WyecBridge.sol` (wyec @ `d2e382b`) builds them (plan §4.4):
-//! domain `{name: "WyecBridge", version: "1", chainId, verifyingContract}` and the four typed
-//! messages `Mint`, `SetGuardians`, `SetPaused`, `SetBridge`.
+//! EIP-712 digests exactly as `WyecBridge.sol` (wyec @ `cad126a`) builds them (plan §4.4):
+//! domain `{name: "WyecBridge", version: "1", chainId, verifyingContract}` and the six typed
+//! messages `Mint` (both mint paths), `Challenge` (the optimistic path's veto,
+//! wyec-contract-design.md §4.5), `SetGuardians`, `SetPaused`, `SetMintLimit`, `SetBridge`.
 
 use crate::bytes::{Hash32, keccak256};
 use crate::eth::EthAddress;
@@ -15,6 +16,8 @@ pub const DOMAIN_TYPE: &str =
     "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
 /// `Mint`'s type string.
 pub const MINT_TYPE: &str = "Mint(bytes32 lockId,uint256 amount,address to)";
+/// `Challenge`'s type string: a guardian's veto of optimistic proposal `proposalId` for `lockId`.
+pub const CHALLENGE_TYPE: &str = "Challenge(bytes32 lockId,uint256 proposalId)";
 /// `SetGuardians`' type string.
 pub const SET_GUARDIANS_TYPE: &str =
     "SetGuardians(address[] guardians,uint8 threshold,uint256 adminNonce)";
@@ -22,6 +25,9 @@ pub const SET_GUARDIANS_TYPE: &str =
 pub const SET_PAUSED_TYPE: &str = "SetPaused(bool paused,uint256 adminNonce)";
 /// `SetBridge`' type string.
 pub const SET_BRIDGE_TYPE: &str = "SetBridge(address newBridge,uint256 adminNonce)";
+/// `SetMintLimit`'s type string.
+pub const SET_MINT_LIMIT_TYPE: &str =
+    "SetMintLimit(uint256 mintCap,uint256 capWindow,uint256 adminNonce)";
 
 /// A uint as its 32-byte ABI word.
 pub fn uint_word(v: u128) -> [u8; 32] {
@@ -81,6 +87,13 @@ impl Domain {
         self.digest(&mint_struct_hash(lock_id, amount, to))
     }
 
+    /// The digest a guardian signs to challenge optimistic proposal `proposal_id` of `lock_id`
+    /// (`challengeMint(lockId, proposalId, sig)`). Proposal ids are the contract's `uint96`
+    /// counter; the digest binds the id, so a challenge never deletes a later re-proposal.
+    pub fn challenge_digest(&self, lock_id: &Hash32, proposal_id: u128) -> Hash32 {
+        self.digest(&challenge_struct_hash(lock_id, proposal_id))
+    }
+
     /// The digest for `setGuardians(guardians, threshold, sigs)` at `admin_nonce`.
     pub fn set_guardians_digest(
         &self,
@@ -100,6 +113,20 @@ impl Domain {
         self.digest(&set_paused_struct_hash(paused, admin_nonce))
     }
 
+    /// The digest for `setMintLimit(mintCap, capWindow, sigs)` at `admin_nonce`.
+    pub fn set_mint_limit_digest(
+        &self,
+        mint_cap: u128,
+        cap_window: u64,
+        admin_nonce: u64,
+    ) -> Hash32 {
+        self.digest(&set_mint_limit_struct_hash(
+            mint_cap,
+            cap_window,
+            admin_nonce,
+        ))
+    }
+
     /// The digest for `setBridge(newBridge, sigs)` at `admin_nonce`.
     pub fn set_bridge_digest(&self, new_bridge: &EthAddress, admin_nonce: u64) -> Hash32 {
         self.digest(&set_bridge_struct_hash(new_bridge, admin_nonce))
@@ -113,6 +140,15 @@ pub fn mint_struct_hash(lock_id: &Hash32, amount: u64, to: &EthAddress) -> Hash3
         *lock_id,
         uint_word(u128::from(amount)),
         to.to_word(),
+    ])
+}
+
+/// `keccak256(abi.encode(CHALLENGE_TYPEHASH, lockId, proposalId))`.
+pub fn challenge_struct_hash(lock_id: &Hash32, proposal_id: u128) -> Hash32 {
+    encode(&[
+        keccak256(CHALLENGE_TYPE.as_bytes()),
+        *lock_id,
+        uint_word(proposal_id),
     ])
 }
 
@@ -146,6 +182,16 @@ pub fn set_bridge_struct_hash(new_bridge: &EthAddress, admin_nonce: u64) -> Hash
     encode(&[
         keccak256(SET_BRIDGE_TYPE.as_bytes()),
         new_bridge.to_word(),
+        uint_word(u128::from(admin_nonce)),
+    ])
+}
+
+/// `keccak256(abi.encode(SET_MINT_LIMIT_TYPEHASH, mintCap, capWindow, adminNonce))`.
+pub fn set_mint_limit_struct_hash(mint_cap: u128, cap_window: u64, admin_nonce: u64) -> Hash32 {
+    encode(&[
+        keccak256(SET_MINT_LIMIT_TYPE.as_bytes()),
+        uint_word(mint_cap),
+        uint_word(u128::from(cap_window)),
         uint_word(u128::from(admin_nonce)),
     ])
 }
