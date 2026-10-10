@@ -1,6 +1,6 @@
 # Wrapped Ycash on NEAR — the third vault application
 
-**Revision 1, 2026-10-10. Branch `claude/hawkeye-near-wyec` (exploratory: built so the option is
+**Revision 2, 2026-10-10 (NH5 as built, §4 item 6). Branch `claude/hawkeye-near-wyec` (exploratory: built so the option is
 ready, not a commitment to ship).** Extends the Hawkeye plan of record
 ([`hawkeye-bridge-plan.md`](hawkeye-bridge-plan.md), "the main plan") from one foreign chain
 (Ethereum) to two. Decisions are numbered **N-\***, phases **NH0–NH6**, open questions **NQ-\***.
@@ -141,6 +141,25 @@ business step, not code.
    `NearScheme`. Ledger schema v4: chain-neutral accounts (`ethereum:0x…` / `near:<id>`) and
    guardians (`ethereum:0x…` / `secp256k1:<x‖y>`), cursor `foreign`; v3 ledgers migrate losslessly.
    Status: `foreign_kind`, `guardian`, `foreign` (the old `eth_address` / `ethereum` kept).
+6. **As built (NH5): against a real nearcore.** The NEAR sandbox node is pinned at nearcore
+   **2.13.4** (`near/tools/fetch-sandbox.sh`, SHA-256 checked; the version near-workspaces 0.23 /
+   near-sandbox 0.3.16 uses, so the contract tests, the adapter test and the devnet run one node).
+   `crates/hawkeye-near/tests/sandbox.rs` (env-gated: `HAWKEYE_NEAR_SANDBOX_RPC`,
+   `HAWKEYE_NEAR_SANDBOX_KEY`) drives every RPC shape the NH4 client had only seen from its mock;
+   two differed and are fixed in the client and the mock: (a) a **view call that panics** is
+   answered in `result.error` as `wasm execution failed with error: HostError(GuestPanic {
+   panic_msg: "…" })` (a missing contract: `CompilationError(CodeDoesNotExist …)`), not with the
+   `Smart contract panicked:` wording of a failed transaction; (b) `send_tx` outcomes carry
+   `gas_burnt`, now summed into `TxOutcome` / `CallOutcome`. Blocks, `status`,
+   `view_access_key`, `EXPERIMENTAL_changes` (`cause.receipt_hash`), `EXPERIMENTAL_receipt`,
+   transaction panics and `InvalidNonce` matched the mock; the N-8 scanner found a threshold mint,
+   two proposals, a challenge, an execute and a burn at their blocks with the right keys on the
+   first real run. The codec gained `CreateAccount`, `DeployContract` and a full-access `AddKey`
+   (golden-vectored against `near-primitives`), used only by set-up code (`admin.rs`,
+   `examples/near-admin.rs`); the daemon never creates accounts or deploys. The devnet raises the
+   sandbox's `epoch_length` to 100 000 so no epoch change or garbage collection happens within a
+   run (the scanner needs every block since `start_block`; a production RPC must keep them, or be
+   archival, as before). The sandbox binary needs glibc ≥ 2.39: its CI jobs run on ubuntu-24.04.
 
 ## 5. Phases
 
@@ -151,7 +170,7 @@ business step, not code.
 | NH2 ✅ | `near/` contract: token + bridge, unit tests (`near-sdk` test env), wasm build, sandbox integration tests (`near-workspaces`, CI) | all green; wasm size and gas measured |
 | NH3 ✅ | `ForeignChain` trait; Ethereum behind it with no behaviour change (all existing tests and drills still pass) | Ethereum devnet demo PASS on both node lines |
 | NH4 ✅ | `hawkeye-near` adapter + daemon support | engine tests against a NEAR mock RPC |
-| NH5 | NEAR devnet: real regtest ycashd + NEAR sandbox + Hawkeyes; `scenario demo` and `rogue-mint` | PASS on both node lines (CI: the NEAR sandbox binary downloads on GitHub runners) |
+| NH5 ✅ | NEAR devnet: real regtest ycashd + NEAR sandbox + Hawkeyes; `scenario demo` and `rogue-mint` (`devnet/hawkeye-devnet --foreign near`); the adapter against a real sandbox (CI `near-adapter-sandbox`) | PASS on both node lines: devnet-e2e run 38041601513 (ycash-dd v4.5.0 and ycash6 6.22.0-rc1 × ethereum and near, all green, transcripts as artifacts `devnet-<line>-<foreign>`); ci run 38039974967 (`near-adapter-sandbox`) |
 | NH6 | testnet trial, audit, Foundation parameters | — |
 
 ## 6. Open questions
@@ -160,5 +179,5 @@ business step, not code.
 |---|---|---|
 | NQ-1 | One bridge set per chain (N-2) or one shared set | separate sets |
 | NQ-2 | Contract upgrades on NEAR | none in v1; a successor contract with a threshold-signed migration if ever needed |
-| NQ-3 | Who funds NEAR storage and gas (N-10) | the bridge operators' treasury; ~0.00125 NEAR per new holder, gas per mint ~10–30 TGas |
+| NQ-3 | Who funds NEAR storage and gas (N-10) | the bridge operators' treasury; ~0.00125 NEAR per new holder. Measured on the 2.13.4 sandbox (gas burnt, transaction + receipts; NH5): threshold mint (k = 2, registering the receiver) 3.40 TGas, `propose_mint` 2.88, `challenge_mint` 2.85, `execute_mint` 2.71, `burn` 2.61, deploy + `new` 24.09 (297 200-byte wasm); Hawkeye attaches 100 TGas per call (`gas_tgas`) and is refunded the rest |
 | NQ-4 | Direct NEAR ↔ Ethereum wYEC routing | out of scope: each bridge is backed by its own vaults; moving between them is burn on one + lock on the other |
