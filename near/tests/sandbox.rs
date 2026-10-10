@@ -268,7 +268,7 @@ async fn sandbox_propose_challenge_execute() -> anyhow::Result<()> {
     let alice = env
         .relayer
         .create_subaccount("alice")
-        .initial_balance(NearToken::from_near(1))
+        .initial_balance(NearToken::from_near(2))
         .transact()
         .await?
         .into_result()?;
