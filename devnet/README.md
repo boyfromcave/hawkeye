@@ -184,7 +184,7 @@ SIGTERM and SIGKILL on each process group, and fails if anything is left. If `up
            mint_mode = "optimistic"  mint_threshold = 2      # --mint-mode threshold: k = 2
 [keys]     secret_hex = "<hex32>"
 [store]    path = "<run>/attestor<i>/hawkeye.db"
-[api]      listen = "127.0.0.1:<7800+i>"
+[api]      listen = "127.0.0.1:<7800+i>"   (base: --api-base, default 7800)
 [policy]   auto_slash = true
 [peers]    urls = [the other attestors' http://api URLs]
 [devnet]   drills = true

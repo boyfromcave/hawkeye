@@ -335,6 +335,15 @@ def proc_alive(pid, match=None):
     """pid is running (not a zombie) and, if given, its command line contains `match`."""
     if not pid:
         return False
+    if not os.path.isdir("/proc/self"):      # macOS / BSD: no procfs, ask ps
+        try:
+            out = subprocess.run(["ps", "-o", "stat=", "-o", "command=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if not out or out.split(None, 1)[0].startswith("Z"):
+            return False
+        return not match or match in out
     try:
         with open("/proc/%d/stat" % pid) as f:
             if f.read().rsplit(")", 1)[1].split()[0] == "Z":
@@ -473,6 +482,7 @@ class Devnet:
         self.lines = []        # the transcript (scenario)
         self._help_cache = {}
         self.bridge_overrides = {}  # from the command line (--mint-mode, --challenge-window), applied by `up`
+        self.api_base = 7800        # --api-base: node0's hawkeye API port; attestor i listens on api_base + i
 
     # ---------------------------------------------------------------- output
     def say(self, text=""):
@@ -642,10 +652,10 @@ class Devnet:
         ports = []
         for i in range(attestors + 1):
             ports += [base_port + 2 * i, base_port + 2 * i + 1]
-        api_ports = [7800 + i for i in range(1, attestors + 1)]
+        api_ports = [self.api_base + i for i in range(0, attestors + 1)]
         busy = [p for p in ports + api_ports + [anvil_port] if not free_port(p)]
         if busy:
-            die("ports in use: %s (choose --base-port / --anvil-port)" % busy)
+            die("ports in use: %s (choose --base-port / --anvil-port / --api-base)" % busy)
 
         line, version, banner = node_line(ycashd)
         os.makedirs(self.dir, exist_ok=True)
@@ -705,7 +715,7 @@ class Devnet:
             secret = new_secret()
             member, eth = self.derive_keys(secret)
             self.s["attestors"].append({"index": i, "node": i, "secret_hex": secret.hex(), "memberkey": member,
-                                        "eth_address": eth, "api": "127.0.0.1:%d" % (7800 + i),
+                                        "eth_address": eth, "api": "127.0.0.1:%d" % (self.api_base + i),
                                         "config": self.path("attestor%d.toml" % i), "home": self.path("attestor%d" % i),
                                         "log": self.path("attestor%d" % i, "hawkeye.log"), "pid": None})
             self.say("  attestor%d: member key %s, eth address %s" % (i, member, eth))
@@ -756,7 +766,7 @@ class Devnet:
         self.s["depositor"] = {"config": self.path("node0.toml"), "home": self.path("node0"), "pid": None}
         os.makedirs(self.s["depositor"]["home"], exist_ok=True)
         self.write_config(self.s["depositor"]["config"], 0, self.s["holder"]["secret_hex"],
-                          self.s["depositor"]["home"], "127.0.0.1:7800", [b["api"] for b in self.s["attestors"]])
+                          self.s["depositor"]["home"], "127.0.0.1:%d" % self.api_base, [b["api"] for b in self.s["attestors"]])
         self.save()
         for a in self.s["attestors"]:
             self.enroll(a)
@@ -1123,6 +1133,12 @@ format = "text"
             out = self.hawkeye(dep, "lock", str(amount), "--dest", dest, *extra).stdout.strip()
             self.say("hawkeye lock %s --dest %s%s: %s" % (amount, dest, " --owner-age %d" % owner_age if owner_age is not None else "",
                                                          out.replace("\n", " | ")))
+            try:                     # the JSON document: since the PQ owner its 66-hex `owner` precedes `txid`
+                j = json.loads(out.splitlines()[-1])
+                return {"txid": j["txid"], "outpoint": "%s:%d" % (j["txid"], j.get("vout", 0)), "via": "hawkeye",
+                        "output": out, "owner": j.get("owner"), "ownerheight": j.get("owner_height")}
+            except (ValueError, KeyError, IndexError, TypeError):
+                pass
             m = re.search(r"\b([0-9a-f]{64})(?::(\d+))?", out)
             return {"txid": m.group(1) if m else None, "outpoint": "%s:%s" % (m.group(1), m.group(2) or 0) if m else None,
                     "via": "hawkeye", "output": out}
@@ -2704,6 +2720,7 @@ def main():
         p.add_argument("--activation", type=int, default=110, help="UPGRADE_VAULT height (default 110)")
         p.add_argument("--base-port", type=int, default=18400, help="node i: p2p base+2i, rpc base+2i+1")
         p.add_argument("--anvil-port", type=int, default=18545)
+        p.add_argument("--api-base", type=int, default=7800, help="hawkeye API ports: node0 base, attestor i base+i")
         p.add_argument("--interval", type=float, default=2.0, help="background miner: seconds per block (0: off)")
         p.add_argument("--block-time", type=int, default=1, help="anvil block time in seconds (0: automine)")
         p.add_argument("--mint-mode", choices=["optimistic", "threshold"], default=BRIDGE["mint_mode"],
@@ -2753,6 +2770,7 @@ def main():
     dv = Devnet(getattr(args, "dir", None) or os.environ.get("HAWKEYE_DEVNET_DIR") or DEFAULT_DIR)
     if hasattr(args, "mint_mode"):
         dv.bridge_overrides = {"mint_mode": args.mint_mode, "challenge_window": args.challenge_window}
+        dv.api_base = args.api_base
     try:
         if args.command == "up":
             dv.up(args.attestors, args.activation, args.base_port, args.anvil_port, args.interval, args.block_time)
