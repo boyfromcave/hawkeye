@@ -5,6 +5,8 @@
 # and a locked release build uploaded as an artifact.
 # Contracts: the Foundry project in eth/ against wyec at its pinned commit (build, sizes, tests,
 # deploy script against a local anvil).
+# NEAR: the wyec-near contract (unit tests, wasm, near-workspaces sandbox tests) and Hawkeye's NEAR
+# adapter against a real NEAR sandbox node (crates/hawkeye-near/tests/sandbox.rs).
 # Workflows: actionlint.
 #
 # Every third-party action is pinned to a commit SHA (the tag in the trailing comment); the
@@ -240,3 +242,45 @@ jobs:
           name: wyec-near-wasm
           path: near/target/wasm32-unknown-unknown/release/wyec_near.wasm
           retention-days: 14
+
+  # The NH4 adapter's RPC shapes against a real nearcore (NEAR plan NH5): the pinned sandbox node
+  # (near/tools/fetch-sandbox.sh, SHA-256 checked), the release wasm deployed by the test itself.
+  near-adapter-sandbox:
+    name: NEAR adapter on a real sandbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: near-adapter
+          workspaces: |
+            . -> target
+            near -> target
+      - name: wasm build
+        working-directory: near
+        run: cargo build --locked --target wasm32-unknown-unknown --release
+      - name: start a NEAR sandbox
+        run: |
+          bin=$(near/tools/fetch-sandbox.sh)
+          "$bin" --version
+          home="$RUNNER_TEMP/near-sandbox"
+          "$bin" --home "$home" init --fast
+          nohup "$bin" --home "$home" run --rpc-addr 127.0.0.1:3030 --network-addr 127.0.0.1:24567 \
+            >"$RUNNER_TEMP/near-sandbox.log" 2>&1 &
+          for _ in $(seq 1 120); do
+            curl -sf http://127.0.0.1:3030/status >/dev/null && break
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:3030/status | head -c 400
+          echo "HAWKEYE_NEAR_SANDBOX_KEY=$home/validator_key.json" >>"$GITHUB_ENV"
+      - name: adapter tests against the sandbox
+        env:
+          HAWKEYE_NEAR_SANDBOX_RPC: http://127.0.0.1:3030
+          HAWKEYE_REQUIRE_NEAR_SANDBOX: "1"
+        run: cargo test --locked -p hawkeye-near --test sandbox -- --nocapture
+      - name: sandbox log
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/near-sandbox.log"

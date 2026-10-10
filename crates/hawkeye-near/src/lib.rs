@@ -4,6 +4,7 @@
 //!
 //! | Module | Contents |
 //! |---|---|
+//! | [`admin`] | the one place transactions are signed and sent (nonce handling), and account set-up for devnets and tests |
 //! | [`tx`] | a hand-rolled Borsh codec for `TransactionV0` / `SignedTransaction` with `FunctionCall` actions, golden-vectored against `near-primitives` |
 //! | [`keys`] | the relayer's ed25519 key from a NEAR credentials JSON file |
 //! | [`rpc`] | the JSON-RPC client: views at `final` or a block, `block`, `EXPERIMENTAL_changes`, `EXPERIMENTAL_receipt`, access keys, `send_tx` (`FINAL`) |
@@ -14,6 +15,7 @@
 //! The attestation scheme (digests, signatures, guardian keys) is `hawkeye-core::near`'s; this
 //! crate never signs an attestation, only the relayer's transaction envelopes.
 
+pub mod admin;
 pub mod contract;
 pub mod error;
 pub mod keys;

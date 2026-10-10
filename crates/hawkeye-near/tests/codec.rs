@@ -5,6 +5,7 @@
 use borsh::BorshSerialize;
 use hawkeye_core::AccountId;
 use hawkeye_near::KeyFile;
+use hawkeye_near::keys::decode_key_text;
 use hawkeye_near::rpc::b58;
 use hawkeye_near::tx::{Action, FunctionCall, SignedTransaction, Transaction};
 use serde_json::Value;
@@ -30,7 +31,22 @@ fn tx_of(v: &Value, key: &KeyFile) -> Transaction {
         .unwrap()
         .iter()
         .map(|a| {
-            if let Some(f) = a.get("FunctionCall") {
+            if a == "CreateAccount" {
+                Action::CreateAccount
+            } else if let Some(d) = a.get("DeployContract") {
+                Action::DeployContract {
+                    code: hex::decode(s(d, "code_hex")).unwrap(),
+                }
+            } else if let Some(k) = a.get("AddKey") {
+                assert_eq!(s(k, "permission"), "FullAccess");
+                Action::AddFullAccessKey {
+                    public_key: decode_key_text(s(k, "public_key"))
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                    nonce: s(k, "nonce").parse().unwrap(),
+                }
+            } else if let Some(f) = a.get("FunctionCall") {
                 Action::FunctionCall(FunctionCall {
                     method_name: s(f, "method_name").into(),
                     args: hex::decode(s(f, "args_hex")).unwrap(),
@@ -57,7 +73,14 @@ fn tx_of(v: &Value, key: &KeyFile) -> Transaction {
 #[test]
 fn near_primitives_vectors() {
     let vs = vectors();
-    assert!(vs.len() >= 5);
+    assert!(vs.len() >= 7);
+    let kinds: Vec<&Value> = vs
+        .iter()
+        .flat_map(|v| v["actions"].as_array().unwrap())
+        .collect();
+    assert!(kinds.iter().any(|a| a.get("AddKey").is_some()));
+    assert!(kinds.iter().any(|a| a.get("DeployContract").is_some()));
+    assert!(kinds.iter().any(|a| *a == "CreateAccount"));
     for v in &vs {
         let name = s(v, "name");
         let key = KeyFile::from_json(
@@ -103,6 +126,19 @@ struct FunctionCallAction {
     deposit: u128,
 }
 
+#[derive(BorshSerialize)]
+enum Permission {
+    #[allow(dead_code)]
+    FunctionCall,
+    FullAccess,
+}
+
+#[derive(BorshSerialize)]
+struct AccessKey {
+    nonce: u64,
+    permission: Permission,
+}
+
 #[allow(dead_code)]
 #[derive(BorshSerialize)]
 enum BorshAction {
@@ -110,6 +146,8 @@ enum BorshAction {
     DeployContract(Vec<u8>),
     FunctionCall(FunctionCallAction),
     Transfer(u128),
+    Stake,
+    AddKey(PublicKey, AccessKey),
 }
 
 #[derive(BorshSerialize)]
@@ -139,6 +177,12 @@ fn matches_the_borsh_derive() {
                 deposit: u128::MAX - 1,
             }),
             Action::Transfer { deposit: 9 },
+            Action::CreateAccount,
+            Action::DeployContract { code: vec![1, 2] },
+            Action::AddFullAccessKey {
+                public_key: [6; 32],
+                nonce: 11,
+            },
         ],
     };
     let derived = borsh::to_vec(&TransactionV0 {
@@ -155,6 +199,15 @@ fn matches_the_borsh_derive() {
                 deposit: u128::MAX - 1,
             }),
             BorshAction::Transfer(9),
+            BorshAction::CreateAccount,
+            BorshAction::DeployContract(vec![1, 2]),
+            BorshAction::AddKey(
+                PublicKey::Ed25519([6; 32]),
+                AccessKey {
+                    nonce: 11,
+                    permission: Permission::FullAccess,
+                },
+            ),
         ],
     })
     .unwrap();

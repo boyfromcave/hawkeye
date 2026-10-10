@@ -21,10 +21,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::admin::send_actions;
 use crate::error::{Error, Result};
 use crate::keys::KeyFile;
 use crate::rpc::{BlockRef, NearRpc, ReceiptView};
-use crate::tx::{Action, FunctionCall, Transaction};
+use crate::tx::{Action, FunctionCall};
 
 /// The default gas per call: 100 TGas (a mint with registration or a threshold mint of a few
 /// signatures uses ~10–30 TGas, NEAR plan NQ-3).
@@ -100,6 +101,8 @@ pub struct CallOutcome {
     pub height: u64,
     /// The call's return value (JSON bytes).
     pub value: Vec<u8>,
+    /// Gas burnt by the transaction and all its receipts.
+    pub gas_burnt: u64,
 }
 
 /// A bridge event found by [`WyecNear::scan`].
@@ -568,53 +571,31 @@ impl WyecNear {
             .as_ref()
             .ok_or_else(|| Error::Key("no relayer key: this client is read-only".into()))?;
         let mut last = r.nonce.lock().await;
-        let mut retried = false;
-        loop {
-            let ak = self
-                .rpc
-                .access_key(r.key.account_id.as_str(), &r.key.public_key_text())
-                .await?;
-            let nonce = ak.nonce.max(last.unwrap_or(0)) + 1;
-            let tx = Transaction {
-                signer_id: r.key.account_id.clone(),
-                public_key: r.key.public_key(),
-                nonce,
-                receiver_id: self.domain.contract_id.clone(),
-                block_hash: ak.block_hash,
-                actions: vec![Action::FunctionCall(FunctionCall {
-                    method_name: method.to_owned(),
-                    args: serde_json::to_vec(&args).expect("JSON"),
-                    gas: self.gas,
-                    deposit,
-                })],
-            };
-            let signed = tx.sign(r.key.signing_key())?;
-            match self.rpc.send_tx(&signed.borsh()).await {
-                Ok(o) => {
-                    *last = Some(nonce);
-                    let height = self
-                        .rpc
-                        .block(BlockRef::Hash(o.receipt_block))
-                        .await?
-                        .height;
-                    return Ok(CallOutcome {
-                        tx: o.tx_hash,
-                        height,
-                        value: o.value,
-                    });
-                }
-                Err(e) if e.is_invalid_nonce() && !retried => {
-                    retried = true;
-                    *last = None;
-                }
-                Err(e) => {
-                    // final and failed (a panic), or not known to have landed: either way the
-                    // next transaction takes a higher nonce
-                    *last = Some(nonce);
-                    return Err(e);
-                }
-            }
-        }
+        let o = send_actions(
+            &self.rpc,
+            &r.key,
+            &mut last,
+            &self.domain.contract_id,
+            vec![Action::FunctionCall(FunctionCall {
+                method_name: method.to_owned(),
+                args: serde_json::to_vec(&args).expect("JSON"),
+                gas: self.gas,
+                deposit,
+            })],
+        )
+        .await?;
+        drop(last);
+        let height = self
+            .rpc
+            .block(BlockRef::Hash(o.receipt_block))
+            .await?
+            .height;
+        Ok(CallOutcome {
+            tx: o.tx_hash,
+            height,
+            value: o.value,
+            gas_burnt: o.gas_burnt,
+        })
     }
 
     /// `mint(lock_id, amount, receiver_id, sigs)`: `sigs` as given (see [`sort_signatures`]).

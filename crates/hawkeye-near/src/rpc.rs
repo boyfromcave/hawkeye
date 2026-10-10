@@ -121,6 +121,8 @@ pub struct TxOutcome {
     pub receipt_block: [u8; 32],
     /// That receipt's id.
     pub receipt_id: Option<[u8; 32]>,
+    /// Gas burnt by the transaction and all its receipts (`outcome.gas_burnt`, summed).
+    pub gas_burnt: u64,
 }
 
 /// An access key's state.
@@ -317,7 +319,8 @@ impl NearRpc {
             json!(B64.encode(serde_json::to_vec(args).expect("JSON"))),
         );
         let r = self.call("query", Value::Object(p)).await?;
-        // nodes before 1.x answered a failed view as a result with an `error` string
+        // nearcore (2.13 included) answers a failed view as a result with an `error` string:
+        // `wasm execution failed with error: HostError(GuestPanic { panic_msg: "…" })`
         if let Some(e) = r.get("error").and_then(Value::as_str) {
             return Err(match extract_panic(e) {
                 Some(p) => Error::Panic(p),
@@ -488,11 +491,24 @@ impl NearRpc {
                 None,
             ),
         };
+        let mut gas_burnt = as_u64(
+            field(&r, &["transaction_outcome", "outcome", "gas_burnt"])?,
+            "gas_burnt",
+        )?;
+        for o in r
+            .get("receipts_outcome")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            gas_burnt += as_u64(field(o, &["outcome", "gas_burnt"])?, "gas_burnt")?;
+        }
         Ok(TxOutcome {
             tx_hash,
             value,
             receipt_block,
             receipt_id,
+            gas_burnt,
         })
     }
 }

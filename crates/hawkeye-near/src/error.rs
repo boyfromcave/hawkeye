@@ -94,14 +94,40 @@ pub fn panic_name(message: &str) -> Option<&'static str> {
         .map(|(_, n)| *n)
 }
 
-/// The panic text inside a NEAR error string (`… Smart contract panicked: wyec: … "))`), if
-/// there is one.
+/// The panic text inside a NEAR error string, if there is one. nearcore words a contract panic
+/// two ways: a failed transaction's `ExecutionError` says `Smart contract panicked: <msg>`; a view
+/// call's error (nearcore 2.x: `result.error` of `query`) is the Debug form
+/// `wasm execution failed with error: HostError(GuestPanic { panic_msg: "<msg>" })`, where `<msg>`
+/// is Debug-escaped.
 pub fn extract_panic(text: &str) -> Option<String> {
+    const GUEST: &str = "GuestPanic { panic_msg: \"";
+    if let Some(i) = text.find(GUEST) {
+        return Some(debug_unescape(&text[i + GUEST.len()..]));
+    }
     const P: &str = "Smart contract panicked: ";
     let rest = &text[text.find(P)? + P.len()..];
     // a Debug-printed error ends the message at the closing quote
     let end = rest.find('"').unwrap_or(rest.len());
     Some(rest[..end].trim_end_matches('\\').replace("\\'", "'"))
+}
+
+/// A Rust Debug string's contents up to its closing (unescaped) quote, unescaped.
+fn debug_unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '"' => break,
+            '\\' => match it.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(o) => out.push(o),
+                None => break,
+            },
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The panic text in any string of a JSON value (an RPC error or a failed status).
@@ -160,6 +186,16 @@ mod tests {
             Some("wyec: no such proposal")
         );
         assert_eq!(extract_panic("Exceeded the prepaid gas."), None);
+        // a view call's panic as nearcore 2.13 answers it (`result.error` of `query`)
+        let view = r#"wasm execution failed with error: HostError(GuestPanic { panic_msg: "wyec: lock_id must be 32 bytes of hex" })"#;
+        assert_eq!(
+            extract_panic(view).as_deref(),
+            Some("wyec: lock_id must be 32 bytes of hex")
+        );
+        let quoted = r#"HostError(GuestPanic { panic_msg: "say \"hi\" \\ ok" })"#;
+        assert_eq!(extract_panic(quoted).as_deref(), Some(r#"say "hi" \ ok"#));
+        let no_code = r#"wasm execution failed with error: CompilationError(CodeDoesNotExist { account_id: "wyec.near" })"#;
+        assert_eq!(extract_panic(no_code), None);
         let e = Error::Panic("wyec: lock consumed".into());
         assert_eq!(e.revert_name(), Some("LockConsumed"));
         assert_eq!(e.to_string(), "panicked: wyec: lock consumed");

@@ -10,9 +10,11 @@
 use std::str::FromStr;
 
 use near_crypto::{KeyType, SecretKey, Signature};
+use near_primitives::account::{AccessKey, AccessKeyPermission};
 use near_primitives::hash::CryptoHash;
 use near_primitives::transaction::{
-    Action, FunctionCallAction, SignedTransaction, Transaction, TransactionV0, TransferAction,
+    Action, AddKeyAction, CreateAccountAction, DeployContractAction, FunctionCallAction,
+    SignedTransaction, Transaction, TransactionV0, TransferAction,
 };
 use near_primitives::types::{AccountId, Balance, Gas};
 use near_sdk::borsh;
@@ -26,6 +28,10 @@ const FILE: &str = concat!(
 enum A {
     Call(&'static str, Vec<u8>, u64, u128),
     Transfer(u128),
+    CreateAccount,
+    Deploy(Vec<u8>),
+    /// A full-access ed25519 key (from this seed) with this nonce.
+    AddFullAccessKey(&'static str, u64),
 }
 
 struct Case {
@@ -117,6 +123,33 @@ fn cases() -> Vec<Case> {
             block_hash: [0x42; 32],
             actions: vec![A::Call("config", vec![], 1, 1)],
         },
+        // the account set-up a devnet sends (hawkeye-near `admin`, NH5)
+        Case {
+            name: "create_subaccount_with_key",
+            seed: "hawkeye tx vector 6",
+            signer: "test.near",
+            receiver: "hawkeye1.test.near",
+            nonce: 9_000_001,
+            block_hash: [0x5c; 32],
+            actions: vec![
+                A::CreateAccount,
+                A::Transfer(50_000_000_000_000_000_000_000_000),
+                A::AddFullAccessKey("hawkeye tx vector 6 new key", 0),
+            ],
+        },
+        Case {
+            name: "deploy_and_init",
+            seed: "hawkeye tx vector 7",
+            signer: "wyec.test.near",
+            receiver: "wyec.test.near",
+            nonce: 2,
+            block_hash: [0x77; 32],
+            actions: vec![
+                A::Deploy(b"\0asm\x01\0\0\0 not a real module".to_vec()),
+                A::Call("new", br#"{"network_id":"sandbox"}"#.to_vec(), 100 * tgas, 0),
+                A::AddFullAccessKey("hawkeye tx vector 7 new key", u64::MAX),
+            ],
+        },
     ]
 }
 
@@ -136,6 +169,15 @@ fn build(c: &Case) -> Value {
             A::Transfer(d) => Action::Transfer(TransferAction {
                 deposit: Balance::from_yoctonear(*d),
             }),
+            A::CreateAccount => Action::CreateAccount(CreateAccountAction {}),
+            A::Deploy(code) => Action::DeployContract(DeployContractAction { code: code.clone() }),
+            A::AddFullAccessKey(seed, nonce) => Action::AddKey(Box::new(AddKeyAction {
+                public_key: SecretKey::from_seed(KeyType::ED25519, seed).public_key(),
+                access_key: AccessKey {
+                    nonce: *nonce,
+                    permission: AccessKeyPermission::FullAccess,
+                },
+            })),
         })
         .collect();
     let tx = Transaction::V0(TransactionV0 {
@@ -168,6 +210,11 @@ fn build(c: &Case) -> Value {
                 "method_name": m, "args_hex": hex::encode(args),
                 "gas": gas.to_string(), "deposit": deposit.to_string()}}),
             A::Transfer(d) => json!({"Transfer": {"deposit": d.to_string()}}),
+            A::CreateAccount => json!("CreateAccount"),
+            A::Deploy(code) => json!({"DeployContract": {"code_hex": hex::encode(code)}}),
+            A::AddFullAccessKey(seed, nonce) => json!({"AddKey": {
+                "public_key": SecretKey::from_seed(KeyType::ED25519, seed).public_key().to_string(),
+                "nonce": nonce.to_string(), "permission": "FullAccess"}}),
         })
         .collect();
     json!({

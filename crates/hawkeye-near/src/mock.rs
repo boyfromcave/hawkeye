@@ -41,6 +41,10 @@ pub const BURN_RECORD_FIXED_BYTES: u128 = 40 + 5 + 76;
 /// The first block's timestamp: 2026-01-01T00:00:00Z.
 pub const GENESIS_NS: u64 = 1_767_225_600_000_000_000;
 const NS: u64 = 1_000_000_000;
+/// The gas the mock reports burnt converting a transaction (a function call's ~2.4 TGas).
+pub const MOCK_TX_GAS: u64 = 2_428_000_000_000;
+/// The gas the mock reports burnt executing its receipt.
+pub const MOCK_RECEIPT_GAS: u64 = 5_000_000_000_000;
 
 fn sha(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -848,9 +852,10 @@ impl MockState {
             "transaction": {"hash": b58(&tx_hash), "signer_id": t.signer_id.as_str(),
                             "receiver_id": t.receiver_id.as_str(), "nonce": t.nonce},
             "transaction_outcome": {"id": b58(&tx_hash), "block_hash": b58(&block_hash),
-                                    "outcome": {"logs": [], "status": {"SuccessReceiptId": b58(&receipt_id)}}},
+                                    "outcome": {"logs": [], "gas_burnt": MOCK_TX_GAS,
+                                                "status": {"SuccessReceiptId": b58(&receipt_id)}}},
             "receipts_outcome": [{"id": b58(&receipt_id), "block_hash": b58(&block_hash),
-                                  "outcome": {"logs": [], "status": status}}],
+                                  "outcome": {"logs": [], "gas_burnt": MOCK_RECEIPT_GAS, "status": status}}],
         }))
     }
 
@@ -871,10 +876,11 @@ impl MockState {
                     if p.get("account_id").and_then(Value::as_str)
                         != Some(self.domain.contract_id.as_str())
                     {
-                        return Err(
-                            json!({"name": "HANDLER_ERROR", "cause": {"name": "NO_CONTRACT_CODE", "info": {}},
-                                          "code": -32000, "message": "Server error"}),
-                        );
+                        // nearcore 2.13 answers a failed view in the result, not as an RPC error
+                        return Ok(json!({"error": format!(
+                            "wasm execution failed with error: CompilationError(CodeDoesNotExist {{ account_id: {:?} }})",
+                            p.get("account_id").and_then(Value::as_str).unwrap_or("")),
+                            "logs": [], "block_height": b.height, "block_hash": b58(&b.hash)}));
                     }
                     let args: Value = p
                         .get("args_base64")
@@ -885,11 +891,10 @@ impl MockState {
                     match b.contract.view(&self.domain, m, &args, b.timestamp_ns) {
                         Ok(v) => Ok(json!({"result": serde_json::to_vec(&v).expect("JSON"),
                             "logs": [], "block_height": b.height, "block_hash": b58(&b.hash)})),
-                        Err(e) => Err(json!({"name": "HANDLER_ERROR",
-                            "cause": {"name": "CONTRACT_EXECUTION_ERROR", "info": {"vm_error":
-                                format!("wasm execution failed with error: FunctionCallError(ExecutionError(\"Smart contract panicked: {e}\"))"),
-                                "block_height": b.height, "block_hash": b58(&b.hash)}},
-                            "code": -32000, "message": "Server error"})),
+                        // as nearcore 2.13 answers a view panic (seen on a real sandbox, NH5)
+                        Err(e) => Ok(json!({"error": format!(
+                            "wasm execution failed with error: HostError(GuestPanic {{ panic_msg: {e:?} }})"),
+                            "logs": [], "block_height": b.height, "block_hash": b58(&b.hash)})),
                     }
                 }
                 Some("view_access_key") => {

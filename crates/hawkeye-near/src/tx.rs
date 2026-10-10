@@ -1,12 +1,17 @@
 //! NEAR transactions, hand-rolled Borsh (NEAR plan NH4): the subset Hawkeye sends — a
-//! `TransactionV0` of `FunctionCall` (and `Transfer`) actions signed with an ed25519 access key.
+//! `TransactionV0` of `FunctionCall` (and `Transfer`) actions signed with an ed25519 access key —
+//! and the account set-up actions a devnet or test uses ([`crate::admin`], NH5): `CreateAccount`,
+//! `DeployContract` and a full-access `AddKey`.
 //!
 //! ```text
 //! TransactionV0   = signer_id: String ‖ public_key: PublicKey ‖ nonce: u64 ‖ receiver_id: String
 //!                   ‖ block_hash: [u8; 32] ‖ actions: Vec<Action>
 //! PublicKey       = 0u8 (ED25519) ‖ [u8; 32]
-//! Action          = 2u8 FunctionCall { method_name: String, args: Vec<u8>, gas: u64, deposit: u128 }
+//! Action          = 0u8 CreateAccount
+//!                 | 1u8 DeployContract { code: Vec<u8> }
+//!                 | 2u8 FunctionCall { method_name: String, args: Vec<u8>, gas: u64, deposit: u128 }
 //!                 | 3u8 Transfer { deposit: u128 }
+//!                 | 5u8 AddKey { public_key: PublicKey, access_key: { nonce: u64, permission: 1u8 (FullAccess) } }
 //! SignedTransaction = TransactionV0 ‖ Signature (0u8 ‖ [u8; 64])
 //! hash            = SHA256(borsh(TransactionV0)),  signature = ed25519(hash)
 //! ```
@@ -26,10 +31,18 @@ use crate::error::{Error, Result};
 
 /// The `KeyType::ED25519` tag of a public key and a signature.
 pub const ED25519: u8 = 0;
+/// Borsh index of `Action::CreateAccount`.
+pub const ACTION_CREATE_ACCOUNT: u8 = 0;
+/// Borsh index of `Action::DeployContract`.
+pub const ACTION_DEPLOY_CONTRACT: u8 = 1;
 /// Borsh index of `Action::FunctionCall`.
 pub const ACTION_FUNCTION_CALL: u8 = 2;
 /// Borsh index of `Action::Transfer`.
 pub const ACTION_TRANSFER: u8 = 3;
+/// Borsh index of `Action::AddKey`.
+pub const ACTION_ADD_KEY: u8 = 5;
+/// Borsh index of `AccessKeyPermission::FullAccess` (`FunctionCall` is 0).
+pub const PERMISSION_FULL_ACCESS: u8 = 1;
 /// 1 TGas.
 pub const TGAS: u64 = 1_000_000_000_000;
 
@@ -55,6 +68,20 @@ pub enum Action {
     Transfer {
         /// yoctoNEAR.
         deposit: u128,
+    },
+    /// Create the receiver account (a sub-account of the signer, or a top-level one).
+    CreateAccount,
+    /// Set the receiver's contract code.
+    DeployContract {
+        /// The wasm.
+        code: Vec<u8>,
+    },
+    /// Add a full-access ed25519 key to the receiver.
+    AddFullAccessKey {
+        /// The ed25519 public key.
+        public_key: [u8; 32],
+        /// The key's starting nonce (0: nearcore sets it from the block height).
+        nonce: u64,
     },
 }
 
@@ -108,6 +135,18 @@ impl Action {
             Action::Transfer { deposit } => {
                 out.push(ACTION_TRANSFER);
                 out.extend_from_slice(&deposit.to_le_bytes());
+            }
+            Action::CreateAccount => out.push(ACTION_CREATE_ACCOUNT),
+            Action::DeployContract { code } => {
+                out.push(ACTION_DEPLOY_CONTRACT);
+                put_bytes(out, code);
+            }
+            Action::AddFullAccessKey { public_key, nonce } => {
+                out.push(ACTION_ADD_KEY);
+                out.push(ED25519);
+                out.extend_from_slice(public_key);
+                out.extend_from_slice(&nonce.to_le_bytes());
+                out.push(PERMISSION_FULL_ACCESS);
             }
         }
     }
@@ -179,6 +218,19 @@ impl Transaction {
                     })
                 }
                 ACTION_TRANSFER => Action::Transfer { deposit: r.u128()? },
+                ACTION_CREATE_ACCOUNT => Action::CreateAccount,
+                ACTION_DEPLOY_CONTRACT => Action::DeployContract {
+                    code: r.bytes()?.to_vec(),
+                },
+                ACTION_ADD_KEY => {
+                    r.key_type()?;
+                    let public_key = r.array::<32>()?;
+                    let nonce = r.u64()?;
+                    match r.u8()? {
+                        PERMISSION_FULL_ACCESS => Action::AddFullAccessKey { public_key, nonce },
+                        p => return Err(Error::Decode(format!("unsupported key permission {p}"))),
+                    }
+                }
                 other => return Err(Error::Decode(format!("unsupported action {other}"))),
             });
         }
@@ -313,6 +365,14 @@ mod tests {
                     deposit: 1,
                 }),
                 Action::Transfer { deposit: 5 },
+                Action::CreateAccount,
+                Action::DeployContract {
+                    code: vec![0, 0x61, 0x73, 0x6d],
+                },
+                Action::AddFullAccessKey {
+                    public_key: [8; 32],
+                    nonce: 3,
+                },
             ],
         }
     }
