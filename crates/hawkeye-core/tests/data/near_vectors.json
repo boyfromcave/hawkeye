@@ -1,0 +1,823 @@
+{
+  "accountIds": {
+    "invalid": [
+      {
+        "id": "",
+        "reason": "account id shorter than 2"
+      },
+      {
+        "id": "a",
+        "reason": "account id shorter than 2"
+      },
+      {
+        "id": "A",
+        "reason": "account id shorter than 2"
+      },
+      {
+        "id": "Abc",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "-near",
+        "reason": "account id has a leading or doubled separator"
+      },
+      {
+        "id": "near-",
+        "reason": "account id has a trailing separator"
+      },
+      {
+        "id": "-near-",
+        "reason": "account id has a leading or doubled separator"
+      },
+      {
+        "id": "near.",
+        "reason": "account id has a trailing separator"
+      },
+      {
+        "id": ".near",
+        "reason": "account id has a leading or doubled separator"
+      },
+      {
+        "id": "near@",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "@near",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "неар",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "@@@@@",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "0__0",
+        "reason": "account id has a leading or doubled separator"
+      },
+      {
+        "id": "0_-_0",
+        "reason": "account id has a leading or doubled separator"
+      },
+      {
+        "id": "..",
+        "reason": "account id has a leading or doubled separator"
+      },
+      {
+        "id": "a..near",
+        "reason": "account id has a leading or doubled separator"
+      },
+      {
+        "id": "nEar",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "_bowen",
+        "reason": "account id has a leading or doubled separator"
+      },
+      {
+        "id": "hello world",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "abcdefghijklmnopqrstuvwxyz.abcdefghijklmnopqrstuvwxyz.abcdefghijklmnopqrstuvwxyz",
+        "reason": "account id longer than 64"
+      },
+      {
+        "id": "01234567890123456789012345678901234567890123456789012345678901234",
+        "reason": "account id longer than 64"
+      },
+      {
+        "id": "some-complex-address@gmail.com",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "sub.buy_d1gitz@atata@b0-rg.c_0_m",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "0xB794F5EA0BA39494CE839613FFFBA74279579268",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "98793CD91A3F870FB126F66285808C7E094AFCFC4EDA8A970F6648CDF0DBD6DE",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "alice.near\n",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      },
+      {
+        "id": "alice\u0000near",
+        "reason": "account id has a character outside a-z 0-9 - _ ."
+      }
+    ],
+    "valid": [
+      {
+        "id": "aa",
+        "kind": "named"
+      },
+      {
+        "id": "a-a",
+        "kind": "named"
+      },
+      {
+        "id": "a-aa",
+        "kind": "named"
+      },
+      {
+        "id": "100",
+        "kind": "named"
+      },
+      {
+        "id": "0o",
+        "kind": "named"
+      },
+      {
+        "id": "com",
+        "kind": "named"
+      },
+      {
+        "id": "near",
+        "kind": "named"
+      },
+      {
+        "id": "bowen",
+        "kind": "named"
+      },
+      {
+        "id": "b-o_w_e-n",
+        "kind": "named"
+      },
+      {
+        "id": "b.owen",
+        "kind": "named"
+      },
+      {
+        "id": "bro.wen",
+        "kind": "named"
+      },
+      {
+        "id": "a.ha",
+        "kind": "named"
+      },
+      {
+        "id": "a.b-a.ra",
+        "kind": "named"
+      },
+      {
+        "id": "system",
+        "kind": "named"
+      },
+      {
+        "id": "over.9000",
+        "kind": "named"
+      },
+      {
+        "id": "google.com",
+        "kind": "named"
+      },
+      {
+        "id": "illia.cheapaccounts.near",
+        "kind": "named"
+      },
+      {
+        "id": "0o0ooo00oo00o",
+        "kind": "named"
+      },
+      {
+        "id": "alex-skidanov",
+        "kind": "named"
+      },
+      {
+        "id": "10-4.8-2",
+        "kind": "named"
+      },
+      {
+        "id": "no_lols",
+        "kind": "named"
+      },
+      {
+        "id": "0123456789012345678901234567890123456789012345678901234567890123",
+        "kind": "near-implicit"
+      },
+      {
+        "id": "near.a",
+        "kind": "named"
+      },
+      {
+        "id": "alice.near",
+        "kind": "named"
+      },
+      {
+        "id": "wyec.near",
+        "kind": "named"
+      },
+      {
+        "id": "wyec-bridge.testnet",
+        "kind": "named"
+      },
+      {
+        "id": "wyec.test.near",
+        "kind": "named"
+      },
+      {
+        "id": "intents.near",
+        "kind": "named"
+      },
+      {
+        "id": "98793cd91a3f870fb126f66285808c7e094afcfc4eda8a970f6648cdf0dbd6de",
+        "kind": "near-implicit"
+      },
+      {
+        "id": "0xb794f5ea0ba39494ce839613fffba74279579268",
+        "kind": "eth-implicit"
+      },
+      {
+        "id": "0s1234567890abcdef1234567890abcdef12345678",
+        "kind": "named"
+      }
+    ]
+  },
+  "burns": [
+    {
+      "borsh": "00000000000000000a000000616c6963652e6e65617280b2e60e000000000000000000000000010000000000000000000000777777777777777777777777777777777777777715cd5b07000000000000b0d4acc66c18",
+      "record": {
+        "amount": "250000000",
+        "blockHeight": "123456789",
+        "from": "alice.near",
+        "nonce": "0",
+        "timestampNs": "1760000000000000000",
+        "ycashRecipient": "0100000000000000000000007777777777777777777777777777777777777777"
+      },
+      "sha256": "0ba0e860b578358acede9ce263e71bae5b8ce8cf5cea3badade9f33ff13a1f8e"
+    },
+    {
+      "borsh": "0100000000000000400000003938373933636439316133663837306662313236663636323835383038633765303934616663666334656461386139373066363634386364663064626436646501000000000000000000000000000000010100000000000000000000010101010101010101010101010101010101010101000000000000000000000000000000",
+      "record": {
+        "amount": "1",
+        "blockHeight": "1",
+        "from": "98793cd91a3f870fb126f66285808c7e094afcfc4eda8a970f6648cdf0dbd6de",
+        "nonce": "1",
+        "timestampNs": "0",
+        "ycashRecipient": "0101000000000000000000000101010101010101010101010101010101010101"
+      },
+      "sha256": "591ea9e16f6fa1d2ca3f570742d8503899894b74291d3b266dd8dcfdfc26065c"
+    },
+    {
+      "borsh": "ffffffffffffffff2a00000030786237393466356561306261333934393463653833393631336666666261373432373935373932363800000000000000000100000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "record": {
+        "amount": "18446744073709551616",
+        "blockHeight": "18446744073709551615",
+        "from": "0xb794f5ea0ba39494ce839613fffba74279579268",
+        "nonce": "18446744073709551615",
+        "timestampNs": "18446744073709551615",
+        "ycashRecipient": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "sha256": "d968ba5b778bf7c2001470cf2bd2375d359d06b9ad8622de17d21fa47fb7bf42"
+    }
+  ],
+  "comment": "Hawkeye NEAR golden vectors (docs/hawkeye-near-plan.md §2). Generated by crates/hawkeye-core/tests/near_vectors.rs; format in tests/data/README.md. Hex is lowercase without 0x; u64/u128 are decimal strings.",
+  "deployments": [
+    {
+      "bridge": "d13bff34bf8241cca5ce3a067a05f50cf635c63c",
+      "chainId": "11168732693897472933",
+      "chainIdLe": "a5eb0ceb354fff9a",
+      "contractId": "wyec.near",
+      "networkId": "mainnet"
+    },
+    {
+      "bridge": "cadf2906ef2f5af877b6bb709ec3088e0ff552d0",
+      "chainId": "14886446175779299179",
+      "chainIdLe": "6b1f4cd3ec4797ce",
+      "contractId": "wyec-bridge.testnet",
+      "networkId": "testnet"
+    },
+    {
+      "bridge": "0fade7deba05e23335da6cc2e866270c77eb1875",
+      "chainId": "8725942363845980750",
+      "chainIdLe": "4e72920f59c61879",
+      "contractId": "wyec.test.near",
+      "networkId": "sandbox"
+    },
+    {
+      "bridge": "3d70e2b7487bb2c5a1785ad47604f325e3053936",
+      "chainId": "5494535470632760948",
+      "chainIdLe": "7476d934e682404c",
+      "contractId": "wyec.node0",
+      "networkId": "localnet"
+    }
+  ],
+  "destinations": [
+    {
+      "accountId": "alice.near",
+      "script": "6a0d4e5231616c6963652e6e656172"
+    },
+    {
+      "accountId": "wyec-bridge.testnet",
+      "script": "6a164e5231777965632d6272696467652e746573746e6574"
+    },
+    {
+      "accountId": "98793cd91a3f870fb126f66285808c7e094afcfc4eda8a970f6648cdf0dbd6de",
+      "script": "6a434e523139383739336364393161336638373066623132366636363238353830386337653039346166636663346564613861393730663636343863646630646264366465"
+    },
+    {
+      "accountId": "0xb794f5ea0ba39494ce839613fffba74279579268",
+      "script": "6a2d4e5231307862373934663565613062613339343934636538333936313366666662613734323739353739323638"
+    },
+    {
+      "accountId": "aa",
+      "script": "6a054e52316161"
+    },
+    {
+      "accountId": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "script": "6a434e52317a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"
+    }
+  ],
+  "destinationsInvalid": [
+    {
+      "reason": "does not begin \"NR1\"",
+      "script": "6a0d4e5232616c6963652e6e656172"
+    },
+    {
+      "reason": "does not begin \"NR1\"",
+      "script": "6a0d6e7231616c6963652e6e656172"
+    },
+    {
+      "reason": "not a valid NEAR account id",
+      "script": "6a034e5231"
+    },
+    {
+      "reason": "not a valid NEAR account id",
+      "script": "6a044e523161"
+    },
+    {
+      "reason": "not a valid NEAR account id",
+      "script": "6a0d4e5231416c6963652e6e656172"
+    },
+    {
+      "reason": "not a valid NEAR account id",
+      "script": "6a0e4e5231616c6963652e2e6e656172"
+    },
+    {
+      "reason": "not a valid NEAR account id",
+      "script": "6a444e52316161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+    },
+    {
+      "reason": "does not begin \"NR1\"",
+      "script": "6a200000000000000000000000001111111111111111111111111111111111111111"
+    },
+    {
+      "reason": "not one canonical push",
+      "script": "6a4c0d4e5231616c6963652e6e656172"
+    },
+    {
+      "reason": "not one canonical push",
+      "script": "6a0d4e5231616c6963652e6e6561720100"
+    },
+    {
+      "reason": "not an OP_RETURN",
+      "script": "0d4e5231616c6963652e6e656172"
+    }
+  ],
+  "digestDomain": "HawkeyeNear-v1",
+  "keys": [
+    {
+      "compressed": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+      "secret": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "compressed": "024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+      "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+      "secret": "0202020202020202020202020202020202020202020202020202020202020202"
+    },
+    {
+      "compressed": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+      "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+      "secret": "0303030303030303030303030303030303030303030303030303030303030303"
+    }
+  ],
+  "memos": [
+    {
+      "bridge": "d13bff34bf8241cca5ce3a067a05f50cf635c63c",
+      "bridgeKind": "near",
+      "chainId": "11168732693897472933",
+      "data": "0ba0e860b578358acede9ce263e71bae5b8ce8cf5cea3badade9f33ff13a1f8e",
+      "kind": 1,
+      "payload": "484b4e3101a5eb0ceb354fff9ad13bff34bf8241cca5ce3a067a05f50cf635c63c00000000000000000ba0e860b578358acede9ce263e71bae5b8ce8cf5cea3badade9f33ff13a1f8e",
+      "ref": "0",
+      "script": "6a49484b4e3101a5eb0ceb354fff9ad13bff34bf8241cca5ce3a067a05f50cf635c63c00000000000000000ba0e860b578358acede9ce263e71bae5b8ce8cf5cea3badade9f33ff13a1f8e"
+    },
+    {
+      "bridge": "0fade7deba05e23335da6cc2e866270c77eb1875",
+      "bridgeKind": "near",
+      "chainId": "8725942363845980750",
+      "data": "d968ba5b778bf7c2001470cf2bd2375d359d06b9ad8622de17d21fa47fb7bf42",
+      "kind": 1,
+      "payload": "484b4e31014e72920f59c618790fade7deba05e23335da6cc2e866270c77eb1875ffffffffffffffffd968ba5b778bf7c2001470cf2bd2375d359d06b9ad8622de17d21fa47fb7bf42",
+      "ref": "18446744073709551615",
+      "script": "6a49484b4e31014e72920f59c618790fade7deba05e23335da6cc2e866270c77eb1875ffffffffffffffffd968ba5b778bf7c2001470cf2bd2375d359d06b9ad8622de17d21fa47fb7bf42"
+    },
+    {
+      "bridge": "cadf2906ef2f5af877b6bb709ec3088e0ff552d0",
+      "bridgeKind": "near",
+      "chainId": "14886446175779299179",
+      "data": "79aa640fb34c6a04eacd32e552384d30642ff60fa3636583e7deca477ffe5c24",
+      "kind": 2,
+      "payload": "484b4e31026b1f4cd3ec4797cecadf2906ef2f5af877b6bb709ec3088e0ff552d0c0c62d000000000079aa640fb34c6a04eacd32e552384d30642ff60fa3636583e7deca477ffe5c24",
+      "ref": "3000000",
+      "script": "6a49484b4e31026b1f4cd3ec4797cecadf2906ef2f5af877b6bb709ec3088e0ff552d0c0c62d000000000079aa640fb34c6a04eacd32e552384d30642ff60fa3636583e7deca477ffe5c24"
+    },
+    {
+      "bridge": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bridgeKind": "ethereum",
+      "chainId": "11155111",
+      "data": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "kind": 1,
+      "payload": "484b423101a736aa0000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0201000000000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "ref": "258",
+      "script": "6a49484b423101a736aa0000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0201000000000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "bridge": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bridgeKind": "ethereum",
+      "chainId": "11155111",
+      "data": "79aa640fb34c6a04eacd32e552384d30642ff60fa3636583e7deca477ffe5c24",
+      "kind": 2,
+      "payload": "484b423102a736aa0000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc0c62d000000000079aa640fb34c6a04eacd32e552384d30642ff60fa3636583e7deca477ffe5c24",
+      "ref": "3000000",
+      "script": "6a49484b423102a736aa0000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc0c62d000000000079aa640fb34c6a04eacd32e552384d30642ff60fa3636583e7deca477ffe5c24"
+    }
+  ],
+  "messages": [
+    {
+      "borsh": "00d60f3f6d3f69ddc7993fa92fbf93350c7b95c2ee25e8f80223865154857d5f2580b2e60e0000000000000000000000000a000000616c6963652e6e656172",
+      "digest": "06ef45d8ba0df8a62f51337010600af6dc3c277c843ef018f1561b9f9c1fbe64",
+      "domain": {
+        "contractId": "wyec.near",
+        "networkId": "mainnet"
+      },
+      "message": {
+        "amount": "250000000",
+        "lockId": "d60f3f6d3f69ddc7993fa92fbf93350c7b95c2ee25e8f80223865154857d5f25",
+        "receiverId": "alice.near",
+        "type": "Mint"
+      },
+      "preimage": "4861776b6579654e6561722d7631070000006d61696e6e657409000000777965632e6e65617200d60f3f6d3f69ddc7993fa92fbf93350c7b95c2ee25e8f80223865154857d5f2580b2e60e0000000000000000000000000a000000616c6963652e6e656172",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "18a2e8ab49e81e00d5a4ac866e3733a6f5993e28829e89b59c6a5ed96cb2bda048fcc4c36beeda4989c3265adcb01aeb6d4c1ef75e696e118042c9248591413c01"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "107941d838f3fb039ccf6a0a929d84cbbc9131ec10f9b885ef6491d33b9eaa715a499ceada47725f256bce363f9d405dc1760cbebd87040fe0efd63de52c0ff100"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "1796e74ce700c7ae67b649b122a92c69842fba378fdc421ad7aead7479ace49d3e727c1e09deb6f26b9833952c609e80d0d5298db5cabe0b86b5a6410f9d71d300"
+        }
+      ],
+      "tag": 0
+    },
+    {
+      "borsh": "00340e15ee8facb62d364441010e02f861c049b7a6d8c93bf30ba71c82c87cb03e010000000000000000000000000000004000000039383739336364393161336638373066623132366636363238353830386337653039346166636663346564613861393730663636343863646630646264366465",
+      "digest": "81971d5e75a1cd7fa9f405b411ae55fcc332657021588fbdf5e39cfd72f67372",
+      "domain": {
+        "contractId": "wyec-bridge.testnet",
+        "networkId": "testnet"
+      },
+      "message": {
+        "amount": "1",
+        "lockId": "340e15ee8facb62d364441010e02f861c049b7a6d8c93bf30ba71c82c87cb03e",
+        "receiverId": "98793cd91a3f870fb126f66285808c7e094afcfc4eda8a970f6648cdf0dbd6de",
+        "type": "Mint"
+      },
+      "preimage": "4861776b6579654e6561722d763107000000746573746e657413000000777965632d6272696467652e746573746e657400340e15ee8facb62d364441010e02f861c049b7a6d8c93bf30ba71c82c87cb03e010000000000000000000000000000004000000039383739336364393161336638373066623132366636363238353830386337653039346166636663346564613861393730663636343863646630646264366465",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "1c6815e691a396410455aef86973fcb3bfe7c4202964e88b2c8dcd0fc537196d575e1ed3fc74623479983358ae8cd252ab684e5ff365e81bc909d64201f2096700"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "671b7d8dc998c1fa3e08cf45b1529c90470506192095fcb940776c98f63b47472d71592e53768dafa11e766bc8b6d30c96fce3195e8dd599047380e1ca7f56ed01"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "16a3aa4c0c46bc2275cfc5c67cbc5be005f39b276d7db8e18c0436e7d5a97db15732bc68dab1df0019a3852465cbec9a2e129fa5afc9998d0a7c21ad7b7d92cb00"
+        }
+      ],
+      "tag": 0
+    },
+    {
+      "borsh": "004242424242424242424242424242424242424242424242424242424242424242040000000000000001000000000000002a000000307862373934663565613062613339343934636538333936313366666662613734323739353739323638",
+      "digest": "8625e55e39f5f0ba049231ba772dce849f2a89b3a1ae5e650dcce5b2024fef16",
+      "domain": {
+        "contractId": "wyec.test.near",
+        "networkId": "sandbox"
+      },
+      "message": {
+        "amount": "18446744073709551620",
+        "lockId": "4242424242424242424242424242424242424242424242424242424242424242",
+        "receiverId": "0xb794f5ea0ba39494ce839613fffba74279579268",
+        "type": "Mint"
+      },
+      "preimage": "4861776b6579654e6561722d76310700000073616e64626f780e000000777965632e746573742e6e656172004242424242424242424242424242424242424242424242424242424242424242040000000000000001000000000000002a000000307862373934663565613062613339343934636538333936313366666662613734323739353739323638",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "a9e282a456a0d533434c401afcc2400c08d53923443ea036b73f81dcf53f4d8e24cc6ea8cc3c8be0498fc34bb03966ac4839c9e698b4c6ac753ea8515565c20d01"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "207991ecc55abb200fa155b010f3671bd03da6f6489975210f15519e1367d8dc2bc32c5903ace0d4b47a479e48d76d87fabb476f4735a06d9deeccecabbaad6e01"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "4fc3a97891411a63f280afb6ba0b309aada7b348215999fc6781bc2987eceee47a3ed0ff1d7934cf31dffa21087f54381cebad4321f65bc2b9a75165ef7ca63a00"
+        }
+      ],
+      "tag": 0
+    },
+    {
+      "borsh": "01d60f3f6d3f69ddc7993fa92fbf93350c7b95c2ee25e8f80223865154857d5f250100000000000000",
+      "digest": "adb5ca7c25e3dd5936c5e636015076b1d9e7d68b0be049d905e791fc3e2c9296",
+      "domain": {
+        "contractId": "wyec.near",
+        "networkId": "mainnet"
+      },
+      "message": {
+        "lockId": "d60f3f6d3f69ddc7993fa92fbf93350c7b95c2ee25e8f80223865154857d5f25",
+        "proposalId": "1",
+        "type": "Challenge"
+      },
+      "preimage": "4861776b6579654e6561722d7631070000006d61696e6e657409000000777965632e6e65617201d60f3f6d3f69ddc7993fa92fbf93350c7b95c2ee25e8f80223865154857d5f250100000000000000",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "1af215947b0c31c02658c87eee8cf519a554383703dadf80b490ade16145d4c256db4832d37f1ea1ff5e2b9c707ebd4a580ade7029192da826612e926092edcd00"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "f6a2d2f586c57f8af83cfb3f2f4c08908fbcb5819294c8a0f9741446997dfb716002eb8cdf6e681f5de9359b1523c95b7fc2b683fc7b3f13cf8c14b01307d8a700"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "0a68e0b66e1f7a4c651411e1bfadf83b709f584aff0c0ee09a2397144923022f5c7295ccc05eae73c13a4cda1ba9a9795d9c4f2a32269b6fc586af718736a6dc00"
+        }
+      ],
+      "tag": 1
+    },
+    {
+      "borsh": "014242424242424242424242424242424242424242424242424242424242424242ffffffffffffffff",
+      "digest": "ce3583614191f7ec7a6b552d2a4d1d6c0141500d7046108153fcea3badde0a1d",
+      "domain": {
+        "contractId": "wyec-bridge.testnet",
+        "networkId": "testnet"
+      },
+      "message": {
+        "lockId": "4242424242424242424242424242424242424242424242424242424242424242",
+        "proposalId": "18446744073709551615",
+        "type": "Challenge"
+      },
+      "preimage": "4861776b6579654e6561722d763107000000746573746e657413000000777965632d6272696467652e746573746e6574014242424242424242424242424242424242424242424242424242424242424242ffffffffffffffff",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "fe0621f0e30ef839b9679f2adf247207267c799ac4bf58ffca6435a3d16666740c072c5617f2e9c20b55e099257cf7a853220b2a24b5b8da505200160eb316b300"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "cb179d06545da4725717c28ea5be59c20044ae8d00dbfd49c2a35ab545a4806e14993c5da351c012e9987ed229d3ab862c46a1b99720ddf6f46e33835e27ae7400"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "f548ef8a93ba41c2f16399d2baa29f39d0f396e440b5bfd35a936430bceb7bd868b9300ae9c70a402aae1d334070fb02dfaf03db8b56a5f81694a021b6430a5601"
+        }
+      ],
+      "tag": 1
+    },
+    {
+      "borsh": "02030000001b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d14d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458020000000000000000",
+      "digest": "a3a3d1117b80b820083d131a14a27f90742dfaab83cfcfa81c6ccc005329838a",
+      "domain": {
+        "contractId": "wyec.near",
+        "networkId": "mainnet"
+      },
+      "message": {
+        "adminNonce": "0",
+        "guardians": [
+          "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458"
+        ],
+        "threshold": 2,
+        "type": "SetGuardians"
+      },
+      "preimage": "4861776b6579654e6561722d7631070000006d61696e6e657409000000777965632e6e65617202030000001b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d14d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458020000000000000000",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "6da4b3ef37166d1b6fa2e08e896f678c57ca2ba7df0c268b276a2963ddfee7625b3907b1ce1328ec42ce9f0b5dc8ab7205911cf5a4f0f6f024c8ad1acc5d52b601"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "4b24f00b8c0d082d5710b93e671a221c62b679a4a687f6cbac10d857ecf7379d03dcc13a616aee2fca7ed56fdb05b48da666a373fec5f1c6eca77f8f3b8f8a1000"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "3c0173e662d815487581c443b9df6e979ffa7de40c8192dcf35a5b610fe9fc43348135c67cabb2daabcef1195eb314c9b6e876a42774a463811866255f456be300"
+        }
+      ],
+      "tag": 2
+    },
+    {
+      "borsh": "02010000001b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1010700000000000000",
+      "digest": "e44ba8623a84d9f098209fe726f3a4cc160b6e4a871f5d6c00b803016d0d930f",
+      "domain": {
+        "contractId": "wyec.node0",
+        "networkId": "localnet"
+      },
+      "message": {
+        "adminNonce": "7",
+        "guardians": [
+          "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1"
+        ],
+        "threshold": 1,
+        "type": "SetGuardians"
+      },
+      "preimage": "4861776b6579654e6561722d7631080000006c6f63616c6e65740a000000777965632e6e6f64653002010000001b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1010700000000000000",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "b7f6a91586b6b3a0ee4bdf57d1a79e3d68c317e57e6ce43ff0c7742de5396a4256edbb6b0c7c70e17e6c30a31579066a0adfb97330607353e0653852d43d932c01"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "6f9e7937c2b6b79ca4fd0396d0a67ff7d3fe855b844c3436e5b797ba1a5230702b64261e626f828fb3cac99fdce78ec8fcf73180c16154bef3477cfe34c1eafb00"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "b90e4e02e266cd261af694897c04dc7e5c1d6e759cadd62299c4228770ebb4a95a74be32a5da5070aa25385001e9ff7cd4096eba1e07ad0df05024cb00271fe700"
+        }
+      ],
+      "tag": 2
+    },
+    {
+      "borsh": "03010100000000000000",
+      "digest": "378dee753ad3625e82ca361ddc6df89ef882a9ef1ebf9e1aa98a75c235a7dd6e",
+      "domain": {
+        "contractId": "wyec.near",
+        "networkId": "mainnet"
+      },
+      "message": {
+        "adminNonce": "1",
+        "paused": true,
+        "type": "SetPaused"
+      },
+      "preimage": "4861776b6579654e6561722d7631070000006d61696e6e657409000000777965632e6e65617203010100000000000000",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "7f39d518e6138b2444f7333893e44e8b9cda1349bcd2511a38d62cf227c57a2839764b882476cdd792ee83d66f1089a841679361712540b94fd497a8d576174701"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "6d2979bcc943b6e01b71c0b01b182c526ffe8e79af4a86a45d40d3b052fde02a6476cfb6925253b6066fd8200cbc4fbe3729fdfbb8cbc7d0fc46ce754c37d1ac01"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "a10c275923b30677b2cdb08e67086c413f7c3cd4c3b8aeee09f5cda9f593f83759da21716f6a0f01c50a813aecda00a074974105c761d47b6d3b2f384dc5fd1801"
+        }
+      ],
+      "tag": 3
+    },
+    {
+      "borsh": "03000200000000000000",
+      "digest": "cb6d2985d2848a1daae56942fe48fd45c029cd9e70c4b67e6277215754d1dae5",
+      "domain": {
+        "contractId": "wyec.test.near",
+        "networkId": "sandbox"
+      },
+      "message": {
+        "adminNonce": "2",
+        "paused": false,
+        "type": "SetPaused"
+      },
+      "preimage": "4861776b6579654e6561722d76310700000073616e64626f780e000000777965632e746573742e6e65617203000200000000000000",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "0ee50d3d29bdd203e3fd4c90623fa255b1dc6d4e2e699893e3fd3b84272e6616462e058ece4474e38829583fa570a39c92693f0581d6f76e8f12f0a58ca5aa3900"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "edfd5b5fd9d055c340c4c48996527c5fd1d8d0e6f9f4c7233434377d9326cb9b74fbf13935fc0729b2dace6b7377225b4f7e343f31ab5dff9db452811ab7977400"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "fb62c3c93158ea07b42d431e3bdbb79a9d6df883034721efbed99bf44b22832b60e91848012c8a7a2cdfc18ebc2b2214469dd41288ca3e5e65d05a8792b24ca301"
+        }
+      ],
+      "tag": 3
+    },
+    {
+      "borsh": "0400e8764817000000000000000000000080510100000000000300000000000000",
+      "digest": "a414275ca0b6ee4ea48d21a12a22d21d3dde91e59fe21eb2a1f684e9917232e3",
+      "domain": {
+        "contractId": "wyec.near",
+        "networkId": "mainnet"
+      },
+      "message": {
+        "adminNonce": "3",
+        "capWindowSec": "86400",
+        "mintCap": "100000000000",
+        "type": "SetMintLimit"
+      },
+      "preimage": "4861776b6579654e6561722d7631070000006d61696e6e657409000000777965632e6e6561720400e8764817000000000000000000000080510100000000000300000000000000",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "cc86368a2cf56fe9c076e096b7a2dc779ee4d612a02d1466211aae8f10c0743a50520f828d796f4e0cf1195d553dcc625f4fd5da3edd17ac5fcd8eb7f6e7b56300"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "3a9390ed1a8a73db8c55bf5e1abc6fae4a5a1af35405d23e7e8c7cb9617c3ba163a60658e447a022da786255020b739bf33839f9f2bf39613101ad5c8d2946c100"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "ac0c1b904dab9e3d92d01eab1f9698e0d38b4ad4eb11f79e8bc2dddfc860380750bd5e11b6f1f1629afa4c2b1b902e378d9ff80d4ac0e0e52d7b7c9e71d304ca00"
+        }
+      ],
+      "tag": 4
+    },
+    {
+      "borsh": "04ffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffff",
+      "digest": "195974a9dd1fabe39da6f837220d723120f481b400ec59621e263b7747882a09",
+      "domain": {
+        "contractId": "wyec-bridge.testnet",
+        "networkId": "testnet"
+      },
+      "message": {
+        "adminNonce": "18446744073709551615",
+        "capWindowSec": "0",
+        "mintCap": "340282366920938463463374607431768211455",
+        "type": "SetMintLimit"
+      },
+      "preimage": "4861776b6579654e6561722d763107000000746573746e657413000000777965632d6272696467652e746573746e657404ffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffff",
+      "signatures": [
+        {
+          "guardian": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1",
+          "key": 0,
+          "signature": "cd51eabf08de008c3ee4a031e7186d997ba513d2be7c38b77ce14e6b061fad7105fd393d3b16e92fd6e7d226d2d6bb5bf4bc95bc721a5c1e40454d71e462578600"
+        },
+        {
+          "guardian": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0",
+          "key": 1,
+          "signature": "f7d136d9822f724da0bb93201c12ac4d2a18c79953ad9ed369e321c43e25a53b60083ce27f1914117fda8d2ad22a4a88ff0808a05e1fe50d54e89124a062e8b300"
+        },
+        {
+          "guardian": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3379e92c265e71e481ba82a84675a47ac705a200fcd524e92d93b0e7386f26a5458",
+          "key": 2,
+          "signature": "125c00a38ea539e26c0955fc89e67869f93828e6f77e562db944d9f92e0431bf3940aa06ecbddb3c3718217d39aa0f4dd9087e8d82f2f3e80c1875a0a74e71bb01"
+        }
+      ],
+      "tag": 4
+    }
+  ],
+  "version": 1
+}

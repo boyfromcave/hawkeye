@@ -44,12 +44,16 @@ pub enum Error {
     /// A `ycashRecipient` bytes32 that does not decode (plan §4.2).
     #[error("bad recipient: {0}")]
     Recipient(&'static str),
-    /// A Hawkeye `HKB1` memo that does not decode (plan §4.3).
+    /// A Hawkeye `HKB1` / `HKN1` memo that does not decode (plan §4.3, NEAR plan §2.2).
     #[error("bad memo: {0}")]
     Memo(&'static str),
-    /// A lock destination `OP_RETURN` that does not decode (plan §4.1 rule 3).
+    /// A lock destination `OP_RETURN` that does not decode (plan §4.1 rule 3, NEAR plan §2.1).
     #[error("bad destination: {0}")]
     Destination(&'static str),
+    /// A NEAR encoding that is not valid: an account id outside NEAR's rules, an empty network
+    /// id, a signature `v` outside {0, 1} (NEAR plan §2).
+    #[error("bad NEAR encoding: {0}")]
+    Near(&'static str),
     /// A transaction that does not parse as Overwinter v3 / Sapling v4, or an input index it
     /// does not have.
     #[error("bad transaction: {0}")]

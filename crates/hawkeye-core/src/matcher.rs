@@ -1,23 +1,26 @@
 //! Intent classification (plan §3.2, HK-4, §5.3): every `WYEC` intent seen on Ycash is matched
 //! to a finalized burn or a roll through its `HKB1` memo, or it is unmatched and gets cancelled.
+//! The NEAR bridge is the same with `NYEC` and `HKN1` ([`classify_intent_for`]).
 //!
 //! The matcher is pure: the engine supplies the intent's transaction outputs, the V it spent (for
 //! rolls), and a lookup of burns with their consumption state from its ledger. Consumption ("a
 //! burn is consumed by the first intent carrying its memo that is mined and not cancelled") is
 //! the engine's bookkeeping; the matcher only reads it.
 
+use crate::bridge::BridgeKind;
 use crate::bytes::Hash32;
-use crate::memo::{Deployment, HawkeyeMemo, MemoKind, is_memo_script, parse_memo_script};
+use crate::memo::{Deployment, HawkeyeMemo, MemoKind, is_any_memo_script, parse_any_memo_script};
 use crate::policy::TxOut;
 use crate::recipient::YcashRecipient;
-use crate::template::{IntentParams, TAG_WYEC, VaultParams};
+use crate::template::{IntentParams, VaultParams};
 
 /// A finalized `BurnToYcash` event as the ledger holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Burn {
     /// The burn nonce.
     pub nonce: u64,
-    /// The Ethereum transaction hash.
+    /// The Ethereum transaction hash; for NEAR, `SHA256(borsh(BurnRecord))` (what the
+    /// `HKN1` memo's `data` carries, NEAR plan §2.4).
     pub tx_hash: Hash32,
     /// The amount in wYEC base units (= zatoshi).
     pub amount: u64,
@@ -71,13 +74,14 @@ pub struct MatchContext {
 /// Why an intent is unmatched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unmatched {
-    /// The unlock carries no `HKB1` memo.
+    /// The unlock carries no memo (`HKB1` or `HKN1`).
     NoMemo,
     /// More than one memo (HK-8: one burn ↔ one intent).
     MultipleMemos,
-    /// A memo that claims `HKB1` and does not decode.
+    /// A memo that claims `HKB1` or `HKN1` and does not decode.
     MalformedMemo,
-    /// The memo names another deployment (chain id or bridge).
+    /// The memo names another deployment (chain id or bridge), or is the other bridge's
+    /// (`HKN1` on Ethereum, `HKB1` on NEAR).
     WrongDeployment,
     /// The memo names a burn nonce the ledger does not have as finalized, or whose txhash
     /// differs.
@@ -127,7 +131,7 @@ impl Unmatched {
 /// The classification of an observed intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Classification {
-    /// Not a `WYEC` intent of the attestor set: not ours to judge.
+    /// Not an intent of the bridge's tag and the attestor set: not ours to judge.
     Foreign,
     /// Pays finalized burn `nonce` (value and recipient checked).
     MatchedBurn {
@@ -149,14 +153,26 @@ pub fn is_benign_race(a: u32, b: u32, takeover: u32) -> bool {
     a.abs_diff(b) <= takeover
 }
 
-/// Classify an observed intent (§3.2). `lookup` returns the finalized burn with a nonce.
+/// Classify an observed intent of the Ethereum bridge (§3.2). `lookup` returns the finalized
+/// burn with a nonce.
 pub fn classify_intent(
     ctx: &MatchContext,
     obs: &ObservedIntent<'_>,
     lookup: impl Fn(u64) -> Option<Burn>,
 ) -> Classification {
+    classify_intent_for(BridgeKind::Ethereum, ctx, obs, lookup)
+}
+
+/// Classify an observed intent of bridge `kind` (§3.2): intents of `kind`'s vault tag are
+/// judged, and a memo of the other bridge's magic is [`Unmatched::WrongDeployment`].
+pub fn classify_intent_for(
+    kind: BridgeKind,
+    ctx: &MatchContext,
+    obs: &ObservedIntent<'_>,
+    lookup: impl Fn(u64) -> Option<Burn>,
+) -> Classification {
     use Classification::Unmatched as U;
-    if obs.intent.tag != TAG_WYEC
+    if obs.intent.tag != kind.tag()
         || obs.intent.set_id != ctx.set_id
         || obs.intent.cancel_set_id != ctx.set_id
     {
@@ -165,17 +181,17 @@ pub fn classify_intent(
     let memo_outputs: Vec<&TxOut> = obs
         .outputs
         .iter()
-        .filter(|o| is_memo_script(&o.script_pubkey))
+        .filter(|o| is_any_memo_script(&o.script_pubkey))
         .collect();
     let memo: HawkeyeMemo = match memo_outputs.as_slice() {
         [] => return U(Unmatched::NoMemo),
-        [one] => match parse_memo_script(&one.script_pubkey) {
+        [one] => match parse_any_memo_script(&one.script_pubkey) {
             Ok(Some(m)) => m,
             _ => return U(Unmatched::MalformedMemo),
         },
         _ => return U(Unmatched::MultipleMemos),
     };
-    if memo.deployment != ctx.deployment {
+    if !memo.is_for(kind, &ctx.deployment) {
         return U(Unmatched::WrongDeployment);
     }
     match memo.kind {
@@ -231,7 +247,7 @@ mod tests {
     use super::*;
     use crate::eth::EthAddress;
     use crate::script::op_return_script;
-    use crate::template::intent_for;
+    use crate::template::{TAG_NYEC, TAG_WYEC, intent_for};
 
     const SET: Hash32 = [0x5e; 32];
 
@@ -529,5 +545,102 @@ mod tests {
         assert!(is_benign_race(13, 10, 3));
         assert!(!is_benign_race(10, 14, 3));
         assert!(is_benign_race(5, 5, 0));
+    }
+
+    #[test]
+    fn near_bridge() {
+        use Classification::Unmatched as U;
+        let nctx = MatchContext {
+            deployment: crate::near::Domain::new(
+                "sandbox",
+                crate::near::AccountId::parse("wyec.test.near").unwrap(),
+            )
+            .unwrap()
+            .deployment(),
+            ..ctx()
+        };
+        let nvault = VaultParams {
+            tag: TAG_NYEC,
+            ..vault()
+        };
+        let intent = intent_for(&nvault, &recipient().script()).unwrap();
+        let run = |intent: &IntentParams, memo: HawkeyeMemo, c: &MatchContext, k: BridgeKind| {
+            let case = Case::with(*intent, memo, 5000);
+            classify_intent_for(
+                k,
+                c,
+                &ObservedIntent {
+                    txid: [0x01; 32],
+                    first_seen: 10,
+                    intent: &case.intent,
+                    value: case.value,
+                    outputs: &case.outputs,
+                    spent_vault: Some(&nvault),
+                },
+                |n| Some(burn(None)).filter(|b| b.nonce == n),
+            )
+        };
+        let hkn = HawkeyeMemo::burn_release_for(BridgeKind::Near, nctx.deployment, 9, [0xee; 32]);
+        assert_eq!(
+            run(&intent, hkn, &nctx, BridgeKind::Near),
+            Classification::MatchedBurn { nonce: 9 }
+        );
+        // an HKB1 memo with the NEAR deployment's bytes is the wrong bridge
+        let hkb = HawkeyeMemo::burn_release(nctx.deployment, 9, [0xee; 32]);
+        assert_eq!(
+            run(&intent, hkb, &nctx, BridgeKind::Near),
+            U(Unmatched::WrongDeployment)
+        );
+        // and on Ethereum an HKN1 memo with the Ethereum deployment's bytes is too
+        let eth_intent = intent_for(&vault(), &recipient().script()).unwrap();
+        let hkn_eth =
+            HawkeyeMemo::burn_release_for(BridgeKind::Near, ctx().deployment, 9, [0xee; 32]);
+        assert_eq!(
+            run(&eth_intent, hkn_eth, &ctx(), BridgeKind::Ethereum),
+            U(Unmatched::WrongDeployment)
+        );
+        // the NEAR matcher ignores WYEC intents, the Ethereum one NYEC intents
+        assert_eq!(
+            run(&eth_intent, hkn, &nctx, BridgeKind::Near),
+            Classification::Foreign
+        );
+        assert_eq!(
+            run(&intent, memo9(), &ctx(), BridgeKind::Ethereum),
+            Classification::Foreign
+        );
+        // a NEAR roll
+        let new = VaultParams {
+            owner_height: 6000,
+            ..nvault
+        };
+        let roll = HawkeyeMemo::roll_for(BridgeKind::Near, nctx.deployment, &new).unwrap();
+        let ri = intent_for(&nvault, &new.script().unwrap()).unwrap();
+        assert_eq!(
+            run(&ri, roll, &nctx, BridgeKind::Near),
+            Classification::MatchedRoll { new_vault: new }
+        );
+        // an HKN1 memo beside an HKB1 one is two memos
+        let mut case = Case::with(intent, hkn, 5000);
+        case.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: hkb.to_script(),
+        });
+        assert_eq!(
+            classify_intent_for(
+                BridgeKind::Near,
+                &nctx,
+                &ObservedIntent {
+                    txid: [0x01; 32],
+                    first_seen: 10,
+                    intent: &case.intent,
+                    value: 5000,
+                    outputs: &case.outputs,
+                    spent_vault: None,
+                },
+                |_| None,
+            ),
+            U(Unmatched::MultipleMemos)
+        );
+        assert_eq!(TAG_WYEC, BridgeKind::Ethereum.tag());
     }
 }

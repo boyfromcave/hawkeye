@@ -2279,9 +2279,11 @@ name = "hawkeye-core"
 version = "0.1.0"
 dependencies = [
  "blake2b_simd",
+ "borsh",
  "bs58",
  "hex",
  "k256",
+ "near-account-id",
  "ripemd",
  "serde",
  "serde_json",
@@ -3010,6 +3012,12 @@ dependencies = [
  "wasi",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "near-account-id"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d2c8642aeca89873dbcf2a2f74ff90cd87f6691f11b66aeed2af7c136192d10"
 
 [[package]]
 name = "nu-ansi-term"

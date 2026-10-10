@@ -11,8 +11,10 @@ use crate::error::{Error, Result, array};
 use crate::keys::{PubKey33, is_compressed_pubkey};
 use crate::script::*;
 
-/// The bridge's vault tag, `"WYEC"`.
+/// The Ethereum bridge's vault tag, `"WYEC"`.
 pub const TAG_WYEC: [u8; 4] = *b"WYEC";
+/// The NEAR bridge's vault tag, `"NYEC"` (0x4E 0x59 0x45 0x43, NEAR plan N-1).
+pub const TAG_NYEC: [u8; 4] = *b"NYEC";
 
 /// `delay` range (V and I).
 pub const DELAY_MIN: u16 = 1;
