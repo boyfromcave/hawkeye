@@ -1,15 +1,19 @@
-//! Replays the node's golden vector (`tests/data/vault_vectors.json`, ycash-dd `dbc1ab0`).
+//! Replays the node's golden vector (`tests/data/vault_vectors.json`, ycash-dd `q/tmpl`
+//! `a8572900f`: the post-quantum owner of quantum spec §1).
 
 use hawkeye_core::bytes::{OutPoint, from_hex, from_hex_array};
 use hawkeye_core::keys::SecretKey;
+use hawkeye_core::pq::PqKeyId;
 use hawkeye_core::script::{OP_CHECKSEQUENCEVERIFY, OP_CHECKSETDORMANT, OP_CHECKSETSIG};
 use hawkeye_core::setsig::{
     act_msg, recover_compact, recover_compact_lenient, set_sig_msg, sign_compact,
 };
+use hawkeye_core::sighash::zip243;
 use hawkeye_core::template::{
     TemplateKind, TemplateShape, bond_redeem, bond_spk, intent_for, parse_bond, parse_intent,
     parse_selector, parse_vault, template_shape,
 };
+use hawkeye_core::tx::Transaction;
 use hawkeye_core::{IntentParams, VaultParams};
 use serde_json::Value;
 
@@ -36,6 +40,10 @@ fn int(v: &Value) -> u64 {
     v.as_u64().expect("unsigned integer")
 }
 
+fn owner(o: &Value) -> PqKeyId {
+    PqKeyId::new(int(&o["scheme"]) as u8, arr(&o["hash"])).expect("a registered scheme")
+}
+
 fn vault_params(p: &Value) -> VaultParams {
     VaultParams {
         tag: arr(&p["tag"]),
@@ -44,7 +52,7 @@ fn vault_params(p: &Value) -> VaultParams {
         delay: int(&p["delay"]) as u16,
         owner_height: int(&p["ownerHeight"]) as u32,
         app_height: int(&p["appHeight"]) as u32,
-        owner_key: arr(&p["ownerKey"]),
+        owner: owner(&p["owner"]),
     }
 }
 
@@ -56,7 +64,7 @@ fn intent_params(p: &Value) -> IntentParams {
         delay: int(&p["delay"]) as u16,
         cancel_set_id: arr(&p["cancelSetId"]),
         set_id: arr(&p["setId"]),
-        owner_key: arr(&p["ownerKey"]),
+        owner: owner(&p["owner"]),
     }
 }
 
@@ -104,13 +112,64 @@ fn vaults() {
     }
 }
 
+/// The PQ owner: `owner = scheme ‖ SHA256(scheme ‖ pk)`; the SLH-DSA public key begins with
+/// `PK.seed`, the last 16 bytes of the 48-byte seed (`SK.seed ‖ SK.prf ‖ PK.seed`).
+#[test]
+fn pq_owner() {
+    let v = vectors();
+    let o = &v["pqOwner"];
+    let pk = hx(&o["pk"]);
+    let seed = hx(&o["seed"]);
+    assert_eq!((pk.len(), seed.len()), (32, 48));
+    assert_eq!(pk[..16], seed[32..]);
+    let id = owner(&o["owner"]);
+    assert_eq!(id.scheme, 1);
+    assert_eq!(PqKeyId::of_public_key(1, &pk).unwrap(), id);
+    // every vault and intent of the vector but the scheme-2 case is owned by it
+    let mut schemes = vec![];
+    for c in list(&v, "vaults").iter().chain(list(&v, "intents")) {
+        let p = owner(&c["params"]["owner"]);
+        assert_eq!(p.hash, id.hash);
+        schemes.push(p.scheme);
+    }
+    assert!(
+        schemes.contains(&2),
+        "the vector covers a Falcon (scheme 2) owner"
+    );
+}
+
+/// The cases whose skeleton matches but whose fields do not are `Malformed` (the node rejects
+/// the transaction); the former secp256k1 owner shape is not a template at all.
+const MALFORMED_V: [&str; 6] = [
+    "owner-scheme-0",
+    "owner-scheme-3",
+    "owner-scheme-16",
+    "owner-scheme-as-data-push",
+    "owner-schemes-differ",
+    "owner-hashes-differ",
+];
+
 #[test]
 fn vaults_invalid() {
     let v = vectors();
     let cases = list(&v, "vaultsInvalid");
     assert!(!cases.is_empty());
+    let mut seen = 0;
     for c in cases {
         let script = hx(&c["script"]);
+        let name = c["name"].as_str().unwrap();
+        if MALFORMED_V.contains(&name) {
+            assert_eq!(
+                template_shape(&script),
+                Some(TemplateShape::Malformed),
+                "{name}"
+            );
+            seen += 1;
+        }
+        if name == "owner-ec-key-checksig" {
+            assert_eq!(template_shape(&script), None, "{name}");
+            seen += 1;
+        }
         assert!(
             parse_vault(&script).is_err(),
             "{} ({}) must not parse",
@@ -123,6 +182,11 @@ fn vaults_invalid() {
             c["name"]
         );
     }
+    assert_eq!(
+        seen,
+        MALFORMED_V.len() + 1,
+        "the PQ owner cases are in the vector"
+    );
 }
 
 #[test]
@@ -157,12 +221,61 @@ fn intents_invalid() {
     let cases = list(&v, "intentsInvalid");
     assert!(!cases.is_empty());
     for c in cases {
+        let script = hx(&c["script"]);
         assert!(
-            parse_intent(&hx(&c["script"])).is_err(),
+            parse_intent(&script).is_err(),
             "{} ({})",
             c["name"],
             c["reason"]
         );
+        match c["name"].as_str().unwrap() {
+            "owner-ec-key-checksig" => assert_eq!(template_shape(&script), None),
+            "owner-scheme-3" => assert_eq!(template_shape(&script), Some(TemplateShape::Malformed)),
+            _ => {}
+        }
+    }
+}
+
+/// A post-quantum owner spend (V selector 2): the chunked scriptSig `<sig_1>…<sig_16> OP_16
+/// <pk> OP_1 OP_2` (7,939 bytes) parses as selector 2 with 19 arguments, it is the scriptSig of
+/// input `nIn`, and the input's ZIP-243 sighash is the vector's.
+#[test]
+fn owner_spends() {
+    let v = vectors();
+    let cases = list(&v, "ownerSpends");
+    assert!(!cases.is_empty());
+    let pk = hx(&v["pqOwner"]["pk"]);
+    for c in cases {
+        let name = &c["name"];
+        let script_sig = hx(&c["scriptSig"]);
+        assert_eq!(script_sig.len(), 7939, "{name}");
+        let s = parse_selector(TemplateKind::Vault, &script_sig).unwrap();
+        assert_eq!(u64::from(s.selector), int(&c["selector"]), "{name}");
+        assert_eq!(s.args.len(), 19, "{name}");
+        assert!(s.args[..15].iter().all(|a| a.len() == 520), "{name}");
+        assert_eq!(s.args[15].len(), 57, "{name}");
+        assert_eq!(s.args[16], vec![16], "{name}: s");
+        assert_eq!(s.args[17], pk, "{name}: pk");
+        assert_eq!(s.args[18], vec![1], "{name}: p");
+        let tx = Transaction::parse(&hx(&c["tx"])).unwrap();
+        let n_in = int(&c["nIn"]) as usize;
+        assert_eq!(tx.vin[n_in].script_sig, script_sig, "{name}");
+        let script_code = hx(&c["scriptCode"]);
+        assert!(
+            parse_vault(&script_code).is_ok(),
+            "{name}: scriptCode is a V"
+        );
+        let sighash = zip243(
+            &tx,
+            n_in,
+            &script_code,
+            int(&c["amount"]),
+            // the hashtype is the signature's last byte (the end of its last chunk)
+            u32::from(*s.args[15].last().unwrap()),
+            int(&c["branchId"]) as u32,
+        )
+        .unwrap();
+        assert_eq!(sighash, arr::<32>(&c["sighash"]), "{name}");
     }
 }
 

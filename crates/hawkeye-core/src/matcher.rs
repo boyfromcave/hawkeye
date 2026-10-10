@@ -255,7 +255,7 @@ mod tests {
             delay: 6,
             owner_height: 1000,
             app_height: 0,
-            owner_key: [2; 33],
+            owner: crate::pq::PqKeyId::new(1, [2; 32]).unwrap(),
         }
     }
 
@@ -476,7 +476,7 @@ mod tests {
 
         // the memo names one vault, the intent pays another
         let elsewhere = VaultParams {
-            owner_key: [3; 33],
+            owner: crate::pq::PqKeyId::new(1, [3; 32]).unwrap(),
             ..new
         };
         let c = Case::with(

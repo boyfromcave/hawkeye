@@ -121,7 +121,7 @@ pub fn roll() -> Classification {
             delay: 6,
             owner_height: 2_000_000,
             app_height: 0,
-            owner_key: [0x03; 33],
+            owner: hawkeye_core::PqKeyId::new(1, [0x03; 32]).unwrap(),
         },
     }
 }

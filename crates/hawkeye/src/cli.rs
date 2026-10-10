@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use hawkeye_core::address::decode_address;
+use hawkeye_core::address::{decode_address, decode_pq_address, encode_pq_address};
 use hawkeye_core::lock::{destination_script, lock_id};
+use hawkeye_core::pq::{PqKeyId, SCHEME_SLH_DSA_SHA2_128S};
 use hawkeye_core::template::{TAG_WYEC, VaultParams};
 use hawkeye_core::{EthAddress, OutPoint as CoreOutPoint};
 use hawkeye_eth::{B256, EthClient, EthConfig, U256};
@@ -110,27 +111,63 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `--owner`: a post-quantum address of the configured network (53 characters) or a `pqkeyid`
+/// (66 hex digits). The bridge's lock policy mints for SLH-DSA (scheme 1) owners only.
+pub fn parse_owner(text: &str, network: hawkeye_core::address::Network) -> Result<PqKeyId> {
+    let owner = if text.len() == 66 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        PqKeyId::from_hex(text).map_err(|e| anyhow!("--owner: {e}"))?
+    } else {
+        decode_pq_address(text, network).map_err(|e| anyhow!("--owner: {e}"))?
+    };
+    ensure!(
+        owner.scheme == SCHEME_SLH_DSA_SHA2_128S,
+        "--owner: scheme {} is not SLH-DSA-SHA2-128s (1); the lock policy would refuse the vault",
+        owner.scheme
+    );
+    Ok(owner)
+}
+
 /// `hawkeye lock`: the depositor's lock (plan §1.2): a `WYEC` V of the configured set plus the
-/// destination `OP_RETURN`, funded and signed by this node's wallet.
-pub async fn lock(s: &Settings, amount: &str, dest: &str, owner_age: Option<u32>) -> Result<()> {
+/// destination `OP_RETURN`, funded and signed by this node's wallet. The owner is post-quantum:
+/// `--owner` (an address or `pqkeyid`, possibly another wallet's), else a new SLH-DSA key of
+/// this node's wallet from `vault_getnewowner`, which then also signs `hawkeye recover`.
+pub async fn lock(
+    s: &Settings,
+    amount: &str,
+    dest: &str,
+    owner_age: Option<u32>,
+    owner: Option<&str>,
+) -> Result<()> {
     let p = &s.params;
     let to = EthAddress::parse(dest).map_err(|e| anyhow!("--dest: {e}"))?;
     ensure!(to != EthAddress::ZERO, "--dest is the zero address");
     let value = zat(amount)?;
+    let owner = owner.map(|o| parse_owner(o, s.network)).transpose()?;
     let node = ycash(s)?;
     let tip = node.getblockcount().await?;
     let age = owner_age.unwrap_or(p.min_owner_age + p.roll_margin + 10);
-    let owner_address = node.getnewaddress().await?;
-    let owner_key = node
-        .validateaddress(&owner_address)
-        .await?
-        .pubkey
-        .ok_or_else(|| anyhow!("validateaddress gave no pubkey"))?;
-    let owner_key: [u8; 33] = owner_key
-        .0
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("owner key is not compressed"))?;
+    let owner = match owner {
+        Some(o) => o,
+        None => {
+            let n = node
+                .vault_getnewowner(Some(SCHEME_SLH_DSA_SHA2_128S))
+                .await
+                .context("vault_getnewowner")?;
+            ensure!(
+                n.scheme == SCHEME_SLH_DSA_SHA2_128S
+                    && n.owner.scheme() == n.scheme
+                    && n.keyhash.as_slice() == n.owner.hash(),
+                "vault_getnewowner: inconsistent owner {n:?}"
+            );
+            let o = PqKeyId::from_bytes(&n.owner.0).map_err(|e| anyhow!("owner: {e}"))?;
+            ensure!(
+                encode_pq_address(&o, s.network) == n.address,
+                "vault_getnewowner: address {} is not the owner's on this network",
+                n.address
+            );
+            o
+        }
+    };
     let v = VaultParams {
         tag: TAG_WYEC,
         set_id: p.set_id,
@@ -138,7 +175,7 @@ pub async fn lock(s: &Settings, amount: &str, dest: &str, owner_age: Option<u32>
         delay: p.delay,
         owner_height: tip + 1 + age,
         app_height: 0,
-        owner_key,
+        owner,
     };
     let script = v.script().map_err(|e| anyhow!("vault: {e}"))?;
     // coins: confirmed, spendable, not spent by a mempool transaction
@@ -210,12 +247,14 @@ pub async fn lock(s: &Settings, amount: &str, dest: &str, owner_age: Option<u32>
     let txid = node.sendrawtransaction(&signed.hex, false).await?;
     let id = lock_id(&CoreOutPoint::new(txid.0, 0));
     info!(event = "lock_sent", txid = %txid, value, to = %to.to_checksum(),
-          owner_height = v.owner_height, lockid = %format!("0x{}", hex::encode(id)));
+          owner_height = v.owner_height, owner = %owner, lockid = %format!("0x{}", hex::encode(id)));
     print(&json!({
         "txid": txid.to_string(),
         "vout": 0,
         "lockid": format!("0x{}", hex::encode(id)),
         "owner_height": v.owner_height,
+        "owner": owner.to_hex(),
+        "owner_address": encode_pq_address(&owner, s.network),
         "to": to.to_checksum(),
         "amount_zat": value,
     }))
@@ -472,7 +511,10 @@ pub async fn rogue_mint(
 }
 
 /// `hawkeye recover`: `vault_ownerspend` of every `WYEC` vault and intent of the set this
-/// wallet owns (selector 2 after `ownerHeight`, 3 once the set is released).
+/// wallet owns (selector 2 after `ownerHeight`, 3 once the set is released). The owner is a
+/// post-quantum key of the node wallet (`vault_list` `mine`); the node signs the SLH-DSA spend
+/// (a 7,939-byte scriptSig, about 8.1 KB) and charges `max(10,000 zat, -pqfeerate × size)`.
+/// Hawkeye holds no owner key and no post-quantum code.
 pub async fn recover(s: &Settings) -> Result<()> {
     let node = ycash(s)?;
     let rows = node

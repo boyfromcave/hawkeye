@@ -61,6 +61,8 @@ pub const OP_CHECKSEQUENCEVERIFY: u8 = 0xb2;
 pub const OP_CHECKSETSIG: u8 = 0xc0;
 /// `OP_CHECKSETDORMANT` (upgrade plan §15.2).
 pub const OP_CHECKSETDORMANT: u8 = 0xc1;
+/// `OP_CHECKPQSIG` (quantum spec §0): the V/I owner check, `<keyHash> <scheme> OP_CHECKPQSIG`.
+pub const OP_CHECKPQSIG: u8 = 0xc2;
 
 /// The default maximum size of a script number operand (`CScriptNum`'s `nMaxNumSize`).
 pub const DEFAULT_MAX_NUM_SIZE: usize = 5;

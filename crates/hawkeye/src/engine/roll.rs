@@ -4,7 +4,7 @@
 //! [`mint_leader_for`] over the vault outpoint's `lockId`, with takeover every `TAKEOVER` blocks
 //! counted from the moment it fell due — unlocks the **whole** vault (no re-lock remainder, which
 //! would keep the old `ownerHeight`) into one intent whose recipient is a fresh V with the same
-//! tag, sets, delay and owner key, `appHeight` 0 and `ownerHeight = tip + 1 + MIN_OWNER_AGE +
+//! tag, sets, delay and owner (the post-quantum owner slot, byte for byte), `appHeight` 0 and `ownerHeight = tip + 1 + MIN_OWNER_AGE +
 //! ROLL_MARGIN + ROLL_SLACK`, carrying the kind-2 memo (`ref` = the new `ownerHeight`, `data` =
 //! SHA256 of the new V's scriptPubKey). Watchers verify it from the intent alone (the matcher's
 //! `MatchedRoll`) and do not cancel it; an invalid roll is cancelled and slashable like any

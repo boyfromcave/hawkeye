@@ -1,6 +1,7 @@
 """Generate hawkeye-ycash codec fixtures from the node's Python test framework.
 
 Run: python3 -I crates/hawkeye-ycash/tests/data/gen_fixtures.py <ycash-dd> crates/hawkeye-ycash/tests/data
+(<ycash-dd> may be a `git archive` of a branch, with YCASH_REV=<commit> naming it.)
 Uses ycash-dd qa/rpc-tests/test_framework/yellowback_model.serialize_tx_v4 (the v4 serialiser the
 devnet's bridge-sim uses) and vault.py's template builders; sighash.json / vault_vectors.json
 transactions are taken verbatim from ycash-dd src/test/data.
@@ -51,7 +52,8 @@ def p2pkh_sigscript():
 
 
 SET_A = rb(32)
-OWNER = bytes.fromhex("022144abd3c2b40612b5ec126349833834e2c68d1ace1fc242b3db0b687ee54676")
+# the post-quantum owner of the node vector (quantum spec §1): scheme 1 || SHA256(1 || pk)
+OWNER = bytes.fromhex("01c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258")
 VP = v.VaultParams(b"WYEC", SET_A, SET_A, 6, 4400, 0, OWNER)
 V_SPK = v.vault_script(VP)
 RECIP = p2pkh(rb(20))
@@ -180,7 +182,8 @@ vv = json.load(open(os.path.join(YCASH, "src/test/data/vault_vectors.json")))
 spends = [{"name": s["name"], "hex": s["tx"], "txid": txid_of(bytes.fromhex(s["tx"])), "nIn": s["nIn"],
            "scriptSig": s["scriptSig"]} for s in vv["spends"]]
 
-rev = subprocess.run(["git", "-C", YCASH, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+rev = os.environ.get("YCASH_REV") or subprocess.run(["git", "-C", YCASH, "rev-parse", "HEAD"], capture_output=True,
+                                                    text=True).stdout.strip()
 meta = {"generator": "crates/hawkeye-ycash/tests/data/gen_fixtures.py", "ycash-dd": rev}
 os.makedirs(OUT, exist_ok=True)
 with open(os.path.join(OUT, "v4_transparent.json"), "w") as f:

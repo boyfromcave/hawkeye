@@ -6,7 +6,8 @@
 //! | [`bytes`] | sha256 / sha256d / hash160 / keccak256, txid display ↔ internal order, [`OutPoint`] |
 //! | [`script`] | opcodes, `CScriptNum`, canonical pushes, op iteration, P2PKH / P2SH / `OP_RETURN` |
 //! | [`keys`] | [`SecretKey`], compressed keys, member ordering |
-//! | [`template`] | the vault V, intent I and bond B templates, selectors (upgrade plan §15.3) |
+//! | [`pq`] | [`PqKeyId`]: the post-quantum vault owner id (quantum spec §1.1, §6.2) |
+//! | [`template`] | the vault V, intent I and bond B templates, selectors (upgrade plan §15.3; PQ owner, quantum spec §1) |
 //! | [`setsig`] | `SetSigMsg`, `ActMsg`, 65-byte recoverable compact signatures (§15.2, §4.5) |
 //! | [`tx`] | Overwinter v3 / Sapling v4 transaction parser and serialiser (sighash fields) |
 //! | [`sighash`] | ZIP-243 (v4) and ZIP-143 (v3) transparent signature hashes |
@@ -15,7 +16,7 @@
 //! | [`eip712`] | `WyecBridge` domain and the `Mint` / `SetGuardians` / `SetPaused` / `SetBridge` digests (§4.4) |
 //! | [`lock`] | `lockId` and the lock destination `OP_RETURN` (§4.1) |
 //! | [`recipient`] | the `ycashRecipient` bytes32 codec (§4.2) |
-//! | [`address`] | Ycash transparent addresses (base58check) |
+//! | [`address`] | Ycash transparent addresses and PQ owner addresses (base58check) |
 //! | [`memo`] | the `HKB1` memo (§4.3) |
 //! | [`policy`] | the lock policy (§4.1) |
 //! | [`matcher`] | intent classification (§3.2) |
@@ -35,6 +36,7 @@ pub mod lock;
 pub mod matcher;
 pub mod memo;
 pub mod policy;
+pub mod pq;
 pub mod recipient;
 pub mod script;
 pub mod setsig;
@@ -48,5 +50,6 @@ pub use error::{Error, Result};
 pub use eth::EthAddress;
 pub use keys::{PubKey33, SecretKey};
 pub use memo::{Deployment, HawkeyeMemo};
+pub use pq::PqKeyId;
 pub use recipient::YcashRecipient;
 pub use template::{IntentParams, VaultParams};

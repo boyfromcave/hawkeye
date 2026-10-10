@@ -5,10 +5,16 @@
 //! Builders emit exactly the node's bytes; parsers accept **only** those bytes — the opcode
 //! skeleton, canonical pushes, minimal numbers in their `push_int` form, field sizes and ranges
 //! — by decoding the fields and rebuilding the script for comparison.
+//!
+//! The owner is post-quantum, the only owner shape (quantum spec §1): the owner slot is
+//! `<ownerHash:32> OP_1|OP_2 OP_CHECKPQSIG` (35 bytes, the scheme pushed with `push_int`, never
+//! as the data push `01 01`), so V has 45 tokens and I 32. A V or I with the former secp256k1
+//! owner (`<ownerKey:33> OP_CHECKSIG`) is not a template at all (`template_shape` → `None`).
 
 use crate::bytes::{Hash32, sha256};
 use crate::error::{Error, Result, array};
-use crate::keys::{PubKey33, is_compressed_pubkey};
+use crate::keys::PubKey33;
+use crate::pq::{PqKeyId, is_known_scheme};
 use crate::script::*;
 
 /// The bridge's vault tag, `"WYEC"`.
@@ -53,8 +59,8 @@ pub struct VaultParams {
     pub owner_height: u32,
     /// The APP branch's height (0 = disabled).
     pub app_height: u32,
-    /// The owner's compressed key.
-    pub owner_key: PubKey33,
+    /// The owner: a post-quantum key id (scheme and key hash).
+    pub owner: PqKeyId,
 }
 
 /// The fields of an intent I.
@@ -72,8 +78,8 @@ pub struct IntentParams {
     pub cancel_set_id: Hash32,
     /// The originating vault's set (its dormancy releases the owner, selector 3).
     pub set_id: Hash32,
-    /// The originating vault's owner key.
-    pub owner_key: PubKey33,
+    /// The originating vault's owner.
+    pub owner: PqKeyId,
 }
 
 impl VaultParams {
@@ -88,8 +94,8 @@ impl VaultParams {
         if self.app_height > APP_HEIGHT_MAX {
             return Err(Error::Template("appHeight out of range"));
         }
-        if !is_compressed_pubkey(&self.owner_key) {
-            return Err(Error::Template("ownerKey not compressed"));
+        if !is_known_scheme(self.owner.scheme) {
+            return Err(Error::Template("owner scheme"));
         }
         Ok(())
     }
@@ -116,13 +122,11 @@ impl VaultParams {
         s.extend_from_slice(&[OP_ELSE, OP_DUP, OP_2, OP_EQUAL, OP_IF, OP_DROP]);
         push_int_to(&mut s, i64::from(self.owner_height));
         s.extend_from_slice(&[OP_CHECKLOCKTIMEVERIFY, OP_DROP]);
-        push_to(&mut s, &self.owner_key);
-        s.push(OP_CHECKSIG);
+        owner_slot_to(&mut s, &self.owner);
         s.extend_from_slice(&[OP_ELSE, OP_DUP, OP_3, OP_EQUAL, OP_IF, OP_DROP]);
         push_to(&mut s, &self.set_id);
         s.extend_from_slice(&[OP_CHECKSETDORMANT, OP_VERIFY]);
-        push_to(&mut s, &self.owner_key);
-        s.push(OP_CHECKSIG);
+        owner_slot_to(&mut s, &self.owner);
         s.extend_from_slice(&[OP_ELSE, OP_4, OP_EQUALVERIFY]);
         push_int_to(&mut s, i64::from(self.app_height));
         s.extend_from_slice(&[OP_CHECKLOCKTIMEVERIFY, OP_ENDIF, OP_ENDIF, OP_ENDIF]);
@@ -136,8 +140,8 @@ impl IntentParams {
         if self.delay < DELAY_MIN {
             return Err(Error::Template("delay out of range"));
         }
-        if !is_compressed_pubkey(&self.owner_key) {
-            return Err(Error::Template("ownerKey not compressed"));
+        if !is_known_scheme(self.owner.scheme) {
+            return Err(Error::Template("owner scheme"));
         }
         Ok(())
     }
@@ -161,10 +165,18 @@ impl IntentParams {
         s.extend_from_slice(&[OP_2, OP_CHECKSETSIG, OP_ELSE, OP_3, OP_EQUALVERIFY]);
         push_to(&mut s, &self.set_id);
         s.extend_from_slice(&[OP_CHECKSETDORMANT, OP_VERIFY]);
-        push_to(&mut s, &self.owner_key);
-        s.extend_from_slice(&[OP_CHECKSIG, OP_ENDIF, OP_ENDIF]);
+        owner_slot_to(&mut s, &self.owner);
+        s.extend_from_slice(&[OP_ENDIF, OP_ENDIF]);
         s
     }
+}
+
+/// The owner slot `<ownerHash:32> <scheme> OP_CHECKPQSIG`: the scheme as a script number, so
+/// `OP_1`/`OP_2` (quantum spec F-1), 35 bytes.
+fn owner_slot_to(s: &mut Vec<u8>, owner: &PqKeyId) {
+    push_to(s, &owner.hash);
+    push_int_to(s, i64::from(owner.scheme));
+    s.push(OP_CHECKPQSIG);
 }
 
 /// The V scriptPubKey of `p` (see [`VaultParams::script`]).
@@ -177,8 +189,8 @@ pub fn intent_script(p: &IntentParams) -> Result<Vec<u8>> {
     p.script()
 }
 
-const V_OPS: usize = 43;
-const I_OPS: usize = 31;
+const V_OPS: usize = 45;
+const I_OPS: usize = 32;
 
 fn data_field<const N: usize>(op: &Op<'_>, what: &'static str) -> Result<[u8; N]> {
     let d = op.data.ok_or(Error::Template(what))?;
@@ -197,8 +209,16 @@ fn ranged<T: TryFrom<i64>>(v: i64, what: &'static str) -> Result<T> {
     T::try_from(v).map_err(|_| Error::Template(what))
 }
 
-/// The fields of `spk` if it is exactly a V (§15.3: shape, canonical pushes, minimal numbers,
-/// ranges, both `setId` and `ownerKey` copies equal).
+/// The owner of an owner slot's hash and scheme tokens (the C++ `TokOwner`): a 32-byte push and a
+/// script number in the registry; minimality is left to the rebuild-and-compare.
+fn owner_field(hash: &Op<'_>, scheme: &Op<'_>) -> Result<PqKeyId> {
+    let hash: Hash32 = data_field(hash, "ownerHash")?;
+    let scheme = ranged::<u8>(num_field(scheme, "owner scheme")?, "owner scheme")?;
+    PqKeyId::new(scheme, hash).map_err(|_| Error::Template("owner scheme"))
+}
+
+/// The fields of `spk` if it is exactly a V (§15.3 with the PQ owner of quantum spec §1.2:
+/// shape, canonical pushes, minimal numbers, ranges, both `setId` and owner copies equal).
 pub fn parse_vault(spk: &[u8]) -> Result<VaultParams> {
     let ops = get_ops(spk).map_err(|_| Error::Template("shape"))?;
     if ops.len() != V_OPS {
@@ -206,12 +226,12 @@ pub fn parse_vault(spk: &[u8]) -> Result<VaultParams> {
     }
     let delay = num_field(&ops[2], "delay")?;
     let owner_height = num_field(&ops[19], "ownerHeight")?;
-    let app_height = num_field(&ops[38], "appHeight")?;
+    let app_height = num_field(&ops[40], "appHeight")?;
     let p = VaultParams {
         tag: data_field(&ops[0], "tag")?,
         cancel_set_id: data_field(&ops[1], "cancelSetId")?,
         set_id: data_field(&ops[10], "setId")?,
-        owner_key: data_field(&ops[22], "ownerKey")?,
+        owner: owner_field(&ops[22], &ops[23])?,
         delay: ranged::<u16>(delay, "delay out of range")?,
         owner_height: ranged::<u32>(owner_height, "ownerHeight out of range")?,
         app_height: ranged::<u32>(app_height, "appHeight out of range")?,
@@ -237,7 +257,7 @@ pub fn parse_intent(spk: &[u8]) -> Result<IntentParams> {
         delay: ranged::<u16>(delay, "delay out of range")?,
         cancel_set_id: data_field(&ops[18], "cancelSetId")?,
         set_id: data_field(&ops[24], "setId")?,
-        owner_key: data_field(&ops[27], "ownerKey")?,
+        owner: owner_field(&ops[27], &ops[28])?,
     };
     p.check()?;
     if p.script_unchecked() != spk {
@@ -246,7 +266,7 @@ pub fn parse_intent(spk: &[u8]) -> Result<IntentParams> {
     Ok(p)
 }
 
-/// The I a V's unlock creates for `recipient_spk` (S-2: the V's tag, sets, delay and owner key;
+/// The I a V's unlock creates for `recipient_spk` (S-2: the V's tag, sets, delay and owner;
 /// `vaultHash = SHA256(V)`, `recipientHash = SHA256(recipient)`).
 pub fn intent_for(vault: &VaultParams, recipient_spk: &[u8]) -> Result<IntentParams> {
     Ok(IntentParams {
@@ -256,7 +276,7 @@ pub fn intent_for(vault: &VaultParams, recipient_spk: &[u8]) -> Result<IntentPar
         delay: vault.delay,
         cancel_set_id: vault.cancel_set_id,
         set_id: vault.set_id,
-        owner_key: vault.owner_key,
+        owner: vault.owner,
     })
 }
 
@@ -282,9 +302,9 @@ const V_SKELETON: [Option<u8>; V_OPS] = [
     o(OP_DUP), o(OP_1), o(OP_EQUAL), o(OP_IF),
     o(OP_DROP), F, o(OP_1), o(OP_CHECKSETSIG),
     o(OP_ELSE), o(OP_DUP), o(OP_2), o(OP_EQUAL), o(OP_IF),
-    o(OP_DROP), F, o(OP_CHECKLOCKTIMEVERIFY), o(OP_DROP), F, o(OP_CHECKSIG),
+    o(OP_DROP), F, o(OP_CHECKLOCKTIMEVERIFY), o(OP_DROP), F, F, o(OP_CHECKPQSIG),
     o(OP_ELSE), o(OP_DUP), o(OP_3), o(OP_EQUAL), o(OP_IF),
-    o(OP_DROP), F, o(OP_CHECKSETDORMANT), o(OP_VERIFY), F, o(OP_CHECKSIG),
+    o(OP_DROP), F, o(OP_CHECKSETDORMANT), o(OP_VERIFY), F, F, o(OP_CHECKPQSIG),
     o(OP_ELSE), o(OP_4), o(OP_EQUALVERIFY), F, o(OP_CHECKLOCKTIMEVERIFY),
     o(OP_ENDIF), o(OP_ENDIF), o(OP_ENDIF),
 ];
@@ -295,7 +315,8 @@ const I_SKELETON: [Option<u8>; I_OPS] = [
     o(OP_DROP), F, o(OP_CHECKSEQUENCEVERIFY),
     o(OP_ELSE), o(OP_DUP), o(OP_2), o(OP_EQUAL), o(OP_IF),
     o(OP_DROP), F, o(OP_2), o(OP_CHECKSETSIG),
-    o(OP_ELSE), o(OP_3), o(OP_EQUALVERIFY), F, o(OP_CHECKSETDORMANT), o(OP_VERIFY), F, o(OP_CHECKSIG),
+    o(OP_ELSE), o(OP_3), o(OP_EQUALVERIFY), F, o(OP_CHECKSETDORMANT), o(OP_VERIFY),
+    F, F, o(OP_CHECKPQSIG),
     o(OP_ENDIF), o(OP_ENDIF),
 ];
 
@@ -427,7 +448,7 @@ mod tests {
             delay: 6,
             owner_height: 1000,
             app_height: 0,
-            owner_key: [2; 33],
+            owner: PqKeyId::new(1, [0x33; 32]).unwrap(),
         }
     }
 
@@ -474,14 +495,16 @@ mod tests {
             .script()
             .is_err()
         );
-        assert!(
-            VaultParams {
-                owner_key: [4; 33],
+        for scheme in [0, 3, 16, 255] {
+            let bad = VaultParams {
+                owner: PqKeyId {
+                    scheme,
+                    hash: [0x33; 32],
+                },
                 ..vp()
-            }
-            .script()
-            .is_err()
-        );
+            };
+            assert!(bad.script().is_err());
+        }
         assert!(parse_intent(&vp().script().unwrap()).is_err());
     }
 
@@ -501,13 +524,87 @@ mod tests {
     #[test]
     fn malformed_shapes() {
         let mut s = vp().script().unwrap();
-        // the second setId copy (op 30) differs: skeleton matches, fields do not
+        // the second setId copy (op 31) differs: skeleton matches, fields do not
         let pos = s.windows(32).rposition(|w| w == [0x11; 32]).unwrap();
         s[pos] = 0x12;
         assert!(parse_vault(&s).is_err());
         assert_eq!(template_shape(&s), Some(TemplateShape::Malformed));
         assert_eq!(template_shape(&p2pkh_script(&[0; 20])), None);
         assert_eq!(template_shape(&[]), None);
+    }
+
+    /// The bytes of the owner slot: `20 <hash> 51|52 c2`, 35 bytes, twice in V and once in I.
+    #[test]
+    fn pq_owner_slot_bytes() {
+        for scheme in [1u8, 2] {
+            let owner = PqKeyId::new(scheme, [0x33; 32]).unwrap();
+            let mut slot = vec![0x20];
+            slot.extend([0x33; 32]);
+            slot.extend([OP_1 + scheme - 1, OP_CHECKPQSIG]);
+            assert_eq!(slot.len(), 35);
+            let v = VaultParams { owner, ..vp() };
+            let vs = v.script().unwrap();
+            assert_eq!(vs.windows(35).filter(|w| *w == slot.as_slice()).count(), 2);
+            assert_eq!(get_ops(&vs).unwrap().len(), 45);
+            let i = intent_for(&v, &p2pkh_script(&[9; 20])).unwrap();
+            assert_eq!(i.owner, owner);
+            let is = i.script().unwrap();
+            assert_eq!(is.windows(35).filter(|w| *w == slot.as_slice()).count(), 1);
+            assert_eq!(get_ops(&is).unwrap().len(), 32);
+            assert_eq!(parse_intent(&is).unwrap(), i);
+        }
+        // the scheme as the data push `01 01` (F-1's defect) is not the canonical V
+        let good = vp().script().unwrap();
+        let pos = good
+            .windows(3)
+            .position(|w| w == [0x33, OP_1, OP_CHECKPQSIG])
+            .unwrap()
+            + 1;
+        let mut bad = good[..pos].to_vec();
+        bad.extend([0x01, 0x01]);
+        bad.extend(&good[pos + 1..]);
+        assert!(parse_vault(&bad).is_err());
+        assert_eq!(template_shape(&bad), Some(TemplateShape::Malformed));
+    }
+
+    /// A V whose two owner copies differ is malformed; the former secp256k1 owner shape
+    /// (`<key:33> OP_CHECKSIG`, 43 tokens) is not a template.
+    #[test]
+    fn owner_copies_and_ec_owner() {
+        let good = vp().script().unwrap();
+        let mut s = good.clone();
+        let pos = s.windows(32).rposition(|w| w == [0x33; 32]).unwrap();
+        s[pos] = 0x34;
+        assert_eq!(template_shape(&s), Some(TemplateShape::Malformed));
+        let mut s = good.clone();
+        let last = s
+            .windows(2)
+            .rposition(|w| w == [OP_1, OP_CHECKPQSIG])
+            .unwrap();
+        s[last] = OP_2;
+        assert_eq!(template_shape(&s), Some(TemplateShape::Malformed));
+        // swap each owner slot for `21 <02…33> ac`
+        let mut slot = vec![0x20];
+        slot.extend([0x33; 32]);
+        slot.extend([OP_1, OP_CHECKPQSIG]);
+        let mut ec = vec![0x21, 0x02];
+        ec.extend([0x33; 32]);
+        ec.push(OP_CHECKSIG);
+        let mut out = vec![];
+        let mut i = 0;
+        while i < good.len() {
+            if good[i..].starts_with(&slot) {
+                out.extend(&ec);
+                i += slot.len();
+            } else {
+                out.push(good[i]);
+                i += 1;
+            }
+        }
+        assert_eq!(out.len(), good.len());
+        assert_eq!(get_ops(&out).unwrap().len(), 43);
+        assert_eq!(template_shape(&out), None);
+        assert!(parse_vault(&out).is_err());
     }
 
     #[test]

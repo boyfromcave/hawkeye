@@ -4,9 +4,14 @@
 //! The leading characters are not what the chainparams comments promise for P2SH: mainnet P2SH
 //! (`1c2c`) encodes to `s2…` or `s3…`, testnet/regtest P2SH (`1c2a`) to `s2…` (not `t2…`).
 //! Decoding goes by prefix bytes, never by the leading characters.
+//!
+//! A vault owner is named by a **post-quantum address** (quantum spec §4): base58check of
+//! `pqVersion(2) ‖ scheme ‖ keyHash(32)`, 53 characters, `ye…` / `yt…` / `yr…` (versions
+//! `0x56BF` / `0x571E` / `0x5710`, ycash-dd `src/yellowback/params.cpp`, `pqAddressVersion`).
 
 use crate::bytes::sha256d;
 use crate::error::{Error, Result};
+use crate::pq::PqKeyId;
 use crate::recipient::{RecipientKind, YcashRecipient};
 
 /// A Ycash network.
@@ -34,6 +39,15 @@ impl Network {
         match self {
             Self::Mainnet => [0x1c, 0x2c],
             Self::Testnet | Self::Regtest => [0x1c, 0x2a],
+        }
+    }
+
+    /// The post-quantum (owner) address version: `ye…`, `yt…`, `yr…`.
+    pub fn pq_prefix(self) -> [u8; 2] {
+        match self {
+            Self::Mainnet => [0x56, 0xbf],
+            Self::Testnet => [0x57, 0x1e],
+            Self::Regtest => [0x57, 0x10],
         }
     }
 
@@ -91,9 +105,77 @@ pub fn decode_address(s: &str, network: Network) -> Result<YcashRecipient> {
     }
 }
 
+/// The post-quantum address of `owner` on `network` (53 characters).
+pub fn encode_pq_address(owner: &PqKeyId, network: Network) -> String {
+    let mut data = network.pq_prefix().to_vec();
+    data.extend_from_slice(&owner.to_bytes());
+    base58check_encode(&data)
+}
+
+/// Decode a post-quantum address of `network` (the node's `DecodeAddress(…, CPQKeyID&)`:
+/// exactly 35 bytes, this network's version, a registered scheme).
+pub fn decode_pq_address(s: &str, network: Network) -> Result<PqKeyId> {
+    let v = base58check_decode(s)?;
+    if v.len() != 35 {
+        return Err(Error::Address("wrong payload length"));
+    }
+    if v[..2] != network.pq_prefix() {
+        return Err(Error::Address("prefix of another network or kind"));
+    }
+    let id: [u8; 33] = v[2..].try_into().expect("33 bytes");
+    PqKeyId::from_bytes(&id).map_err(|_| Error::Address("unknown post-quantum scheme"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Expected strings computed independently (Python base58check over the quantum spec §4
+    /// versions); the scheme-1 hash is the node vector's `pqOwner`.
+    #[test]
+    fn pq_addresses() {
+        let owner =
+            PqKeyId::from_hex("01c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258")
+                .unwrap();
+        let falcon = PqKeyId::new(2, [0xff; 32]).unwrap();
+        for (net, a1, a2) in [
+            (
+                Network::Mainnet,
+                "ye3W1TcRQYJwa47heYwxWkw1eKQidXYKExKCyNt1NtcxQiqLtXn6o",
+                "ye3YQ3Qi6kNXH3raBGN1X5sqhzen1asdngrUcPFHTXHHsyMAHi8gj",
+            ),
+            (
+                Network::Testnet,
+                "yt6aumwesAuyddGxd69TMPTzuxgobqJ5JRHPMY2vNY5Z2UHDaLMVu",
+                "yt6dJMjwZNyZLd1q9oZWMiQpydvrytdPr9pezYQCTAjtVio7KiffW",
+            ),
+            (
+                Network::Regtest,
+                "yr2U5mgcGim9hz2msM5vrF2g6UbzU9SH896fXhg53fP14XePwX6PL",
+                "yr2WUMUtxvpjQymeQ4VyrZyWA9r3rCmbfsdwAi3M8J3LXnAGrkb5E",
+            ),
+        ] {
+            assert_eq!(encode_pq_address(&owner, net), a1);
+            assert_eq!(encode_pq_address(&falcon, net), a2);
+            assert_eq!(a1.len(), 53);
+            assert_eq!(decode_pq_address(a1, net).unwrap(), owner);
+            assert_eq!(decode_pq_address(a2, net).unwrap(), falcon);
+        }
+        let main = encode_pq_address(&owner, Network::Mainnet);
+        assert!(decode_pq_address(&main, Network::Testnet).is_err());
+        // a transparent address is not an owner address, nor the other way round
+        let t = encode_address(&YcashRecipient::p2pkh([7; 20]), Network::Mainnet);
+        assert!(decode_pq_address(&t, Network::Mainnet).is_err());
+        assert!(decode_address(&main, Network::Mainnet).is_err());
+        // scheme 3 under the right version
+        let mut d = Network::Mainnet.pq_prefix().to_vec();
+        d.push(3);
+        d.extend([0; 32]);
+        assert_eq!(
+            decode_pq_address(&base58check_encode(&d), Network::Mainnet),
+            Err(Error::Address("unknown post-quantum scheme"))
+        );
+    }
 
     /// Expected strings computed independently (Python base58check over the same prefixes).
     #[test]

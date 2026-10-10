@@ -305,6 +305,12 @@ impl YcashRpc {
 
     // ------------------------------------------------------------------ vault RPCs
 
+    /// A new post-quantum owner key of the node wallet (`scheme` default 1, SLH-DSA-SHA2-128s).
+    pub async fn vault_getnewowner(&self, scheme: Option<u8>) -> Result<NewOwner, Error> {
+        self.call("vault_getnewowner", params(vec![scheme.map(Value::from)]))
+            .await
+    }
+
     pub async fn vault_lock(&self, p: &VaultLockParams) -> Result<VaultLockResult, Error> {
         let m = "vault_lock";
         self.call(m, vec![val(m, p)?]).await

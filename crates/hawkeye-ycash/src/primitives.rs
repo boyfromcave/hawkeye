@@ -162,6 +162,55 @@ impl FromStr for PubKey {
 }
 string_serde!(PubKey, "a 66-digit hex compressed public key");
 
+/// A post-quantum key id (`pqkeyid` in the contract, quantum spec §6.2): 66 hex digits, the scheme
+/// byte (`01` SLH-DSA-SHA2-128s or `02` FN-DSA-512) then the 32-byte key hash as the template
+/// pushes it. The vault owner. A distinct type from [`PubKey`] although it has the same length:
+/// a compressed key beginning `02` would otherwise read as a Falcon owner.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PqKeyId(pub [u8; 33]);
+
+impl PqKeyId {
+    /// The scheme byte.
+    pub fn scheme(&self) -> u8 {
+        self.0[0]
+    }
+
+    /// The 32-byte key hash.
+    pub fn hash(&self) -> [u8; 32] {
+        self.0[1..].try_into().expect("32 bytes")
+    }
+}
+
+impl fmt::Display for PqKeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl fmt::Debug for PqKeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PqKeyId({self})")
+    }
+}
+
+impl FromStr for PqKeyId {
+    type Err = HexError;
+    fn from_str(s: &str) -> Result<Self, HexError> {
+        let k = decode_fixed::<33>("post-quantum key id", s)?;
+        if k[0] != 1 && k[0] != 2 {
+            return Err(HexError {
+                what: "post-quantum key id",
+                text: s.to_owned(),
+            });
+        }
+        Ok(PqKeyId(k))
+    }
+}
+string_serde!(
+    PqKeyId,
+    "a 66-digit hex post-quantum key id (scheme 01 or 02, then the key hash)"
+);
+
 /// Arbitrary hex bytes (`hex` in the contract): transactions, scripts, signatures, tags.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct HexBytes(pub Vec<u8>);
@@ -332,5 +381,13 @@ mod tests {
         assert!(k.parse::<PubKey>().is_ok());
         assert!(format!("04{}", "11".repeat(32)).parse::<PubKey>().is_err());
         assert!("02".parse::<PubKey>().is_err());
+        let q = format!("01{}", "ab".repeat(32));
+        let id: PqKeyId = q.parse().unwrap();
+        assert_eq!((id.scheme(), id.hash()), (1, [0xab; 32]));
+        assert_eq!(id.to_string(), q);
+        assert!(format!("02{}", "11".repeat(32)).parse::<PqKeyId>().is_ok());
+        assert!(format!("03{}", "11".repeat(32)).parse::<PqKeyId>().is_err());
+        assert!(format!("00{}", "11".repeat(32)).parse::<PqKeyId>().is_err());
+        assert!("01".parse::<PqKeyId>().is_err());
     }
 }

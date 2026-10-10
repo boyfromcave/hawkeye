@@ -5,7 +5,7 @@
 //! against the declared parameter objects.
 
 use hawkeye_ycash::types::*;
-use hawkeye_ycash::{Amount, Hash256, HexBytes, OutPoint, PubKey, json};
+use hawkeye_ycash::{Amount, Hash256, HexBytes, OutPoint, PqKeyId, PubKey, json};
 use serde_json::Value;
 
 fn contract() -> Value {
@@ -18,6 +18,7 @@ fn contract() -> Value {
 
 const HASH: &str = "8f1a6d5b7a31000000000000000000000000000000000000000000000000ab01";
 const KEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+const PQKEYID: &str = "01c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258";
 
 /// JSON text samples of a contract type: one per `oneOf` branch / optional-field choice.
 fn samples(c: &Value, t: &Value, with_optional: bool) -> Vec<String> {
@@ -41,6 +42,7 @@ fn samples(c: &Value, t: &Value, with_optional: bool) -> Vec<String> {
         "hex" => vec!["\"57594543\"".into()],
         "hash" => vec![format!("\"{HASH}\"")],
         "key" => vec![format!("\"{KEY}\"")],
+        "pqkeyid" => vec![format!("\"{PQKEYID}\"")],
         "outpoint" => vec![format!("\"{HASH}:1\"")],
         "address" => vec!["\"tmRGc4CD1UyUdbSJmTUzcB6oDqk4qUaHnnh\"".into()],
         "int" => vec!["3".into()],
@@ -104,6 +106,7 @@ fn through(method: &str, text: &str) -> Result<Value, String> {
         "set_buildact" | "set_signact" => rt::<ActResult>(text),
         "set_sendact" | "set_equivocation" | "vault_send" | "vault_release" => rt::<Hash256>(text),
         "vault_lock" => rt::<VaultLockResult>(text),
+        "vault_getnewowner" => rt::<NewOwner>(text),
         "vault_buildunlock" => rt::<BuildUnlockResult>(text),
         "set_signunlock" | "set_signcancel" => rt::<SetSigResult>(text),
         "vault_buildcancel" => rt::<BuildCancelResult>(text),
@@ -120,9 +123,10 @@ fn contract_is_the_node_copy() {
     assert_eq!(c["branchid"], "6d5b7a31");
     assert_eq!(
         c["source"]["sha256"],
-        "744c041915b05f6d850904fbfd44734aea13373f27b9c0aa1bcfe63c32f48819"
+        "662ac36d7410d7c0434fccdef91edf659acbdf430911d552f5610eceda498e55"
     );
-    assert_eq!(c["methods"].as_object().unwrap().len(), 21);
+    assert_eq!(c["methods"].as_object().unwrap().len(), 22);
+    assert_eq!(c["types"]["pqkeyid"]["json"], "string");
 }
 
 #[test]
@@ -177,7 +181,8 @@ fn amounts_are_exact() {
         "valuezat":30000000,"height":5,"script":"00","tag":"57594543","tagtext":"WYEC",
         "setid":"00000000000000000000000000000000000000000000000000000000000000bb",
         "cancelsetid":"00000000000000000000000000000000000000000000000000000000000000bb","delay":6,"ownerheight":400,
-        "appheight":0,"ownerkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","wallet":false}]"#)
+        "appheight":0,"owner":"01c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258",
+        "ownerscheme":1,"wallet":false}]"#)
     .unwrap();
     let v = t[0].as_vault().unwrap();
     assert_eq!(v.value.zat(), v.valuezat);
@@ -246,6 +251,10 @@ fn check_value(c: &Value, t: &Value, v: &Value, what: &str) {
         "hex" => assert!(v.as_str().is_some_and(|s| hex::decode(s).is_ok()), "{what}"),
         "hash" => assert!(v.as_str().is_some_and(|s| s.len() == 64), "{what}"),
         "key" => assert!(v.as_str().is_some_and(|s| s.len() == 66), "{what}"),
+        "pqkeyid" => assert!(
+            v.as_str().is_some_and(|s| s.parse::<PqKeyId>().is_ok()),
+            "{what}"
+        ),
         "outpoint" => assert!(
             v.as_str().is_some_and(|s| s.parse::<OutPoint>().is_ok()),
             "{what}"
@@ -271,6 +280,7 @@ fn parameters_match_the_contract() {
     let c = contract();
     let h: Hash256 = HASH.parse().unwrap();
     let k: PubKey = KEY.parse().unwrap();
+    let owner: PqKeyId = PQKEYID.parse().unwrap();
     let full = SetCreateParams {
         seats: 3,
         unlockthreshold: 1,
@@ -306,7 +316,7 @@ fn parameters_match_the_contract() {
         ownerheight: 400,
         appheight: None,
         amount: Amount(1_000_000_000),
-        ownerkey: Some(k),
+        owner: Some(owner),
     };
     check_object(
         &c,
@@ -317,7 +327,7 @@ fn parameters_match_the_contract() {
     let filter = VaultListFilter {
         tag: Some("WYEC".into()),
         setid: Some(h),
-        owner: Some(k),
+        owner: Some(owner),
         kind: Some(TemplateKind::Intent),
         mine: Some(true),
     };

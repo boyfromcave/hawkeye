@@ -25,4 +25,4 @@ pub mod types;
 pub use amount::Amount;
 pub use client::{Auth, YcashRpc};
 pub use error::{Error, ErrorReason, RpcError};
-pub use primitives::{Bytes32, Hash256, HexBytes, OutPoint, PubKey};
+pub use primitives::{Bytes32, Hash256, HexBytes, OutPoint, PqKeyId, PubKey};
