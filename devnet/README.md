@@ -194,7 +194,8 @@ SIGTERM and SIGKILL on each process group, and fails if anything is left. If `up
 `node0.toml` has the same shape but points at node0, with `api` 127.0.0.1:7800. Its
 `[keys] secret_hex` is the **holder's** Ethereum key. The depositor and the holder are one person
 on two chains, so `hawkeye --config node0.toml lock` and `... burn` both use it. That key is never
-imported into node0's wallet: the lock's owner key is a fresh node0 wallet key.
+imported into node0's wallet: the lock's owner key is a fresh node0 wallet key (on the quantum
+line a post-quantum SLH-DSA owner from `vault_getnewowner`; node0 signs `recover`'s owner spends).
 
 ### lock / burn / rogue: the binary first, fallbacks until it has them
 

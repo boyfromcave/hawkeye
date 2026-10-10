@@ -207,7 +207,7 @@ def ycash_recipient32(address):
 OP_0, OP_PUSHDATA1, OP_PUSHDATA2, OP_1NEGATE, OP_1 = 0x00, 0x4c, 0x4d, 0x4f, 0x51
 OP_IF, OP_ELSE, OP_ENDIF, OP_VERIFY, OP_RETURN = 0x63, 0x67, 0x68, 0x69, 0x6a
 OP_2DROP, OP_DROP, OP_DUP, OP_EQUAL, OP_EQUALVERIFY = 0x6d, 0x75, 0x76, 0x87, 0x88
-OP_CHECKSIG, OP_CLTV, OP_CHECKSETSIG, OP_CHECKSETDORMANT = 0xac, 0xb1, 0xc0, 0xc1
+OP_CHECKSIG, OP_CLTV, OP_CHECKSETSIG, OP_CHECKSETDORMANT, OP_CHECKPQSIG = 0xac, 0xb1, 0xc0, 0xc1, 0xc2
 OP_2, OP_3, OP_4 = 0x52, 0x53, 0x54
 
 
@@ -248,17 +248,25 @@ def txid_internal(display_hex):
     return bytes.fromhex(display_hex)[::-1]
 
 
-def vault_script(tag, set_id, cancel_set_id, delay, owner_height, app_height, owner_key):
-    """The V scriptPubKey (upgrade plan §15.3; ycash-dd qa/rpc-tests/test_framework/vault.py vault_script)."""
+def owner_slot(owner):
+    """The post-quantum owner slot <keyHash:32> OP_1|OP_2 OP_CHECKPQSIG (quantum spec §1.1); owner = scheme || keyHash."""
+    if len(owner) != 33 or owner[0] not in (1, 2):
+        die("not a post-quantum owner id: %s" % owner.hex())
+    return push(owner[1:]) + push_int(owner[0]) + bytes([OP_CHECKPQSIG])
+
+
+def vault_script(tag, set_id, cancel_set_id, delay, owner_height, app_height, owner):
+    """The V scriptPubKey (upgrade plan §15.3 with the PQ owner of quantum spec §1; ycash-dd
+    qa/rpc-tests/test_framework/vault.py vault_script)."""
     return (push(tag) + push(cancel_set_id) + push_int(delay) + bytes([OP_2DROP, OP_DROP])
             + bytes([OP_DUP, OP_1, OP_EQUAL, OP_IF])
             + bytes([OP_DROP]) + push(set_id) + bytes([OP_1, OP_CHECKSETSIG])
             + bytes([OP_ELSE, OP_DUP, OP_2, OP_EQUAL, OP_IF])
             + bytes([OP_DROP]) + push_int(owner_height) + bytes([OP_CLTV, OP_DROP])
-            + push(owner_key) + bytes([OP_CHECKSIG])
+            + owner_slot(owner)
             + bytes([OP_ELSE, OP_DUP, OP_3, OP_EQUAL, OP_IF])
             + bytes([OP_DROP]) + push(set_id) + bytes([OP_CHECKSETDORMANT, OP_VERIFY])
-            + push(owner_key) + bytes([OP_CHECKSIG])
+            + owner_slot(owner)
             + bytes([OP_ELSE])
             + bytes([OP_4, OP_EQUALVERIFY]) + push_int(app_height) + bytes([OP_CLTV])
             + bytes([OP_ENDIF, OP_ENDIF, OP_ENDIF]))
@@ -1127,12 +1135,12 @@ format = "text"
             dest_bytes = bytes(12) + dest_bytes
         if len(dest_bytes) != 32 or dest_bytes[:12] != bytes(12) or dest_bytes == bytes(32):
             die("destination must be a non-zero 20-byte Ethereum address")
-        owner_key = bytes.fromhex(n.validateaddress(n.getnewaddress())["pubkey"])
+        owner = bytes.fromhex(n.vault_getnewowner(1)["owner"])  # an SLH-DSA owner of node0's wallet
         tip = self.tip()
         b = self.bridge()
         owner_height = tip + 1 + (owner_age if owner_age is not None else b["min_owner_age"] + OWNER_AGE_SLACK)
         set_id = txid_internal(self.s["set"]["setid"])
-        spk = vault_script(TAG, set_id, set_id, b["delay"], owner_height, 0, owner_key)
+        spk = vault_script(TAG, set_id, set_id, b["delay"], owner_height, 0, owner)
         value = zat(amount)
         locked = {(c["txid"], c["vout"]) for c in n.listlockunspent()}
         pending = set()
@@ -1162,8 +1170,8 @@ format = "text"
         decoded = n.vault_decodescript(spk.hex())
         if decoded.get("type") != "vault":
             die("the node does not decode the fallback lock's V: %s" % jdump(decoded))
-        self.say("locked %s YEC (fallback builder): %s:0 WYEC V under %s, ownerHeight %d, owner key %s.., dest %s%s"
-                 % (amount, txid, self.s["set"]["setid"][:16], owner_height, owner_key.hex()[:16], "0x" + dest_bytes[12:].hex(),
+        self.say("locked %s YEC (fallback builder): %s:0 WYEC V under %s, ownerHeight %d, PQ owner %s.., dest %s%s"
+                 % (amount, txid, self.s["set"]["setid"][:16], owner_height, owner.hex()[:16], "0x" + dest_bytes[12:].hex(),
                     ", nLockTime %d" % lock_time if sequence != 0xFFFFFFFF else ""))
         return {"txid": txid, "outpoint": "%s:0" % txid, "via": "fallback", "ownerheight": owner_height, "hex": signed["hex"]}
 
