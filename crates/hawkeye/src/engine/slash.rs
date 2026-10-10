@@ -31,7 +31,6 @@ use tracing::{info, warn};
 use super::ycash::{IntentFacts, classify};
 use super::{Ctx, Engine, block_on};
 use crate::convert::{intent_params, op_core, outputs};
-use crate::foreign::Account;
 use crate::peers::{SlashSignRequest, SlashSignResponse};
 
 /// Cases that lapse after this many Ycash blocks without a removal.
@@ -320,11 +319,12 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
             let cursor = ctx
-                .db(|t| t.cursor(Chain::Ethereum))?
+                .db(|t| t.cursor(Chain::Foreign))?
                 .map_or(0, |c| c.height);
             ensure!(
                 cursor >= fin,
-                "{code}, but this attestor's Ethereum view lags (cursor {cursor} < finalized {fin})"
+                "{code}, but this attestor's {} view lags (cursor {cursor} < finalized {fin})",
+                p.bridge_kind.title()
             );
         }
         Classification::Unmatched(_) => {}
@@ -386,14 +386,11 @@ async fn verify_mint(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
             "lock refused by policy here: {}",
             l.rejection_reason.unwrap_or_default()
         ),
-        Some(l)
-            if l.value_zat != amount
-                || l.destination.map(Account::Ethereum) != Some(to.clone()) =>
-        {
+        Some(l) if l.value_zat != amount || l.destination.as_ref() != Some(&to) => {
             format!(
                 "lock is {} zat to {:?} here, signed {amount} to {to}",
                 l.value_zat,
-                l.destination.map(|d| d.to_checksum()),
+                l.destination.as_ref().map(|d| d.to_string()),
             )
         }
         Some(l) => bail!(

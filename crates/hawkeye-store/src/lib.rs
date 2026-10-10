@@ -5,11 +5,12 @@
 //! | Module | Contents |
 //! |---|---|
 //! | [`state`] | the §5.1 machines ([`LockState`], [`BurnState`], [`IntentState`], [`VaultState`], [`SlashState`]) and their edge tables |
-//! | [`locks`] | `WYEC` locks (§1.2, §4.1) |
-//! | [`burns`] | `BurnToYcash` events (§1.3), the matcher's burn lookup |
+//! | [`accounts`] | foreign-chain accounts and guardians as ledger text (v4: Ethereum or NEAR) |
+//! | [`locks`] | the bridge's locks (§1.2, §4.1; `WYEC` or `NYEC`) |
+//! | [`burns`] | burns on the foreign chain (§1.3), the matcher's burn lookup |
 //! | [`intents`] | intents seen on Ycash and their classification (§3.2, §5.3) |
 //! | [`vaults`] | the set's vault outputs (§3.1) |
-//! | [`signonce`] | sign-once records: EIP-712 `Mint` by `lockId`, `Challenge` by `(lockId, proposalId)`, the drill's rogue `Mint`, Ycash set/act signatures by `(set, prevout)` (HK-7) |
+//! | [`signonce`] | sign-once records: the bridge's `Mint` attestation by `lockId`, `Challenge` by `(lockId, proposalId)`, the drill's rogue `Mint`, Ycash set/act signatures by `(set, prevout)` (HK-7) |
 //! | [`slash`] | slash cases (§2.3, §5.3) |
 //! | [`progress`] | restart state (v2): deferred mint checks, slash votes gathered and given, set signatures seen |
 //! | [`chain`] | chain cursors and reorg rewinds (§5.4) |
@@ -31,6 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
+pub mod accounts;
 pub mod burns;
 pub mod chain;
 mod error;
@@ -44,6 +46,7 @@ pub mod slash;
 pub mod state;
 pub mod vaults;
 
+pub use accounts::{Account, Guardian};
 pub use burns::{BurnKey, BurnRecord, NewBurn};
 pub use chain::{Cursor, RewindReport};
 pub use error::{Result, SignerError, StoreError};
@@ -90,12 +93,17 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(5))?;
         // In-memory databases answer "memory"; files answer "wal".
         let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")?;
+        conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        // SQLite's table-rebuild procedure: migrations run with foreign keys off, each checked
+        // with `foreign_key_check` before it commits; then they are enabled for good.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migrated = migrate(&mut conn);
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        migrated?;
         let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
         if fk != 1 {
             return Err(StoreError::corrupt("foreign keys could not be enabled"));
         }
-        migrate(&mut conn)?;
         Ok(Self {
             conn,
             clock: system_clock,
@@ -147,7 +155,7 @@ impl Store {
         &mut self,
         lock_id: &hawkeye_core::bytes::Hash32,
         amount: u64,
-        to: &hawkeye_core::EthAddress,
+        to: &Account,
         digest: &hawkeye_core::bytes::Hash32,
         sign: F,
     ) -> Result<MintSignRecord>
@@ -185,6 +193,16 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     for (i, sql) in schema::MIGRATIONS.iter().enumerate().skip(current as usize) {
         let t = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         t.execute_batch(sql)?;
+        let violations: i64 =
+            t.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
+        if violations != 0 {
+            return Err(StoreError::corrupt(format!(
+                "migration to v{} leaves {violations} foreign-key violations",
+                i + 1
+            )));
+        }
         t.pragma_update(None, "user_version", i + 1)?;
         t.commit()?;
     }

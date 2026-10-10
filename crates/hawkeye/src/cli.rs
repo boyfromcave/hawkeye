@@ -6,9 +6,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hawkeye_core::address::decode_address;
-use hawkeye_core::lock::{destination_script, lock_id};
+use hawkeye_core::lock::lock_id;
 use hawkeye_core::template::VaultParams;
-use hawkeye_core::{EthAddress, OutPoint as CoreOutPoint};
+use hawkeye_core::{
+    AccountId, BridgeKind, Destination, EthAddress, Guardian, OutPoint as CoreOutPoint,
+};
 use hawkeye_store::{SignDomain, Store, YcashSignKey};
 use hawkeye_ycash::tx::{Transaction, TxIn, TxOut};
 use hawkeye_ycash::types::{Recipient, TemplateKind, VaultListFilter};
@@ -66,15 +68,19 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
         "hawkeye {} on {} — set {}",
         st.version, st.network, st.set_id
     );
-    println!("member {}  eth {}", st.member_key, st.eth_address);
     println!(
-        "ycash tip {} cursor {} (lag {}); ethereum finalized {} cursor {} (lag {})",
+        "member {}  {} guardian {}",
+        st.member_key, st.foreign_kind, st.guardian
+    );
+    println!(
+        "ycash tip {} cursor {} (lag {}); {} final {} cursor {} (lag {})",
         st.ycash.tip,
         st.ycash.cursor,
         st.ycash.lag,
-        st.ethereum.tip,
-        st.ethereum.cursor,
-        st.ethereum.lag
+        st.foreign_kind,
+        st.foreign.tip,
+        st.foreign.cursor,
+        st.foreign.lag
     );
     println!("live members {}", st.live_members);
     for (name, m) in [
@@ -110,12 +116,40 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `hawkeye lock`: the depositor's lock (plan §1.2): a V of the bridge's tag (`WYEC`) and the
-/// configured set plus the destination `OP_RETURN`, funded and signed by this node's wallet.
+/// A `--dest` for a lock of the `kind` bridge: an Ethereum address (`0x` + 40 hex, EIP-55
+/// checked when mixed case, not zero) for Ethereum, a NEAR account id for NEAR (NEAR plan §2.1;
+/// a lowercase `0x` + 40 hex is NEAR's EVM-implicit account there). A destination of the other
+/// chain is refused by name.
+pub fn parse_destination(kind: BridgeKind, text: &str) -> Result<Destination> {
+    let eth = EthAddress::parse(text);
+    let near = AccountId::parse(text);
+    match kind {
+        BridgeKind::Ethereum => match (eth, near) {
+            (Ok(a), _) => {
+                ensure!(a != EthAddress::ZERO, "--dest is the zero address");
+                Ok(Destination::Ethereum(a))
+            }
+            (Err(_), Ok(n)) => bail!(
+                "--dest {n} is a NEAR account id; this Hawkeye's bridge is on Ethereum ([foreign] kind)"
+            ),
+            (Err(e), Err(_)) => bail!("--dest: {e}"),
+        },
+        BridgeKind::Near => match (near, eth) {
+            (Ok(n), _) => Ok(Destination::Near(n)),
+            (Err(_), Ok(a)) => bail!(
+                "--dest {a} is an Ethereum address; this Hawkeye's bridge is on NEAR ([foreign] kind)"
+            ),
+            (Err(e), Err(_)) => bail!("--dest: {e}"),
+        },
+    }
+}
+
+/// `hawkeye lock`: the depositor's lock (plan §1.2): a V of the bridge's tag (`WYEC` or `NYEC`)
+/// and the configured set plus the destination `OP_RETURN` (an Ethereum address, or `"NR1"` ‖ a
+/// NEAR account id), funded and signed by this node's wallet.
 pub async fn lock(s: &Settings, amount: &str, dest: &str, owner_age: Option<u32>) -> Result<()> {
     let p = &s.params;
-    let to = EthAddress::parse(dest).map_err(|e| anyhow!("--dest: {e}"))?;
-    ensure!(to != EthAddress::ZERO, "--dest is the zero address");
+    let to = parse_destination(p.bridge_kind, dest)?;
     let value = zat(amount)?;
     let node = ycash(s)?;
     let tip = node.getblockcount().await?;
@@ -189,7 +223,7 @@ pub async fn lock(s: &Settings, amount: &str, dest: &str, owner_age: Option<u32>
         },
         TxOut {
             value: 0,
-            script_pubkey: destination_script(&to),
+            script_pubkey: to.script(),
         },
     ];
     if total - value - LOCK_FEE > 0 {
@@ -209,33 +243,49 @@ pub async fn lock(s: &Settings, amount: &str, dest: &str, owner_age: Option<u32>
     );
     let txid = node.sendrawtransaction(&signed.hex, false).await?;
     let id = lock_id(&CoreOutPoint::new(txid.0, 0));
-    info!(event = "lock_sent", txid = %txid, value, to = %to.to_checksum(),
+    info!(event = "lock_sent", txid = %txid, value, to = %to,
           owner_height = v.owner_height, lockid = %format!("0x{}", hex::encode(id)));
     print(&json!({
         "txid": txid.to_string(),
         "vout": 0,
         "lockid": format!("0x{}", hex::encode(id)),
         "owner_height": v.owner_height,
-        "to": to.to_checksum(),
+        "to": to.to_string(),
         "amount_zat": value,
     }))
 }
 
-/// `hawkeye burn`: the bridge's burn (`WyecBridge.burn(amount, ycashRecipient)`) with the §4.2
-/// encoding, from `--eth-key` (default: the config's `[keys] secret_hex`).
+/// `hawkeye burn`: the bridge's burn with the §4.2 encoding. Ethereum:
+/// `WyecBridge.burn(amount, ycashRecipient)` from `--eth-key` (default: the config's `[keys]
+/// secret_hex`). NEAR: `wyec-near` `burn(amount, ycash_recipient)` signed by the holder's NEAR
+/// credentials file `--near-key` (default: the config's relayer key), attaching the record's
+/// storage deposit.
 pub async fn burn(
     s: &Settings,
     amount: &str,
     recipient: &str,
     eth_key: Option<&str>,
+    near_key: Option<&std::path::Path>,
 ) -> Result<()> {
     let r = decode_address(recipient, s.network).map_err(|e| anyhow!("--recipient: {e}"))?;
     let value = zat(amount)?;
-    let key = match eth_key {
-        Some(k) => parse_secret(k)?,
-        None => s.load_key().context("no --eth-key and no [keys] key")?,
+    let chain = match s.foreign {
+        BridgeKind::Ethereum => {
+            ensure!(near_key.is_none(), "--near-key is for a NEAR bridge");
+            let key = match eth_key {
+                Some(k) => parse_secret(k)?,
+                None => s.load_key().context("no --eth-key and no [keys] key")?,
+            };
+            foreign::connect(s, &key).await?
+        }
+        BridgeKind::Near => {
+            ensure!(
+                eth_key.is_none(),
+                "--eth-key is for an Ethereum bridge; use --near-key"
+            );
+            foreign::near::connect_as(s, near_key).await?
+        }
     };
-    let chain = foreign::connect(s, &key).await?;
     let b = chain
         .burn(u64::try_from(value)?, r.to_bytes32())
         .await
@@ -393,6 +443,20 @@ pub fn invented_lock_id(signer: &EthAddress, nanos: u128) -> [u8; 32] {
     hawkeye_core::bytes::sha256(&pre)
 }
 
+/// [`invented_lock_id`] of a guardian: an Ethereum guardian's address as there; a NEAR
+/// guardian's 64-byte key in its place.
+pub fn invented_lock_id_for(signer: &Guardian, nanos: u128) -> [u8; 32] {
+    match signer {
+        Guardian::Ethereum(a) => invented_lock_id(a, nanos),
+        Guardian::Secp256k1(k) => {
+            let mut pre = b"hawkeye/rogue-mint/".to_vec();
+            pre.extend_from_slice(k);
+            pre.extend_from_slice(&nanos.to_be_bytes());
+            hawkeye_core::bytes::sha256(&pre)
+        }
+    }
+}
+
 /// `hawkeye rogue-mint` (drill D-5 only): this attestor signs `Mint(lockId, amount, to)` for a
 /// lockId with no lock behind it (sign-once, `eip712-drill-mint`, through the bridge's
 /// attestation scheme) and opens an optimistic proposal with it (`proposeMint`, gas from its own
@@ -410,22 +474,24 @@ pub async fn rogue_mint(
     let me = chain
         .guardian_of(&key.public_key())
         .map_err(|e| anyhow!("member key: {e}"))?;
-    let me_eth = me
-        .ledger_eth()
-        .ok_or_else(|| anyhow!("{me}: the ledger (schema v2) stores Ethereum addresses only"))?;
-    let to = match to {
+    let to: Account = match to {
         Some(t) => chain.parse_account(t).map_err(|e| anyhow!("--to: {e}"))?,
-        None => Account::Ethereum(me_eth),
+        None => me.account().ok_or_else(|| {
+            anyhow!(
+                "--to is required on {}: a guardian key is no account",
+                s.foreign.title()
+            )
+        })?,
     };
-    let to_eth = to.ethereum().copied().ok_or_else(|| {
-        anyhow!("--to {to}: the ledger (schema v2) stores Ethereum addresses only")
-    })?;
-    ensure!(to_eth != EthAddress::ZERO, "--to is the zero address");
+    ensure!(
+        to.ethereum() != Some(&EthAddress::ZERO),
+        "--to is the zero address"
+    );
     let lock_id: [u8; 32] = match lock_id {
         Some(h) => hawkeye_core::bytes::from_hex_array("--lock-id", h)
             .map_err(|e| anyhow!("--lock-id: {e}"))?,
-        None => invented_lock_id(
-            &me_eth,
+        None => invented_lock_id_for(
+            &me,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos(),
@@ -435,9 +501,8 @@ pub async fn rogue_mint(
         .mint_digest(&lock_id, value, &to)
         .map_err(|e| anyhow!("{e}"))?;
     let mut store = Store::open(&s.store_path)?;
-    let rec = store.tx(|t| {
-        t.sign_once_drill_mint(&lock_id, value, &to_eth, &digest, |d| chain.sign(&key, d))
-    })?;
+    let rec = store
+        .tx(|t| t.sign_once_drill_mint(&lock_id, value, &to, &digest, |d| chain.sign(&key, d)))?;
     let foreign::Proposed {
         mined,
         proposal_id,
@@ -445,7 +510,13 @@ pub async fn rogue_mint(
     } = chain
         .propose_mint(lock_id, value, to.clone(), rec.signature)
         .await
-        .map_err(|e| anyhow!("proposeMint: {e}"))?;
+        .map_err(|e| {
+            let call = match s.foreign {
+                BridgeKind::Ethereum => "proposeMint",
+                BridgeKind::Near => "propose_mint",
+            };
+            anyhow!("{call}: {e}")
+        })?;
     info!(event = "rogue_mint_proposed", lock_id = %format!("0x{}", hex::encode(lock_id)),
           proposal_id, amount = value, to = %to, tx = %mined.tx, eta);
     print(&json!({
@@ -514,6 +585,58 @@ mod tests {
     }
 
     #[test]
+    fn destinations_follow_the_bridge_kind() {
+        let a = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+        assert_eq!(
+            parse_destination(BridgeKind::Ethereum, a).unwrap(),
+            Destination::Ethereum(EthAddress::parse(a).unwrap())
+        );
+        let e = parse_destination(BridgeKind::Near, a)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is an Ethereum address"), "{e}");
+        let n = parse_destination(BridgeKind::Near, "alice.near").unwrap();
+        assert_eq!(n.near().unwrap().as_str(), "alice.near");
+        assert_eq!(n.script()[..5], [0x6a, 0x0d, b'N', b'R', b'1']);
+        let e = parse_destination(BridgeKind::Ethereum, "alice.near")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is a NEAR account id"), "{e}");
+        // lowercase 0x + 40 hex: an Ethereum address there, NEAR's EVM-implicit account here
+        let lower = a.to_lowercase();
+        assert!(matches!(
+            parse_destination(BridgeKind::Ethereum, &lower).unwrap(),
+            Destination::Ethereum(_)
+        ));
+        assert!(matches!(
+            parse_destination(BridgeKind::Near, &lower).unwrap(),
+            Destination::Near(_)
+        ));
+        let zero = format!("0x{}", "0".repeat(40));
+        assert!(parse_destination(BridgeKind::Ethereum, &zero).is_err());
+        for bad in ["", "Alice.near", "a", "a..b"] {
+            assert!(parse_destination(BridgeKind::Near, bad).is_err(), "{bad}");
+            assert!(
+                parse_destination(BridgeKind::Ethereum, bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn invented_lock_ids_per_guardian_kind() {
+        let a = EthAddress([1; 20]);
+        assert_eq!(
+            invented_lock_id_for(&Guardian::Ethereum(a), 5),
+            invented_lock_id(&a, 5)
+        );
+        assert_ne!(
+            invented_lock_id_for(&Guardian::Secp256k1([1; 64]), 5),
+            invented_lock_id_for(&Guardian::Secp256k1([2; 64]), 5)
+        );
+    }
+
+    #[test]
     fn drill_gate_needs_drills_and_refuses_mainnet() {
         assert!(drill_gate(&params(true, false), "rogue-mint").is_ok());
         assert!(drill_gate(&params(true, true), "rogue-mint").is_err());
@@ -536,7 +659,7 @@ mod tests {
                     tx_hash: [0xab; 32],
                     block_number: 9,
                     block_hash: [1; 32],
-                    from: EthAddress([2; 20]),
+                    from: Destination::Ethereum(EthAddress([2; 20])),
                     amount: 400_000_000,
                     recipient: r.to_bytes32(),
                     finalized: true,
@@ -572,7 +695,7 @@ mod tests {
                     tx_hash: [0xab; 32],
                     block_number: 9,
                     block_hash: [1; 32],
-                    from: EthAddress([2; 20]),
+                    from: Destination::Ethereum(EthAddress([2; 20])),
                     amount: 1,
                     recipient: YcashRecipient::p2pkh([0x11; 20]).to_bytes32(),
                     finalized: false,

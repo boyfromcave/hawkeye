@@ -1,0 +1,40 @@
+[package]
+name = "hawkeye-near"
+description = "Hawkeye's NEAR adapter: a JSON-RPC client (final views, block changes, receipts, send_tx), a hand-rolled Borsh transaction codec signed with the relayer's ed25519 key, the wyec-near contract client and block scanner, and a mock NEAR RPC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# An in-process mock NEAR JSON-RPC node with a wyec-near contract model (`hawkeye_near::mock`),
+# for this crate's and the daemon's engine tests.
+mock = ["dep:axum"]
+
+[dependencies]
+hawkeye-core = { path = "../hawkeye-core" }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"], optional = true }
+base64 = "=0.23.1"
+bs58 = { version = "=0.5.1", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+hex = "=0.4.3"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+thiserror = "=2.0.21"
+tokio = { version = "=1.53.2", features = ["net", "rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+# Cross-check of the hand-rolled codec against the borsh crate's derive (tests/codec.rs).
+borsh = { version = "=1.8.1", features = ["derive"] }
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.2", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "client_mock"
+required-features = ["mock"]

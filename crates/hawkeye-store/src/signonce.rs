@@ -2,7 +2,8 @@
 //!
 //! The record kinds:
 //!
-//! - **EIP-712 `Mint`** (`eip712-mint`), keyed by `lockId`: one `(amount, to, digest)` ever.
+//! - **`Mint`** (`eip712-mint`: the domain name dates from Ethereum; NEAR's Borsh-SHA256 `Mint`
+//!   attestation is recorded the same way), keyed by `lockId`: one `(amount, to, digest)` ever.
 //!   Hawkeye signs these itself, so this record *is* the guard.
 //! - **EIP-712 `Challenge`** (`eip712-challenge`, schema v3), keyed by `(lockId, proposalId)`: the
 //!   optimistic mint's veto. Refused outright when the ledger holds a policy-OK lock matching the
@@ -20,10 +21,11 @@
 //! returned, so a signature never leaves the process unrecorded. If the signer fails nothing is
 //! recorded; if the commit fails the signature is dropped (and was never released).
 
+use hawkeye_core::OutPoint;
 use hawkeye_core::bytes::Hash32;
-use hawkeye_core::{EthAddress, OutPoint};
 use rusqlite::params;
 
+use crate::accounts::{Account, Guardian, SqlAccount, SqlGuardian};
 use crate::state::{LockState, SignDomain};
 
 /// Lock states in which a `(amount, to)` match means the lock is a real, policy-OK mint.
@@ -45,11 +47,11 @@ pub struct ChallengeSignRecord {
     /// The contract's proposal id.
     pub proposal_id: u128,
     /// The proposal's proposer (its signer).
-    pub proposer: EthAddress,
+    pub proposer: Guardian,
     /// The proposal's amount.
     pub amount: u64,
     /// The proposal's recipient.
-    pub to: EthAddress,
+    pub to: Account,
     /// Why it was challenged.
     pub reason: String,
     /// The EIP-712 digest signed.
@@ -61,18 +63,18 @@ pub struct ChallengeSignRecord {
 }
 
 /// The proposal a challenge is about (what [`Tx::sign_once_challenge`] judges and records).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChallengedProposal {
     /// The `lockId`.
     pub lock_id: Hash32,
     /// The contract's proposal id (non-zero).
     pub proposal_id: u128,
     /// The proposer.
-    pub proposer: EthAddress,
+    pub proposer: Guardian,
     /// The proposed amount.
     pub amount: u64,
     /// The proposed recipient.
-    pub to: EthAddress,
+    pub to: Account,
 }
 use crate::{Result, SignerError, StoreError, Tx, hx};
 
@@ -84,7 +86,7 @@ pub struct MintSignRecord {
     /// The signed amount (zatoshi = wYEC base units).
     pub amount: u64,
     /// The signed recipient.
-    pub to: EthAddress,
+    pub to: Account,
     /// The EIP-712 digest signed.
     pub digest: Hash32,
     /// The 65-byte `r ‖ s ‖ v` signature.
@@ -137,7 +139,7 @@ impl Tx<'_> {
         &self,
         lock_id: &Hash32,
         amount: u64,
-        to: &EthAddress,
+        to: &Account,
         digest: &Hash32,
         sign: F,
     ) -> Result<MintSignRecord>
@@ -178,20 +180,27 @@ impl Tx<'_> {
                 lock.state
             )));
         }
-        if lock.value_zat != amount || lock.destination != Some(*to) {
+        if lock.value_zat != amount || lock.destination.as_ref() != Some(to) {
             return Err(StoreError::Invalid(format!(
                 "lock {}: Mint(amount {amount}, to {to}) does not match the lock \
                  (value {}, destination {:?})",
                 hx(lock_id),
                 lock.value_zat,
-                lock.destination.map(|d| d.to_string())
+                lock.destination.as_ref().map(|d| d.to_string())
             )));
         }
         let signature = sign(digest).map_err(|e| StoreError::Signer(e.into()))?;
         self.conn().execute(
             "INSERT INTO sign_once_mint (lock_id, amount, recipient, digest, signature, signed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![lock_id, amount, to.0, digest, signature, self.now()],
+            params![
+                lock_id,
+                amount,
+                SqlAccount(to.clone()),
+                digest,
+                signature,
+                self.now()
+            ],
         )?;
         self.transition_lock(
             lock_id,
@@ -241,7 +250,7 @@ impl Tx<'_> {
         if let Some(l) = self.lock(&p.lock_id)?
             && MINTABLE.contains(&l.state)
             && l.value_zat == p.amount
-            && l.destination == Some(p.to)
+            && l.destination.as_ref() == Some(&p.to)
         {
             return Err(StoreError::Invalid(format!(
                 "proposal {} of lock {} matches the {} lock ({} to {}): never challenged",
@@ -260,9 +269,9 @@ impl Tx<'_> {
             params![
                 p.lock_id,
                 p.proposal_id.to_string(),
-                p.proposer.0,
+                SqlGuardian(p.proposer),
                 p.amount,
-                p.to.0,
+                SqlAccount(p.to.clone()),
                 reason,
                 digest,
                 signature,
@@ -287,9 +296,9 @@ impl Tx<'_> {
                 Ok(ChallengeSignRecord {
                     lock_id: *lock_id,
                     proposal_id,
-                    proposer: EthAddress(r.get(0)?),
+                    proposer: r.get::<_, SqlGuardian>(0)?.0,
                     amount: r.get(1)?,
-                    to: EthAddress(r.get(2)?),
+                    to: r.get::<_, SqlAccount>(2)?.0,
                     reason: r.get(3)?,
                     digest: r.get(4)?,
                     signature: r.get(5)?,
@@ -317,9 +326,9 @@ impl Tx<'_> {
                             "proposal id".into(),
                         )
                     })?,
-                    proposer: EthAddress(r.get(2)?),
+                    proposer: r.get::<_, SqlGuardian>(2)?.0,
                     amount: r.get(3)?,
-                    to: EthAddress(r.get(4)?),
+                    to: r.get::<_, SqlAccount>(4)?.0,
                     reason: r.get(5)?,
                     digest: r.get(6)?,
                     signature: r.get(7)?,
@@ -336,7 +345,7 @@ impl Tx<'_> {
         &self,
         lock_id: &Hash32,
         amount: u64,
-        to: &EthAddress,
+        to: &Account,
         digest: &Hash32,
         sign: F,
     ) -> Result<MintSignRecord>
@@ -345,7 +354,7 @@ impl Tx<'_> {
         E: Into<SignerError>,
     {
         if let Some(old) = self.drill_mint_signature(lock_id)? {
-            return if (old.amount, old.to, old.digest) == (amount, *to, *digest) {
+            return if (old.amount, &old.to, old.digest) == (amount, to, *digest) {
                 Ok(old)
             } else {
                 Err(StoreError::SignOnceConflict {
@@ -366,7 +375,14 @@ impl Tx<'_> {
             "INSERT INTO sign_once_drill_mint (lock_id, amount, recipient, digest, signature,
                                                signed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![lock_id, amount, to.0, digest, signature, self.now()],
+            params![
+                lock_id,
+                amount,
+                SqlAccount(to.clone()),
+                digest,
+                signature,
+                self.now()
+            ],
         )?;
         self.drill_mint_signature(lock_id)?
             .ok_or_else(|| StoreError::corrupt("sign-once record vanished"))
@@ -382,7 +398,7 @@ impl Tx<'_> {
                 Ok(MintSignRecord {
                     lock_id: r.get(0)?,
                     amount: r.get(1)?,
-                    to: EthAddress(r.get(2)?),
+                    to: r.get::<_, SqlAccount>(2)?.0,
                     digest: r.get(3)?,
                     signature: r.get(4)?,
                     signed_at: r.get(5)?,
@@ -401,7 +417,7 @@ impl Tx<'_> {
                 Ok(MintSignRecord {
                     lock_id: r.get(0)?,
                     amount: r.get(1)?,
-                    to: EthAddress(r.get(2)?),
+                    to: r.get::<_, SqlAccount>(2)?.0,
                     digest: r.get(3)?,
                     signature: r.get(4)?,
                     signed_at: r.get(5)?,

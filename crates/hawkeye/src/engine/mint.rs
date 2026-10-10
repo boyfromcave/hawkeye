@@ -4,9 +4,9 @@
 //! submission in the configured mode, the finalized event scan, and the mint watcher. Every
 //! foreign-chain call goes through [`ForeignChain`](crate::foreign::ForeignChain).
 //!
-//! The ledger (schema v2) stores lock destinations, mint recipients and proposers as 20-byte
-//! Ethereum addresses; an event naming another chain's account is refused before the ledger is
-//! touched (the NEAR adapter brings its migration, NEAR plan NH4).
+//! The ledger (schema v4) stores lock destinations, mint recipients, burners and proposers as
+//! chain-neutral accounts and guardians: an Ethereum address or a NEAR account id, a 20-byte
+//! address or a 64-byte key (NEAR plan NH4).
 //!
 //! **Optimistic mode** (wyec-contract-design.md §4.5, the Foundation's model): the mint leader
 //! (§5.2, over the members the contract has not `vetoed` for the lock) calls `proposeMint` with its
@@ -26,7 +26,6 @@
 use std::collections::HashSet;
 
 use anyhow::{Result, anyhow};
-use hawkeye_core::EthAddress;
 use hawkeye_core::bytes::Hash32;
 use hawkeye_core::leader::mint_leader_for;
 use hawkeye_core::policy::LockFacts;
@@ -43,12 +42,8 @@ use tracing::{info, warn};
 use super::Engine;
 use crate::convert::outputs;
 use crate::foreign::{
-    Account, ForeignError, ForeignEvent, ForeignResult, Guardian, Proposal, ProposalStatus,
-    Scanned, TxId,
+    Account, ForeignError, ForeignEvent, ForeignResult, Guardian, Proposal, ProposalStatus, TxId,
 };
-
-/// Most Ethereum blocks scanned per tick.
-const MAX_ETH_BLOCKS_PER_TICK: u64 = 5_000;
 
 /// What a `Minted` event means for the ledger.
 enum MintVerdict {
@@ -62,38 +57,6 @@ enum MintVerdict {
 
 fn lock_hex(id: &Hash32) -> String {
     format!("0x{}", hex::encode(id))
-}
-
-/// The ledger's 20-byte form of a foreign account (schema v2 stores Ethereum addresses).
-fn ledger_account(a: &Account) -> Result<EthAddress> {
-    a.ethereum()
-        .copied()
-        .ok_or_else(|| anyhow!("{a}: the ledger (schema v2) stores Ethereum addresses only"))
-}
-
-/// The ledger's 20-byte form of a guardian.
-fn ledger_guardian(g: &Guardian) -> Result<EthAddress> {
-    g.ledger_eth()
-        .ok_or_else(|| anyhow!("{g}: the ledger (schema v2) stores Ethereum addresses only"))
-}
-
-/// Every account a scanned event names, in the ledger's form (refused before the ledger is
-/// touched, so the cursor does not pass an event it could not record).
-fn check_ledger_accounts(events: &[Scanned]) -> Result<()> {
-    for ev in events {
-        match &ev.event {
-            ForeignEvent::Burn { from: a, .. }
-            | ForeignEvent::Minted { to: a, .. }
-            | ForeignEvent::MintProposed { to: a, .. } => {
-                ledger_account(a)?;
-            }
-            _ => {}
-        }
-        if let ForeignEvent::MintProposed { proposer: g, .. } = &ev.event {
-            ledger_guardian(g)?;
-        }
-    }
-    Ok(())
 }
 
 /// Whether an undecided proposal (§5.3 step 2) must be challenged now: at the latest when a
@@ -118,7 +81,7 @@ pub fn challenge_due(
 fn judge_minted(
     t: &Tx<'_>,
     lock_id: &Hash32,
-    to: &EthAddress,
+    to: &Account,
     amount: u64,
     block: u64,
     proposal: bool,
@@ -136,11 +99,11 @@ fn judge_minted(
             l.rejection_reason.unwrap_or_default()
         )));
     }
-    if l.value_zat != amount || l.destination != Some(*to) {
+    if l.value_zat != amount || l.destination.as_ref() != Some(to) {
         return Ok(MintVerdict::Fraud(format!(
             "lock is {} zat to {:?}, {} {amount} to {to}",
             l.value_zat,
-            l.destination.map(|d| d.to_checksum()),
+            l.destination.as_ref().map(|d| d.to_string()),
             if proposal { "proposed" } else { "minted" }
         )));
     }
@@ -164,14 +127,15 @@ fn judge_minted(
         t.transition_lock(lock_id, *s, h, Some("Minted observed (finalized)"))?;
     }
     if !path.is_empty() {
-        info!(event = "mint_observed", lock_id = %lock_hex(lock_id), amount, to = %to.to_checksum(), block);
+        info!(event = "mint_observed", lock_id = %lock_hex(lock_id), amount, to = %to, block);
     }
     Ok(MintVerdict::Ok)
 }
 
 impl Engine {
-    /// Scan finalized Ethereum blocks: burns into the ledger (orphans held, §3.4), `Minted` /
-    /// `MintProposed` checked against locks, challenges and limit changes logged.
+    /// Scan the foreign chain's final blocks (Ethereum: finalized; NEAR: `final`): burns into the
+    /// ledger (orphans held, §3.4), `Minted` / `MintProposed` checked against locks, challenges
+    /// and limit changes logged.
     pub(crate) async fn scan_eth(&mut self) -> Result<()> {
         self.mem.eth_fresh = false;
         let fin = self
@@ -181,22 +145,20 @@ impl Engine {
             .await
             .map_err(|e| anyhow!("finalized block: {e}"))?;
         self.mem.eth_finalized = fin;
-        let cursor = self.ctx.db(|t| t.cursor(Chain::Ethereum))?;
+        let cursor = self.ctx.db(|t| t.cursor(Chain::Foreign))?;
         let from = cursor.map_or(self.ctx.params.eth_start_block, |c| c.height + 1);
         if fin < from {
             self.mem.eth_fresh = true;
             return Ok(());
         }
-        let to = fin.min(from + MAX_ETH_BLOCKS_PER_TICK - 1);
+        let to = fin.min(from + self.ctx.foreign.max_scan_blocks().max(1) - 1);
         let batch = self
             .ctx
             .foreign
             .scan(from, to)
             .await
             .map_err(|e| anyhow!("scan {from}..={to}: {e}"))?;
-        check_ledger_accounts(&batch.events)?;
         let (events, to_hash) = (batch.events, batch.to_hash);
-        let acct = |a: &Account| a.ethereum().copied().unwrap_or_default(); // checked above
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
         let mut frauds = vec![];
@@ -221,7 +183,7 @@ impl Engine {
                             tx_hash: m.tx.0,
                             block_number: m.height,
                             block_hash: m.block_hash,
-                            from: acct(from),
+                            from: from.clone(),
                             amount,
                             recipient: *ycash_recipient,
                             finalized: true,
@@ -264,7 +226,7 @@ impl Engine {
                         let amount = u64::try_from(*amount).unwrap_or(u64::MAX);
                         let pm = PendingMintRecord {
                             lock_id: *lock_id,
-                            to: acct(to),
+                            to: to.clone(),
                             amount,
                             tx_hash: m.tx.0,
                             block: m.height,
@@ -279,7 +241,7 @@ impl Engine {
                         } = &ev.event
                         {
                             info!(event = "mint_proposal_observed", lock_id = %lock_hex(&pm.lock_id),
-                                  proposal_id, proposer = %proposer, amount, to = %pm.to.to_checksum(),
+                                  proposal_id, proposer = %proposer, amount, to = %pm.to,
                                   eta, block = m.height);
                         }
                         match judge_minted(t, &pm.lock_id, &pm.to, amount, m.height, proposal)?
@@ -331,7 +293,7 @@ impl Engine {
                     }
                 }
             }
-            t.advance_cursor(Chain::Ethereum, to, &to_hash)?;
+            t.advance_cursor(Chain::Foreign, to, &to_hash)?;
             Ok(())
         })?;
         if rotated {
@@ -449,7 +411,7 @@ impl Engine {
     /// get a slash case each, and an alarm is raised.
     async fn fraudulent_mint(&mut self, pm: &PendingMintRecord, why: &str) -> Result<()> {
         warn!(event = "fraudulent_mint", lock_id = %lock_hex(&pm.lock_id), amount = pm.amount,
-              to = %pm.to.to_checksum(), tx = %format!("0x{}", hex::encode(pm.tx_hash)),
+              to = %pm.to, tx = %format!("0x{}", hex::encode(pm.tx_hash)),
               proposal = pm.proposal, reason = why);
         self.alarm(
             "fraudulent-mint",
@@ -464,7 +426,7 @@ impl Engine {
         }
         let foreign = self.ctx.foreign.clone();
         let digest = foreign
-            .mint_digest(&pm.lock_id, pm.amount, &Account::Ethereum(pm.to))
+            .mint_digest(&pm.lock_id, pm.amount, &pm.to)
             .map_err(|e| anyhow!("{e}"))?;
         let sigs = foreign
             .mint_signatures(TxId(pm.tx_hash))
@@ -497,7 +459,7 @@ impl Engine {
                 "subject": hex::encode(pm.lock_id),
                 "lock_id": lock_hex(&pm.lock_id),
                 "amount": pm.amount,
-                "to": pm.to.to_checksum(),
+                "to": pm.to.to_string(),
                 "eth_tx": format!("0x{}", hex::encode(pm.tx_hash)),
                 "eth_block": pm.block,
                 "proposal": pm.proposal,
@@ -532,11 +494,7 @@ impl Engine {
             return;
         }
         let live = match self.ctx.foreign.proposal(pm.lock_id).await {
-            Ok(Some(p))
-                if p.amount == u128::from(pm.amount) && p.to == Account::Ethereum(pm.to) =>
-            {
-                p
-            }
+            Ok(Some(p)) if p.amount == u128::from(pm.amount) && p.to == pm.to => p,
             Ok(Some(p)) => {
                 info!(event = "mint_challenge_skipped", lock_id = %lock_hex(&pm.lock_id),
                       proposal_id = p.id, reason = "a different proposal is live (judged on its own)");
@@ -584,22 +542,14 @@ impl Engine {
         let foreign = self.ctx.foreign.clone();
         let digest = foreign.challenge_digest(&lock_id, live.id);
         let key = self.ctx.key.clone();
-        let (proposer, to) = match (ledger_guardian(&live.proposer), ledger_account(&live.to)) {
-            (Ok(p), Ok(t)) => (p, t),
-            (Err(e), _) | (_, Err(e)) => {
-                warn!(event = "mint_challenge_refused", lock_id = %lock_hex(&lock_id),
-                      proposal_id = live.id, error = %format!("{e:#}"));
-                return;
-            }
-        };
         let rec = self.ctx.db(|t| {
             t.sign_once_challenge(
                 &ChallengedProposal {
                     lock_id,
                     proposal_id: live.id,
-                    proposer,
+                    proposer: live.proposer,
                     amount: u64::try_from(live.amount).unwrap_or(u64::MAX),
-                    to,
+                    to: live.to.clone(),
                 },
                 why,
                 &digest,
@@ -751,9 +701,11 @@ impl Engine {
         let signer = self.ctx.guardian()?;
         let to_sign = self.ctx.db(|t| t.locks_in_state(LockState::PolicyOk))?;
         for l in to_sign {
-            let Some(to) = l.destination else { continue };
+            let Some(to) = l.destination.clone() else {
+                continue;
+            };
             let digest = foreign
-                .mint_digest(&l.lock_id, l.value_zat, &Account::Ethereum(to))
+                .mint_digest(&l.lock_id, l.value_zat, &to)
                 .map_err(|e| anyhow!("{e}"))?;
             self.ctx.db(|t| {
                 t.sign_once_mint(&l.lock_id, l.value_zat, &to, &digest, |d| {
@@ -761,7 +713,7 @@ impl Engine {
                 })
             })?;
             info!(event = "mint_signed", lock_id = %lock_hex(&l.lock_id), amount = l.value_zat,
-                  to = %to.to_checksum(), signer = %signer);
+                  to = %to, signer = %signer);
             super::drill_crash_point(&p, "mint_signed");
         }
         match p.mint_mode {
@@ -780,7 +732,9 @@ impl Engine {
                 .db(|t| t.locks_in_state(LockState::MintSubmitted))?,
         );
         for l in candidates {
-            let Some(to) = l.destination else { continue };
+            let Some(to) = l.destination.clone() else {
+                continue;
+            };
             let since = tip.saturating_sub(l.block_height + p.confirmations - 1);
             let Some(leader) = mint_leader_for(&l.lock_id, self.live(), since, p.takeover) else {
                 continue;
@@ -794,7 +748,7 @@ impl Engine {
             let digest = self
                 .ctx
                 .foreign
-                .mint_digest(&l.lock_id, l.value_zat, &Account::Ethereum(to))
+                .mint_digest(&l.lock_id, l.value_zat, &to)
                 .map_err(|e| anyhow!("{e}"))?;
             let sigs = self.collect_mint_sigs(&l.lock_id, &digest).await?;
             let need = p.mint_mode.signatures_needed();
@@ -808,12 +762,12 @@ impl Engine {
             let res = self
                 .ctx
                 .foreign
-                .threshold_mint(k, l.lock_id, l.value_zat, Account::Ethereum(to), sigs)
+                .threshold_mint(k, l.lock_id, l.value_zat, to.clone(), sigs)
                 .await;
             match res {
                 Ok(m) => {
                     info!(event = "mint_submitted", lock_id = %lock_hex(&l.lock_id),
-                          amount = l.value_zat, to = %to.to_checksum(), tx = %m.tx,
+                          amount = l.value_zat, to = %to, tx = %m.tx,
                           block = m.height, signatures = n);
                     if l.state == LockState::Signed {
                         self.ctx.db(|t| {
@@ -851,7 +805,9 @@ impl Engine {
             .await
             .map_err(|e| anyhow!("challenge window: {e}"))?;
         for l in locks {
-            let Some(to) = l.destination else { continue };
+            let Some(to) = l.destination.clone() else {
+                continue;
+            };
             if self.consumed(&l.lock_id).await? {
                 continue; // the Minted event moves the lock
             }
@@ -872,7 +828,7 @@ impl Engine {
             };
             match (live, status) {
                 (Some(p), ProposalStatus::Pending | ProposalStatus::Ready)
-                    if p.amount == u128::from(l.value_zat) && p.to == Account::Ethereum(to) =>
+                    if p.amount == u128::from(l.value_zat) && p.to == to =>
                 {
                     if status == ProposalStatus::Ready {
                         self.execute(&l, &p, now, window).await?;
@@ -893,7 +849,7 @@ impl Engine {
 
     /// Propose `l` if this attestor is the mint leader among the live members the contract has
     /// not barred from the lock (`vetoed`).
-    async fn propose(&mut self, l: &LockRecord, to: &EthAddress) -> Result<()> {
+    async fn propose(&mut self, l: &LockRecord, to: &Account) -> Result<()> {
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
         if self.recently_submitted(&l.lock_id) {
@@ -935,12 +891,7 @@ impl Engine {
         let res = self
             .ctx
             .foreign
-            .propose_mint(
-                l.lock_id,
-                l.value_zat,
-                Account::Ethereum(*to),
-                own.signature,
-            )
+            .propose_mint(l.lock_id, l.value_zat, to.clone(), own.signature)
             .await;
         match res {
             Ok(crate::foreign::Proposed {
@@ -949,7 +900,7 @@ impl Engine {
                 eta,
             }) => {
                 info!(event = "mint_proposed", lock_id = %lock_hex(&l.lock_id), proposal_id,
-                      amount = l.value_zat, to = %to.to_checksum(), tx = %mined.tx, eta,
+                      amount = l.value_zat, to = %to, tx = %mined.tx, eta,
                       reproposal = l.state == LockState::Challenged);
                 if matches!(l.state, LockState::Signed | LockState::Challenged) {
                     self.ctx.db(|t| {

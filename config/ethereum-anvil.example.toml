@@ -1,0 +1,54 @@
+# Hawkeye over the Ethereum bridge (WyecBridge + WrappedYcash, tag WYEC): one attestor of a
+# regtest Ycash set against anvil. `[foreign]` may be left out: Ethereum is the default.
+#
+# Relative paths resolve against this file's directory.
+
+[network]
+name = "regtest"
+
+[ycash]
+rpc_url = "http://127.0.0.1:18232"
+rpc_user = "u"
+rpc_password = "p"
+
+[foreign]
+kind = "ethereum"
+
+[eth]
+rpc_url = "http://127.0.0.1:8545"
+deployment = "../eth/deployments/31337.json"   # as eth/script/Deploy.s.sol writes it
+finality = "finalized"
+
+[bridge]
+set_id = "1111111111111111111111111111111111111111111111111111111111111111"
+delay = 6
+confirmations = 2
+min_owner_age = 400
+roll_margin = 50
+takeover_blocks = 4
+heartbeat_blocks = 10
+min_lock = "0.1"
+max_lock = "1000"
+mint_mode = "optimistic"
+
+[keys]
+secret_hex = "0101010101010101010101010101010101010101010101010101010101010101"   # dev only
+
+[store]
+path = "hawkeye.db"
+
+[api]
+listen = "127.0.0.1:7801"
+
+[policy]
+auto_slash = true
+
+[peers]
+urls = ["http://127.0.0.1:7802", "http://127.0.0.1:7803"]
+
+[devnet]
+drills = true
+
+[log]
+level = "info"
+format = "text"

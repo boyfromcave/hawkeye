@@ -432,7 +432,7 @@ impl Engine {
             Ok((
                 c,
                 t.cursor(hawkeye_store::Chain::Ycash)?,
-                t.cursor(hawkeye_store::Chain::Ethereum)?,
+                t.cursor(hawkeye_store::Chain::Foreign)?,
             ))
         })?;
         let [locks, burns, intents, vaults, slash_cases] = counts;
@@ -440,22 +440,27 @@ impl Engine {
         let ecursor = ecur.map_or(0, |c| c.height);
         let tip = u64::from(self.mem.tip);
         let supply_alarm = self.mem.alarms.contains_key("supply");
+        let guardian = self.ctx.guardian()?.to_string();
+        let foreign = Heights {
+            tip: self.mem.eth_finalized,
+            cursor: ecursor,
+            lag: self.mem.eth_finalized.saturating_sub(ecursor),
+        };
         Ok(Status {
             version: env!("CARGO_PKG_VERSION").into(),
             network: self.ctx.network_name.clone(),
             set_id: txid_to_display(&self.ctx.params.set_id),
             member_key: hex::encode(self.ctx.me),
-            eth_address: self.ctx.guardian()?.to_string(),
+            foreign_kind: self.ctx.params.bridge_kind.to_string(),
+            eth_address: guardian.clone(),
+            guardian,
             ycash: Heights {
                 tip,
                 cursor: ycursor,
                 lag: tip.saturating_sub(ycursor),
             },
-            ethereum: Heights {
-                tip: self.mem.eth_finalized,
-                cursor: ecursor,
-                lag: self.mem.eth_finalized.saturating_sub(ecursor),
-            },
+            ethereum: foreign.clone(),
+            foreign,
             locks,
             burns,
             intents,

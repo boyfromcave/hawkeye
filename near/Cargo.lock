@@ -4358,6 +4358,8 @@ dependencies = [
  "hex",
  "k256",
  "near-contract-standards",
+ "near-crypto",
+ "near-primitives",
  "near-sdk",
  "near-workspaces",
  "serde_json",

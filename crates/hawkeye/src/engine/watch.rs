@@ -236,7 +236,7 @@ impl Engine {
     async fn handle_unmatched(&mut self, i: &IntentRecord) -> Result<()> {
         let code = i.classification.clone().unwrap_or_default();
         if code == "unmatched:unknown-burn" && !self.mem.eth_fresh {
-            return Ok(()); // this attestor's Ethereum view may lag the burn's finality
+            return Ok(()); // this attestor's foreign-chain view may lag the burn's finality
         }
         let tip = self.mem.tip;
         let cancellable = match self.mem.intent_rows.get(&i.outpoint) {

@@ -1,10 +1,13 @@
-//! `BurnToYcash` events (plan §1.3; the Burn machine of §5.1).
+//! Burns on the foreign chain (plan §1.3; the Burn machine of §5.1): Ethereum `BurnToYcash`
+//! events, NEAR `BurnRecord`s.
 
 use core::fmt;
 
 use hawkeye_core::bytes::Hash32;
 use hawkeye_core::matcher::{Burn, Consumer};
 use hawkeye_core::{Deployment, EthAddress, OutPoint, PubKey33};
+
+use crate::accounts::{Account, SqlAccount};
 use rusqlite::{Row, params};
 
 use crate::state::{BurnState, IntentState, ObjectKind, check_forward};
@@ -37,19 +40,20 @@ impl fmt::Display for BurnKey {
     }
 }
 
-/// A burn as read from an Ethereum log.
+/// A burn as read from the foreign chain (an Ethereum log, a NEAR burn record).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewBurn {
     /// The burn's key.
     pub key: BurnKey,
-    /// The Ethereum transaction hash.
+    /// The Ethereum transaction hash; NEAR: `SHA256(borsh(BurnRecord))` (the `HKN1` memo's
+    /// `data`).
     pub tx_hash: Hash32,
     /// The block number.
     pub block_number: u64,
     /// The block hash.
     pub block_hash: Hash32,
     /// The burner.
-    pub from: EthAddress,
+    pub from: Account,
     /// The amount in wYEC base units (= zatoshi).
     pub amount: u64,
     /// The raw `ycashRecipient` bytes32 (§4.2), decoded or not.
@@ -63,14 +67,14 @@ pub struct NewBurn {
 pub struct BurnRecord {
     /// The burn's key.
     pub key: BurnKey,
-    /// The Ethereum transaction hash.
+    /// The Ethereum transaction hash (NEAR: the burn record's hash).
     pub tx_hash: Hash32,
     /// The block number.
     pub block_number: u64,
     /// The block hash.
     pub block_hash: Hash32,
     /// The burner.
-    pub from: EthAddress,
+    pub from: Account,
     /// The amount in base units.
     pub amount: u64,
     /// The raw recipient.
@@ -114,7 +118,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<BurnRecord> {
         tx_hash: r.get(3)?,
         block_number: r.get(4)?,
         block_hash: r.get(5)?,
-        from: EthAddress(r.get(6)?),
+        from: r.get::<_, SqlAccount>(6)?.0,
         amount: r.get(7)?,
         recipient: r.get(8)?,
         state: r.get(9)?,
@@ -171,7 +175,7 @@ impl Tx<'_> {
                         new.tx_hash,
                         new.block_number,
                         new.block_hash,
-                        new.from.0,
+                        SqlAccount(new.from.clone()),
                         new.amount,
                         new.recipient,
                         self.now(),
@@ -202,7 +206,7 @@ impl Tx<'_> {
                 new.tx_hash,
                 new.block_number,
                 new.block_hash,
-                new.from.0,
+                SqlAccount(new.from.clone()),
                 new.amount,
                 new.recipient,
                 target,

@@ -1,5 +1,6 @@
-//! The member key on both chains (plan §3.5, HK-7): its Ycash form (compressed key, WIF for
-//! `importprivkey`) and its Ethereum form (guardian address, local signer).
+//! The member key on every chain (plan §3.5, HK-7): its Ycash form (compressed key, WIF for
+//! `importprivkey`), its Ethereum form (guardian address, local signer) and its NEAR guardian
+//! form (the 64-byte uncompressed key `wyec-near` recovers, NEAR plan §2.3).
 
 use anyhow::{Result, anyhow};
 use hawkeye_core::SecretKey;
@@ -14,6 +15,9 @@ pub struct KeyInfo {
     pub memberkey: String,
     /// The Ethereum guardian address (EIP-55).
     pub eth_address: String,
+    /// The NEAR guardian key: 64 bytes `x ‖ y` as hex, no prefix (what `wyec-near`'s `new` and
+    /// `set_guardians` take).
+    pub near_guardian: String,
 }
 
 /// The key's two public forms.
@@ -21,6 +25,7 @@ pub fn key_info(key: &SecretKey) -> KeyInfo {
     KeyInfo {
         memberkey: hex::encode(key.public_key()),
         eth_address: key.eth_address().to_checksum(),
+        near_guardian: hex::encode(hawkeye_core::near::guardian_key_of(key)),
     }
 }
 

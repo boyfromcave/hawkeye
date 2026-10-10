@@ -22,7 +22,8 @@ use crate::{Result, StoreError, Tx};
 /// A chain cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
-    /// The last processed height (Ycash height or Ethereum block number).
+    /// The last processed height (Ycash height, or the foreign chain's: an Ethereum block
+    /// number, a NEAR block height).
     pub height: u64,
     /// Its block hash, when known (a rewind below the hash window leaves it unknown).
     pub hash: Option<Hash32>,
@@ -410,7 +411,7 @@ impl Tx<'_> {
             )?;
             rep.burns_deleted.push(k);
         }
-        self.rewind_cursor(Chain::Ethereum, block)?;
+        self.rewind_cursor(Chain::Foreign, block)?;
         Ok(rep)
     }
 

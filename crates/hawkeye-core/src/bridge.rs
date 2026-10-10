@@ -52,6 +52,14 @@ impl BridgeKind {
         Self::ALL.into_iter().find(|k| k.memo_magic() == magic)
     }
 
+    /// `"Ethereum"` or `"NEAR"` (messages).
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Ethereum => "Ethereum",
+            Self::Near => "NEAR",
+        }
+    }
+
     /// `"ethereum"` or `"near"` (config and vector files).
     pub const fn name(self) -> &'static str {
         match self {
@@ -79,9 +87,65 @@ impl core::str::FromStr for BridgeKind {
     }
 }
 
+/// A guardian (an attestor as a bridge contract knows it), derived from its Ycash member key:
+/// what a bridge's attestation signature recovers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Guardian {
+    /// The Ethereum address of the member key (`keccak256(uncompressed)[12..]`).
+    Ethereum(crate::eth::EthAddress),
+    /// The 64-byte uncompressed secp256k1 key `x ‖ y` (NEAR plan §2.3: what `env::ecrecover`
+    /// returns).
+    Secp256k1([u8; 64]),
+}
+
+impl Guardian {
+    /// The guardian as an account (Ethereum: its address; a NEAR guardian key is not one).
+    pub fn account(&self) -> Option<crate::lock::Destination> {
+        match self {
+            Guardian::Ethereum(a) => Some(crate::lock::Destination::Ethereum(*a)),
+            Guardian::Secp256k1(_) => None,
+        }
+    }
+
+    /// The Ethereum address, if this is an Ethereum guardian.
+    pub fn ledger_eth(&self) -> Option<crate::eth::EthAddress> {
+        match self {
+            Guardian::Ethereum(a) => Some(*a),
+            Guardian::Secp256k1(_) => None,
+        }
+    }
+}
+
+impl core::fmt::Display for Guardian {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Guardian::Ethereum(a) => f.write_str(&a.to_checksum()),
+            Guardian::Secp256k1(k) => {
+                f.write_str("0x")?;
+                for b in k {
+                    write!(f, "{b:02x}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guardians_display() {
+        let a = crate::eth::EthAddress([0xab; 20]);
+        assert_eq!(Guardian::Ethereum(a).to_string(), a.to_checksum());
+        assert_eq!(
+            Guardian::Secp256k1([1; 64]).to_string(),
+            format!("0x{}", "01".repeat(64))
+        );
+        assert_eq!(Guardian::Secp256k1([1; 64]).account(), None);
+        assert_eq!(Guardian::Ethereum(a).ledger_eth(), Some(a));
+    }
 
     #[test]
     fn kinds() {

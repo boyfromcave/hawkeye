@@ -12,7 +12,7 @@
 //! | Chain | Digest | Signature | Guardian |
 //! |---|---|---|---|
 //! | Ethereum ([`ethereum`]) | EIP-712 (main plan §4.4) | 65 bytes `r ‖ s ‖ v`, `v ∈ {27, 28}`, low S | 20-byte address |
-//! | NEAR (NH4) | `SHA256("HawkeyeNear-v1" ‖ borsh …)` (NEAR plan §2.3) | 65 bytes `r ‖ s ‖ v`, `v ∈ {0, 1}`, low S | 64-byte uncompressed key |
+//! | NEAR ([`near`]) | `SHA256("HawkeyeNear-v1" ‖ borsh …)` (NEAR plan §2.3) | 65 bytes `r ‖ s ‖ v`, `v ∈ {0, 1}`, low S | 64-byte uncompressed key |
 //!
 //! Neutral types: amounts are `u128` base units (= zatoshi, both tokens have 8 decimals), lock
 //! ids, transaction and block hashes `[u8; 32]`, accounts an [`Account`] and guardians a
@@ -28,15 +28,22 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use hawkeye_core::bytes::Hash32;
-use hawkeye_core::{Deployment, EthAddress, PubKey33, SecretKey};
+use hawkeye_core::{Deployment, PubKey33, SecretKey};
 
 use crate::config::Settings;
 
 pub mod ethereum;
+pub mod near;
 
 pub use ethereum::{Eip712Scheme, EthereumChain};
+pub use near::{NearChain, NearScheme};
+
+/// The most foreign blocks one [`ForeignChain::scan`] covers by default (the engine's span per
+/// tick; an adapter that reads block by block lowers it with
+/// [`ForeignChain::max_scan_blocks`]).
+pub const MAX_SCAN_BLOCKS: u64 = 5_000;
 
 /// Plan §3.3: on mainnet the bridge's threshold is at least 2 in every mint mode (at 1 a single
 /// key mints through the threshold path at once and skips the challenge window), on either chain.
@@ -50,42 +57,9 @@ pub use hawkeye_core::BridgeKind;
 /// lock [`Destination`](hawkeye_core::Destination) (an Ethereum address, or a NEAR account id).
 pub use hawkeye_core::Destination as Account;
 
-/// A guardian (an attestor as the foreign contract knows it), derived from its Ycash member key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Guardian {
-    /// The Ethereum address of the member key (`keccak256(uncompressed)[12..]`).
-    Ethereum(EthAddress),
-    /// The 64-byte uncompressed secp256k1 key `x ‖ y` (NEAR plan §2.3: what `env::ecrecover`
-    /// returns).
-    Secp256k1([u8; 64]),
-}
-
-impl Guardian {
-    /// The guardian as an account (Ethereum: its address; a NEAR guardian key is not one).
-    pub fn account(&self) -> Option<Account> {
-        match self {
-            Guardian::Ethereum(a) => Some(Account::Ethereum(*a)),
-            Guardian::Secp256k1(_) => None,
-        }
-    }
-
-    /// The 20-byte form the ledger stores (schema v2 keeps Ethereum addresses for proposers).
-    pub fn ledger_eth(&self) -> Option<EthAddress> {
-        match self {
-            Guardian::Ethereum(a) => Some(*a),
-            Guardian::Secp256k1(_) => None,
-        }
-    }
-}
-
-impl fmt::Display for Guardian {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Guardian::Ethereum(a) => f.write_str(&a.to_checksum()),
-            Guardian::Secp256k1(k) => write!(f, "0x{}", hex::encode(k)),
-        }
-    }
-}
+/// A guardian (an attestor as the foreign contract knows it), derived from its Ycash member key
+/// (`hawkeye-core`'s, so the ledger can store it).
+pub use hawkeye_core::Guardian;
 
 /// A foreign transaction hash, displayed `0x`-hex (as alloy prints a `B256`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -374,6 +348,12 @@ pub trait ForeignChain: AttestationScheme + Send + Sync {
     /// The bridge's events in `[from, to]` (both final), in chain order.
     fn scan(&self, from: u64, to: u64) -> BoxFut<'_, ScanBatch>;
 
+    /// The most blocks the engine asks [`scan`](Self::scan) for at once (default
+    /// [`MAX_SCAN_BLOCKS`]).
+    fn max_scan_blocks(&self) -> u64 {
+        MAX_SCAN_BLOCKS
+    }
+
     /// The latest block's timestamp, Unix seconds.
     fn now(&self) -> BoxFut<'_, u64>;
 
@@ -450,20 +430,19 @@ pub trait ForeignChain: AttestationScheme + Send + Sync {
     fn burn(&self, amount: u64, ycash_recipient: Hash32) -> BoxFut<'_, Burned>;
 }
 
-/// Connect the configured foreign chain with `key` as the sender (Ethereum: the key's account
-/// signs and pays gas).
+/// Connect the configured foreign chain. Ethereum: `key`'s account signs and pays gas. NEAR:
+/// the operator's relayer key (`[near] relayer_key_file`) sends; `key` only attests.
 pub async fn connect(s: &Settings, key: &SecretKey) -> Result<Arc<dyn ForeignChain>> {
     match s.foreign {
         BridgeKind::Ethereum => Ok(Arc::new(EthereumChain::connect(s, key).await?)),
-        BridgeKind::Near => Err(anyhow!(
-            "foreign.kind \"near\": the NEAR adapter is not built yet (NEAR plan NH4)"
-        )),
+        BridgeKind::Near => near::connect_as(s, None).await,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hawkeye_core::EthAddress;
 
     #[test]
     fn revert_names_match_whole_errors_only() {

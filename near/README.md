@@ -43,7 +43,9 @@ borsh(BridgeMessage))`, `contract_id = env::current_account_id()`. **Burn record
 **Events** (NEP-297, `EVENT_JSON:` logs): `nep141` `ft_mint` / `ft_burn` / `ft_transfer`, and
 `{"standard":"wyec_bridge","version":"1.0.0","event":…,"data":[{…}]}` for `minted`,
 `mint_proposed`, `mint_challenged`, `burn_to_ycash`, `guardians_changed`, `paused`,
-`mint_limit_changed`. Hawkeye reads state with view calls at `finality: final` (N-8), not events.
+`mint_limit_changed`. Hawkeye reads state, not events (N-8): per final block, the receipts that
+changed this contract's state (`EXPERIMENTAL_changes`, `EXPERIMENTAL_receipt`), completed with view
+calls at that block (`crates/hawkeye-near/src/contract.rs`).
 
 ## Differences from the Ethereum `WyecBridge`
 
@@ -107,6 +109,12 @@ each signature recovers to through the host's `ecrecover(…, malleability_flag 
 `BurnRecord`'s Borsh bytes and SHA-256 (also through the contract's `record_hash`).
 `vectors_file` keeps this contract's own `vectors/messages.json` byte-stable, and
 `vectors_verify_in_the_contract` re-verifies it through the host functions.
+
+`tests/tx_vectors.rs` (not a sandbox test) builds and signs NEAR transactions with
+`near-primitives` / `near-crypto` 0.37.4 and keeps
+`../crates/hawkeye-near/tests/data/tx_vectors.json` byte-stable; Hawkeye's hand-rolled codec
+(`crates/hawkeye-near/src/tx.rs`) is checked against it (`WYEC_NEAR_WRITE_TX_VECTORS=1 cargo test
+--test tx_vectors` regenerates it).
 
 ## Deploy (testnet, near-cli-rs)
 

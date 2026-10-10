@@ -1,0 +1,64 @@
+# Hawkeye over the NEAR bridge (wyec-near, NEAR plan docs/hawkeye-near-plan.md, tag NYEC):
+# one attestor of a regtest Ycash set against a local NEAR sandbox. One Hawkeye process serves
+# one bridge (NEAR plan §0 item 5): an Ethereum Hawkeye and a NEAR Hawkeye beside the same
+# ycashd each have their own config, ledger and signer set (N-2).
+#
+# Relative paths resolve against this file's directory.
+
+[network]
+name = "regtest"            # Ycash network; a NEAR mainnet bridge pairs only with "mainnet"
+
+[ycash]
+rpc_url = "http://127.0.0.1:18232"
+rpc_user = "u"
+rpc_password = "p"
+
+[foreign]
+kind = "near"               # "ethereum" (the default, with [eth]) or "near" (with [near])
+
+[near]
+rpc_url = "http://127.0.0.1:3030"
+network_id = "sandbox"      # bound into every attestation digest: the contract's network_id
+contract_id = "wyec.test.near"
+# The operator's own NEAR account: it sends and pays for this attestor's transactions (mint,
+# propose_mint, challenge_mint, execute_mint) and never attests. The member key below attests.
+relayer_account = "hawkeye1.test.near"
+relayer_key_file = "keys/hawkeye1.test.near.json"   # near-cli credentials JSON
+start_block = 1             # the contract's deployment block: the scan starts here
+gas_tgas = 100              # per call (default 100)
+
+[bridge]
+tag = "NYEC"                # optional: the NEAR bridge's tag is NYEC (WYEC is refused)
+set_id = "1111111111111111111111111111111111111111111111111111111111111111"
+delay = 6
+confirmations = 2
+min_owner_age = 400
+roll_margin = 50
+takeover_blocks = 4
+heartbeat_blocks = 10
+min_lock = "0.1"
+max_lock = "1000"
+mint_mode = "optimistic"
+mint_threshold = 2          # required for mint_mode = "threshold" on NEAR (no deployment file)
+
+[keys]
+secret_hex = "0101010101010101010101010101010101010101010101010101010101010101"   # dev only
+
+[store]
+path = "hawkeye-near.db"
+
+[api]
+listen = "127.0.0.1:7811"
+
+[policy]
+auto_slash = true
+
+[peers]
+urls = ["http://127.0.0.1:7812", "http://127.0.0.1:7813"]
+
+[devnet]
+drills = true
+
+[log]
+level = "info"
+format = "text"

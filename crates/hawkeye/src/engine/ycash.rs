@@ -362,10 +362,8 @@ fn apply_outputs(
         .filter(|o| is_op_return(&o.script_pubkey))
         .collect();
     let destination = match returns.as_slice() {
-        // the ledger (schema v2) stores Ethereum destinations; a NEAR one is NEAR plan NH4
-        [one] => Destination::parse(p.bridge_kind, &one.script_pubkey)
-            .ok()
-            .and_then(|d| d.ethereum().copied()),
+        // the bridge kind's destination: an Ethereum address or a NEAR account id (ledger v4)
+        [one] => Destination::parse(p.bridge_kind, &one.script_pubkey).ok(),
         _ => None,
     };
     for (n, o) in tx.outputs.iter().enumerate() {
@@ -391,13 +389,13 @@ fn apply_outputs(
                 outpoint: op,
                 value_zat: value,
                 owner_height: v.owner_height,
-                destination,
+                destination: destination.clone(),
                 block_hash: *block_hash,
                 block_height: h,
             })?;
             info!(event = "lock_seen", lock_id = %format!("0x{}", hex::encode(rec.lock_id)),
                   outpoint = %op, value, height = h,
-                  to = ?destination.map(|d| d.to_checksum()));
+                  to = ?destination.as_ref().map(|d| d.to_string()));
         }
     }
     Ok(())

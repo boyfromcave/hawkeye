@@ -1,10 +1,12 @@
 //! The ledger schema as an ordered list of migrations.
 //!
 //! `PRAGMA user_version` is the number of migrations applied. [`MIGRATIONS`] is append-only:
-//! a released migration is never edited; a change is a new entry.
+//! a released migration is never edited; a change is a new entry. Migrations run with foreign
+//! keys off and are checked with `PRAGMA foreign_key_check` before they commit (SQLite's table
+//! rebuild procedure, which v4 uses).
 
 /// Every migration, in order. Entry `i` takes `user_version` from `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// Version 1: the H4 ledger.
 const V1: &str = r#"
@@ -302,6 +304,197 @@ CREATE TRIGGER sign_once_challenge_immutable_update BEFORE UPDATE ON sign_once_c
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
 CREATE TRIGGER sign_once_challenge_immutable_delete BEFORE DELETE ON sign_once_challenge
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_drill_mint_immutable_update BEFORE UPDATE ON sign_once_drill_mint
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_drill_mint_immutable_delete BEFORE DELETE ON sign_once_drill_mint
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+"#;
+
+/// Version 4 (NEAR plan NH4): the foreign chain is no longer always Ethereum. Every column that
+/// held a 20-byte Ethereum address becomes chain-neutral text (`accounts` module:
+/// `ethereum:0x…`, `near:<account id>`; proposers `ethereum:0x…` or `secp256k1:<x ‖ y hex>`), and
+/// the foreign scan cursor is `foreign` instead of `ethereum`. Each table is rebuilt (SQLite
+/// cannot alter a CHECK) and its rows copied: an Ethereum address `a` becomes
+/// `'ethereum:0x' || lower(hex(a))`, losslessly. Sign-once rows keep their digest and signature
+/// bytes; their immutability triggers are re-created.
+const V4: &str = r#"
+-- Chain-neutral account text (also enforced in Rust):
+--   ethereum:0x<40 lowercase hex>  (51 chars)   near:<NEAR account id>  (7..69 chars)
+-- Guardian text: ethereum:0x<40 hex> or secp256k1:<128 lowercase hex> (138 chars).
+
+-- chain cursors: 'ethereum' -> 'foreign'
+CREATE TABLE chain_cursor_v4 (
+    chain       TEXT    PRIMARY KEY CHECK (chain IN ('ycash', 'foreign')),
+    height      INTEGER NOT NULL CHECK (height >= 0),
+    hash        BLOB    CHECK (hash IS NULL OR length(hash) = 32),
+    updated_at  INTEGER NOT NULL
+);
+INSERT INTO chain_cursor_v4 (chain, height, hash, updated_at)
+    SELECT CASE chain WHEN 'ethereum' THEN 'foreign' ELSE chain END, height, hash, updated_at
+    FROM chain_cursor;
+DROP TABLE chain_cursor;
+ALTER TABLE chain_cursor_v4 RENAME TO chain_cursor;
+
+CREATE TABLE chain_blocks_v4 (
+    chain       TEXT    NOT NULL CHECK (chain IN ('ycash', 'foreign')),
+    height      INTEGER NOT NULL CHECK (height >= 0),
+    hash        BLOB    NOT NULL CHECK (length(hash) = 32),
+    PRIMARY KEY (chain, height)
+) WITHOUT ROWID;
+INSERT INTO chain_blocks_v4 (chain, height, hash)
+    SELECT CASE chain WHEN 'ethereum' THEN 'foreign' ELSE chain END, height, hash
+    FROM chain_blocks;
+DROP TABLE chain_blocks;
+ALTER TABLE chain_blocks_v4 RENAME TO chain_blocks;
+
+-- locks.destination
+CREATE TABLE locks_v4 (
+    lock_id          BLOB    PRIMARY KEY CHECK (length(lock_id) = 32),
+    txid             BLOB    NOT NULL CHECK (length(txid) = 32),
+    vout             INTEGER NOT NULL CHECK (vout >= 0),
+    value_zat        INTEGER NOT NULL CHECK (value_zat >= 0),
+    owner_height     INTEGER NOT NULL CHECK (owner_height >= 0),
+    destination      TEXT    CHECK (destination IS NULL
+                                    OR (destination GLOB 'ethereum:0x*' AND length(destination) = 51)
+                                    OR (destination GLOB 'near:*' AND length(destination) BETWEEN 7 AND 69)),
+    block_hash       BLOB    NOT NULL CHECK (length(block_hash) = 32),
+    block_height     INTEGER NOT NULL CHECK (block_height >= 0),
+    state            TEXT    NOT NULL,
+    rejection_reason TEXT,
+    exposure         INTEGER NOT NULL DEFAULT 0 CHECK (exposure IN (0, 1)),
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE (txid, vout)
+);
+INSERT INTO locks_v4
+    SELECT lock_id, txid, vout, value_zat, owner_height,
+           CASE WHEN destination IS NULL THEN NULL
+                ELSE 'ethereum:0x' || lower(hex(destination)) END,
+           block_hash, block_height, state, rejection_reason, exposure, created_at, updated_at
+    FROM locks;
+DROP TABLE locks;
+ALTER TABLE locks_v4 RENAME TO locks;
+CREATE INDEX locks_state  ON locks (state);
+CREATE INDEX locks_height ON locks (block_height);
+
+-- burns.sender (the deployment's 20-byte `bridge` stays: NEAR's is a hash of the contract id)
+CREATE TABLE burns_v4 (
+    id              INTEGER PRIMARY KEY,
+    chain_id        INTEGER NOT NULL CHECK (chain_id >= 0),
+    bridge          BLOB    NOT NULL CHECK (length(bridge) = 20),
+    nonce           INTEGER NOT NULL CHECK (nonce >= 0),
+    tx_hash         BLOB    NOT NULL CHECK (length(tx_hash) = 32),
+    block_number    INTEGER NOT NULL CHECK (block_number >= 0),
+    block_hash      BLOB    NOT NULL CHECK (length(block_hash) = 32),
+    sender          TEXT    NOT NULL CHECK ((sender GLOB 'ethereum:0x*' AND length(sender) = 51)
+                                            OR (sender GLOB 'near:*' AND length(sender) BETWEEN 7 AND 69)),
+    amount          INTEGER NOT NULL CHECK (amount >= 0),
+    recipient       BLOB    NOT NULL CHECK (length(recipient) = 32),
+    state           TEXT    NOT NULL,
+    leader          BLOB    CHECK (leader IS NULL OR length(leader) = 33),
+    assigned_height INTEGER,
+    waiting_epoch   INTEGER,
+    intent_txid     BLOB,
+    intent_vout     INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE (chain_id, bridge, nonce),
+    CHECK ((intent_txid IS NULL) = (intent_vout IS NULL)),
+    FOREIGN KEY (intent_txid, intent_vout) REFERENCES intents (txid, vout)
+);
+INSERT INTO burns_v4
+    SELECT id, chain_id, bridge, nonce, tx_hash, block_number, block_hash,
+           'ethereum:0x' || lower(hex(sender)), amount, recipient, state, leader, assigned_height,
+           waiting_epoch, intent_txid, intent_vout, created_at, updated_at
+    FROM burns;
+DROP TABLE burns;
+ALTER TABLE burns_v4 RENAME TO burns;
+CREATE INDEX burns_state ON burns (state, nonce);
+CREATE INDEX burns_block ON burns (block_number);
+
+-- sign_once_mint.recipient
+CREATE TABLE sign_once_mint_v4 (
+    lock_id    BLOB    PRIMARY KEY CHECK (length(lock_id) = 32)
+                       REFERENCES locks (lock_id) ON DELETE RESTRICT,
+    amount     INTEGER NOT NULL CHECK (amount >= 0),
+    recipient  TEXT    NOT NULL CHECK ((recipient GLOB 'ethereum:0x*' AND length(recipient) = 51)
+                                       OR (recipient GLOB 'near:*' AND length(recipient) BETWEEN 7 AND 69)),
+    digest     BLOB    NOT NULL CHECK (length(digest) = 32),
+    signature  BLOB    NOT NULL CHECK (length(signature) = 65),
+    signed_at  INTEGER NOT NULL
+);
+INSERT INTO sign_once_mint_v4
+    SELECT lock_id, amount, 'ethereum:0x' || lower(hex(recipient)), digest, signature, signed_at
+    FROM sign_once_mint;
+DROP TABLE sign_once_mint;
+ALTER TABLE sign_once_mint_v4 RENAME TO sign_once_mint;
+CREATE TRIGGER sign_once_mint_immutable_update BEFORE UPDATE ON sign_once_mint
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_mint_immutable_delete BEFORE DELETE ON sign_once_mint
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+
+-- pending_mints.recipient
+CREATE TABLE pending_mints_v4 (
+    lock_id      BLOB    NOT NULL CHECK (length(lock_id) = 32),
+    tx_hash      BLOB    NOT NULL CHECK (length(tx_hash) = 32),
+    recipient    TEXT    NOT NULL CHECK ((recipient GLOB 'ethereum:0x*' AND length(recipient) = 51)
+                                         OR (recipient GLOB 'near:*' AND length(recipient) BETWEEN 7 AND 69)),
+    amount       INTEGER NOT NULL CHECK (amount >= 0),
+    block        INTEGER NOT NULL CHECK (block >= 0),
+    since_height INTEGER NOT NULL CHECK (since_height >= 0),
+    proposal     INTEGER NOT NULL CHECK (proposal IN (0, 1)),
+    created_at   INTEGER NOT NULL,
+    PRIMARY KEY (lock_id, tx_hash)
+) WITHOUT ROWID;
+INSERT INTO pending_mints_v4
+    SELECT lock_id, tx_hash, 'ethereum:0x' || lower(hex(recipient)), amount, block, since_height,
+           proposal, created_at
+    FROM pending_mints;
+DROP TABLE pending_mints;
+ALTER TABLE pending_mints_v4 RENAME TO pending_mints;
+
+-- sign_once_challenge.proposer, .recipient
+CREATE TABLE sign_once_challenge_v4 (
+    lock_id      BLOB    NOT NULL CHECK (length(lock_id) = 32),
+    proposal_id  TEXT    NOT NULL CHECK (proposal_id GLOB '[1-9]*' AND proposal_id NOT GLOB '*[^0-9]*'
+                                         AND length(proposal_id) <= 29),
+    proposer     TEXT    NOT NULL CHECK ((proposer GLOB 'ethereum:0x*' AND length(proposer) = 51)
+                                         OR (proposer GLOB 'secp256k1:*' AND length(proposer) = 138)),
+    amount       INTEGER NOT NULL CHECK (amount >= 0),
+    recipient    TEXT    NOT NULL CHECK ((recipient GLOB 'ethereum:0x*' AND length(recipient) = 51)
+                                         OR (recipient GLOB 'near:*' AND length(recipient) BETWEEN 7 AND 69)),
+    reason       TEXT    NOT NULL,
+    digest       BLOB    NOT NULL CHECK (length(digest) = 32),
+    signature    BLOB    NOT NULL CHECK (length(signature) = 65),
+    signed_at    INTEGER NOT NULL,
+    PRIMARY KEY (lock_id, proposal_id)
+) WITHOUT ROWID;
+INSERT INTO sign_once_challenge_v4
+    SELECT lock_id, proposal_id, 'ethereum:0x' || lower(hex(proposer)), amount,
+           'ethereum:0x' || lower(hex(recipient)), reason, digest, signature, signed_at
+    FROM sign_once_challenge;
+DROP TABLE sign_once_challenge;
+ALTER TABLE sign_once_challenge_v4 RENAME TO sign_once_challenge;
+CREATE TRIGGER sign_once_challenge_immutable_update BEFORE UPDATE ON sign_once_challenge
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_challenge_immutable_delete BEFORE DELETE ON sign_once_challenge
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+
+-- sign_once_drill_mint.recipient
+CREATE TABLE sign_once_drill_mint_v4 (
+    lock_id    BLOB    PRIMARY KEY CHECK (length(lock_id) = 32),
+    amount     INTEGER NOT NULL CHECK (amount >= 0),
+    recipient  TEXT    NOT NULL CHECK ((recipient GLOB 'ethereum:0x*' AND length(recipient) = 51)
+                                       OR (recipient GLOB 'near:*' AND length(recipient) BETWEEN 7 AND 69)),
+    digest     BLOB    NOT NULL CHECK (length(digest) = 32),
+    signature  BLOB    NOT NULL CHECK (length(signature) = 65),
+    signed_at  INTEGER NOT NULL
+) WITHOUT ROWID;
+INSERT INTO sign_once_drill_mint_v4
+    SELECT lock_id, amount, 'ethereum:0x' || lower(hex(recipient)), digest, signature, signed_at
+    FROM sign_once_drill_mint;
+DROP TABLE sign_once_drill_mint;
+ALTER TABLE sign_once_drill_mint_v4 RENAME TO sign_once_drill_mint;
 CREATE TRIGGER sign_once_drill_mint_immutable_update BEFORE UPDATE ON sign_once_drill_mint
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
 CREATE TRIGGER sign_once_drill_mint_immutable_delete BEFORE DELETE ON sign_once_drill_mint

@@ -29,6 +29,10 @@ tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread"] }
 # No `install` feature: building must not download the sandbox binary (S3 is unreachable here);
 # the sandbox tests are skipped unless NEAR_SANDBOX=1 (tests/sandbox.rs).
 near-workspaces = { version = "=0.23.0", default-features = false, features = ["rustls"] }
+# tests/tx_vectors.rs: nearcore's own transaction types and signer, to golden-vector Hawkeye's
+# hand-rolled transaction codec (already in the lock through near-workspaces).
+near-primitives = "=0.37.4"
+near-crypto = "=0.37.4"
 
 [features]
 # CI only: lets near-workspaces download the NEAR sandbox binary for tests/sandbox.rs.

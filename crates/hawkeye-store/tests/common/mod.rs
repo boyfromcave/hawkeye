@@ -7,7 +7,7 @@ use hawkeye_core::matcher::{Classification, Unmatched};
 use hawkeye_core::template::{TAG_WYEC, VaultParams};
 use hawkeye_core::{Deployment, EthAddress, OutPoint};
 use hawkeye_store::{
-    BurnKey, LockState, NewBurn, NewIntent, NewLock, NewVault, Store, StoreError, Tx,
+    Account, BurnKey, LockState, NewBurn, NewIntent, NewLock, NewVault, Store, StoreError, Tx,
 };
 
 pub const DEP: Deployment = Deployment {
@@ -15,7 +15,7 @@ pub const DEP: Deployment = Deployment {
     bridge: EthAddress([0xb0; 20]),
 };
 
-pub const DEST: EthAddress = EthAddress([0xd5; 20]);
+pub const DEST: Account = Account::Ethereum(EthAddress([0xd5; 20]));
 pub const SET: Hash32 = [0x5e; 32];
 pub const LEADER: [u8; 33] = [0x02; 33];
 
@@ -82,7 +82,7 @@ pub fn new_burn(nonce: u64, block: u64, finalized: bool) -> NewBurn {
         tx_hash: h(0xe0, nonce as u32),
         block_number: block,
         block_hash: h(0xeb, block as u32),
-        from: EthAddress([0xf1; 20]),
+        from: Account::Ethereum(EthAddress([0xf1; 20])),
         amount: 500_000 + nonce,
         recipient: [0x01; 32],
         finalized,

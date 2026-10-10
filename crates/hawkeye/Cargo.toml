@@ -1,6 +1,6 @@
 [package]
 name = "hawkeye"
-description = "Hawkeye, the wYEC bridge attestor: engine (plan §5), daemon, status API and CLI"
+description = "Hawkeye, the wYEC bridge attestor: engine (plan §5), daemon, status API and CLI, over an Ethereum or a NEAR bridge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 hawkeye-core = { path = "../hawkeye-core" }
 hawkeye-eth = { path = "../hawkeye-eth" }
+hawkeye-near = { path = "../hawkeye-near" }
 hawkeye-store = { path = "../hawkeye-store" }
 hawkeye-ycash = { path = "../hawkeye-ycash" }
 alloy = { version = "=2.5.0", default-features = false, features = [
@@ -43,6 +44,7 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "json", "std", "ansi"] }
 
 [dev-dependencies]
+hawkeye-near = { path = "../hawkeye-near", features = ["mock"] }
 hawkeye-ycash = { path = "../hawkeye-ycash", features = ["mock"] }
 alloy = { version = "=2.5.0", default-features = false, features = ["node-bindings"] }
 tempfile = "=3.27.0"

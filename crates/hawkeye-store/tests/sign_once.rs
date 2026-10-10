@@ -7,7 +7,8 @@ use std::cell::Cell;
 use common::*;
 use hawkeye_core::EthAddress;
 use hawkeye_store::{
-    ChallengedProposal, LockState, ObjectKind, SignDomain, Store, StoreError, YcashSignKey,
+    Account, ChallengedProposal, Guardian, LockState, ObjectKind, SignDomain, Store, StoreError,
+    YcashSignKey,
 };
 
 #[test]
@@ -28,7 +29,7 @@ fn mint_identical_call_returns_stored_signature_without_signing() {
     assert_eq!(calls.get(), 1);
     assert_eq!(first.signature, fake_sig(&[7; 32]).unwrap());
     assert_eq!(
-        (first.amount, first.to, first.digest),
+        (first.amount, first.to.clone(), first.digest),
         (amount, DEST, [7; 32])
     );
 
@@ -68,7 +69,7 @@ fn mint_conflict_never_calls_the_signer() {
         |_: &[u8; 32]| -> Result<[u8; 65], StoreError> { panic!("signer called on conflict") };
     for (a, to, d) in [
         (amount + 1, DEST, [7; 32]),
-        (amount, EthAddress([0xee; 20]), [7; 32]),
+        (amount, Account::Ethereum(EthAddress([0xee; 20])), [7; 32]),
         (amount, DEST, [8; 32]),
     ] {
         match s.sign_once_mint(&id, a, &to, &d, never) {
@@ -108,7 +109,13 @@ fn mint_refuses_locks_that_are_not_policy_ok_or_do_not_match() {
             Err(StoreError::Invalid(_))
         ));
         assert!(matches!(
-            t.sign_once_mint(&id, v, &EthAddress([1; 20]), &[7; 32], never),
+            t.sign_once_mint(
+                &id,
+                v,
+                &Account::Ethereum(EthAddress([1; 20])),
+                &[7; 32],
+                never
+            ),
             Err(StoreError::Invalid(_))
         ));
         assert!(t.mint_signature(&id)?.is_none());
@@ -293,11 +300,11 @@ fn sign_once_rows_are_immutable_in_sqlite() {
     assert!(raw.execute("UPDATE events SET to_state = 'X'", []).is_err());
 }
 
-fn proposal(lock_id: [u8; 32], id: u128, amount: u64, to: EthAddress) -> ChallengedProposal {
+fn proposal(lock_id: [u8; 32], id: u128, amount: u64, to: Account) -> ChallengedProposal {
     ChallengedProposal {
         lock_id,
         proposal_id: id,
-        proposer: EthAddress([0xee; 20]),
+        proposer: Guardian::Ethereum(EthAddress([0xee; 20])),
         amount,
         to,
     }
@@ -399,7 +406,7 @@ fn a_matching_proposal_is_never_challenged() {
     .unwrap();
     s.tx(|t| {
         t.sign_once_challenge(
-            &proposal(id, 3, amount, EthAddress([1; 20])),
+            &proposal(id, 3, amount, Account::Ethereum(EthAddress([1; 20]))),
             "to",
             &[4; 32],
             fake_sig,

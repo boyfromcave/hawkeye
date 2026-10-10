@@ -48,7 +48,7 @@ pub mod template;
 pub mod tx;
 
 pub use attribution::VAULT_BRANCH_ID;
-pub use bridge::BridgeKind;
+pub use bridge::{BridgeKind, Guardian};
 pub use bytes::{Hash32, OutPoint};
 pub use error::{Error, Result};
 pub use eth::EthAddress;

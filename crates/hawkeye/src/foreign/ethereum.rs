@@ -59,12 +59,12 @@ impl EthereumChain {
 
     /// Connect the configured deployment (`[eth]`), sending from `key`'s account.
     pub async fn connect(s: &Settings, key: &SecretKey) -> anyhow::Result<Self> {
-        let mut ec = EthConfig::new(
-            s.eth_url.clone(),
-            s.deployment.chain_id,
-            s.deployment.bridge,
-        );
-        ec.token = Some(s.deployment.token);
+        let d = s
+            .deployment
+            .as_ref()
+            .ok_or_else(|| anyhow!("no [eth] deployment: the bridge is not on Ethereum"))?;
+        let mut ec = EthConfig::new(s.eth_url.clone(), d.chain_id, d.bridge);
+        ec.token = Some(d.token);
         ec.finality = s.finality;
         let client = EthClient::connect(&ec, Some(eth_signer(key)?))
             .await

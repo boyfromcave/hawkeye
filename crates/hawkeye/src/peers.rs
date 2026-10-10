@@ -26,9 +26,10 @@ pub struct LockView {
     pub block_height: u32,
     /// Policy rejection reason.
     pub rejection_reason: Option<String>,
-    /// This attestor's EIP-712 `Mint` signature (`0x` + 65 bytes), if it signed.
+    /// This attestor's `Mint` attestation (`0x` + 65 bytes: EIP-712 on Ethereum, Borsh-SHA256
+    /// on NEAR), if it signed.
     pub signature: Option<String>,
-    /// This attestor's guardian address.
+    /// This attestor's guardian (Ethereum address, or NEAR 64-byte key).
     pub signer: String,
 }
 
@@ -37,7 +38,7 @@ pub struct LockView {
 pub struct BurnView {
     /// Burn nonce.
     pub nonce: u64,
-    /// Ethereum tx hash.
+    /// The burn's id: the Ethereum tx hash, or NEAR's `SHA256(borsh(BurnRecord))`.
     pub tx_hash: String,
     /// Amount (base units).
     pub amount: u64,

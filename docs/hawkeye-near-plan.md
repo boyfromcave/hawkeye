@@ -43,7 +43,7 @@ ready, not a commitment to ship).** Extends the Hawkeye plan of record
 | N-5 | Burn-reference memo `"HKN1"`, same 73-byte layout as `HKB1` (main plan §4.3) | one memo parser; the magic says which bridge, and a memo for one bridge is unmatched on the other |
 | N-6 | Attestation messages: `SHA256("HawkeyeNear-v1" ‖ borsh(network_id) ‖ borsh(contract_id) ‖ borsh(msg))`, signed secp256k1, 65-byte `r‖s‖v` with `v ∈ {0,1}`, low-S | `env::ecrecover` takes a 32-byte hash, 64-byte sig and `v`; the domain prefix and both ids stop cross-network and cross-contract replay (the EIP-712 domain's job on Ethereum) |
 | N-7 | One contract, `wyec-near`: NEP-141 + NEP-145 + NEP-148 token **and** the bridge policy | NEAR cross-contract calls are asynchronous; a token/bridge split (as on Ethereum) adds callback failure modes for no benefit; the contract stays small |
-| N-8 | **Burns, mints and proposals are recorded in contract state and read with view calls at `finality: final`** | NEAR RPC has no log filter; an on-chain burn log (`get_burns(from_nonce, limit)`) is a deterministic, reorg-free source; the memo's `data` is the SHA-256 of the burn record |
+| N-8 | **Burns, mints and proposals are recorded in contract state and read with view calls at `finality: final`**; Hawkeye finds them **per final block**: `EXPERIMENTAL_changes` (`data_changes` of the contract) names every receipt that changed its state, `EXPERIMENTAL_receipt` gives each one's calls, and views at that block (`block_id`) complete them (`get_proposal` after a `propose_mint`, before an `execute_mint`; `get_burns` between the burn counts before and after a block with a `burn`) | NEAR RPC has no log filter; an on-chain burn log (`get_burns(from_nonce, limit)`) is a deterministic, reorg-free source; the memo's `data` is the SHA-256 of the burn record. The watcher must see **every** proposal, including one for a lockId Hawkeye has never seen and one sent through another contract, which no view can enumerate; a state change cannot be hidden, whoever sent the receipt (NH4) |
 | N-9 | No full-access key after deployment; no upgrade method in v1 (NQ-2) | the Ethereum side has no proxy and no admin key; same trust statement on NEAR |
 | N-11 | A burn pays the storage of its own `BurnRecord` (refund of any excess) instead of 1 yoctoNEAR | on NEAR the contract pays for stored bytes; 1-yocto burns would let anyone drain its balance with zero-amount burns and then block mints |
 | N-12 | Threshold signatures sorted strictly ascending by recovered 64-byte key | one comparison per signature for distinctness, as the Ethereum contract's ascending-address rule |
@@ -125,7 +125,22 @@ business step, not code.
 3. **Tag-parameterized Ycash half.** Every `TAG_WYEC` comparison becomes the bridge's configured tag;
    the memo magic follows the chain kind.
 4. Config: `[foreign] kind = "ethereum" | "near"`, `[near] rpc_url, network_id, contract_id,
-   relayer_account, relayer_key_file`, `[bridge] tag`.
+   relayer_account, relayer_key_file, start_block, gas_tgas`, `[bridge] tag`.
+5. **As built (NH4).** `crates/hawkeye-near`: JSON-RPC client (`query` views at `final` or a
+   block, `block`, `EXPERIMENTAL_changes`, `EXPERIMENTAL_receipt`, `view_access_key`, `send_tx`
+   with `wait_until: FINAL`); a hand-rolled Borsh codec for `TransactionV0` / `SignedTransaction`
+   with `FunctionCall` actions, signed with the relayer's ed25519 key from a NEAR credentials JSON
+   (byte-for-byte golden vectors built and signed by `near-primitives` / `near-crypto` 0.37.4 in
+   `near/tests/tx_vectors.rs`); the `wyec-near` client (nonce = access-key nonce at `final`, never
+   below the last used, + 1; an `InvalidNonce` is re-read and retried once; the envelope is
+   rebuilt, the attestation in it is the engine's sign-once record); the N-8 scanner (cursor =
+   final block height; a height NEAR skipped has no changes; a burn's id is
+   `SHA256(borsh(BurnRecord))`, a mint's or proposal's its receipt id); contract panics mapped to
+   the Ethereum bridge's error names (`wyec: lock consumed` → `LockConsumed`, …); a mock NEAR
+   node with a model of the contract. `crates/hawkeye/src/foreign/near.rs`: `NearChain` /
+   `NearScheme`. Ledger schema v4: chain-neutral accounts (`ethereum:0x…` / `near:<id>`) and
+   guardians (`ethereum:0x…` / `secp256k1:<x‖y>`), cursor `foreign`; v3 ledgers migrate losslessly.
+   Status: `foreign_kind`, `guardian`, `foreign` (the old `eth_address` / `ethereum` kept).
 
 ## 5. Phases
 
@@ -135,7 +150,7 @@ business step, not code.
 | NH1 ✅ | `hawkeye-core::near` encodings + vectors | vectors pass in Rust and in the contract |
 | NH2 ✅ | `near/` contract: token + bridge, unit tests (`near-sdk` test env), wasm build, sandbox integration tests (`near-workspaces`, CI) | all green; wasm size and gas measured |
 | NH3 ✅ | `ForeignChain` trait; Ethereum behind it with no behaviour change (all existing tests and drills still pass) | Ethereum devnet demo PASS on both node lines |
-| NH4 | `hawkeye-near` adapter + daemon support | engine tests against a NEAR mock RPC |
+| NH4 ✅ | `hawkeye-near` adapter + daemon support | engine tests against a NEAR mock RPC |
 | NH5 | NEAR devnet: real regtest ycashd + NEAR sandbox + Hawkeyes; `scenario demo` and `rogue-mint` | PASS on both node lines (CI: the NEAR sandbox binary downloads on GitHub runners) |
 | NH6 | testnet trial, audit, Foundation parameters | — |
 

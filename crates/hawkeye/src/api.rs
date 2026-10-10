@@ -65,7 +65,7 @@ async fn lock(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
             outpoint: l.outpoint.to_string(),
             state: l.state.to_string(),
             amount: l.value_zat,
-            to: l.destination.map(|d| d.to_checksum()),
+            to: l.destination.map(|d| d.to_string()),
             block_height: l.block_height,
             rejection_reason: l.rejection_reason,
             signature: sig.map(|s| format!("0x{}", hex::encode(s.signature))),

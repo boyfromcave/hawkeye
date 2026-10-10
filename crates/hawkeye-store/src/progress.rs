@@ -6,9 +6,10 @@
 //! ledger transaction as the action they describe where there is one.
 
 use hawkeye_core::bytes::Hash32;
-use hawkeye_core::{EthAddress, OutPoint, PubKey33};
+use hawkeye_core::{OutPoint, PubKey33};
 use rusqlite::params;
 
+use crate::accounts::{Account, SqlAccount};
 use crate::state::FaultKind;
 use crate::{Result, Tx};
 
@@ -17,13 +18,13 @@ use crate::{Result, Tx};
 pub struct PendingMintRecord {
     /// The `lockId` minted against.
     pub lock_id: Hash32,
-    /// The Ethereum transaction.
+    /// The foreign transaction (Ethereum transaction hash; NEAR receipt id).
     pub tx_hash: Hash32,
     /// The mint recipient.
-    pub to: EthAddress,
+    pub to: Account,
     /// The amount (base units = zatoshi).
     pub amount: u64,
-    /// The Ethereum block.
+    /// The foreign block (height).
     pub block: u64,
     /// The Ycash tip when it was first deferred (the grace period counts from here).
     pub since_height: u32,
@@ -103,7 +104,7 @@ impl Tx<'_> {
             params![
                 r.lock_id,
                 r.tx_hash,
-                r.to.0,
+                SqlAccount(r.to.clone()),
                 r.amount,
                 r.block,
                 r.since_height,
@@ -124,7 +125,7 @@ impl Tx<'_> {
                 Ok(PendingMintRecord {
                     lock_id: r.get(0)?,
                     tx_hash: r.get(1)?,
-                    to: EthAddress(r.get(2)?),
+                    to: r.get::<_, SqlAccount>(2)?.0,
                     amount: r.get(3)?,
                     block: r.get(4)?,
                     since_height: r.get(5)?,

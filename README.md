@@ -25,9 +25,12 @@ The Foundation's model is **one attestation, a challenge window, and slashing**:
 | `crates/hawkeye-core` | pure encodings and rules: templates, memo, recipient, lockId, EIP-712, policy, matching |
 | `crates/hawkeye-ycash` | ycashd JSON-RPC client (`set_*`, `vault_*`, stock), v4 tx codec, mock node |
 | `crates/hawkeye-eth` | Ethereum adapter (alloy): bindings, finalized scanner, signer, mint submitter |
-| `crates/hawkeye-store` | SQLite ledger, sign-once records, evidence |
-| `crates/hawkeye` | the daemon and CLI |
+| `crates/hawkeye-near` | NEAR adapter (NEAR plan NH4): JSON-RPC client, hand-rolled Borsh transaction codec (golden-vectored against `near-primitives`), relayer key, `wyec-near` client and block scanner, mock NEAR node |
+| `crates/hawkeye-store` | SQLite ledger, sign-once records, evidence (v4: chain-neutral accounts) |
+| `crates/hawkeye` | the daemon and CLI (`[foreign] kind = "ethereum"` or `"near"`) |
 | `eth/` | Foundry project: wyec at a pinned commit, deploy scripts (anvil, Sepolia), vectors |
+| `near/` | the `wyec-near` contract (NEP-141 wYEC + bridge policy), its own cargo project |
+| `config/` | sample configs: `ethereum-anvil.example.toml`, `near-sandbox.example.toml` |
 | `devnet/` | regtest `ycashd` + anvil + several Hawkeyes, scenario drills |
 
 ## Build
