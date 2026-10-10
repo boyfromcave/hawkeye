@@ -45,6 +45,8 @@ ready, not a commitment to ship).** Extends the Hawkeye plan of record
 | N-7 | One contract, `wyec-near`: NEP-141 + NEP-145 + NEP-148 token **and** the bridge policy | NEAR cross-contract calls are asynchronous; a token/bridge split (as on Ethereum) adds callback failure modes for no benefit; the contract stays small |
 | N-8 | **Burns, mints and proposals are recorded in contract state and read with view calls at `finality: final`** | NEAR RPC has no log filter; an on-chain burn log (`get_burns(from_nonce, limit)`) is a deterministic, reorg-free source; the memo's `data` is the SHA-256 of the burn record |
 | N-9 | No full-access key after deployment; no upgrade method in v1 (NQ-2) | the Ethereum side has no proxy and no admin key; same trust statement on NEAR |
+| N-11 | A burn pays the storage of its own `BurnRecord` (refund of any excess) instead of 1 yoctoNEAR | on NEAR the contract pays for stored bytes; 1-yocto burns would let anyone drain its balance with zero-amount burns and then block mints |
+| N-12 | Threshold signatures sorted strictly ascending by recovered 64-byte key | one comparison per signature for distinctness, as the Ethereum contract's ascending-address rule |
 | N-10 | Mint auto-registers the receiver's storage (NEP-145), paid from the contract balance; the deployer funds it | a depositor on Ycash cannot register storage on NEAR; the cost is ~0.00125 NEAR per new holder |
 
 ## 2. Normative encodings (implemented in `hawkeye-core::near`, golden-vectored, mirrored in the contract)
@@ -103,7 +105,7 @@ struct BurnRecord { nonce: u64, from: String, amount: u128, ycash_recipient: [u8
 | `propose_mint(lock_id, amount, receiver_id, sig)` | anyone | one guardian's Mint signature; opens a proposal with `eta = now + challenge_window` |
 | `challenge_mint(lock_id, proposal_id, sig)` | anyone | any one guardian's Challenge signature deletes the proposal and **vetoes the proposer for that lock** (wyec#1's rule) |
 | `execute_mint(lock_id)` | anyone | after `eta`, proposer still a guardian; consumes `lock_id`; rate limit |
-| `burn(amount, ycash_recipient)` | holder, 1 yoctoNEAR | burns, appends a `BurnRecord`, emits NEP-297 events `ft_burn` and `wyec_bridge/burn_to_ycash` |
+| `burn(amount, ycash_recipient)` | holder, deposit ≥ the record's storage cost (`burn_storage_deposit`, ~0.0013–0.0019 NEAR; excess refunded) | burns, appends a `BurnRecord`, emits NEP-297 events `ft_burn` and `wyec_bridge/burn_to_ycash` (N-11) |
 | `set_guardians`, `set_paused`, `set_mint_limit` | threshold of current guardians | admin acts with `admin_nonce`; pause stops mint/propose/execute/burn, never challenge or transfers |
 | views | anyone | `get_guardians`, `get_threshold`, `is_consumed`, `get_proposal`, `get_burns(from_nonce, limit)`, `get_burn_count`, `mint_available`, `config` |
 
@@ -130,8 +132,8 @@ business step, not code.
 | Phase | Content | Exit |
 |---|---|---|
 | NH0 | this plan, branch | — |
-| NH1 | `hawkeye-core::near` encodings + vectors | vectors pass in Rust and in the contract |
-| NH2 | `near/` contract: token + bridge, unit tests (`near-sdk` test env), wasm build, sandbox integration tests (`near-workspaces`, CI) | all green; wasm size and gas measured |
+| NH1 ✅ | `hawkeye-core::near` encodings + vectors | vectors pass in Rust and in the contract |
+| NH2 ✅ | `near/` contract: token + bridge, unit tests (`near-sdk` test env), wasm build, sandbox integration tests (`near-workspaces`, CI) | all green; wasm size and gas measured |
 | NH3 | `ForeignChain` trait; Ethereum behind it with no behaviour change (all existing tests and drills still pass) | Ethereum devnet demo PASS on both node lines |
 | NH4 | `hawkeye-near` adapter + daemon support | engine tests against a NEAR mock RPC |
 | NH5 | NEAR devnet: real regtest ycashd + NEAR sandbox + Hawkeyes; `scenario demo` and `rogue-mint` | PASS on both node lines (CI: the NEAR sandbox binary downloads on GitHub runners) |

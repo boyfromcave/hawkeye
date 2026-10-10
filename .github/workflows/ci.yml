@@ -207,3 +207,36 @@ jobs:
         run: ./tools/export-abi.sh --check
       - name: deploy script against a local anvil
         run: ./tools/deploy-anvil-smoke.sh
+
+  near-contract:
+    name: NEAR contract (wyec-near)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: near
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: near
+          workspaces: near
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: unit tests (near-sdk test env, golden vectors shared with hawkeye-core)
+        run: cargo test --locked
+      - name: wasm build (the flags in near/.cargo/config.toml apply)
+        run: |
+          cargo build --locked --target wasm32-unknown-unknown --release
+          ls -l target/wasm32-unknown-unknown/release/wyec_near.wasm
+      - name: sandbox tests on a real NEAR node (near-workspaces downloads the sandbox)
+        env:
+          NEAR_SANDBOX: "1"
+        run: cargo test --locked --features sandbox-install --test sandbox -- --nocapture
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wyec-near-wasm
+          path: near/target/wasm32-unknown-unknown/release/wyec_near.wasm
+          retention-days: 14

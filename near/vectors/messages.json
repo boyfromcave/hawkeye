@@ -1,0 +1,310 @@
+{
+  "description": "wyec-near golden vectors (docs/hawkeye-near-plan.md §2.3, §2.4). digest = SHA256(preimage), preimage = \"HawkeyeNear-v1\" || borsh(network_id) || borsh(contract_id) || borsh(message); signature = r || s || v (v in {0,1}, low-S, RFC 6979). Guardian secrets are SHA256(\"wyec-near test guardian \" || index). Written by `WYEC_NEAR_WRITE_VECTORS=1 cargo test vectors_file`.",
+  "domain": "HawkeyeNear-v1",
+  "guardians": [
+    {
+      "index": 0,
+      "secret": "e59484f2d582546f41c213103fc353f4164afa7e8b8f75215f32f1f7fc46f223",
+      "pubkey": "6ea80978bcafeff9dadcf3ca7764b7124ed52b4923ee4d57a5156ea26fb470ae0d8c7df9391f52a244a2e18403b7d82f741b58253b5598343f521d6b00aa51cc"
+    },
+    {
+      "index": 1,
+      "secret": "2aa4b3cca26de4ef8d97f1611008b205e5332a7d8ea8d7dd699132f59ea69726",
+      "pubkey": "3b79b8968fb16628dccf1260da15b537c0aeaf11b33bcfe531a1181e6dcfd8f262b816e0bf61f570b4a61ef302f052051612e2bd3342b111c83b218400cc4bdc"
+    },
+    {
+      "index": 2,
+      "secret": "096325f7ec3750ca6d83f96dd8872770cee18eb0ae458d90e497f968d13aa85d",
+      "pubkey": "bae5541e814d05fda131e5db46cd7940fd6753d98b6321a8ff47fc7f29950542ebf3e0721f5c347983ccc4a09edc8d66724f803bb57a9b1a28b07fa0ecc0fdef"
+    }
+  ],
+  "messages": [
+    {
+      "name": "mint",
+      "network_id": "testnet",
+      "contract_id": "wyec.testnet",
+      "message": {
+        "Mint": {
+          "lock_id": "e0efc66409878b7f211300efe289db82d901025bc08556a4e9d9564dea243aff",
+          "amount": "123456789",
+          "receiver_id": "alice.testnet"
+        }
+      },
+      "borsh": "00e0efc66409878b7f211300efe289db82d901025bc08556a4e9d9564dea243aff15cd5b070000000000000000000000000d000000616c6963652e746573746e6574",
+      "preimage": "4861776b6579654e6561722d763107000000746573746e65740c000000777965632e746573746e657400e0efc66409878b7f211300efe289db82d901025bc08556a4e9d9564dea243aff15cd5b070000000000000000000000000d000000616c6963652e746573746e6574",
+      "digest": "267be11eb38b7f99bf42f0b8bd70b28f05169f5bbc7832f341eeb7ae98486fbe",
+      "signatures": [
+        {
+          "guardian": 0,
+          "signature": "e2ab032da7cbb7645652008b4805e4aa09a49cea7203a4837f9dfe2aecb7098575c4749f09c89218fee528ff943dea5579652cf7f912fb8e01894272caf47f2f01"
+        },
+        {
+          "guardian": 1,
+          "signature": "cc04d9dfe1bf84eb75e18935d53d6d096ee6a5794a88d79064d4e399ffb8e5d758e1eaefa11720498e929013d02eb6d8ac916c3f87eaa17183d7fd85198fba0f00"
+        },
+        {
+          "guardian": 2,
+          "signature": "0dbb40b54d694e25e8debd37f11faef9a0c98641501fc8af7a25fa60a13f666604bb2147e09d635907a2b5da1fe1ac46e6691a59ee95e910e8078376ab2b638700"
+        }
+      ]
+    },
+    {
+      "name": "mint_implicit_account_max_supply",
+      "network_id": "mainnet",
+      "contract_id": "wyec.near",
+      "message": {
+        "Mint": {
+          "lock_id": "300cb4ee1cb352ce842b13e570416fd3ce8d7f0ebc13d4a00b3c0a576dca6843",
+          "amount": "2100000000000000",
+          "receiver_id": "98793cd91a3f870fb126f66285808c7e094afcfc4eda8a970f6648cdf0dbd6de"
+        }
+      },
+      "borsh": "00300cb4ee1cb352ce842b13e570416fd3ce8d7f0ebc13d4a00b3c0a576dca68430040075af075070000000000000000004000000039383739336364393161336638373066623132366636363238353830386337653039346166636663346564613861393730663636343863646630646264366465",
+      "preimage": "4861776b6579654e6561722d7631070000006d61696e6e657409000000777965632e6e65617200300cb4ee1cb352ce842b13e570416fd3ce8d7f0ebc13d4a00b3c0a576dca68430040075af075070000000000000000004000000039383739336364393161336638373066623132366636363238353830386337653039346166636663346564613861393730663636343863646630646264366465",
+      "digest": "1c285e090f37aaaf73362c28b7924f0714c4297c14e80948082014396bcac0b2",
+      "signatures": [
+        {
+          "guardian": 0,
+          "signature": "ec566aa1029bae9ecb4e0017f2e6e98daa053bfcc69b014179da7a617ad096002f27acf68c631df5ff07dd2ce5ac29bdaaf1876f99d30c9a4b0f8c37a817b85e00"
+        },
+        {
+          "guardian": 1,
+          "signature": "4e82b9a43742ce6b1775f1de4a450cf9fac5ceb62c283adf02332dce3c82b87744262bc33b3c713db65ec23c06da227d4c6806de29e3d7c480f821038abde9e100"
+        },
+        {
+          "guardian": 2,
+          "signature": "9f7d2c8f66a31d451f9c293509b410f2957257335508e51585648947eeb5ee3c155ce4b75d296d543eb42b4f19fbda07ef145e5d7772556b11c460caa0b36d8700"
+        }
+      ]
+    },
+    {
+      "name": "mint_evm_implicit_account",
+      "network_id": "sandbox",
+      "contract_id": "wyec.test.near",
+      "message": {
+        "Mint": {
+          "lock_id": "4da31b3383fe61baca4894a64077b676d5f249a05212bcbf2e7fd10f482f97ef",
+          "amount": "1",
+          "receiver_id": "0x85f17cf997934a597031b2e18a9ab6ebd4b9f6a4"
+        }
+      },
+      "borsh": "004da31b3383fe61baca4894a64077b676d5f249a05212bcbf2e7fd10f482f97ef010000000000000000000000000000002a000000307838356631376366393937393334613539373033316232653138613961623665626434623966366134",
+      "preimage": "4861776b6579654e6561722d76310700000073616e64626f780e000000777965632e746573742e6e656172004da31b3383fe61baca4894a64077b676d5f249a05212bcbf2e7fd10f482f97ef010000000000000000000000000000002a000000307838356631376366393937393334613539373033316232653138613961623665626434623966366134",
+      "digest": "c55451e9f38c4952e16330c88ab09d99cd12fe1a948633b2a94369bc10550bf8",
+      "signatures": [
+        {
+          "guardian": 0,
+          "signature": "d775d163352614eb153388be7666195f1e14433648d819de4127df8813a0ad717a24320cdafdca37f94c2f85ff2d83bba2a99ac9e080afe6786c650726dcad2101"
+        },
+        {
+          "guardian": 1,
+          "signature": "f950369d632843ed58e5af246089ed23104ff7a2245c0c6322714b1f249045d84fe0e11ef7adec194f9048ca2d64dcc2affd97d8637ed815918f555e8210343200"
+        },
+        {
+          "guardian": 2,
+          "signature": "159ca1b2bde77754fd356f81c7394f6a6757890ecbb03b2349251dcf32cbc85341f4e02ec18588bdc1e37784a08a30e8dce1b45943054ac0d1c611055a5bd8ab01"
+        }
+      ]
+    },
+    {
+      "name": "challenge",
+      "network_id": "testnet",
+      "contract_id": "wyec.testnet",
+      "message": {
+        "Challenge": {
+          "lock_id": "e0efc66409878b7f211300efe289db82d901025bc08556a4e9d9564dea243aff",
+          "proposal_id": 1
+        }
+      },
+      "borsh": "01e0efc66409878b7f211300efe289db82d901025bc08556a4e9d9564dea243aff0100000000000000",
+      "preimage": "4861776b6579654e6561722d763107000000746573746e65740c000000777965632e746573746e657401e0efc66409878b7f211300efe289db82d901025bc08556a4e9d9564dea243aff0100000000000000",
+      "digest": "6c3215c09d0e0ea1085f35d56fdcb97585be672d20a84953ec2c29e73970a5ca",
+      "signatures": [
+        {
+          "guardian": 0,
+          "signature": "b3c9b76392f991690d4703f3274244f081a41a8bf2ab2013a21799fad7fab17655533858046f32b2af0bae161796ce7e86c4f57d9b69568c9471aaf7c5eccc5e00"
+        },
+        {
+          "guardian": 1,
+          "signature": "a76b9afdd4a5e30f1adbf2f8412cbd5cb13ea46cf7c7ca93a2d02359d78e607126125a84421543083d8748f77da9b022d4e19b51a2c36160e15584a15c0022b600"
+        },
+        {
+          "guardian": 2,
+          "signature": "0982cdf64572045eddfcc14a572253e8cea8a38ef5a9920b586a5ccf5472fd8c6a019bc341c856599add81798041be9d0950bf4f462a0d4e06bb6fac044780a100"
+        }
+      ]
+    },
+    {
+      "name": "challenge_large_id",
+      "network_id": "testnet",
+      "contract_id": "wyec.testnet",
+      "message": {
+        "Challenge": {
+          "lock_id": "e0efc66409878b7f211300efe289db82d901025bc08556a4e9d9564dea243aff",
+          "proposal_id": 72623859790382856
+        }
+      },
+      "borsh": "01e0efc66409878b7f211300efe289db82d901025bc08556a4e9d9564dea243aff0807060504030201",
+      "preimage": "4861776b6579654e6561722d763107000000746573746e65740c000000777965632e746573746e657401e0efc66409878b7f211300efe289db82d901025bc08556a4e9d9564dea243aff0807060504030201",
+      "digest": "2dc527ab4cde396f2b9f93edc49a9a1acb27fcc9ffef28befb256f8460167c77",
+      "signatures": [
+        {
+          "guardian": 0,
+          "signature": "72c736ec2dc5769260ff90cd18d2f4607953447fb73bc36551702fe5123153d2405ad93d36ba7f80a164847b0e6e27beb6544dcc3c16bde5a08bcbb9be7e157a00"
+        },
+        {
+          "guardian": 1,
+          "signature": "33f8ae96c964e575d6a5c3329eefb91b268415884c6ad238a542f98530d2cf342685e99237b951e3b7e646497065f93a50a7b3dcbf28289a83c8f0612f268d0001"
+        },
+        {
+          "guardian": 2,
+          "signature": "46bf847a8557550c00c9d2302396a52ad833586bf001ef15572f5359b74c38631b5d0ae94e27e73ba4026fac4b12a6d0ad64946b66b8de013f6eee3249a5954200"
+        }
+      ]
+    },
+    {
+      "name": "set_guardians",
+      "network_id": "testnet",
+      "contract_id": "wyec.testnet",
+      "message": {
+        "SetGuardians": {
+          "guardians": [
+            "6ea80978bcafeff9dadcf3ca7764b7124ed52b4923ee4d57a5156ea26fb470ae0d8c7df9391f52a244a2e18403b7d82f741b58253b5598343f521d6b00aa51cc",
+            "3b79b8968fb16628dccf1260da15b537c0aeaf11b33bcfe531a1181e6dcfd8f262b816e0bf61f570b4a61ef302f052051612e2bd3342b111c83b218400cc4bdc",
+            "bae5541e814d05fda131e5db46cd7940fd6753d98b6321a8ff47fc7f29950542ebf3e0721f5c347983ccc4a09edc8d66724f803bb57a9b1a28b07fa0ecc0fdef"
+          ],
+          "threshold": 2,
+          "admin_nonce": 0
+        }
+      },
+      "borsh": "02030000006ea80978bcafeff9dadcf3ca7764b7124ed52b4923ee4d57a5156ea26fb470ae0d8c7df9391f52a244a2e18403b7d82f741b58253b5598343f521d6b00aa51cc3b79b8968fb16628dccf1260da15b537c0aeaf11b33bcfe531a1181e6dcfd8f262b816e0bf61f570b4a61ef302f052051612e2bd3342b111c83b218400cc4bdcbae5541e814d05fda131e5db46cd7940fd6753d98b6321a8ff47fc7f29950542ebf3e0721f5c347983ccc4a09edc8d66724f803bb57a9b1a28b07fa0ecc0fdef020000000000000000",
+      "preimage": "4861776b6579654e6561722d763107000000746573746e65740c000000777965632e746573746e657402030000006ea80978bcafeff9dadcf3ca7764b7124ed52b4923ee4d57a5156ea26fb470ae0d8c7df9391f52a244a2e18403b7d82f741b58253b5598343f521d6b00aa51cc3b79b8968fb16628dccf1260da15b537c0aeaf11b33bcfe531a1181e6dcfd8f262b816e0bf61f570b4a61ef302f052051612e2bd3342b111c83b218400cc4bdcbae5541e814d05fda131e5db46cd7940fd6753d98b6321a8ff47fc7f29950542ebf3e0721f5c347983ccc4a09edc8d66724f803bb57a9b1a28b07fa0ecc0fdef020000000000000000",
+      "digest": "055fc6e2e7ba0a7d0ebb4533849b82dce0e9c1c5285d2a0a5aa369235de40992",
+      "signatures": [
+        {
+          "guardian": 0,
+          "signature": "00d9a11c65876da2ba244f31dbb7922fc077c27afab2b1024c65af463f39d1794480dd10fb993af546bef43b332de2259a87404fe615f64d4cb6e3914e32f66b00"
+        },
+        {
+          "guardian": 1,
+          "signature": "12370549771462c37b4b352c07033477618ef324d55722854a61d07af0f609c54b1edcdf783e3a3d8342b5c0a0d10703aa7b41418e7dc17ad3a0dbc627bf7e6d01"
+        },
+        {
+          "guardian": 2,
+          "signature": "15bed2c090e9056e04e804fba7b0baacecdcd5d547e18ec2a7d8544aaf9f478d691d5365a7dd05b4b777ada3154a7e4b4b391b78edf289d5d82b1dabcba5f6d001"
+        }
+      ]
+    },
+    {
+      "name": "set_paused",
+      "network_id": "testnet",
+      "contract_id": "wyec.testnet",
+      "message": {
+        "SetPaused": {
+          "paused": true,
+          "admin_nonce": 1
+        }
+      },
+      "borsh": "03010100000000000000",
+      "preimage": "4861776b6579654e6561722d763107000000746573746e65740c000000777965632e746573746e657403010100000000000000",
+      "digest": "163bc0e76fe37dbabd8e32dcf3aa9751849f5789222fe15b177d7b635ef63f32",
+      "signatures": [
+        {
+          "guardian": 0,
+          "signature": "936cb4d268cd5573c80c9f9be7943362b301a46be8b80eaf4ab54918366434485fb3c442c5e6dea2d18db42775098e22e89a898e202b164ad005505f02a4663901"
+        },
+        {
+          "guardian": 1,
+          "signature": "a9959c0c218c4a4f571e9db4ba2a8f86d4bfa891a01400b47ac86ba251743cc26fcf195060b6caaf1cf15f55447943e6cc7bfa92f8f83fb04a386213e006593901"
+        },
+        {
+          "guardian": 2,
+          "signature": "dc09802a7884ddd0fcbcfa572b613ab8eaf371cb29a1e6155a5d75e48b3e7d5f4aabd703b5d9ba7e64a2a1be091f6c69666b32ec03cfec615b44cc5c28b5e1b600"
+        }
+      ]
+    },
+    {
+      "name": "set_unpaused",
+      "network_id": "testnet",
+      "contract_id": "wyec.testnet",
+      "message": {
+        "SetPaused": {
+          "paused": false,
+          "admin_nonce": 2
+        }
+      },
+      "borsh": "03000200000000000000",
+      "preimage": "4861776b6579654e6561722d763107000000746573746e65740c000000777965632e746573746e657403000200000000000000",
+      "digest": "ddccaa7a9a9222da4c884e69fd14ecaf3393976426993776236f632a79b81745",
+      "signatures": [
+        {
+          "guardian": 0,
+          "signature": "6681502b990dd827ca017797ea75fd15fdcbcd9a6f58c68f0ef239c1dcef50321bf9c6dbf7bde2d08e0fd2c5b9a1c5dc983b075ce87b4620d7f2586b6104fdd801"
+        },
+        {
+          "guardian": 1,
+          "signature": "5f92839bff0bed3749a1a9ab75e63390fdb2d1cfa4ceb03798016678409b055954ed2efc615ce2cc6d8ecb24bf803592c58e45c052f0910a4a409438008e0d7e01"
+        },
+        {
+          "guardian": 2,
+          "signature": "0fbcabf16fba2a18c4ee412eade22db9bf873b7560017d0b4d2c978a716f6b831f261c85c4e6396518261ce0fc673d662cfc37eb655a2ccdde445aecc874285600"
+        }
+      ]
+    },
+    {
+      "name": "set_mint_limit",
+      "network_id": "testnet",
+      "contract_id": "wyec.testnet",
+      "message": {
+        "SetMintLimit": {
+          "mint_cap": "100000000000",
+          "cap_window_sec": 86400,
+          "admin_nonce": 3
+        }
+      },
+      "borsh": "0400e8764817000000000000000000000080510100000000000300000000000000",
+      "preimage": "4861776b6579654e6561722d763107000000746573746e65740c000000777965632e746573746e65740400e8764817000000000000000000000080510100000000000300000000000000",
+      "digest": "fa131a4ce12458e249b66c0b8578329245ed501942c57ccb6e1ec9c68f70aff6",
+      "signatures": [
+        {
+          "guardian": 0,
+          "signature": "6de5f741428ea1c1ef0557d28bf66125ca81003abf2e5151bbb5963be708b92e30e21965d0eaa48c963a1efdcd5b4ab8f6232ff34eb963911badccb837f9429c00"
+        },
+        {
+          "guardian": 1,
+          "signature": "2ab0db733dc6777231daa5ac6708ac207b9706387fa740e33ef44651942649fd036ef06b992d4788916e90047d877818ec19d0ea4e0f54e5111742f28503db9501"
+        },
+        {
+          "guardian": 2,
+          "signature": "f1509ab3774b92109c0c1b3d619ecf0ad491f31e3655e3976c4ffea5431ded614dcbc892eb2865c496bbb91600d16daaa93d3e04dff879841dca08105d0a570100"
+        }
+      ]
+    }
+  ],
+  "burn_records": [
+    {
+      "record": {
+        "nonce": 0,
+        "from": "alice.testnet",
+        "amount": "50000000",
+        "ycash_recipient": "010000000000000000000000abababababababababababababababababababab",
+        "block_height": 187654321,
+        "timestamp_ns": "1760000000123456789"
+      },
+      "borsh": "00000000000000000d000000616c6963652e746573746e657480f0fa02000000000000000000000000010000000000000000000000ababababababababababababababababababababb1602f0b0000000015cd0bdcacc66c18",
+      "sha256": "00c2f545a83ca75dde17cf013148c4876755f8c68ab670a8aecd38048a71676e"
+    },
+    {
+      "record": {
+        "nonce": 7,
+        "from": "98793cd91a3f870fb126f66285808c7e094afcfc4eda8a970f6648cdf0dbd6de",
+        "amount": "2100000000000000",
+        "ycash_recipient": "0101000000000000000000001111111111111111111111111111111111111111",
+        "block_height": 1,
+        "timestamp_ns": "0"
+      },
+      "borsh": "070000000000000040000000393837393363643931613366383730666231323666363632383538303863376530393461666366633465646138613937306636363438636466306462643664650040075af07507000000000000000000010100000000000000000000111111111111111111111111111111111111111101000000000000000000000000000000",
+      "sha256": "f61f483e25b6038f00fe7cb45aafba86cd80b757bd2992a4535c4a10ab7c53f2"
+    }
+  ]
+}

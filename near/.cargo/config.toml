@@ -1,0 +1,8 @@
+# What `cargo near build` passes (cargo-near-build 0.11.5): `--cfg near` makes near-sdk call the NEAR
+# host functions (without it, wasm builds use pure-Rust fallbacks, "not for on-chain use"), and
+# `link-arg=-s` strips the symbols. A RUSTFLAGS environment variable replaces these: unset it.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-s", "--cfg", "near"]
+
+[build]
+target-dir = "target"
