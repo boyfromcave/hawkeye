@@ -35,21 +35,16 @@ env:
   NODE_REF: ${{ inputs.node_ref || 'upgrade/vault' }}
 
 jobs:
-  demo:
-    name: demo on ${{ matrix.line }} (${{ matrix.foreign }})
+  # The node binaries per line, built on ubuntu-22.04 (the depends toolchain needs libtinfo5) and
+  # cached per line + node commit; the demo jobs restore them from that cache. They link only libc,
+  # libm and libgcc_s, so the NEAR jobs run them on ubuntu-24.04 (the sandbox needs glibc 2.39).
+  node:
+    name: node ${{ matrix.line }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
-    # Hawkeye and the node are checked out side by side, never one inside the other: the node's
-    # depends step runs `cargo vendor`, which would otherwise find Hawkeye's workspace manifest
-    # (resolver 3) above the node and fail with the node's older cargo.
-    defaults:
-      run:
-        working-directory: hawkeye
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        line: [ycash-dd, ycash6]
-        foreign: [ethereum, near]
         include:
           - line: ycash-dd
             repo: boyfromcave/ycash-dd
@@ -60,10 +55,8 @@ jobs:
             daemon: src/ycashd
             cli: src/ycash-cli
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: hawkeye
-          persist-credentials: false
+      # Only the node is checked out here: its depends step runs `cargo vendor`, which would find
+      # Hawkeye's workspace manifest (resolver 3) above the node and fail with the node's cargo.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ matrix.repo }}
@@ -74,19 +67,19 @@ jobs:
         id: node
         working-directory: node
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: build prerequisites
-        working-directory: .
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libc6-dev m4 g++-multilib \
-            autoconf libtool ncurses-dev unzip git python3 zlib1g-dev curl bsdmainutils \
-            automake libtinfo5
       - name: cached node binaries
         id: bin
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: node-bin
           key: node-bin-${{ matrix.line }}-${{ steps.node.outputs.sha }}
+      - name: build prerequisites
+        if: steps.bin.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libc6-dev m4 g++-multilib \
+            autoconf libtool ncurses-dev unzip git python3 zlib1g-dev curl bsdmainutils \
+            automake libtinfo5
       - name: cached depends
         if: steps.bin.outputs.cache-hit != 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -116,6 +109,56 @@ jobs:
           make -C src -j"$(nproc)" "$(basename "$DAEMON")" "$(basename "$CLI")"
           mkdir -p ../node-bin
           cp "$DAEMON" "$CLI" ../node-bin/
+
+  demo:
+    name: demo on ${{ matrix.line }} (${{ matrix.foreign }})
+    needs: node
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    # Hawkeye and the node are checked out side by side, never one inside the other (see `node`).
+    defaults:
+      run:
+        working-directory: hawkeye
+    strategy:
+      fail-fast: false
+      matrix:
+        line: [ycash-dd, ycash6]
+        foreign: [ethereum, near]
+        include:
+          - line: ycash-dd
+            repo: boyfromcave/ycash-dd
+            daemon: src/ycashd
+            cli: src/ycash-cli
+          - line: ycash6
+            repo: boyfromcave/ycash6
+            daemon: src/ycashd
+            cli: src/ycash-cli
+          - foreign: ethereum
+            runner: ubuntu-22.04
+          # the pinned NEAR sandbox (nearcore 2.13.4) needs glibc >= 2.39
+          - foreign: near
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: hawkeye
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ env.NODE_REF }}
+          path: node
+          persist-credentials: false
+      - name: node commit
+        id: node
+        working-directory: node
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: node binaries (from the node job)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: node-bin
+          key: node-bin-${{ matrix.line }}-${{ steps.node.outputs.sha }}
+          fail-on-cache-miss: true
       - name: zk parameters
         if: matrix.line == 'ycash-dd'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
