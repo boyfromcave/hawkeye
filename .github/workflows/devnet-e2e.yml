@@ -1,7 +1,9 @@
-# Hawkeye beside a real node, on both node lines (ycash-dd v4.5.0, ycash6 6.2x): build the node
-# from the line's upgrade/vault branch, start the devnet (regtest nodes + anvil with wYEC + one Hawkeye per attestor) and run `scenario demo`
-# and the optimistic-mint drill `scenario rogue-mint`
-# (lock -> mint, burn -> HKB1 intent -> release, rogue -> cancel -> slash, supply invariant).
+# Hawkeye beside a real node, on both node lines (ycash-dd v4.5.0, ycash6 6.2x) and on both
+# bridges (foreign = ethereum: anvil + wYEC; foreign = near: a NEAR sandbox node + wyec-near, NEAR
+# plan NH5): build the node from the line's upgrade/vault branch, start the devnet (regtest nodes +
+# the bridge + one Hawkeye per attestor) and run `scenario demo` and the optimistic-mint drill
+# `scenario rogue-mint` (lock -> mint, burn -> HKB1/HKN1 intent -> release, rogue -> cancel ->
+# slash, supply invariant).
 # This is the plan's §9 success criterion as a repeatable job; the mock never counts toward it.
 #
 # Slow (a cold node build is ~1 h), so it runs nightly, on demand, and when devnet/ or the
@@ -18,7 +20,7 @@ on:
         default: upgrade/vault
   push:
     branches: [main, "claude/**"]
-    paths: ["devnet/**", "crates/**", "eth/**", ".github/workflows/devnet-e2e.yml"]
+    paths: ["devnet/**", "crates/**", "eth/**", "near/**", ".github/workflows/devnet-e2e.yml"]
 
 permissions:
   contents: read
@@ -34,7 +36,7 @@ env:
 
 jobs:
   demo:
-    name: demo on ${{ matrix.line }}
+    name: demo on ${{ matrix.line }} (${{ matrix.foreign }})
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     # Hawkeye and the node are checked out side by side, never one inside the other: the node's
@@ -46,6 +48,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        line: [ycash-dd, ycash6]
+        foreign: [ethereum, near]
         include:
           - line: ycash-dd
             repo: boyfromcave/ycash-dd
@@ -124,34 +128,50 @@ jobs:
         working-directory: node
         run: ./zcutil/fetch-params.sh
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        if: matrix.foreign == 'ethereum'
         with:
           version: ${{ env.FOUNDRY_VERSION }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: matrix.foreign == 'ethereum'
         with:
           node-version: 22
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: devnet
-          workspaces: hawkeye
+          shared-key: devnet-${{ matrix.foreign }}
+          workspaces: |
+            hawkeye -> target
+            hawkeye/near -> target
       - name: build hawkeye
         run: cargo build --locked --bin hawkeye
       - name: contracts
+        if: matrix.foreign == 'ethereum'
         working-directory: hawkeye/eth
         run: |
           npm ci --ignore-scripts
           ./tools/fetch-wyec.sh
-      - name: scenario demo
+      # NEAR: the wyec-near wasm (near/rust-toolchain.toml brings the wasm target), the set-up helper
+      # (near-admin: accounts, deploy) and the pinned sandbox node (SHA-256 checked).
+      - name: NEAR contract, helper and sandbox
+        if: matrix.foreign == 'near'
+        run: |
+          (cd near && cargo build --locked --target wasm32-unknown-unknown --release)
+          cargo build --locked -p hawkeye-near --example near-admin
+          bin=$(near/tools/fetch-sandbox.sh)
+          "$bin" --version
+          echo "NEAR_SANDBOX_BIN=$bin" >>"$GITHUB_ENV"
+      - name: scenario demo and rogue-mint
         env:
           DEVNET_NATIVE_SOLC: "1"
           DAEMON: ${{ matrix.daemon }}
           CLI: ${{ matrix.cli }}
+          FOREIGN: ${{ matrix.foreign }}
         run: |
           YCASHD="$GITHUB_WORKSPACE/node-bin/$(basename "$DAEMON")"
           YCASH_CLI="$GITHUB_WORKSPACE/node-bin/$(basename "$CLI")"
           export YCASHD YCASH_CLI
           "$YCASHD" -version | head -1
-          python3 devnet/hawkeye-devnet scenario demo --fresh
-          python3 devnet/hawkeye-devnet scenario rogue-mint --fresh
+          python3 devnet/hawkeye-devnet scenario demo --fresh --foreign "$FOREIGN"
+          python3 devnet/hawkeye-devnet scenario rogue-mint --fresh --foreign "$FOREIGN"
       - name: stop the devnet
         if: always()
         run: python3 devnet/hawkeye-devnet down || true
@@ -159,7 +179,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: devnet-${{ matrix.line }}
+          name: devnet-${{ matrix.line }}-${{ matrix.foreign }}
           path: |
             hawkeye/devnet/transcripts/
             hawkeye/devnet/run/transcripts/

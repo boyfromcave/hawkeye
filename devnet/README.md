@@ -299,6 +299,38 @@ crash points armed by
 recorded in the ledger, as a `kill -9` would; the devnet arms it by restarting that Hawkeye with the
 variable set).
 
+## `--foreign near`: the bridge on NEAR (NEAR plan NH5)
+
+```sh
+near/tools/fetch-sandbox.sh                                        # the pinned sandbox node (SHA-256 checked)
+(cd near && cargo build --locked --target wasm32-unknown-unknown --release)   # wyec_near.wasm
+cargo build --locked --bin hawkeye && cargo build --locked -p hawkeye-near --example near-admin
+devnet/hawkeye-devnet scenario demo --fresh --foreign near         # or HAWKEYE_DEVNET_FOREIGN=near
+devnet/hawkeye-devnet scenario rogue-mint --fresh --foreign near
+```
+
+The Ycash half is the same devnet (nodes, set, joins, Hawkeyes); the foreign half is a real
+nearcore sandbox (`near-sandbox` 2.13.4, `NEAR_SANDBOX_BIN` overrides) instead of anvil, on
+`--near-port` (default 18630; p2p the next port). `up` runs `near-sandbox init --fast` (epoch length
+raised to 100 000 blocks, so no epoch change or garbage collection happens during a run), then, as
+`test.near` (the genesis account, `<run>/near/validator_key.json`) through the `near-admin` helper
+(`crates/hawkeye-near/examples/near-admin.rs`, the adapter's own codec): creates `wyec.test.near`
+(50 NEAR), one relayer per attestor `hawkeye<i>.test.near` (20 NEAR; credentials in
+`<run>/near-keys/`) and the holder `alice.test.near`, and deploys and initialises `wyec-near` in one
+transaction: `network_id` `sandbox`, guardians = the members' 64-byte NEAR keys (`hawkeye keys
+derive` `near_guardian`, cross-checked in Python), threshold 2, the 12 s window, no mint cap. Each
+`attestor<i>.toml` has `[foreign] kind = "near"`, `[near]` (`start_block` = the deployment block)
+and `[bridge] tag = "NYEC"`; `node0.toml`'s relayer is the holder, so `hawkeye burn` burns alice's
+wYEC (attaching the record's storage deposit).
+
+| Scenario | NEAR differences from the Ethereum run |
+|---|---|
+| `demo` | lock to `alice.test.near` (an `NYEC` vault, `NR1` destination); the mint is `propose_mint` → window → `execute_mint`; the burn's intent carries an `HKN1` memo whose chainId / bridge are the hashed domain (NEAR plan §2.2) and whose data equals the burn record's `record_hash` (`get_burns`); supply is `ft_total_supply` vs the NYEC value |
+| `rogue-mint` | `hawkeye rogue-mint 5 --to hawkeye1.test.near`; the challenge is found as Hawkeye finds it (the contract's `EXPERIMENTAL_changes` per block → `EXPERIMENTAL_receipt`), attributed by its relayer account and timed by its block; after `eta`: `proposal_status` None, `is_consumed` false, `is_vetoed` true, `execute_mint` panics `wyec: no such proposal` |
+
+Transcripts are `<scenario>-<date>-<line>-<version>-near.txt`. The other drills are Ethereum-only
+(`scenario <drill> --foreign near` is refused).
+
 ## Troubleshooting
 
 - **`ycashd node<i> exited during start-up`**: read `<run>/ycash<i>/stdout.log`. Usually the zk
