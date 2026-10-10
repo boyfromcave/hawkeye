@@ -15,11 +15,10 @@
 
 use anyhow::{Result, anyhow, bail, ensure};
 use hawkeye_core::bytes::{Hash32, sha256d, txid_from_display};
-use hawkeye_core::eip712::Domain;
 use hawkeye_core::leader::leader_for;
 use hawkeye_core::matcher::Classification;
-use hawkeye_core::template::{TAG_WYEC, parse_intent, parse_vault};
-use hawkeye_core::{EthAddress, IntentParams, OutPoint as CoreOutPoint, PubKey33};
+use hawkeye_core::template::{parse_intent, parse_vault};
+use hawkeye_core::{IntentParams, OutPoint as CoreOutPoint, PubKey33};
 use hawkeye_store::{
     Chain, FaultKind, LockState, SignDomain, SlashCaseRecord, SlashProgress, SlashState, VoteGiven,
     YcashSignKey, classification_code,
@@ -32,6 +31,7 @@ use tracing::{info, warn};
 use super::ycash::{IntentFacts, classify};
 use super::{Ctx, Engine, block_on};
 use crate::convert::{intent_params, op_core, outputs};
+use crate::foreign::Account;
 use crate::peers::{SlashSignRequest, SlashSignResponse};
 
 /// Cases that lapse after this many Ycash blocks without a removal.
@@ -220,15 +220,19 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
             continue;
         };
         if let Ok(v) = parse_vault(&spk)
-            && v.tag == TAG_WYEC
+            && v.tag == p.tag()
             && v.set_id == p.set_id
         {
             found = Some((idx, prev, spk, value, v));
             break;
         }
     }
-    let (idx, vault, spk, value, vp) =
-        found.ok_or_else(|| anyhow!("the transaction spends no WYEC vault of this set"))?;
+    let (idx, vault, spk, value, vp) = found.ok_or_else(|| {
+        anyhow!(
+            "the transaction spends no {} vault of this set",
+            p.tag_text()
+        )
+    })?;
     // who signed it: recovered here, a current member here
     let attribution = ctx
         .attributor
@@ -298,7 +302,9 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
     })?;
     let code = classification_code(&c);
     match c {
-        Classification::Foreign => bail!("the intent is not a WYEC intent of this set"),
+        Classification::Foreign => {
+            bail!("the intent is not a {} intent of this set", p.tag_text())
+        }
         Classification::MatchedBurn { nonce } => {
             bail!("the intent matches finalized burn {nonce} here: not a fault")
         }
@@ -307,10 +313,10 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
             bail!("{code}: a benign race (§5.2) is cancelled, never slashed")
         }
         Classification::Unmatched(hawkeye_core::matcher::Unmatched::UnknownBurn) => {
-            // this attestor's Ethereum view may lag the burn's finality
+            // this attestor's foreign-chain view may lag the burn's finality
             let fin = ctx
-                .eth
-                .finalized_block_number()
+                .foreign
+                .finalized_height()
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
             let cursor = ctx
@@ -331,10 +337,9 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
     })
 }
 
-/// A fraudulent mint signature: it recovers to the accused member's guardian address, and no
-/// policy-OK lock with that `(lockId, amount, to)` is in this ledger, whose Ycash view is current.
+/// A fraudulent mint signature: it recovers to the accused member's guardian, and no policy-OK
+/// lock with that `(lockId, amount, to)` is in this ledger, whose Ycash view is current.
 async fn verify_mint(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
-    let p = &ctx.params;
     let lock_id: Hash32 = hex::decode(ev_str(ev, "lock_id")?.trim_start_matches("0x"))?
         .as_slice()
         .try_into()
@@ -342,23 +347,30 @@ async fn verify_mint(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
     let amount = ev["amount"]
         .as_u64()
         .ok_or_else(|| anyhow!("evidence without amount"))?;
-    let to = EthAddress::parse(ev_str(ev, "to")?).map_err(|e| anyhow!("to: {e}"))?;
+    let to = ctx
+        .foreign
+        .parse_account(ev_str(ev, "to")?)
+        .map_err(|e| anyhow!("to: {e}"))?;
     let sig = hex::decode(ev_str(ev, "signature")?.trim_start_matches("0x"))?;
     let claimed: PubKey33 = hex::decode(ev_str(ev, "target")?)?
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("evidence target is not a 33-byte key"))?;
-    let digest =
-        Domain::new(p.deployment.chain_id, p.deployment.bridge).mint_digest(&lock_id, amount, &to);
-    let signer = hawkeye_core::eth::recover_address(&digest, &sig)
+    let digest = ctx
+        .foreign
+        .mint_digest(&lock_id, amount, &to)
+        .map_err(|e| anyhow!("to: {e}"))?;
+    let signer = ctx
+        .foreign
+        .recover(&digest, &sig)
         .map_err(|e| anyhow!("the mint signature does not recover: {e}"))?;
-    let want = hawkeye_core::eth::address_from_pubkey(&claimed)
+    let want = ctx
+        .foreign
+        .guardian_of(&claimed)
         .map_err(|e| anyhow!("evidence target: {e}"))?;
     ensure!(
         signer == want,
-        "the Mint signature recovers to {}, not to the accused's guardian address {}",
-        signer.to_checksum(),
-        want.to_checksum()
+        "the Mint signature recovers to {signer}, not to the accused's guardian address {want}"
     );
     ensure!(
         current_members(ctx).await?.contains(&claimed),
@@ -374,12 +386,16 @@ async fn verify_mint(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
             "lock refused by policy here: {}",
             l.rejection_reason.unwrap_or_default()
         ),
-        Some(l) if l.value_zat != amount || l.destination != Some(to) => format!(
-            "lock is {} zat to {:?} here, signed {amount} to {}",
-            l.value_zat,
-            l.destination.map(|d| d.to_checksum()),
-            to.to_checksum()
-        ),
+        Some(l)
+            if l.value_zat != amount
+                || l.destination.map(Account::Ethereum) != Some(to.clone()) =>
+        {
+            format!(
+                "lock is {} zat to {:?} here, signed {amount} to {to}",
+                l.value_zat,
+                l.destination.map(|d| d.to_checksum()),
+            )
+        }
         Some(l) => bail!(
             "a lock with this (lockId, amount, to) is {} here: not a fault",
             l.state

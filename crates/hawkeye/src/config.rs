@@ -1,6 +1,10 @@
 //! `hawkeye.toml` (plan §6 "Config"): the file as written ([`Config`]) and its checked, resolved
 //! form ([`Settings`]).
 //!
+//! The foreign chain is `[foreign] kind` (`"ethereum"`, the default when the section is absent,
+//! so every existing config keeps working; `"near"` is reserved for NEAR plan NH4), and the
+//! bridge's vault tag is `[bridge] tag` (default `"WYEC"`; NEAR plan §0 item 2).
+//!
 //! Relative paths in the file (`eth.deployment`, `store.path`, `keys.keystore`,
 //! `ycash.cookie_file`) resolve against the directory of the config file.
 
@@ -15,6 +19,8 @@ use hawkeye_eth::{Deployment, Finality, MintMode};
 use hawkeye_ycash::{Amount, Auth, Hash256};
 use serde::Deserialize;
 
+use crate::foreign::BridgeKind;
+
 /// The config file as written.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,8 +29,13 @@ pub struct Config {
     pub network: NetworkSection,
     /// `[ycash]`.
     pub ycash: YcashSection,
-    /// `[eth]`.
-    pub eth: EthSection,
+    /// `[foreign]` (absent: Ethereum).
+    #[serde(default)]
+    pub foreign: ForeignSection,
+    /// `[eth]` (required when `foreign.kind = "ethereum"`).
+    pub eth: Option<EthSection>,
+    /// `[near]`: reserved for the NEAR adapter (NEAR plan §4 item 4, phase NH4).
+    pub near: Option<toml::Table>,
     /// `[bridge]`.
     pub bridge: BridgeSection,
     /// `[keys]`.
@@ -75,6 +86,14 @@ pub struct YcashSection {
     pub start_height: Option<u32>,
 }
 
+/// `[foreign]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForeignSection {
+    /// `"ethereum"` (default) or `"near"` (reserved: not built yet).
+    pub kind: Option<String>,
+}
+
 /// `[eth]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +113,9 @@ pub struct EthSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeSection {
+    /// The bridge's vault tag: four printable ASCII characters (default `"WYEC"`; NEAR's bridge
+    /// is `"NYEC"`). Every vault, intent and lock Hawkeye follows carries it.
+    pub tag: Option<String>,
     /// The attestor set id (display hex, as the RPCs print it).
     pub set_id: String,
     /// The vaults' `delay`: the challenge window D.
@@ -256,6 +278,8 @@ pub struct Settings {
     pub ycash_auth: Auth,
     /// First height to follow from (extension).
     pub ycash_start_height: Option<u32>,
+    /// The foreign chain (`[foreign] kind`).
+    pub foreign: BridgeKind,
     /// Ethereum endpoint.
     pub eth_url: String,
     /// The deployment file's contents.
@@ -287,6 +311,9 @@ pub struct Params {
     pub mainnet: bool,
     /// The attestor set, internal byte order.
     pub set_id: Hash32,
+    /// The bridge (`[foreign] kind`): its vault tag (`[bridge] tag`, the only vaults and intents
+    /// this Hawkeye follows), lock destination and memo magic, as `hawkeye-core` defines them.
+    pub bridge_kind: BridgeKind,
     /// The bridge deployment (memos, burns).
     pub deployment: CoreDeployment,
     /// The first Ethereum block to scan.
@@ -334,6 +361,35 @@ impl Params {
     pub fn set_hash(&self) -> Hash256 {
         Hash256::from_internal(self.set_id)
     }
+
+    /// The bridge's vault tag (`WYEC`, `NYEC`).
+    pub fn tag(&self) -> [u8; 4] {
+        self.bridge_kind.tag()
+    }
+
+    /// The vault tag as text (`vault_list`'s filter, messages): it is printable ASCII.
+    pub fn tag_text(&self) -> String {
+        tag_text(&self.tag())
+    }
+}
+
+/// A vault tag as text (lossy for a non-ASCII tag, which [`parse_tag`] refuses).
+pub fn tag_text(tag: &[u8; 4]) -> String {
+    String::from_utf8_lossy(tag).into_owned()
+}
+
+/// A configured vault tag: exactly four printable ASCII characters (`"WYEC"`, `"NYEC"`). A
+/// module tag with a NUL byte (`YED\0`) is not a bridge's.
+pub fn parse_tag(s: &str) -> Result<[u8; 4]> {
+    let b: [u8; 4] = s
+        .as_bytes()
+        .try_into()
+        .map_err(|_| anyhow!("{s:?} is {} bytes, not 4", s.len()))?;
+    ensure!(
+        b.iter().all(u8::is_ascii_graphic),
+        "{s:?} is not four printable ASCII characters"
+    );
+    Ok(b)
 }
 
 /// A regtest [`Params`] for unit tests.
@@ -343,6 +399,7 @@ pub(crate) fn sample_params(drills: bool, mainnet: bool) -> Params {
         network: Network::Regtest,
         mainnet,
         set_id: [7; 32],
+        bridge_kind: BridgeKind::Ethereum,
         deployment: CoreDeployment {
             chain_id: 31337,
             bridge: EthAddress([0x5f; 20]),
@@ -404,9 +461,32 @@ impl Config {
             (None, None, None) => Auth::None,
             _ => bail!("ycash: give rpc_user and rpc_password, or cookie_file"),
         };
-        let deployment = Deployment::read(resolve(&self.eth.deployment))
+        let foreign = match self.foreign.kind.as_deref() {
+            None => BridgeKind::Ethereum,
+            Some(k) => k.parse().map_err(|e| anyhow!("foreign.kind {k:?}: {e}"))?,
+        };
+        let eth = match foreign {
+            BridgeKind::Ethereum => self
+                .eth
+                .as_ref()
+                .ok_or_else(|| anyhow!("foreign.kind \"ethereum\" needs an [eth] section"))?,
+            BridgeKind::Near => {
+                bail!("foreign.kind \"near\": the NEAR adapter is not built yet (NEAR plan NH4)")
+            }
+        };
+        // hawkeye-core's lock policy and intent matcher judge the vaults of the bridge kind's
+        // tag (Ethereum WYEC, NEAR NYEC): another tag would refuse every lock
+        if let Some(t) = &self.bridge.tag {
+            let tag = parse_tag(t).map_err(|e| anyhow!("bridge.tag {e}"))?;
+            ensure!(
+                tag == foreign.tag(),
+                "bridge.tag {t:?}: the {foreign} bridge's vault tag is {:?}",
+                tag_text(&foreign.tag())
+            );
+        }
+        let deployment = Deployment::read(resolve(&eth.deployment))
             .map_err(|e| anyhow!("eth.deployment: {e}"))?;
-        let finality = match (self.eth.finality.as_deref(), self.eth.depth) {
+        let finality = match (eth.finality.as_deref(), eth.depth) {
             (None, Some(depth)) => Finality::Depth { depth },
             (None | Some("finalized"), fallback_depth) => Finality::Finalized { fallback_depth },
             (Some(other), _) => bail!("eth.finality {other:?}: only \"finalized\" (or use depth)"),
@@ -498,6 +578,7 @@ impl Config {
             network,
             mainnet,
             set_id,
+            bridge_kind: foreign,
             deployment: CoreDeployment {
                 chain_id: deployment.chain_id,
                 bridge: EthAddress(deployment.bridge.into()),
@@ -522,7 +603,8 @@ impl Config {
             ycash_url: self.ycash.rpc_url.clone(),
             ycash_auth,
             ycash_start_height: self.ycash.start_height,
-            eth_url: self.eth.rpc_url.clone(),
+            foreign,
+            eth_url: eth.rpc_url.clone(),
             deployment,
             finality,
             params,
@@ -568,6 +650,7 @@ pub fn base_dir(config_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hawkeye_core::template::TAG_WYEC;
 
     const DEPLOYMENT: &str = r#"{"chainId":31337,"bridge":"0x5FbDB2315678afecb367f032d93F642f64180aa3",
       "token":"0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512","deployBlock":1,"guardians":[],"threshold":1}"#;
@@ -706,6 +789,74 @@ format = "text"
         .settings(d.path())
         .unwrap();
         assert_eq!(s.params.mint_mode, MintMode::Optimistic);
+    }
+
+    /// `[foreign]` absent is Ethereum (existing configs and the devnet unchanged); `"near"` is
+    /// reserved; anything else, or Ethereum without `[eth]`, is refused.
+    #[test]
+    fn foreign_kind() {
+        let d = dir();
+        let s = Config::parse(&sample("regtest", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert_eq!(s.foreign, BridgeKind::Ethereum);
+        let s = Config::parse(&sample("regtest", "[foreign]\nkind = \"ethereum\""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert_eq!(s.foreign, BridgeKind::Ethereum);
+        let e = Config::parse(&sample("regtest", "[foreign]\nkind = \"near\""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not built yet"), "{e}");
+        let e = Config::parse(&sample("regtest", "[foreign]\nkind = \"solana\""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("foreign.kind"), "{e}");
+        let no_eth = sample("regtest", "").replace(
+            "[eth]\nrpc_url = \"http://127.0.0.1:8545\"\ndeployment = \"31337.json\"\nfinality = \"finalized\"\n",
+            "",
+        );
+        let e = Config::parse(&no_eth)
+            .unwrap()
+            .settings(d.path())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("needs an [eth] section"), "{e}");
+    }
+
+    /// `[bridge] tag`: `WYEC` by default; four printable ASCII characters.
+    #[test]
+    fn bridge_tag() {
+        let d = dir();
+        let s = Config::parse(&sample("regtest", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert_eq!(s.params.tag(), *b"WYEC");
+        assert_eq!(s.params.tag_text(), "WYEC");
+        let with = |tag: &str| {
+            Config::parse(
+                &sample("regtest", "")
+                    .replace("[bridge]\n", &format!("[bridge]\ntag = \"{tag}\"\n")),
+            )
+            .unwrap()
+            .settings(d.path())
+        };
+        assert_eq!(with("WYEC").unwrap().params.tag(), TAG_WYEC);
+        // a well-formed tag of another bridge: not the Ethereum bridge's
+        let e = with("NYEC").unwrap_err().to_string();
+        assert!(e.contains("vault tag is \"WYEC\""), "{e}");
+        for bad in ["WYE", "WYECX", "WY C", "YED\\u0000", "WYÉ"] {
+            let e = with(bad).unwrap_err().to_string();
+            assert!(e.contains("bridge.tag"), "{bad}: {e}");
+        }
+        assert_eq!(parse_tag("WYEC").unwrap(), TAG_WYEC);
     }
 
     #[test]

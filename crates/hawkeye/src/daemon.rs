@@ -3,9 +3,8 @@
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use hawkeye_core::SecretKey;
-use hawkeye_eth::{EthClient, EthConfig};
 use hawkeye_store::Store;
 use hawkeye_ycash::YcashRpc;
 use tracing::{error, info, warn};
@@ -13,23 +12,32 @@ use tracing::{error, info, warn};
 use crate::attribution::{Attributor, CoreAttributor};
 use crate::config::Settings;
 use crate::engine::{Ctx, Engine, guardian_mismatch};
-use crate::keys::eth_signer;
+use crate::foreign::{self, MAINNET_MIN_THRESHOLD};
 use crate::peers::Peers;
 use crate::status::Status;
 
-/// Connect to both chains and open the ledger.
+/// Connect to both chains (the foreign one through its adapter, [`foreign::connect`]) and open
+/// the ledger. The adapter must be the configured deployment and speak the memo this build's
+/// codec does.
 pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributor>) -> Result<Ctx> {
     let ycash = YcashRpc::new(s.ycash_url.clone(), s.ycash_auth.clone())?;
-    let mut ec = EthConfig::new(
-        s.eth_url.clone(),
-        s.deployment.chain_id,
-        s.deployment.bridge,
+    let foreign = foreign::connect(s, &key).await?;
+    ensure!(
+        foreign.deployment() == s.params.deployment,
+        "the {} adapter is deployment {:?}, the config says {:?}",
+        foreign.kind(),
+        foreign.deployment(),
+        s.params.deployment
     );
-    ec.token = Some(s.deployment.token);
-    ec.finality = s.finality;
-    let eth = EthClient::connect(&ec, Some(eth_signer(&key)?))
-        .await
-        .map_err(|e| anyhow!("ethereum {}: {e}", s.eth_url))?;
+    // the engine's memos, tag, policy and matcher follow the configured kind
+    ensure!(
+        foreign.kind() == s.params.bridge_kind
+            && foreign.memo_magic() == s.params.bridge_kind.memo_magic(),
+        "the adapter is a {} bridge (memo {:?}), the config says {}",
+        foreign.kind(),
+        String::from_utf8_lossy(&foreign.memo_magic()),
+        s.params.bridge_kind
+    );
     let store =
         Store::open(&s.store_path).with_context(|| format!("ledger {}", s.store_path.display()))?;
     Ok(Ctx {
@@ -37,7 +45,7 @@ pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributo
         me: key.public_key(),
         key,
         ycash: Arc::new(ycash),
-        eth,
+        foreign,
         store: Arc::new(Mutex::new(store)),
         attributor,
         peers: Peers::new(s.peers.clone())?,
@@ -48,7 +56,8 @@ pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributo
 
 /// The start-up checks: the node's network, the set exists, this key is a current member, the
 /// guardian set matches the members (refused on mainnet, warned elsewhere), and the live bridge's
-/// threshold is ≥ 2 on mainnet in every mint mode (plan §3.3; warned elsewhere when it is 1).
+/// threshold is ≥ 2 on mainnet in every mint mode (plan §3.3; warned elsewhere when it is 1) —
+/// the bridge's own rules through [`ForeignChain::check_bridge`](foreign::ForeignChain::check_bridge).
 pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
     let info = ctx.ycash.getblockchaininfo().await.context("ycashd")?;
     let want = match ctx.network_name.as_str() {
@@ -85,25 +94,13 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
         }
         warn!(event = "startup_guardian_mismatch", detail = %d);
     }
-    let threshold = ctx
-        .eth
-        .threshold()
+    let bridge = ctx
+        .foreign
+        .check_bridge(ctx.params.mainnet)
         .await
-        .map_err(|e| anyhow!("bridge threshold: {e}"))?;
-    let window = ctx
-        .eth
-        .challenge_window()
-        .await
-        .map_err(|e| anyhow!("bridge challengeWindow (is it the wyec CR-W1 bridge?): {e}"))?;
-    let chain = if ctx.params.mainnet {
-        hawkeye_eth::mode::MAINNET
-    } else {
-        ctx.eth.chain_id()
-    };
-    if let Err(e) = hawkeye_eth::mode::check_contract_threshold(chain, threshold) {
-        bail!("{e} (plan §3.3)");
-    }
-    if threshold < hawkeye_eth::mode::MAINNET_MIN_THRESHOLD {
+        .map_err(|e| anyhow!("{e}"))?;
+    let (threshold, window) = (bridge.threshold, bridge.challenge_window);
+    if threshold < MAINNET_MIN_THRESHOLD {
         warn!(
             event = "startup_bridge_threshold_one",
             threshold,
@@ -111,7 +108,8 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
         );
     }
     info!(event = "startup_ok", set = %ctx.set_hash(), member = %hex::encode(ctx.me),
-          eth = %ctx.key.eth_address().to_checksum(), chain = %info.chain, tip = info.blocks,
+          foreign = %ctx.foreign.kind(), tag = %ctx.params.tag_text(),
+          eth = %ctx.guardian()?, chain = %info.chain, tip = info.blocks,
           mint_mode = %ctx.params.mint_mode, bridge_threshold = threshold,
           challenge_window = window);
     Ok(())

@@ -48,6 +48,10 @@ async fn metrics(State(ctx): State<Ctx>) -> Response {
 }
 
 async fn lock(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    let signer = match ctx.guardian() {
+        Ok(g) => g.to_string(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
     let Ok(bytes) = hex::decode(id.trim_start_matches("0x")) else {
         return err(StatusCode::BAD_REQUEST, "lockId is not hex");
     };
@@ -65,7 +69,7 @@ async fn lock(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
             block_height: l.block_height,
             rejection_reason: l.rejection_reason,
             signature: sig.map(|s| format!("0x{}", hex::encode(s.signature))),
-            signer: ctx.key.eth_address().to_checksum(),
+            signer,
         })
         .into_response(),
         Ok((None, _)) => err(StatusCode::NOT_FOUND, "unknown lock"),

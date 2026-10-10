@@ -248,6 +248,7 @@ impl Env {
             network: Network::Regtest,
             mainnet: false,
             set_id: self.set.0,
+            bridge_kind: hawkeye_core::BridgeKind::Ethereum,
             deployment: CoreDeployment {
                 chain_id: 31337,
                 bridge: EthAddress(self.dep.bridge.0.0),
@@ -283,7 +284,7 @@ impl Env {
         Engine::new(Ctx {
             params: Arc::new(self.params()),
             me: key.public_key(),
-            eth: self.eth(&key).await,
+            foreign: Arc::new(hawkeye::foreign::EthereumChain::new(self.eth(&key).await)),
             key,
             ycash: Arc::new(self.mock.client()),
             store: Arc::new(Mutex::new(store)),

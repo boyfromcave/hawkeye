@@ -4,7 +4,7 @@
 use anyhow::{Result, anyhow};
 use hawkeye_core::address::encode_address;
 use hawkeye_core::leader::leader_for;
-use hawkeye_core::memo::{HawkeyeMemo, parse_memo_script};
+use hawkeye_core::memo::{HawkeyeMemo, parse_memo_script_for};
 use hawkeye_core::recipient::YcashRecipient;
 use hawkeye_core::template::{TemplateKind, parse_selector, parse_vault};
 use hawkeye_store::{
@@ -118,9 +118,10 @@ impl Engine {
             let Ok(tx) = Transaction::decode_hex(&rec.signed_hex) else {
                 continue;
             };
+            let p = &self.ctx.params;
             let names = tx.outputs.iter().any(|o| {
-                matches!(parse_memo_script(&o.script_pubkey), Ok(Some(m))
-                    if m.reference == nonce && m.deployment == self.ctx.params.deployment)
+                matches!(parse_memo_script_for(p.bridge_kind, &o.script_pubkey), Ok(Some(m))
+                    if m.reference == nonce && m.is_for(p.bridge_kind, &p.deployment))
             });
             if names {
                 return Ok(Some(rec.signed_hex));
@@ -183,7 +184,8 @@ impl Engine {
                         )],
                     )
                     .await?;
-                let memo = HawkeyeMemo::burn_release(p.deployment, nonce, b.tx_hash);
+                let memo =
+                    HawkeyeMemo::burn_release_for(p.bridge_kind, p.deployment, nonce, b.tx_hash);
                 let with_memo = insert_op_return(&built.hex.to_string(), &memo.encode())
                     .map_err(|e| anyhow!("memo: {e}"))?;
                 let ycash = self.ctx.ycash.clone();
@@ -310,8 +312,15 @@ impl Engine {
     /// The new V a roll intent pays: the spent V rebuilt with the memo's `ownerHeight`, checked
     /// against the intent's `recipientHash`.
     async fn roll_target(&mut self, i: &hawkeye_store::IntentRecord) -> Result<Vec<u8>> {
-        let memo = HawkeyeMemo::decode(i.memo.as_deref().ok_or_else(|| anyhow!("no memo"))?)
-            .map_err(|e| anyhow!("memo: {e}"))?;
+        let memo = HawkeyeMemo::decode_for(
+            self.ctx.params.bridge_kind,
+            i.memo.as_deref().ok_or_else(|| anyhow!("no memo"))?,
+        )
+        .map_err(|e| anyhow!("memo: {e}"))?;
+        anyhow::ensure!(
+            memo.is_for(self.ctx.params.bridge_kind, &self.ctx.params.deployment),
+            "the roll memo names another deployment"
+        );
         let origin = i
             .origin_vault
             .ok_or_else(|| anyhow!("origin vault unknown"))?;
@@ -390,7 +399,7 @@ pub fn unlock_signatures(hex: &str) -> Result<usize> {
 }
 
 /// `POST /unlock/sign` (`unlockThreshold > 1`): co-sign a peer's unlock only if, on this
-/// attestor's own node and ledger, it spends one `WYEC` vault of the set into exactly one intent
+/// attestor's own node and ledger, it spends one vault of the bridge's tag (`WYEC`) of the set into exactly one intent
 /// that matches an unconsumed finalized burn through its memo, or is a valid roll of a vault due
 /// here; then `set_signunlock` on this node through the sign-once record (one spend per vault,
 /// ever).
@@ -421,15 +430,19 @@ pub async fn verify_and_sign_unlock(
             continue;
         };
         if let Ok(v) = parse_vault(&o.script_pubkey)
-            && v.tag == hawkeye_core::template::TAG_WYEC
+            && v.tag == p.tag()
             && v.set_id == p.set_id
         {
             vault = Some((idx, op_core(&input.prevout), v));
             break;
         }
     }
-    let (_, origin, vp) =
-        vault.ok_or_else(|| anyhow!("the transaction unlocks no WYEC vault of this set"))?;
+    let (_, origin, vp) = vault.ok_or_else(|| {
+        anyhow!(
+            "the transaction unlocks no {} vault of this set",
+            p.tag_text()
+        )
+    })?;
     // its intents (one, HK-8)
     let mut intents = vec![];
     for (n, o) in tx.outputs.iter().enumerate() {

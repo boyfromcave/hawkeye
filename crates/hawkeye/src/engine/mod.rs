@@ -5,8 +5,10 @@
 //!
 //! 1. **set** — `set_getinfo`: live members (leader schedule, §5.2), this attestor's standing;
 //! 2. **ycash** ([`ycash`]) — follow the active chain block by block (reorgs rewind the ledger,
-//!    §5.4): `WYEC` vaults, new locks, intents created, cancelled and released;
-//! 3. **eth** ([`mint`]) — finalized `BurnToYcash` / `Minted` / `MintProposed` events; every
+//!    §5.4): the bridge's vaults (its configured tag, `WYEC` on Ethereum), new locks, intents
+//!    created, cancelled and released;
+//! 3. **eth** ([`mint`]) — the foreign chain's finalized burn / `Minted` / `MintProposed` events
+//!    (through the [`ForeignChain`] adapter, NEAR plan §4 item 2); every
 //!    `Minted` and every optimistic proposal must match a policy-OK lock (watcher, §5.3 step 2):
 //!    a proposal that does not is challenged within the contract's window (sign-once), in every
 //!    mint mode;
@@ -35,7 +37,6 @@ use anyhow::{Context, Result, anyhow};
 use hawkeye_core::bytes::{Hash32, txid_to_display};
 use hawkeye_core::keys::sort_members;
 use hawkeye_core::{OutPoint as CoreOutPoint, PubKey33, SecretKey};
-use hawkeye_eth::EthClient;
 use hawkeye_store::{
     BurnState, IntentState, LockState, Machine, SlashState, Store, StoreError, Tx, VaultState,
 };
@@ -45,6 +46,7 @@ use tracing::{info, warn};
 
 use crate::attribution::Attributor;
 use crate::config::Params;
+use crate::foreign::{ForeignChain, Guardian};
 use crate::peers::Peers;
 use crate::status::{Alarm, Heights, Status, Supply};
 
@@ -66,8 +68,8 @@ pub struct Ctx {
     pub me: PubKey33,
     /// This attestor's own ycashd.
     pub ycash: Arc<YcashRpc>,
-    /// The bridge deployment (with the member key as sender).
-    pub eth: EthClient,
+    /// The bridge deployment on the foreign chain (Ethereum: with the member key as sender).
+    pub foreign: Arc<dyn ForeignChain>,
     /// The ledger.
     pub store: Arc<Mutex<Store>>,
     /// Set-signature attribution.
@@ -90,6 +92,13 @@ impl Ctx {
     /// The set id in RPC form.
     pub fn set_hash(&self) -> hawkeye_ycash::Hash256 {
         self.params.set_hash()
+    }
+
+    /// This attestor's guardian on the foreign chain.
+    pub fn guardian(&self) -> Result<Guardian> {
+        self.foreign
+            .guardian_of(&self.me)
+            .map_err(|e| anyhow!("member key {}: {e}", hex::encode(self.me)))
     }
 }
 
@@ -242,15 +251,15 @@ impl Engine {
         self.refresh_set().await?;
         self.mem.eth_finalized = self
             .ctx
-            .eth
-            .finalized_block_number()
+            .foreign
+            .finalized_height()
             .await
             .map_err(|e| anyhow!("{e}"))?;
         let rows = self
             .ctx
             .ycash
             .vault_list(Some(&hawkeye_ycash::types::VaultListFilter {
-                tag: Some("WYEC".into()),
+                tag: Some(self.ctx.params.tag_text()),
                 setid: Some(self.ctx.set_hash()),
                 kind: Some(hawkeye_ycash::types::TemplateKind::Vault),
                 ..Default::default()
@@ -371,8 +380,7 @@ impl Engine {
     }
 
     async fn supply(&mut self) -> Result<()> {
-        let supply = self.ctx.eth.total_supply().await?;
-        let supply = u128::try_from(supply).unwrap_or(u128::MAX);
+        let supply = self.ctx.foreign.total_supply().await?;
         self.mem.wyec_supply = supply;
         // a roll in its window holds the vault's value in a matched roll intent (HK-6)
         let locked = self
@@ -383,8 +391,9 @@ impl Engine {
             self.alarm(
                 "supply",
                 format!(
-                    "wYEC totalSupply {supply} > locked WYEC vault value {locked} (rolls in \
-                     flight included)"
+                    "wYEC totalSupply {supply} > locked {} vault value {locked} (rolls in \
+                     flight included)",
+                    self.ctx.params.tag_text()
                 ),
             );
         } else {
@@ -436,7 +445,7 @@ impl Engine {
             network: self.ctx.network_name.clone(),
             set_id: txid_to_display(&self.ctx.params.set_id),
             member_key: hex::encode(self.ctx.me),
-            eth_address: self.ctx.key.eth_address().to_checksum(),
+            eth_address: self.ctx.guardian()?.to_string(),
             ycash: Heights {
                 tip,
                 cursor: ycursor,
@@ -465,7 +474,7 @@ impl Engine {
     }
 
     /// Re-read the guardian set when due (start, rotation events, every 60 ticks) and compare it
-    /// with the current members' Ethereum addresses (plan §3.5, D-15).
+    /// with the current members' guardians (Ethereum: their addresses; plan §3.5, D-15).
     async fn check_guardians(&mut self) -> Result<()> {
         if !self.mem.guardian_check_due && !self.mem.ticks.is_multiple_of(60) {
             return Ok(());
@@ -508,11 +517,11 @@ impl Engine {
     }
 }
 
-/// `None` if the contract's guardians equal the current members' Ethereum addresses, else a
-/// description of the difference.
+/// `None` if the contract's guardians equal the current members' guardians (Ethereum: their
+/// addresses), else a description of the difference.
 pub async fn guardian_mismatch(ctx: &Ctx, members: &[Member]) -> Result<Option<String>> {
-    let guardians: HashSet<_> = ctx
-        .eth
+    let guardians: HashSet<Guardian> = ctx
+        .foreign
         .guardians()
         .await
         .map_err(|e| anyhow!("guardians: {e}"))?
@@ -520,9 +529,11 @@ pub async fn guardian_mismatch(ctx: &Ctx, members: &[Member]) -> Result<Option<S
         .collect();
     let mut expected = HashSet::new();
     for m in members.iter().filter(|m| m.current) {
-        let a = hawkeye_core::eth::address_from_pubkey(&m.key.0)
+        let a = ctx
+            .foreign
+            .guardian_of(&m.key.0)
             .map_err(|e| anyhow!("member key {}: {e}", m.key))?;
-        expected.insert(crate::convert::addr(&a));
+        expected.insert(a);
     }
     if guardians == expected {
         return Ok(None);

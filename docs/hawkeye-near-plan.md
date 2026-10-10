@@ -134,7 +134,7 @@ business step, not code.
 | NH0 | this plan, branch | — |
 | NH1 ✅ | `hawkeye-core::near` encodings + vectors | vectors pass in Rust and in the contract |
 | NH2 ✅ | `near/` contract: token + bridge, unit tests (`near-sdk` test env), wasm build, sandbox integration tests (`near-workspaces`, CI) | all green; wasm size and gas measured |
-| NH3 | `ForeignChain` trait; Ethereum behind it with no behaviour change (all existing tests and drills still pass) | Ethereum devnet demo PASS on both node lines |
+| NH3 ✅ | `ForeignChain` trait; Ethereum behind it with no behaviour change (all existing tests and drills still pass) | Ethereum devnet demo PASS on both node lines |
 | NH4 | `hawkeye-near` adapter + daemon support | engine tests against a NEAR mock RPC |
 | NH5 | NEAR devnet: real regtest ycashd + NEAR sandbox + Hawkeyes; `scenario demo` and `rogue-mint` | PASS on both node lines (CI: the NEAR sandbox binary downloads on GitHub runners) |
 | NH6 | testnet trial, audit, Foundation parameters | — |

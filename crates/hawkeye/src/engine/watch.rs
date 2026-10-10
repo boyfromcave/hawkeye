@@ -1,4 +1,4 @@
-//! The watcher (plan §3.2, §5.3 step 1): every `WYEC` intent of the set — in blocks (the
+//! The watcher (plan §3.2, §5.3 step 1): every intent of the set under the bridge's tag (`WYEC`) — in blocks (the
 //! follower), in `vault_list`, in the mempool — is classified; an unmatched one is cancelled
 //! within its window (one cancel per intent, sign-once, never re-funded) and its signer faces a
 //! slash case unless it is a benign race.
@@ -13,7 +13,6 @@ use hawkeye_core::matcher::Classification;
 use hawkeye_core::memo::{HawkeyeMemo, MemoKind};
 use hawkeye_core::policy::TxOut as CoreTxOut;
 use hawkeye_core::script::op_return_script;
-use hawkeye_core::template::TAG_WYEC;
 use hawkeye_store::{
     BurnKey, BurnState, FaultKind, IntentRecord, IntentState, NewSlashCase, SignDomain,
     YcashSignKey, classification_code,
@@ -38,7 +37,7 @@ impl Engine {
             .ctx
             .ycash
             .vault_list(Some(&VaultListFilter {
-                tag: Some("WYEC".into()),
+                tag: Some(p.tag_text()),
                 setid: Some(self.ctx.set_hash()),
                 kind: Some(RpcKind::Intent),
                 ..VaultListFilter::default()
@@ -175,13 +174,14 @@ impl Engine {
             for i in open {
                 if i.classification.as_deref() == Some("matched-roll")
                     || i.memo.as_deref().is_some_and(|m| {
-                        HawkeyeMemo::decode(m).is_ok_and(|m| m.kind == MemoKind::Roll)
+                        HawkeyeMemo::decode_for(p.bridge_kind, m)
+                            .is_ok_and(|m| m.kind == MemoKind::Roll)
                     })
                 {
                     continue;
                 }
                 let ip = IntentParams {
-                    tag: TAG_WYEC,
+                    tag: p.tag(),
                     recipient_hash: i.recipient_hash,
                     vault_hash: i.vault_hash,
                     delay: p.delay,

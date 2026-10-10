@@ -7,9 +7,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hawkeye_core::address::decode_address;
 use hawkeye_core::lock::{destination_script, lock_id};
-use hawkeye_core::template::{TAG_WYEC, VaultParams};
+use hawkeye_core::template::VaultParams;
 use hawkeye_core::{EthAddress, OutPoint as CoreOutPoint};
-use hawkeye_eth::{B256, EthClient, EthConfig, U256};
 use hawkeye_store::{SignDomain, Store, YcashSignKey};
 use hawkeye_ycash::tx::{Transaction, TxIn, TxOut};
 use hawkeye_ycash::types::{Recipient, TemplateKind, VaultListFilter};
@@ -21,7 +20,8 @@ use crate::attribution::CoreAttributor;
 use crate::config::Settings;
 use crate::convert::op_core;
 use crate::engine::{Engine, block_on};
-use crate::keys::{eth_signer, key_info, parse_secret, wif};
+use crate::foreign::{self, Account};
+use crate::keys::{key_info, parse_secret, wif};
 
 /// The flat fee of a hand-built lock transaction (the node's vault RPCs use the same).
 pub const LOCK_FEE: i64 = 10_000;
@@ -110,8 +110,8 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `hawkeye lock`: the depositor's lock (plan §1.2): a `WYEC` V of the configured set plus the
-/// destination `OP_RETURN`, funded and signed by this node's wallet.
+/// `hawkeye lock`: the depositor's lock (plan §1.2): a V of the bridge's tag (`WYEC`) and the
+/// configured set plus the destination `OP_RETURN`, funded and signed by this node's wallet.
 pub async fn lock(s: &Settings, amount: &str, dest: &str, owner_age: Option<u32>) -> Result<()> {
     let p = &s.params;
     let to = EthAddress::parse(dest).map_err(|e| anyhow!("--dest: {e}"))?;
@@ -132,7 +132,7 @@ pub async fn lock(s: &Settings, amount: &str, dest: &str, owner_age: Option<u32>
         .try_into()
         .map_err(|_| anyhow!("owner key is not compressed"))?;
     let v = VaultParams {
-        tag: TAG_WYEC,
+        tag: p.tag(),
         set_id: p.set_id,
         cancel_set_id: p.set_id,
         delay: p.delay,
@@ -221,8 +221,8 @@ pub async fn lock(s: &Settings, amount: &str, dest: &str, owner_age: Option<u32>
     }))
 }
 
-/// `hawkeye burn`: `WyecBridge.burn(amount, ycashRecipient)` with the §4.2 encoding, from
-/// `--eth-key` (default: the config's `[keys] secret_hex`).
+/// `hawkeye burn`: the bridge's burn (`WyecBridge.burn(amount, ycashRecipient)`) with the §4.2
+/// encoding, from `--eth-key` (default: the config's `[keys] secret_hex`).
 pub async fn burn(
     s: &Settings,
     amount: &str,
@@ -235,24 +235,16 @@ pub async fn burn(
         Some(k) => parse_secret(k)?,
         None => s.load_key().context("no --eth-key and no [keys] key")?,
     };
-    let mut ec = EthConfig::new(
-        s.eth_url.clone(),
-        s.deployment.chain_id,
-        s.deployment.bridge,
-    );
-    ec.token = Some(s.deployment.token);
-    let eth = EthClient::connect(&ec, Some(eth_signer(&key)?))
-        .await
-        .map_err(|e| anyhow!("ethereum: {e}"))?;
-    let b = eth
-        .burn(U256::from(value as u64), B256::from(r.to_bytes32()))
+    let chain = foreign::connect(s, &key).await?;
+    let b = chain
+        .burn(u64::try_from(value)?, r.to_bytes32())
         .await
         .map_err(|e| anyhow!("burn: {e}"))?;
     info!(event = "burn_sent", tx = %b.mined.tx, nonce = %b.nonce, amount = value, recipient);
     print(&json!({
         "txhash": b.mined.tx.to_string(),
-        "nonce": u64::try_from(b.nonce).unwrap_or(u64::MAX),
-        "block": b.mined.block_number,
+        "nonce": b.nonce,
+        "block": b.mined.height,
     }))
 }
 
@@ -298,9 +290,14 @@ pub fn replay_plan(
     Ok(ReplayPlan {
         recipient_script: r.script(),
         amount: amount.unwrap_or(b.amount),
-        memo: hawkeye_core::memo::HawkeyeMemo::burn_release(p.deployment, nonce, b.tx_hash)
-            .encode()
-            .to_vec(),
+        memo: hawkeye_core::memo::HawkeyeMemo::burn_release_for(
+            p.bridge_kind,
+            p.deployment,
+            nonce,
+            b.tx_hash,
+        )
+        .encode()
+        .to_vec(),
     })
 }
 
@@ -336,7 +333,7 @@ pub async fn rogue_unlock(
     };
     let rows = node
         .vault_list(Some(&VaultListFilter {
-            tag: Some("WYEC".into()),
+            tag: Some(s.params.tag_text()),
             setid: Some(s.params.set_hash()),
             kind: Some(TemplateKind::Vault),
             ..VaultListFilter::default()
@@ -357,7 +354,12 @@ pub async fn rogue_unlock(
             break;
         }
     }
-    let (vault, key) = chosen.ok_or_else(|| anyhow!("no unsigned WYEC vault holds {value} zat"))?;
+    let (vault, key) = chosen.ok_or_else(|| {
+        anyhow!(
+            "no unsigned {} vault holds {value} zat",
+            s.params.tag_text()
+        )
+    })?;
     let built = node
         .vault_buildunlock(&vault, std::slice::from_ref(&recipient))
         .await?;
@@ -392,9 +394,9 @@ pub fn invented_lock_id(signer: &EthAddress, nanos: u128) -> [u8; 32] {
 }
 
 /// `hawkeye rogue-mint` (drill D-5 only): this attestor signs `Mint(lockId, amount, to)` for a
-/// lockId with no lock behind it (sign-once, `eip712-drill-mint`) and opens an optimistic
-/// proposal with it (`proposeMint`, gas from its own account) — the fraud the other attestors
-/// must challenge within the window and slash on Ycash.
+/// lockId with no lock behind it (sign-once, `eip712-drill-mint`, through the bridge's
+/// attestation scheme) and opens an optimistic proposal with it (`proposeMint`, gas from its own
+/// account) — the fraud the other attestors must challenge within the window and slash on Ycash.
 pub async fn rogue_mint(
     s: &Settings,
     amount: &str,
@@ -404,80 +406,67 @@ pub async fn rogue_mint(
     drill_gate(&s.params, "rogue-mint")?;
     let value = u64::try_from(zat(amount)?)?;
     let key = s.load_key()?;
-    let me = key.eth_address();
+    let chain = foreign::connect(s, &key).await?;
+    let me = chain
+        .guardian_of(&key.public_key())
+        .map_err(|e| anyhow!("member key: {e}"))?;
+    let me_eth = me
+        .ledger_eth()
+        .ok_or_else(|| anyhow!("{me}: the ledger (schema v2) stores Ethereum addresses only"))?;
     let to = match to {
-        Some(t) => EthAddress::parse(t).map_err(|e| anyhow!("--to: {e}"))?,
-        None => me,
+        Some(t) => chain.parse_account(t).map_err(|e| anyhow!("--to: {e}"))?,
+        None => Account::Ethereum(me_eth),
     };
-    ensure!(to != EthAddress::ZERO, "--to is the zero address");
+    let to_eth = to.ethereum().copied().ok_or_else(|| {
+        anyhow!("--to {to}: the ledger (schema v2) stores Ethereum addresses only")
+    })?;
+    ensure!(to_eth != EthAddress::ZERO, "--to is the zero address");
     let lock_id: [u8; 32] = match lock_id {
         Some(h) => hawkeye_core::bytes::from_hex_array("--lock-id", h)
             .map_err(|e| anyhow!("--lock-id: {e}"))?,
         None => invented_lock_id(
-            &me,
+            &me_eth,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos(),
         ),
     };
-    let mut ec = EthConfig::new(
-        s.eth_url.clone(),
-        s.deployment.chain_id,
-        s.deployment.bridge,
-    );
-    ec.token = Some(s.deployment.token);
-    let eth = EthClient::connect(&ec, Some(eth_signer(&key)?))
-        .await
-        .map_err(|e| anyhow!("ethereum: {e}"))?;
-    let digest = hawkeye_core::eip712::Domain::new(
-        s.deployment.chain_id,
-        EthAddress(s.deployment.bridge.0.0),
-    )
-    .mint_digest(&lock_id, value, &to);
+    let digest = chain
+        .mint_digest(&lock_id, value, &to)
+        .map_err(|e| anyhow!("{e}"))?;
     let mut store = Store::open(&s.store_path)?;
     let rec = store.tx(|t| {
-        t.sign_once_drill_mint(&lock_id, value, &to, &digest, |d| {
-            hawkeye_core::eth::sign_digest(&key, d)
-        })
+        t.sign_once_drill_mint(&lock_id, value, &to_eth, &digest, |d| chain.sign(&key, d))
     })?;
-    let out = eth
-        .propose_mint(
-            B256::from(lock_id),
-            U256::from(value),
-            crate::convert::addr(&to),
-            &rec.signature,
-        )
-        .await
-        .map_err(|e| anyhow!("proposeMint: {e}"))?;
-    let hawkeye_eth::MintSubmitted::Proposed {
+    let foreign::Proposed {
         mined,
         proposal_id,
         eta,
-    } = out
-    else {
-        bail!("proposeMint returned no proposal");
-    };
+    } = chain
+        .propose_mint(lock_id, value, to.clone(), rec.signature)
+        .await
+        .map_err(|e| anyhow!("proposeMint: {e}"))?;
     info!(event = "rogue_mint_proposed", lock_id = %format!("0x{}", hex::encode(lock_id)),
-          proposal_id, amount = value, to = %to.to_checksum(), tx = %mined.tx, eta);
+          proposal_id, amount = value, to = %to, tx = %mined.tx, eta);
     print(&json!({
         "lockid": format!("0x{}", hex::encode(lock_id)),
         "proposal_id": proposal_id.to_string(),
-        "proposer": me.to_checksum(),
+        "proposer": me.to_string(),
         "amount_zat": value,
-        "to": to.to_checksum(),
+        "to": to.to_string(),
         "eta": eta,
         "txhash": mined.tx.to_string(),
-        "block": mined.block_number,
+        "block": mined.height,
     }))
 }
 
-/// `hawkeye recover`: `vault_ownerspend` of every `WYEC` vault and intent of the set this
-/// wallet owns (selector 2 after `ownerHeight`, 3 once the set is released).
+/// `hawkeye recover`: `vault_ownerspend` of every vault and intent of the bridge's tag (`WYEC`)
+/// and the set this wallet owns (selector 2 after `ownerHeight`, 3 once the set is released).
 pub async fn recover(s: &Settings) -> Result<()> {
     let node = ycash(s)?;
     let rows = node
         .vault_list(Some(&VaultListFilter {
-            tag: Some("WYEC".into()),
+            tag: Some(s.params.tag_text()),
             setid: Some(s.params.set_hash()),
             mine: Some(true),
             ..VaultListFilter::default()
