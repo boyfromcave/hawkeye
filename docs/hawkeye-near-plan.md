@@ -1,6 +1,6 @@
 # Wrapped Ycash on NEAR — the third vault application
 
-**Revision 3, 2026-10-11 (post-quantum owners, below and §5; revision 2, 2026-10-10: NH5 as built,
+**Revision 4, 2026-10-11 (post-quantum burn recipients: §2.4 BurnRecord v2, NQ-5 decided, §5 NH-R3/NH-R5; revision 3, 2026-10-11: post-quantum owners, below and §5; revision 2, 2026-10-10: NH5 as built,
 §4 item 6). Branch `claude/hawkeye-near-wyec` (exploratory: built so the option is ready, not a
 commitment to ship).** Extends the Hawkeye plan of record
 ([`hawkeye-bridge-plan.md`](hawkeye-bridge-plan.md), "the main plan") from one foreign chain
@@ -114,10 +114,15 @@ zatoshi (`decimals = 8`), carried as `u128` (NEP-141 `U128` in JSON).
 
 ```rust
 #[derive(BorshSerialize)]
-struct BurnRecord { nonce: u64, from: String, amount: u128, ycash_recipient: [u8; 32], block_height: u64, timestamp_ns: u64 }
+struct BurnRecord { nonce: u64, from: String, amount: u128, ycash_recipient: Vec<u8>, block_height: u64, timestamp_ns: u64 }
 ```
-`ycash_recipient` uses the main plan's §4.2 encoding (version, kind, 10 zero bytes, hash160):
-transparent P2PKH or P2SH only, on the post-quantum line too (NQ-5).
+`ycash_recipient` is the main plan's §4.2 **revision 2** recipient (22 or 35 bytes: version `0x02`,
+kind P2PKH / P2SH / PQPKH, then hash160 or `scheme ‖ keyHash`), borsh-encoded as a `Vec<u8>` (u32 LE
+length, then the bytes). The contract validates it exactly as wyec does (length, version, kind,
+scheme) and refuses anything else. This is **BurnRecord v2** (revision 4, NQ-5): the layout and so
+`record_hash` = the HKN1 memo's `data` differ from v1's `[u8; 32]`; v1 never shipped. `burn` takes
+the recipient as hex (44 or 70 digits); `burn_storage_deposit` prices the record by the longest
+recipient (35 bytes), the excess refunded as before (N-11).
 
 ## 3. The `wyec-near` contract
 
@@ -195,6 +200,8 @@ business step, not code.
 | NH4 ✅ | `hawkeye-near` adapter + daemon support | engine tests against a NEAR mock RPC |
 | NH5 ✅ | NEAR devnet: real regtest ycashd + NEAR sandbox + Hawkeyes; `scenario demo` and `rogue-mint` (`devnet/hawkeye-devnet --foreign near`); the adapter against a real sandbox (CI `near-adapter-sandbox`) | PASS on both node lines: devnet-e2e run 38041601513 (ycash-dd v4.5.0 and ycash6 6.22.0-rc1 × ethereum and near, all green, transcripts as artifacts `devnet-<line>-<foreign>`); ci run 38039974967 (`near-adapter-sandbox`) |
 | NH5-PQ ✅ | post-quantum vault owners on the NEAR line (merge `e8299e8`, 2026-10-11, "Post-quantum owners" above): the NEAR engine tests and the core memo test build their vaults with a PQ owner (`new_wallet_owner`); `hawkeye lock` takes a kind-aware `--dest` and the PQ `--owner`; the devnet's `--foreign near` runs unchanged on the quantum nodes; no NEAR contract, HKN1 or NR1 change | green on the quantum nodes (ycash-dd `d41026209`, ycash6 `0c6c5fdf2`), both bridges: `ci` run 38153755234 (12 jobs) and `devnet-e2e` run 38153755261 (node × 2, demo line × foreign × 2: `demo` and `rogue-mint` PASS on NEAR and Ethereum on both lines; `hawkeye lock` returned a scheme-1 `owner` and a regtest `yr…` `owner_address` on the real node) |
+| NH-R3 | post-quantum burn recipients on NEAR (main plan §9.1 R3): `burn` with the §4.2 revision-2 recipient, BurnRecord v2, regenerated vectors, sandbox tests | green on the real sandbox (CI) |
+| NH-R5 | the `pq-recipient` drill with `--foreign near` on the real quantum nodes (main plan §9.1 R5) | PASS on both lines (CI) |
 | NH6 | testnet trial, audit, Foundation parameters | — |
 
 ## 6. Open questions
@@ -205,4 +212,4 @@ business step, not code.
 | NQ-2 | Contract upgrades on NEAR | none in v1; a successor contract with a threshold-signed migration if ever needed |
 | NQ-3 | Who funds NEAR storage and gas (N-10) | the bridge operators' treasury; ~0.00125 NEAR per new holder. Measured on the 2.13.4 sandbox (gas burnt, transaction + receipts; NH5): threshold mint (k = 2, registering the receiver) 3.40 TGas, `propose_mint` 2.88, `challenge_mint` 2.85, `execute_mint` 2.71, `burn` 2.61, deploy + `new` 24.09 (297 200-byte wasm); Hawkeye attaches 100 TGas per call (`gas_tgas`) and is refunded the rest |
 | NQ-4 | Direct NEAR ↔ Ethereum wYEC routing | out of scope: each bridge is backed by its own vaults; moving between them is burn on one + lock on the other |
-| NQ-5 | A post-quantum burn recipient. `BurnRecord.ycash_recipient` (§2.4, main plan §4.2) encodes a transparent P2PKH / P2SH hash160 only; a `TX_PQPKH` recipient (`scheme ‖ keyHash`, 33 bytes; the plain-YEC `sq…` address of quantum plan D-Q-20) has no kind and does not fit the 30 bytes a `bytes32` leaves | **not in v1.** A holder burns to a transparent address (a PQ wallet holds one; Yellowback's fee payees stay P2PKH on this line, D-Q-5), so nothing is blocked. If ever wanted: a new recipient *version* in a wider field — on NEAR a `burn` variant with a `Vec<u8>` recipient and a `BurnRecord` v2 (a new borsh layout, so a new `record_hash` and HKN1 `data`), on Ethereum a wyec contract change (`burn(uint256, bytes32)` cannot carry it); `hawkeye-core::recipient` gains the `TX_PQPKH` kind and the release pays the 35-byte script. The main plan (its Q-7, the Ethereum side of the same question) and this plan change first (rule 3); the two bridges should take it together or not at all |
+| NQ-5 | A post-quantum burn recipient (`TX_PQPKH`, the plain-YEC `sq…` address of quantum plan D-Q-20; `scheme ‖ keyHash` is 33 bytes, one more than a `bytes32` leaves) | **Decided (owner, 2026-10-11), with the main plan's Q-7: both bridges together.** Main plan §4.2 revision 2 (a 22/35-byte versioned recipient with a PQPKH kind) and §2.4 here (BurnRecord v2); phases R3 (contract + vectors) and R4–R5 (Hawkeye, the devnet drill on both bridges) in the main plan §9.1. No node change. |
