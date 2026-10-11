@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::amount::Amount;
-use crate::primitives::{Bytes32, Hash256, HexBytes, OutPoint, PubKey, SetId, Txid};
+use crate::primitives::{Bytes32, Hash256, HexBytes, OutPoint, PqKeyId, PubKey, SetId, Txid};
 
 // ---------------------------------------------------------------------------------- shapes
 
@@ -100,7 +100,10 @@ pub struct VaultFields {
     pub delay: u32,
     pub ownerheight: u32,
     pub appheight: u32,
-    pub ownerkey: PubKey,
+    /// The post-quantum owner (quantum spec §6.2).
+    pub owner: PqKeyId,
+    /// The owner's scheme (1 SLH-DSA-SHA2-128s, 2 FN-DSA-512), = `owner`'s first byte.
+    pub ownerscheme: u8,
 }
 
 /// `IntentFields`: an I template's parameters.
@@ -111,7 +114,9 @@ pub struct IntentFields {
     pub setid: SetId,
     pub cancelsetid: SetId,
     pub delay: u32,
-    pub ownerkey: PubKey,
+    /// The originating vault's post-quantum owner.
+    pub owner: PqKeyId,
+    pub ownerscheme: u8,
     /// SHA256 of the recipient script (raw order).
     pub recipienthash: Bytes32,
     /// SHA256 of the originating vault's script (raw order).
@@ -434,8 +439,9 @@ pub struct VaultListFilter {
     pub tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setid: Option<SetId>,
+    /// The owner (the node also takes a PQ address).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<PubKey>,
+    pub owner: Option<PqKeyId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<TemplateKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -753,9 +759,11 @@ pub struct VaultLockParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appheight: Option<u32>,
     pub amount: Amount,
-    /// Default: a new wallet key.
+    /// The post-quantum owner (the node also takes a PQ address or `{scheme, keyhash}`; the
+    /// former `ownerkey` is refused, `ownerkey-removed`). Default: a new SLH-DSA key of the
+    /// node wallet, as `vault_getnewowner`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ownerkey: Option<PubKey>,
+    pub owner: Option<PqKeyId>,
 }
 
 /// `vault_lock`'s result.
@@ -766,7 +774,20 @@ pub struct VaultLockResult {
     pub vout: u32,
     pub outpoint: OutPoint,
     pub script: HexBytes,
-    pub ownerkey: PubKey,
+    pub owner: PqKeyId,
+}
+
+/// `vault_getnewowner`'s result: a new post-quantum key of the node wallet for a vault owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewOwner {
+    /// 1 (SLH-DSA-SHA2-128s) or 2 (FN-DSA-512).
+    pub scheme: u8,
+    /// The 32 bytes the V pushes (`hex` in the contract).
+    pub keyhash: HexBytes,
+    /// `scheme ‖ keyhash`.
+    pub owner: PqKeyId,
+    /// The 53-character post-quantum address (`ye…` / `yt…` / `yr…`).
+    pub address: String,
 }
 
 /// `vault_buildunlock`'s result.

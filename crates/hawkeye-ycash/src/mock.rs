@@ -33,7 +33,9 @@ use tokio::sync::oneshot;
 
 use crate::amount::{Amount, COIN};
 use crate::client::{Auth, YcashRpc};
-use crate::primitives::{BlockHash, Bytes32, Hash256, HexBytes, OutPoint, PubKey, SetId, Txid};
+use crate::primitives::{
+    BlockHash, Bytes32, Hash256, HexBytes, OutPoint, PqKeyId, PubKey, SetId, Txid,
+};
 use crate::stock::Unspent;
 use crate::tx::{OP_1, Transaction, TxIn, TxOut};
 use crate::types::*;
@@ -42,6 +44,11 @@ use crate::types::*;
 pub const VAULT_BRANCH_ID: &str = "6d5b7a31";
 /// The flat fee of every transaction the vault RPCs build.
 pub const FEE: i64 = 10_000;
+/// The node's default `-pqfeerate` (zat per 1000 bytes: the relay floor, quantum plan §4.5).
+pub const PQ_FEE_RATE: i64 = 100;
+/// The bytes of an SLH-DSA owner scriptSig (quantum spec §1.5): 15 chunks of 520 and one of 57,
+/// `OP_16`, the 32-byte key, `OP_1`, the selector.
+pub const PQ_OWNER_SCRIPTSIG_LEN: usize = 7939;
 
 type RpcResult = Result<Value, (i64, String)>;
 
@@ -129,8 +136,12 @@ pub struct MockState {
     /// The confirmed template-output index (`vault_list`); dynamic fields are refreshed on read.
     pub templates: BTreeMap<OutPoint, TemplateOut>,
     pub scripts: HashMap<Vec<u8>, KnownScript>,
-    /// Keys in the mock wallet: member keys it signs with, owner keys it holds.
+    /// Keys in the mock wallet: member keys it signs with.
     pub wallet_keys: BTreeSet<PubKey>,
+    /// Post-quantum owner keys in the mock wallet (`vault_getnewowner`).
+    pub wallet_owners: BTreeSet<PqKeyId>,
+    /// `-pqfeerate` in zat per 1000 bytes (owner spends pay `max(FEE, rate × size)`).
+    pub pq_fee_rate: i64,
     /// Address → scriptPubKey for addresses the mock handed out or was told about.
     pub addresses: BTreeMap<String, Vec<u8>>,
     /// `listunspent`'s answer.
@@ -202,6 +213,29 @@ pub fn mock_intent_script(f: &IntentFields) -> Vec<u8> {
     let mut s = vec![0x05, b'M', b'O', b'C', b'K', b'I', 0x20];
     s.extend(sha256(&serde_json::to_vec(f).expect("fields serialize")));
     s
+}
+
+/// The shape of a post-quantum owner scriptSig (quantum spec §1.5): 15 chunks of 520 bytes and
+/// one of 57 (the 7,856-byte SLH-DSA signature and its hashtype), `OP_16`, the 32-byte key,
+/// `OP_1`, then the selector; the bytes are placeholders derived from the owner.
+pub fn mock_pq_owner_script_sig(owner: &PqKeyId, selector: u8) -> Vec<u8> {
+    let mut ss = Vec::with_capacity(PQ_OWNER_SCRIPTSIG_LEN);
+    for i in 0..16 {
+        let n: u16 = if i < 15 { 520 } else { 57 };
+        if n > 75 {
+            ss.push(0x4d);
+            ss.extend(n.to_le_bytes());
+        } else {
+            ss.push(n as u8);
+        }
+        ss.extend(std::iter::repeat_n(owner.0[1], usize::from(n)));
+    }
+    ss.push(OP_1 + 15);
+    ss.push(32);
+    ss.extend(owner.hash());
+    ss.push(OP_1);
+    ss.push(OP_1 + selector - 1);
+    ss
 }
 
 /// A mock set signature by `key` over `sighash`.
@@ -278,6 +312,8 @@ impl MockState {
             templates: BTreeMap::new(),
             scripts: HashMap::new(),
             wallet_keys: BTreeSet::new(),
+            wallet_owners: BTreeSet::new(),
+            pq_fee_rate: PQ_FEE_RATE,
             addresses: BTreeMap::new(),
             unspent: vec![],
             sign_once: HashMap::new(),
@@ -361,6 +397,20 @@ impl MockState {
         let k = PubKey(k);
         self.wallet_keys.insert(k);
         k
+    }
+
+    /// A new SLH-DSA owner key in the wallet (`vault_getnewowner`).
+    pub fn new_wallet_owner(&mut self) -> PqKeyId {
+        let mut k = [1u8; 33];
+        k[1..].copy_from_slice(&self.fresh("pqowner"));
+        let k = PqKeyId(k);
+        self.wallet_owners.insert(k);
+        k
+    }
+
+    /// The mock PQ address of `owner` (the node's is base58check, 53 characters).
+    pub fn pq_address(owner: &PqKeyId) -> String {
+        format!("yrMock{owner}")
     }
 
     /// A new wallet address (a mock P2PKH).
@@ -474,7 +524,7 @@ impl MockState {
                     if let Some(set) = self.set_mut(&fields.setid) {
                         set.lockedvalue = Amount(set.lockedvalue.0 + o.value);
                     }
-                    let wallet = self.wallet_keys.contains(&fields.ownerkey);
+                    let wallet = self.wallet_owners.contains(&fields.owner);
                     self.templates.insert(
                         op,
                         TemplateOut::Vault(VaultOut {
@@ -496,7 +546,7 @@ impl MockState {
                     {
                         set.epochused = Amount(set.epochused.0 + o.value);
                     }
-                    let wallet = self.wallet_keys.contains(&fields.ownerkey);
+                    let wallet = self.wallet_owners.contains(&fields.owner);
                     self.templates.insert(
                         op,
                         TemplateOut::Intent(IntentOutput {
@@ -870,12 +920,12 @@ impl MockState {
         let next = self.next_height();
         let mut t = t.clone();
         match &mut t {
-            TemplateOut::Vault(v) => v.wallet = self.wallet_keys.contains(&v.fields.ownerkey),
+            TemplateOut::Vault(v) => v.wallet = self.wallet_owners.contains(&v.fields.owner),
             TemplateOut::Intent(i) => {
                 i.matureheight = i.height + i.fields.delay;
                 i.mature = next >= i.matureheight;
                 i.cancellable = next - i.height < i.fields.delay;
-                i.wallet = self.wallet_keys.contains(&i.fields.ownerkey);
+                i.wallet = self.wallet_owners.contains(&i.fields.owner);
             }
         }
         t
@@ -924,6 +974,7 @@ impl MockState {
             "set_equivocation" => self.set_equivocation(p),
             // ---- vaults
             "vault_lock" => self.vault_lock(p),
+            "vault_getnewowner" => self.vault_getnewowner(p),
             "vault_buildunlock" => self.vault_build_spend(p, false),
             "vault_app" => self.vault_build_spend(p, true),
             "set_signunlock" => self.set_sign(p, 1),
@@ -1056,21 +1107,21 @@ impl MockState {
                         &v.fields.tag,
                         v.fields.setid,
                         v.fields.cancelsetid,
-                        v.fields.ownerkey,
+                        v.fields.owner,
                     ),
                     TemplateOut::Intent(i) => (
                         TemplateKind::Intent,
                         &i.fields.tag,
                         i.fields.setid,
                         i.fields.cancelsetid,
-                        i.fields.ownerkey,
+                        i.fields.owner,
                     ),
                 };
                 f.kind.is_none_or(|x| x == k)
                     && tag.as_ref().is_none_or(|x| x == &tg.0)
                     && f.setid.is_none_or(|x| x == s1 || x == s2)
                     && f.owner.is_none_or(|x| x == owner)
-                    && (f.mine != Some(true) || self.wallet_keys.contains(&owner))
+                    && (f.mine != Some(true) || self.wallet_owners.contains(&owner))
             })
             .map(|t| self.template_view(t))
             .collect();
@@ -1457,8 +1508,27 @@ impl MockState {
         to_json(&txid)
     }
 
+    fn vault_getnewowner(&mut self, p: &[Value]) -> RpcResult {
+        let scheme: Option<u8> = opt_arg(p, 0, "scheme")?;
+        match scheme.unwrap_or(1) {
+            1 => {}
+            2 => return err(-8, "FN-DSA-512 owners need Falcon active at the next block"),
+            s => return err(-8, format!("unknown post-quantum scheme {s}")),
+        }
+        let owner = self.new_wallet_owner();
+        to_json(&NewOwner {
+            scheme: 1,
+            keyhash: HexBytes(owner.hash().to_vec()),
+            owner,
+            address: Self::pq_address(&owner),
+        })
+    }
+
     fn vault_lock(&mut self, p: &[Value]) -> RpcResult {
         self.ensure_active()?;
+        if p.first().is_some_and(|o| o.get("ownerkey").is_some()) {
+            return err(-8, "ownerkey-removed: use owner (pqkeyid)");
+        }
         let o: VaultLockParams = arg(p, 0, "params")?;
         let tag = tag_bytes(&o.tag)?;
         if !(1..=65535).contains(&o.delay) || o.amount.0 <= 0 {
@@ -1468,9 +1538,9 @@ impl MockState {
         if self.set(&o.setid).is_none() || self.set(&cancelsetid).is_none() {
             return err(-5, "setid and cancelsetid must be confirmed sets");
         }
-        let ownerkey = match o.ownerkey {
+        let owner = match o.owner {
             Some(k) => k,
-            None => self.new_wallet_key(),
+            None => self.new_wallet_owner(),
         };
         let fields = VaultFields {
             tagtext: tag_text(&tag),
@@ -1480,7 +1550,8 @@ impl MockState {
             delay: o.delay,
             ownerheight: o.ownerheight,
             appheight: o.appheight.unwrap_or(0),
-            ownerkey,
+            owner,
+            ownerscheme: owner.scheme(),
         };
         let script = mock_vault_script(&fields);
         self.register_script(script.clone(), KnownScript::Vault(fields));
@@ -1501,7 +1572,7 @@ impl MockState {
             vout: 0,
             outpoint: OutPoint::new(txid, 0),
             script: HexBytes(script),
-            ownerkey,
+            owner,
         })
     }
 
@@ -1554,7 +1625,8 @@ impl MockState {
                 setid: v.fields.setid,
                 cancelsetid: v.fields.cancelsetid,
                 delay: v.fields.delay,
-                ownerkey: v.fields.ownerkey,
+                owner: v.fields.owner,
+                ownerscheme: v.fields.ownerscheme,
                 recipienthash,
                 vaulthash: vault_hash,
             };
@@ -1879,9 +1951,9 @@ impl MockState {
             |s: &Self, id: &SetId| s.set(id).is_some_and(|x| s.set_view(x, next).set.released);
         let (selector, lock_time, owner) = match &t {
             TemplateOut::Vault(v) if next > v.fields.ownerheight => {
-                (2u8, v.fields.ownerheight, v.fields.ownerkey)
+                (2u8, v.fields.ownerheight, v.fields.owner)
             }
-            TemplateOut::Vault(v) if released(self, &v.fields.setid) => (3, 0, v.fields.ownerkey),
+            TemplateOut::Vault(v) if released(self, &v.fields.setid) => (3, 0, v.fields.owner),
             TemplateOut::Vault(v) => {
                 return err(
                     -1,
@@ -1891,32 +1963,37 @@ impl MockState {
                     ),
                 );
             }
-            TemplateOut::Intent(i) if released(self, &i.fields.setid) => (3, 0, i.fields.ownerkey),
+            TemplateOut::Intent(i) if released(self, &i.fields.setid) => (3, 0, i.fields.owner),
             TemplateOut::Intent(_) => return err(-1, "the intent's set is not released"),
         };
-        if !self.wallet_keys.contains(&owner) {
-            return err(-4, "the owner key is not in this wallet");
+        if !self.wallet_owners.contains(&owner) {
+            return err(
+                -4,
+                format!("owner {owner} is not a post-quantum key of this wallet"),
+            );
         }
         let value = t.valuezat();
-        if value <= FEE {
-            return err(-8, "the output does not cover the fee");
-        }
-        let mut ss = vec![71];
-        ss.extend([0x30; 71]);
-        ss.push(OP_1 + selector - 1);
-        let tx = Transaction::new_v4(
+        let ss = mock_pq_owner_script_sig(&owner, selector);
+        let mut tx = Transaction::new_v4(
             vec![TxIn {
                 prevout: op,
                 script_sig: ss,
                 sequence: u32::MAX - 1,
             }],
             vec![TxOut {
-                value: value - FEE,
+                value: 0,
                 script_pubkey: dest,
             }],
             lock_time,
             0,
         );
+        // max(VAULT_RPC_FEE, -pqfeerate × size) (quantum plan §4.5)
+        let size = i64::try_from(tx.encode().len()).unwrap_or(i64::MAX);
+        let fee = FEE.max(self.pq_fee_rate.saturating_mul(size) / 1000);
+        if value <= fee {
+            return err(-8, "the output does not cover the fee");
+        }
+        tx.outputs[0].value = value - fee;
         let txid = self.submit(tx.encode())?;
         to_json(&OwnerSpendResult { txid, selector })
     }

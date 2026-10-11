@@ -334,7 +334,8 @@ impl Env {
                 delay: u32::from(DELAY),
                 ownerheight: vp.owner_height,
                 appheight: 0,
-                ownerkey: PubKey(vp.owner_key),
+                owner: hawkeye_ycash::PqKeyId(vp.owner.to_bytes()),
+                ownerscheme: vp.owner.scheme,
             }),
         );
     }
@@ -348,7 +349,7 @@ impl Env {
     ) -> (CoreOutPoint, VaultParams) {
         let (owner, tip) = {
             let mut st = self.mock.state();
-            (st.new_wallet_key(), st.tip_height())
+            (st.new_wallet_owner(), st.tip_height())
         };
         let vp = VaultParams {
             tag: TAG_WYEC,
@@ -357,7 +358,7 @@ impl Env {
             delay: DELAY,
             owner_height: tip + owner_age,
             app_height: 0,
-            owner_key: owner.0,
+            owner: hawkeye_core::PqKeyId::from_bytes(&owner.0).unwrap(),
         };
         let script = vp.script().unwrap();
         self.register_vault(&vp);
@@ -1398,8 +1399,9 @@ async fn i_rolls_valid_and_invalid() {
         owner_height: new.owner_height + 100,
         ..new
     };
+    // the thief's owner: a key hash derived from a member key
     let thief = VaultParams {
-        owner_key: env.key_of_index(0),
+        owner: hawkeye_core::PqKeyId::new(1, env.key_of_index(0)[1..].try_into().unwrap()).unwrap(),
         ..named
     };
     let client = env.mock.client();

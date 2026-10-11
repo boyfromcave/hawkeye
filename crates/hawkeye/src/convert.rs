@@ -2,10 +2,10 @@
 
 use anyhow::{Result, anyhow};
 use hawkeye_core::policy::TxOut as CoreTxOut;
-use hawkeye_core::{IntentParams, OutPoint as CoreOutPoint, VaultParams};
+use hawkeye_core::{IntentParams, OutPoint as CoreOutPoint, PqKeyId as CorePqKeyId, VaultParams};
 use hawkeye_eth::{Address, B256};
 use hawkeye_ycash::types::{IntentFields, VaultFields};
-use hawkeye_ycash::{Hash256, OutPoint as RpcOutPoint};
+use hawkeye_ycash::{Hash256, OutPoint as RpcOutPoint, PqKeyId as RpcPqKeyId};
 
 /// RPC outpoint → core outpoint (both internal order).
 pub fn op_core(o: &RpcOutPoint) -> CoreOutPoint {
@@ -33,6 +33,21 @@ fn tag4(tag: &[u8]) -> Result<[u8; 4]> {
         .map_err(|_| anyhow!("tag is {} bytes, not 4", tag.len()))
 }
 
+/// The node's post-quantum owner (`owner` and `ownerscheme`, which must agree) → core.
+pub fn owner_core(owner: &RpcPqKeyId, ownerscheme: u8) -> Result<CorePqKeyId> {
+    if owner.scheme() != ownerscheme {
+        return Err(anyhow!(
+            "ownerscheme {ownerscheme} is not the scheme of owner {owner}"
+        ));
+    }
+    CorePqKeyId::from_bytes(&owner.0).map_err(|e| anyhow!("owner: {e}"))
+}
+
+/// A core owner → the RPC `pqkeyid`.
+pub fn owner_rpc(owner: &CorePqKeyId) -> RpcPqKeyId {
+    RpcPqKeyId(owner.to_bytes())
+}
+
 /// An intent's fields as the node prints them → core parameters.
 pub fn intent_params(f: &IntentFields) -> Result<IntentParams> {
     Ok(IntentParams {
@@ -42,7 +57,7 @@ pub fn intent_params(f: &IntentFields) -> Result<IntentParams> {
         delay: u16::try_from(f.delay).map_err(|_| anyhow!("delay out of range"))?,
         cancel_set_id: f.cancelsetid.0,
         set_id: f.setid.0,
-        owner_key: f.ownerkey.0,
+        owner: owner_core(&f.owner, f.ownerscheme)?,
     })
 }
 
@@ -55,7 +70,7 @@ pub fn vault_params(f: &VaultFields) -> Result<VaultParams> {
         delay: u16::try_from(f.delay).map_err(|_| anyhow!("delay out of range"))?,
         owner_height: f.ownerheight,
         app_height: f.appheight,
-        owner_key: f.ownerkey.0,
+        owner: owner_core(&f.owner, f.ownerscheme)?,
     })
 }
 

@@ -187,7 +187,11 @@ impl Engine {
                     delay: p.delay,
                     cancel_set_id: p.set_id,
                     set_id: p.set_id,
-                    owner_key: [2; 33],
+                    // a placeholder: classification never reads the owner
+                    owner: hawkeye_core::PqKeyId {
+                        scheme: hawkeye_core::pq::SCHEME_SLH_DSA_SHA2_128S,
+                        hash: [0; 32],
+                    },
                 };
                 let outs: Vec<CoreTxOut> = i
                     .memo

@@ -15,7 +15,9 @@ name: ci
 
 on:
   push:
-    branches: [main, "claude/**"]
+    # main, the vault upgrade line (upgrade/vault, the GitHub default) and the post-quantum line
+    # (upgrade/quantum-vaults: PQ vault owners, rpcversion 7).
+    branches: [main, upgrade/vault, upgrade/quantum-vaults, "claude/**"]
   pull_request:
   workflow_dispatch:
 

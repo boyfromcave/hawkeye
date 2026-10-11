@@ -50,6 +50,10 @@ enum Cmd {
         /// ownerHeight − tip (default MIN_OWNER_AGE + ROLL_MARGIN + 10).
         #[arg(long)]
         owner_age: Option<u32>,
+        /// The vault owner: a post-quantum (SLH-DSA) address or pqkeyid (default: a new
+        /// owner key of the node wallet, `vault_getnewowner`).
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Holder: burn wYEC to a Ycash transparent address.
     Burn {
@@ -167,7 +171,17 @@ async fn main() -> Result<()> {
             amount_pos,
             dest,
             owner_age,
-        } => cli::lock(&s, &need(amount, amount_pos)?, dest, *owner_age).await,
+            owner,
+        } => {
+            cli::lock(
+                &s,
+                &need(amount, amount_pos)?,
+                dest,
+                *owner_age,
+                owner.as_deref(),
+            )
+            .await
+        }
         Cmd::Burn {
             amount,
             amount_pos,

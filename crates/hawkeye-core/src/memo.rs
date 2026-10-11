@@ -303,7 +303,7 @@ mod tests {
             delay: 6,
             owner_height: 100,
             app_height: 0,
-            owner_key: [2; 33],
+            owner: crate::pq::PqKeyId::new(1, [2; 32]).unwrap(),
         };
         let new = VaultParams {
             owner_height: 5000,
@@ -313,9 +313,9 @@ mod tests {
         assert_eq!(m.reference, 5000);
         let d = HawkeyeMemo::decode(&m.encode()).unwrap();
         assert_eq!(d.rolled_vault(&spent).unwrap(), new);
-        // a different spent vault (another owner key) does not rebuild to the same hash
+        // a different spent vault (another owner) does not rebuild to the same hash
         let other = VaultParams {
-            owner_key: [3; 33],
+            owner: crate::pq::PqKeyId::new(1, [3; 32]).unwrap(),
             ..spent
         };
         assert!(d.rolled_vault(&other).is_err());
@@ -417,7 +417,7 @@ mod tests {
             delay: 6,
             owner_height: 100,
             app_height: 0,
-            owner_key: [2; 33],
+            owner: crate::pq::PqKeyId::new(1, [2; 32]).unwrap(),
         };
         let new = VaultParams {
             owner_height: 7000,

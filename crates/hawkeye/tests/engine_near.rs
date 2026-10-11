@@ -255,7 +255,7 @@ impl Env {
     fn lock(&self, value: i64, to: &AccountId) -> CoreOutPoint {
         let (owner, tip) = {
             let mut st = self.mock.state();
-            (st.new_wallet_key(), st.tip_height())
+            (st.new_wallet_owner(), st.tip_height())
         };
         let vp = VaultParams {
             tag: TAG_NYEC,
@@ -264,7 +264,7 @@ impl Env {
             delay: DELAY,
             owner_height: tip + 1000,
             app_height: 0,
-            owner_key: owner.0,
+            owner: hawkeye_core::PqKeyId::from_bytes(&owner.0).unwrap(),
         };
         let script = vp.script().unwrap();
         self.mock.state().register_script(
@@ -277,7 +277,8 @@ impl Env {
                 delay: u32::from(DELAY),
                 ownerheight: vp.owner_height,
                 appheight: 0,
-                ownerkey: PubKey(vp.owner_key),
+                owner: hawkeye_ycash::PqKeyId(vp.owner.to_bytes()),
+                ownerscheme: vp.owner.scheme,
             }),
         );
         let mut st = self.mock.state();

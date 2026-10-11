@@ -36,7 +36,7 @@ async fn bridge(ratelimitbps: u32) -> (MockYcashd, SetId, hawkeye_ycash::OutPoin
             let k = s.new_wallet_key();
             s.add_member(&set, k, true);
         }
-        let owner = s.new_wallet_key();
+        let owner = s.new_wallet_owner();
         let fields = VaultFields {
             tag: HexBytes(b"WYEC".to_vec()),
             tagtext: "WYEC".into(),
@@ -45,7 +45,8 @@ async fn bridge(ratelimitbps: u32) -> (MockYcashd, SetId, hawkeye_ycash::OutPoin
             delay: 6,
             ownerheight: 400,
             appheight: 0,
-            ownerkey: owner,
+            owner,
+            ownerscheme: owner.scheme(),
         };
         let v = s.add_vault(fields, Amount(1_000_000_000));
         s.mine(1);
@@ -454,10 +455,15 @@ async fn owner_and_app_branches() {
             ownerheight: tip,
             appheight: Some(tip + 3),
             amount: "0.30000001".parse().unwrap(),
-            ownerkey: None,
+            owner: None,
         })
         .await
         .unwrap();
+    assert_eq!(
+        lock.owner.scheme(),
+        1,
+        "the default owner is a new SLH-DSA wallet key"
+    );
     c.generate(1).await.unwrap();
     let rows = c
         .vault_list(Some(&VaultListFilter {
@@ -493,12 +499,82 @@ async fn owner_and_app_branches() {
     assert_eq!(app.intents.len(), 1);
     let spent = c.vault_ownerspend(&lock.outpoint, &a).await.unwrap();
     assert_eq!(spent.selector, 2);
+    // the post-quantum owner spend: a 7,939-byte scriptSig, priced max(10,000, rate × size)
+    let raw = c.getrawtransaction(&spent.txid).await.unwrap();
+    let tx = hawkeye_ycash::tx::Transaction::decode(raw.as_slice()).unwrap();
+    assert_eq!(tx.inputs[0].script_sig.len(), 7939);
+    assert_eq!(*tx.inputs[0].script_sig.last().unwrap(), 0x52);
+    assert_eq!(tx.outputs[0].value, 30_000_001 - 10_000);
     let decoded = c.vault_decodescript(&lock.script).await.unwrap();
     assert!(matches!(decoded, DecodedScript::Vault(f) if f.tagtext == "WYEC"));
     assert_eq!(
         c.vault_decodescript(&HexBytes(vec![0x51])).await.unwrap(),
         DecodedScript::None
     );
+}
+
+/// `vault_getnewowner`, a `vault_lock` with an explicit owner (not this wallet's), and the
+/// size-priced owner spend at a raised `-pqfeerate`.
+#[tokio::test]
+async fn pq_owners() {
+    let (m, set, _vault) = bridge(0).await;
+    let c = m.client();
+    let n = c.vault_getnewowner(None).await.unwrap();
+    assert_eq!((n.scheme, n.owner.scheme()), (1, 1));
+    assert_eq!(n.keyhash.as_slice(), n.owner.hash());
+    assert!(c.vault_getnewowner(Some(3)).await.is_err());
+    let tip = c.getblockcount().await.unwrap();
+    let foreign: hawkeye_ycash::PqKeyId = format!("01{}", "77".repeat(32)).parse().unwrap();
+    let mut outs = vec![];
+    for owner in [n.owner, foreign] {
+        let lock = c
+            .vault_lock(&VaultLockParams {
+                tag: "WYEC".into(),
+                setid: set,
+                cancelsetid: None,
+                delay: 6,
+                ownerheight: tip,
+                appheight: None,
+                amount: "1".parse().unwrap(),
+                owner: Some(owner),
+            })
+            .await
+            .unwrap();
+        assert_eq!(lock.owner, owner);
+        outs.push(lock.outpoint);
+    }
+    c.generate(1).await.unwrap();
+    let rows = c
+        .vault_list(Some(&VaultListFilter {
+            owner: Some(foreign),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let v = rows[0].as_vault().unwrap();
+    assert_eq!(
+        (v.fields.owner, v.fields.ownerscheme, v.wallet),
+        (foreign, 1, false)
+    );
+    let a = c.getnewaddress().await.unwrap();
+    assert!(
+        c.vault_ownerspend(&outs[1], &a).await.is_err(),
+        "not this wallet's owner"
+    );
+    m.state().pq_fee_rate = 5_000; // 50× the floor: the size term binds
+    let spent = c.vault_ownerspend(&outs[0], &a).await.unwrap();
+    let raw = c.getrawtransaction(&spent.txid).await.unwrap();
+    let fee = 100_000_000
+        - hawkeye_ycash::tx::Transaction::decode(raw.as_slice())
+            .unwrap()
+            .outputs[0]
+            .value;
+    assert_eq!(
+        fee,
+        5_000 * i64::try_from(raw.as_slice().len()).unwrap() / 1000
+    );
+    assert!(fee > 10_000);
 }
 
 #[tokio::test]

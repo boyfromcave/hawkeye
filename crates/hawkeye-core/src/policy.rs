@@ -13,6 +13,7 @@ use crate::bridge::BridgeKind;
 use crate::bytes::{Hash32, OutPoint};
 use crate::eth::EthAddress;
 use crate::lock::{Destination, lock_id};
+use crate::pq::SCHEME_SLH_DSA_SHA2_128S;
 use crate::script::is_op_return;
 use crate::template::{VaultParams, parse_vault};
 
@@ -118,6 +119,11 @@ pub enum LockRejection {
     /// Rule 1: `appHeight` is not 0.
     #[error("appHeight {0} is not 0")]
     AppHeightSet(u32),
+    /// Rule 1: the owner's post-quantum scheme is not SLH-DSA-SHA2-128s (scheme 1), the one
+    /// owner scheme of bridge vaults (the owner decision of 2026-10-10; a Falcon owner, valid
+    /// once the node activates it, is refused until this policy is widened).
+    #[error("owner scheme {0} is not SLH-DSA-SHA2-128s (1)")]
+    OwnerScheme(u8),
     /// Rule 2: the owner branch opens too soon.
     #[error("ownerHeight {owner_height} − lock height {coin_height} < MIN_OWNER_AGE {min}")]
     OwnerAgeTooShort {
@@ -218,6 +224,9 @@ impl LockPolicy {
         if v.app_height != 0 {
             return Err(LockRejection::AppHeightSet(v.app_height));
         }
+        if v.owner.scheme != SCHEME_SLH_DSA_SHA2_128S {
+            return Err(LockRejection::OwnerScheme(v.owner.scheme));
+        }
         // 2. minimum owner age
         if v.owner_height.saturating_sub(f.coin_height) < self.min_owner_age
             || v.owner_height < f.coin_height
@@ -287,6 +296,7 @@ mod tests {
     use super::*;
     use crate::lock::{destination_script, near_destination_script};
     use crate::near::AccountId;
+    use crate::pq::PqKeyId;
     use crate::script::{op_return_script, p2pkh_script};
     use crate::template::{TAG_NYEC, TAG_WYEC};
 
@@ -312,7 +322,7 @@ mod tests {
             delay: 6,
             owner_height: 1100,
             app_height: 0,
-            owner_key: [2; 33],
+            owner: PqKeyId::new(1, [0x33; 32]).unwrap(),
         }
     }
 
@@ -391,6 +401,13 @@ mod tests {
                 ..vault()
             }),
             R::AppHeightSet(5)
+        );
+        assert_eq!(
+            bad(VaultParams {
+                owner: PqKeyId::new(2, [0x33; 32]).unwrap(),
+                ..vault()
+            }),
+            R::OwnerScheme(2)
         );
         assert!(matches!(
             bad(VaultParams {

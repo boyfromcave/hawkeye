@@ -10,6 +10,17 @@ and the [wYEC contract design](https://github.com/boyfromcave/wyec/blob/main/doc
 (`wyec` @ `cad126a`, §4.5 the optimistic mint). Decisions here are numbered **HK-\***, change requests to other repositories
 **CR-\***, open questions for the owner and the Foundation **Q-\***, and phases **H0–H8**.
 
+**Post-quantum owners (quantum line `upgrade/quantum-vaults`, 2026-10-10).** On the post-quantum
+line every vault's owner is post-quantum, bridge vaults included (the owner's decision; the
+workspace's `yellowback-quantum-spec.md` §1, §4, §6.2): the owner slot of V and I is
+`<ownerHash:32> OP_1|OP_2 OP_CHECKPQSIG` (35 bytes; V 45 tokens, I 32), the owner is a `pqkeyid`
+(`scheme ‖ SHA256(scheme ‖ pk)`) or a 53-character PQ address (`ye…`/`yt…`/`yr…`), and the
+secp256k1 owner shape is not a template. Hawkeye still holds no owner key and no post-quantum
+code: `hawkeye lock` takes the owner from `vault_getnewowner` (or `--owner`), the depositor's node
+signs `vault_ownerspend`, rolls copy the owner slot byte for byte, and the lock policy mints for
+SLH-DSA-SHA2-128s (scheme 1) owners only (§4.1 rule 1). Wherever this plan says "owner key" read
+"post-quantum owner" on that line; member, bond and guardian keys stay secp256k1.
+
 Naming: **Hawkeye** is the software. An **attestor** is a Ycash participant who runs it and holds a
 seat in the bridge's signer set. **wYEC** is the ERC-20 on Ethereum. A **lock** is a `WYEC`-tagged
 vault output on Ycash, a **burn** is a `BurnToYcash` event on Ethereum, an **intent** is the
@@ -98,7 +109,7 @@ on demand).
 
 | Actor | Runs | Holds |
 |---|---|---|
-| Depositor (Ycash user) | a Ycash wallet that can write a `WYEC` lock (Hawkeye's CLI `hawkeye lock` until YecWallet/YEW ship it) | the vault's owner key |
+| Depositor (Ycash user) | a Ycash wallet that can write a `WYEC` lock (Hawkeye's CLI `hawkeye lock` until YecWallet/YEW ship it) | the vault's owner key (post-quantum on the quantum line: the depositor's node wallet holds it) |
 | wYEC holder (Ethereum user) | any Ethereum wallet, or `hawkeye burn` | wYEC |
 | Attestor (one per seat, 5–15 seats) | `hawkeye` + its own `ycashd` + an Ethereum endpoint | one secp256k1 **member key** (Ycash set member, Ethereum guardian address), a YEC bond, fee coins on both chains |
 | Anyone | — | may submit a signed mint, release a matured intent (U-15), submit an equivocation proof |
@@ -225,7 +236,8 @@ in its ledger and publishes the evidence bundle (§5.3).
 ### 3.1 F-1: the owner branch opens at `ownerHeight` even while the bridge is live (HK-6)
 
 The upgrade plan's §4.1 recovery row reads "`height ≥ lockHeight + BRIDGE_MAX_AGE` **and no intent
-names it**", but the template (§15.3, selector 2) is `<ownerHeight> CLTV <ownerKey> CHECKSIG`:
+names it**", but the template (§15.3, selector 2) is `<ownerHeight> CLTV <ownerKey> CHECKSIG`
+(on the quantum line `<ownerHeight> CLTV <ownerHash> <scheme> OP_CHECKPQSIG`, the same rule):
 unconditional, and `vault_bridge.py` tests "owner recovers a lock older than `BRIDGE_MAX_AGE`
 (guardians live)". So a depositor who minted wYEC and sold it can take the YEC back once that
 height passes. The wYEC stays in circulation and is no longer backed.
@@ -336,7 +348,9 @@ reversed (display order) — `hawkeye-core` converts once at the boundary (upgra
 A confirmed output is a mintable lock iff all hold:
 
 1. it parses as a V (§15.3, exact byte shape) with tag `WYEC`, `setId = cancelSetId =` the
-   configured attestor set, `delay =` the configured D, `appHeight = 0`;
+   configured attestor set, `delay =` the configured D, `appHeight = 0`; on the quantum line the
+   V's owner is post-quantum and its scheme is 1, SLH-DSA-SHA2-128s (`OwnerScheme`: a Falcon
+   owner, valid once the node activates scheme 2, is refused until this rule is widened);
 2. `ownerHeight − coinHeight ≥ MIN_OWNER_AGE` (§3.1);
 3. the same transaction has exactly one `OP_RETURN` whose single push is 32 bytes, the first 12 of
    which are zero (an Ethereum address, left-padded), not beginning `0x5956`, and the address is
@@ -375,7 +389,7 @@ ref      8   u64 LE: kind 1 → the burn nonce; kind 2 → the new V's ownerHeig
 data    32   kind 1 → the burn's Ethereum txhash; kind 2 → SHA256(new V scriptPubKey)
 ```
 A roll is checked inside the window from the intent alone: the watcher rebuilds the new V from the
-spent V (same tag, sets, delay, owner key, appHeight 0) with `ownerHeight = ref`, and requires
+spent V (same tag, sets, delay, owner — the owner slot byte for byte —, appHeight 0) with `ownerHeight = ref`, and requires
 `SHA256(new V spk) = data = the intent's recipientHash`, the spent V to match the intent's
 `vaultHash`, and `ref ≥ tip + MIN_OWNER_AGE − ROLL_MARGIN` (revision 1 had `ref = 0` and a parameter
 hash, which a watcher cannot invert before the release reveals the V).
@@ -511,7 +525,7 @@ the index only works for transactions the attestor's own ledger already saw.
 
 **Interfaces only (workspace rule 2).** `ycashd`: `getblockchaininfo`, `getbestblockhash`,
 `getblock`, `getrawtransaction`, `getrawmempool`, `validateaddress`, `importprivkey`, `listunspent`,
-the 21 `set_*`/`vault_*` RPCs. Ethereum: standard JSON-RPC (`eth_getLogs` with `finalized`,
+the 21 `set_*`/`vault_*` RPCs (22 on the quantum line: `vault_getnewowner`, used by `hawkeye lock`). Ethereum: standard JSON-RPC (`eth_getLogs` with `finalized`,
 `eth_call`, `eth_sendRawTransaction`, `eth_chainId`). No `yed_*` call: `WYEC` is not a module tag.
 
 **Config** (`hawkeye.toml`): network; ycashd URL and cookie; Ethereum URL, chain id, bridge and
@@ -629,6 +643,7 @@ from the members' compressed keys.
 | CR-W2 | wyec | **Done** (wyec#1, `cad126a`). Foundry project (replacing `compile.js`), `Deploy.s.sol` with the predicted-address assertion and the mainnet threshold rule | Hawkeye binds the ABI; Sepolia deploy | done (Hawkeye keeps its own `eth/script/Deploy.s.sol`, the same checks plus `mintMode`, and exports the ABI from the pinned build) |
 | CR-W3 | wyec | **Done** (wyec#1, `cad126a`). §4.2's recipient encoding in `burn`'s NatSpec | one definition | done |
 | CR-N1 | ycash-dd, ycash6 | `vault_lock` `"data"` parameter (finding (73)) | wallets write the destination without hand-built transactions | no |
+| CR-N4 | ycash-dd, ycash6 | quantum line: a post-quantum owner through the `vault_*` surface (client survey C-4) | `hawkeye lock` builds the V itself (CR-N1) and may not call `yed_*` | **done** on ycash-dd `q/wallet` (`vault_getnewowner`, Q5); ycash6 to follow |
 | CR-N2 | ycash-dd, ycash6 | `vault_buildunlock` `"data"` parameter (an OP_RETURN output) | the memo without a tx codec in Hawkeye | no |
 | CR-N3 | ycash-dd, ycash6 | cross-set `SET_REMOVE` (finding (26)) | only if the Foundation insists on an open challenger set (§2.1) | no |
 | CR-U1 | workspace | upgrade plan §4.1: the recovery row's "no intent names it" is not what the template does; add the single-attestation row to §4.2; reference this plan from §4.3 and P5 | accuracy (§3.1) | no |

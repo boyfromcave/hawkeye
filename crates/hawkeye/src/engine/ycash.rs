@@ -899,7 +899,11 @@ mod tests {
             delay: p.delay,
             owner_height: 7000,
             app_height: 0,
-            owner_key: [2; 33],
+            // a placeholder: the memo never reads the owner
+            owner: hawkeye_core::PqKeyId {
+                scheme: hawkeye_core::pq::SCHEME_SLH_DSA_SHA2_128S,
+                hash: [0; 32],
+            },
         };
         let out = |m: HawkeyeMemo| CoreTxOut {
             value: 0,
