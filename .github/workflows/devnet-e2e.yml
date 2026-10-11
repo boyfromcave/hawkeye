@@ -1,5 +1,6 @@
 # Hawkeye beside a real node, on both node lines (ycash-dd v4.5.0, ycash6 6.2x): build the node
-# from the line's upgrade/vault branch, start the devnet (regtest nodes + anvil with wYEC + one Hawkeye per attestor) and run `scenario demo`
+# from the line's branch matching this one (upgrade/quantum-vaults -> upgrade/quantum-vaults, else
+# upgrade/vault), start the devnet (regtest nodes + anvil with wYEC + one Hawkeye per attestor) and run `scenario demo`
 # and the optimistic-mint drill `scenario rogue-mint`
 # (lock -> mint, burn -> HKB1 intent -> release, rogue -> cancel -> slash, supply invariant).
 # This is the plan's §9 success criterion as a repeatable job; the mock never counts toward it.
@@ -14,10 +15,10 @@ on:
   workflow_dispatch:
     inputs:
       node_ref:
-        description: node branch, tag or commit to build (both lines)
-        default: upgrade/vault
+        description: node branch, tag or commit to build (both lines; empty = the branch matching this one)
+        default: ""
   push:
-    branches: [main, "claude/**"]
+    branches: [main, upgrade/vault, upgrade/quantum-vaults, "claude/**"]
     paths: ["devnet/**", "crates/**", "eth/**", ".github/workflows/devnet-e2e.yml"]
 
 permissions:
@@ -30,7 +31,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   FOUNDRY_VERSION: v1.7.1
-  NODE_REF: ${{ inputs.node_ref || 'upgrade/vault' }}
+  # The quantum line's Hawkeye needs the PQ-owner node (vault_getnewowner, the PQ owner slot).
+  NODE_REF: ${{ inputs.node_ref || (github.ref_name == 'upgrade/quantum-vaults' && 'upgrade/quantum-vaults') || 'upgrade/vault' }}
 
 jobs:
   demo:
