@@ -30,8 +30,8 @@ NYEC, locks the NR1 destination, burn releases the HKN1 memo. `scenario demo` an
 rogue-mint` run on either bridge; the other drills are Ethereum-only.
 
 Environment:
-  YCASHD, YCASH_CLI   the node binaries, built from ycash-dd `upgrade/vault` (devnet/README.md);
-                      default: `ycashd` / `ycash-cli` on PATH
+  YCASHD, YCASH_CLI   the node binaries, built from `upgrade/quantum-vaults` of ycash-dd or ycash6
+                      (post-quantum vault owners; devnet/README.md); default: `ycashd` / `ycash-cli` on PATH
   DEVNET_NODE_LINE    ycash-dd | ycash6: the node line (its start-up args, the transcript name);
                       default: read from `ycashd -version` (major version >= 6 is ycash6)
   HAWKEYE             the daemon binary (default: <repo>/target/debug/hawkeye)
@@ -798,7 +798,7 @@ class Devnet:
             return self.resume()
         ycashd, cli, hawkeye = self.binaries()
         if not ycashd or not os.access(ycashd, os.X_OK):
-            die("ycashd not found: set YCASHD (devnet/README.md: build ycash-dd upgrade/vault)")
+            die("ycashd not found: set YCASHD (devnet/README.md: build ycash-dd or ycash6 upgrade/quantum-vaults)")
         foreign = self.foreign_choice or os.environ.get("HAWKEYE_DEVNET_FOREIGN") or "ethereum"
         if foreign not in FOREIGNS:
             die("--foreign must be one of %s, not %r" % (", ".join(FOREIGNS), foreign))
@@ -1445,9 +1445,11 @@ format = "text"
             self.say("background miner resumed")
 
     # ================================================================ commands
-    def lock(self, amount, dest=None, owner_age=None):
+    def lock(self, amount, dest=None, owner_age=None, owner=None):
         """node0 locks YEC under the set: a WYEC V + the destination as an ABI bytes32 OP_RETURN (plan §1.2).
-        `owner_age`: ownerHeight - tip (default: the binary's MIN_OWNER_AGE + ROLL_MARGIN + 10)."""
+        `owner_age`: ownerHeight - tip (default: the binary's MIN_OWNER_AGE + ROLL_MARGIN + 10).
+        `owner`: the vault's post-quantum owner, a PQ address (regtest `yr…`) or a 66-hex pqkeyid of
+        scheme 1; default a new SLH-DSA owner of node0's wallet (vault_getnewowner)."""
         self.load()
         dest = dest or self.holder_account()
         dep = self.s["depositor"]["config"]
@@ -1455,8 +1457,10 @@ format = "text"
             die("the hawkeye binary has no `lock`: a NEAR lock (NR1 destination) needs it")
         if self.use_binary("lock") or self.is_near():
             extra = ["--owner-age", str(owner_age)] if owner_age is not None else []
+            if owner:
+                extra += ["--owner", owner]
             out = self.hawkeye(dep, "lock", str(amount), "--dest", dest, *extra).stdout.strip()
-            self.say("hawkeye lock %s --dest %s%s: %s" % (amount, dest, " --owner-age %d" % owner_age if owner_age is not None else "",
+            self.say("hawkeye lock %s --dest %s%s: %s" % (amount, dest, "".join(" " + e for e in extra),
                                                          out.replace("\n", " | ")))
             try:                     # the JSON document: since the PQ owner its 66-hex `owner` precedes `txid`
                 j = json.loads(out.splitlines()[-1])
@@ -1467,16 +1471,21 @@ format = "text"
             m = re.search(r"\b([0-9a-f]{64})(?::(\d+))?", out)
             return {"txid": m.group(1) if m else None, "outpoint": "%s:%s" % (m.group(1), m.group(2) or 0) if m else None,
                     "via": "hawkeye", "output": out}
-        return self.lock_fallback(amount, dest, owner_age)
+        return self.lock_fallback(amount, dest, owner_age, owner=owner)
 
-    def lock_fallback(self, amount, dest, owner_age=None, lock_time=0, sequence=0xFFFFFFFF):
+    def lock_fallback(self, amount, dest, owner_age=None, lock_time=0, sequence=0xFFFFFFFF, owner=None):
         n = self.node(0)
         dest_bytes = bytes.fromhex(dest[2:] if dest.startswith("0x") else dest)
         if len(dest_bytes) == 20:
             dest_bytes = bytes(12) + dest_bytes
         if len(dest_bytes) != 32 or dest_bytes[:12] != bytes(12) or dest_bytes == bytes(32):
             die("destination must be a non-zero 20-byte Ethereum address")
-        owner = bytes.fromhex(n.vault_getnewowner(1)["owner"])  # an SLH-DSA owner of node0's wallet
+        if owner is None:
+            owner = bytes.fromhex(n.vault_getnewowner(1)["owner"])  # an SLH-DSA owner of node0's wallet
+        else:                        # the fallback has no address codec: a pqkeyid only
+            if not re.fullmatch(r"[0-9a-fA-F]{66}", owner):
+                die("the fallback builder takes --owner as a 66-hex pqkeyid (scheme || keyHash)")
+            owner = bytes.fromhex(owner)
         tip = self.tip()
         b = self.bridge()
         owner_height = tip + 1 + (owner_age if owner_age is not None else b["min_owner_age"] + OWNER_AGE_SLACK)
@@ -3233,6 +3242,8 @@ def main():
     p.add_argument("amount")
     p.add_argument("--dest")
     p.add_argument("--owner-age", type=int, help="ownerHeight - tip (default MIN_OWNER_AGE + ROLL_MARGIN + 10)")
+    p.add_argument("--owner", help="the vault's post-quantum owner: a PQ address (yr… on regtest) or a 66-hex pqkeyid, "
+                                   "scheme 1 (default: a new SLH-DSA owner of node0's wallet, vault_getnewowner)")
     p = sub.add_parser("burn", help="the holder burns wYEC to a Ycash t-address (node0's by default)")
     p.add_argument("amount")
     p.add_argument("--recipient")
@@ -3281,7 +3292,7 @@ def main():
         if args.command == "up":
             dv.up(args.attestors, args.activation, args.base_port, args.anvil_port, args.interval, args.block_time)
         elif args.command == "lock":
-            dv.lock(args.amount, args.dest, args.owner_age)
+            dv.lock(args.amount, args.dest, args.owner_age, args.owner)
         elif args.command == "burn":
             dv.burn(args.amount, args.recipient)
         elif args.command == "rogue":

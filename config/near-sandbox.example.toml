@@ -3,6 +3,11 @@
 # one bridge (NEAR plan §0 item 5): an Ethereum Hawkeye and a NEAR Hawkeye beside the same
 # ycashd each have their own config, ledger and signer set (N-2).
 #
+# The node is a ycashd from `upgrade/quantum-vaults` (either line): the NYEC vaults' owners are
+# post-quantum keys of the depositor's own node wallet (`hawkeye lock` draws one with
+# vault_getnewowner, or takes --owner), never configured here and never seen by the contract. The
+# keys in this file, the secp256k1 member key and the ed25519 relayer key, are unchanged (D-Q-5).
+#
 # Relative paths resolve against this file's directory.
 
 [network]

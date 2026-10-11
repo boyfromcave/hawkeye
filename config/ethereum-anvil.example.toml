@@ -1,6 +1,10 @@
 # Hawkeye over the Ethereum bridge (WyecBridge + WrappedYcash, tag WYEC): one attestor of a
 # regtest Ycash set against anvil. `[foreign]` may be left out: Ethereum is the default.
 #
+# The node is a ycashd from `upgrade/quantum-vaults` (either line): vault owners are post-quantum
+# keys of the depositor's own node wallet (`hawkeye lock` draws one with vault_getnewowner, or
+# takes --owner), never configured here. The only key in this file is the secp256k1 member key.
+#
 # Relative paths resolve against this file's directory.
 
 [network]

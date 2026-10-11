@@ -20,7 +20,9 @@ gathered from the peers' APIs); `--challenge-window N` changes the window. Both 
 options.
 
 Each Hawkeye talks only to its own node's RPC and to anvil (AGENTS.md rule 1). The nodes are
-regtest `ycashd` built from `ycash-dd` `upgrade/vault`, the vault upgrade activated with
+regtest `ycashd` built from the **post-quantum line `upgrade/quantum-vaults`** of `ycash-dd` or
+`ycash6` (every vault owner is a post-quantum key: this Hawkeye parses only the PQ owner slot, so an
+`upgrade/vault` node has no vault it recognises), the vault upgrade activated with
 `-nuparams=6d5b7a31:<h>`. The commands mirror `bridge-sim`'s (ycash-dd
 `contrib/yellowback/devnet/bridge-sim`), whose set-up logic this follows: set creation, closed-set
 joins co-signed by the admit key, several funding coins per wallet, the lock transaction.
@@ -30,13 +32,14 @@ The script is Python 3 standard library only. It also needs Foundry (`anvil`, `f
 
 ## Prerequisites
 
-### 1. `ycashd` from `ycash-dd` `upgrade/vault` (built outside this repository)
+### 1. `ycashd` from `upgrade/quantum-vaults` (either line; built outside this repository)
 
 Hawkeye never patches the node. Build it the way CI does
-(`ycash-dd/.github/workflows/yellowback-tests.yml`, job `build`):
+(`ycash-dd/.github/workflows/yellowback-tests.yml`, job `build`; `.github/workflows/devnet-e2e.yml`
+here builds both lines from `upgrade/quantum-vaults`, `node_ref` overrides):
 
 ```sh
-git clone https://github.com/boyfromcave/ycash-dd -b upgrade/vault ycash-build && cd ycash-build
+git clone https://github.com/boyfromcave/ycash-dd -b upgrade/quantum-vaults ycash-build && cd ycash-build
 BUILD_STAGE=depends ./zcutil/build.sh -j3          # depends (about 25 min)
 host=$(./depends/config.guess)
 ./autogen.sh
@@ -100,7 +103,8 @@ export YCASHD=... YCASH_CLI=...          # the node binaries; default: ycashd / 
 devnet/hawkeye-devnet up [--attestors 3] [--dir devnet/run] [--activation 110] [--interval 2] \
                          [--mint-mode optimistic|threshold] [--challenge-window 12]
 devnet/hawkeye-devnet status [--json]
-devnet/hawkeye-devnet lock 10 [--dest 0x<holder>] [--owner-age N]  # node0 → WYEC vault + dest OP_RETURN
+devnet/hawkeye-devnet lock 10 [--dest 0x<holder> | <near account>] [--owner <yr…|pqkeyid>] [--owner-age N]
+                                                        # node0 → WYEC (NYEC) vault + dest OP_RETURN; PQ owner
 devnet/hawkeye-devnet burn 4 [--recipient <node0 t-addr>]
 devnet/hawkeye-devnet rogue 1 [--attestor 1]            # drill D-2: an unlock with no burn
 devnet/hawkeye-devnet rogue-mint 5 [--attestor 1] [--to 0x..]   # drill D-5: a proposal with no lock
@@ -122,7 +126,7 @@ devnet/hawkeye-devnet scenario dormancy|takeover|double|restart|reorg|rogue-mint
 
 ### Both node lines
 
-The same script drives `ycash-dd` (v4.5.0) and `ycash6` (6.2x) `upgrade/vault` nodes. It reads the
+The same script drives `ycash-dd` (v4.5.0) and `ycash6` (6.2x) `upgrade/quantum-vaults` nodes. It reads the
 line from `ycashd -version` (major version 6 or above is `ycash6`), or from `DEVNET_NODE_LINE`,
 records it in `devnet.json`, and passes that line's extra start-up arguments the way its qa harness
 does: none on `ycash-dd`, and `-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025` on
@@ -194,14 +198,18 @@ SIGTERM and SIGKILL on each process group, and fails if anything is left. If `up
 `node0.toml` has the same shape but points at node0, with `api` 127.0.0.1:7800. Its
 `[keys] secret_hex` is the **holder's** Ethereum key. The depositor and the holder are one person
 on two chains, so `hawkeye --config node0.toml lock` and `... burn` both use it. That key is never
-imported into node0's wallet: the lock's owner key is a fresh node0 wallet key (on the quantum
-line a post-quantum SLH-DSA owner from `vault_getnewowner`; node0 signs `recover`'s owner spends).
+imported into node0's wallet: the lock's owner is a **post-quantum** SLH-DSA-SHA2-128s key of
+node0's wallet (`vault_getnewowner`, or the `--owner` the depositor passes: a regtest `yr…` address
+or a 66-hex `pqkeyid`, scheme 1), and node0 signs `recover`'s owner spends (`vault_ownerspend`,
+about 8 KB each). Hawkeye holds no owner key and no post-quantum code; the member keys it does hold
+stay secp256k1 (quantum plan D-Q-5). The same holds on NEAR: `NYEC` vaults have PQ owners, and the
+NEAR side never sees them (NEAR plan, "Post-quantum owners").
 
 ### lock / burn / rogue: the binary first, fallbacks until it has them
 
 | Command | With the binary | Fallback (used while the subcommand is missing, or with `HAWKEYE_DEVNET_FALLBACK=1`) |
 |---|---|---|
-| `lock A [--dest]` | `hawkeye --config node0.toml lock A --dest <addr>` | Builds the WYEC V in Python (the §15.3 template, `ownerHeight = tip+1+min_owner_age+20`) plus the `OP_RETURN` with the ABI `bytes32` destination. Serialises a v4 transaction, then calls `signrawtransaction` and `sendrawtransaction` on node0, and checks the V with `vault_decodescript`. This is bridge-sim's `lock`. |
+| `lock A [--dest] [--owner]` | `hawkeye --config node0.toml lock A --dest <addr> [--owner <PQ address or pqkeyid>]` (its JSON carries `owner`, `owner_address`, `owner_height`, `txid`, `lockid`) | Builds the WYEC V in Python (the §15.3 template with the PQ owner slot `<ownerHash:32> OP_1 OP_CHECKPQSIG`, the owner a new SLH-DSA key of node0's wallet from `vault_getnewowner` or the `--owner` pqkeyid, `ownerHeight = tip+1+min_owner_age+20`) plus the `OP_RETURN` with the ABI `bytes32` destination. Serialises a v4 transaction, then calls `signrawtransaction` and `sendrawtransaction` on node0, and checks the V with `vault_decodescript`. This is bridge-sim's `lock`. Ethereum only: a NEAR lock (`NR1` destination) needs the binary. |
 | `burn A [--recipient]` | `hawkeye --config node0.toml burn A --recipient <t-addr>` | `cast send <bridge> "burn(uint256,bytes32)"` with the holder key and the §4.2 `ycashRecipient` (`01 00 0…0 hash160`). |
 | `rogue A` | `hawkeye --config attestor1.toml rogue-unlock A` (drill D-3: `rogue-unlock --replay-burn <nonce>`, below) | On node1: `vault_buildunlock` to a fresh node1 address, then `set_signunlock` (attestor1's member key alone meets `unlockthreshold 1`), then `vault_send`. No memo. |
 | `rogue-mint A` | `hawkeye --config attestor1.toml rogue-mint A [--to] [--lock-id]`: signs `Mint(lockId, A, to)` for an invented lockId (sign-once drill record), `proposeMint` from its own account | none (needs the binary) |
@@ -310,8 +318,9 @@ devnet/hawkeye-devnet scenario demo --fresh --foreign near         # or HAWKEYE_
 devnet/hawkeye-devnet scenario rogue-mint --fresh --foreign near
 ```
 
-The Ycash half is the same devnet (nodes, set, joins, Hawkeyes); the foreign half is a real
-nearcore sandbox (`near-sandbox` 2.13.4, `NEAR_SANDBOX_BIN` overrides) instead of anvil, on
+The Ycash half is the same devnet (nodes, set, joins, Hawkeyes) on the same post-quantum nodes:
+the `NYEC` vaults have PQ owners (`hawkeye lock --owner` / `vault_getnewowner`, as the `WYEC` ones),
+which the contract never sees; the foreign half is a real nearcore sandbox (`near-sandbox` 2.13.4, `NEAR_SANDBOX_BIN` overrides) instead of anvil, on
 `--near-port` (default 18630; p2p the next port). `up` runs `near-sandbox init --fast` (epoch length
 raised to 100 000 blocks, so no epoch change or garbage collection happens during a run), then, as
 `test.near` (the genesis account, `<run>/near/validator_key.json`) through the `near-admin` helper
@@ -330,7 +339,9 @@ wYEC (attaching the record's storage deposit).
 | `rogue-mint` | `hawkeye rogue-mint 5 --to hawkeye1.test.near`; the challenge is found as Hawkeye finds it (the contract's `EXPERIMENTAL_changes` per block → `EXPERIMENTAL_receipt`), attributed by its relayer account and timed by its block; after `eta`: `proposal_status` None, `is_consumed` false, `is_vetoed` true, `execute_mint` panics `wyec: no such proposal` |
 
 Transcripts are `<scenario>-<date>-<line>-<version>-near.txt`. The other drills are Ethereum-only
-(`scenario <drill> --foreign near` is refused).
+(`scenario <drill> --foreign near` is refused), the dormancy drill's `hawkeye recover` included;
+the command itself works for either tag (`recover` spends every `WYEC` or `NYEC` output the node
+wallet owns, through `vault_ownerspend`).
 
 ## Troubleshooting
 

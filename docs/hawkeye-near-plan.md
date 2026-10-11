@@ -1,9 +1,31 @@
 # Wrapped Ycash on NEAR — the third vault application
 
-**Revision 2, 2026-10-10 (NH5 as built, §4 item 6). Branch `claude/hawkeye-near-wyec` (exploratory: built so the option is
-ready, not a commitment to ship).** Extends the Hawkeye plan of record
+**Revision 3, 2026-10-11 (post-quantum owners, below and §5; revision 2, 2026-10-10: NH5 as built,
+§4 item 6). Branch `claude/hawkeye-near-wyec` (exploratory: built so the option is ready, not a
+commitment to ship).** Extends the Hawkeye plan of record
 ([`hawkeye-bridge-plan.md`](hawkeye-bridge-plan.md), "the main plan") from one foreign chain
 (Ethereum) to two. Decisions are numbered **N-\***, phases **NH0–NH6**, open questions **NQ-\***.
+
+**Post-quantum owners (quantum line `upgrade/quantum-vaults`, merged into this branch 2026-10-11 as
+`e8299e8`).** `NYEC` vaults have post-quantum owners exactly as `WYEC` vaults do (main plan,
+"Post-quantum owners"; the workspace's `yellowback-quantum-spec.md` §1, quantum plan D-Q-1): the
+same V and I templates with the owner slot `<ownerHash:32> OP_1|OP_2 OP_CHECKPQSIG`, the same
+lock-policy rule (SLH-DSA-SHA2-128s, scheme 1, owners only: main plan §4.1 rule 1; a Falcon-owned
+`NYEC` vault is never minted and its owner recovers at `ownerHeight`), the same
+`hawkeye lock --owner <PQ address | pqkeyid>` (without it, a new owner of the depositor's node
+wallet from `vault_getnewowner`), the same `hawkeye recover` through `vault_ownerspend` (the
+depositor's node signs; Hawkeye holds no owner key and no post-quantum code), and a roll copies the
+owner slot byte for byte. **Nothing changes on the NEAR side**: the `wyec-near` contract, the `NR1`
+destination (§2.1), the `HKN1` memo (§2.2) and the N-6 attestation digests are untouched, because
+attestors and bridge guardians stay secp256k1 (quantum plan D-Q-5) and the contract never sees a
+vault owner. `BurnRecord.ycash_recipient` (§2.4) stays the main plan's §4.2 **transparent** P2PKH /
+P2SH recipient (HK-5): a post-quantum `TX_PQPKH` recipient (a plain-YEC `sq…` address, D-Q-20)
+would need a new recipient kind — recorded as **NQ-5**, not implemented. Mainnet PQ Yellowback
+addresses on this line are `yb…` (mainnet version `0x56AB`; testnet `yt…`, regtest `yr…`;
+D-Q-21). **Node requirement:** this branch parses only the post-quantum owner
+shape, so it runs against `upgrade/quantum-vaults` nodes only, on both lines (at the merge:
+ycash-dd `d41026209`, ycash6 `0c6c5fdf2`; an `upgrade/vault` node has no vault template this
+Hawkeye recognises); `devnet-e2e` builds the node from that branch by default (`NODE_REF`).
 
 ## 0. The answer in one page
 
@@ -94,7 +116,8 @@ zatoshi (`decimals = 8`), carried as `u128` (NEP-141 `U128` in JSON).
 #[derive(BorshSerialize)]
 struct BurnRecord { nonce: u64, from: String, amount: u128, ycash_recipient: [u8; 32], block_height: u64, timestamp_ns: u64 }
 ```
-`ycash_recipient` uses the main plan's §4.2 encoding (version, kind, 10 zero bytes, hash160).
+`ycash_recipient` uses the main plan's §4.2 encoding (version, kind, 10 zero bytes, hash160):
+transparent P2PKH or P2SH only, on the post-quantum line too (NQ-5).
 
 ## 3. The `wyec-near` contract
 
@@ -171,6 +194,7 @@ business step, not code.
 | NH3 ✅ | `ForeignChain` trait; Ethereum behind it with no behaviour change (all existing tests and drills still pass) | Ethereum devnet demo PASS on both node lines |
 | NH4 ✅ | `hawkeye-near` adapter + daemon support | engine tests against a NEAR mock RPC |
 | NH5 ✅ | NEAR devnet: real regtest ycashd + NEAR sandbox + Hawkeyes; `scenario demo` and `rogue-mint` (`devnet/hawkeye-devnet --foreign near`); the adapter against a real sandbox (CI `near-adapter-sandbox`) | PASS on both node lines: devnet-e2e run 38041601513 (ycash-dd v4.5.0 and ycash6 6.22.0-rc1 × ethereum and near, all green, transcripts as artifacts `devnet-<line>-<foreign>`); ci run 38039974967 (`near-adapter-sandbox`) |
+| NH5-PQ ✅ | post-quantum vault owners on the NEAR line (merge `e8299e8`, 2026-10-11, "Post-quantum owners" above): the NEAR engine tests and the core memo test build their vaults with a PQ owner (`new_wallet_owner`); `hawkeye lock` takes a kind-aware `--dest` and the PQ `--owner`; the devnet's `--foreign near` runs unchanged on the quantum nodes; no NEAR contract, HKN1 or NR1 change | green on the quantum nodes (ycash-dd `d41026209`, ycash6 `0c6c5fdf2`), both bridges: `ci` run 38153755234 (12 jobs) and `devnet-e2e` run 38153755261 (node × 2, demo line × foreign × 2: `demo` and `rogue-mint` PASS on NEAR and Ethereum on both lines; `hawkeye lock` returned a scheme-1 `owner` and a regtest `yr…` `owner_address` on the real node) |
 | NH6 | testnet trial, audit, Foundation parameters | — |
 
 ## 6. Open questions
@@ -181,3 +205,4 @@ business step, not code.
 | NQ-2 | Contract upgrades on NEAR | none in v1; a successor contract with a threshold-signed migration if ever needed |
 | NQ-3 | Who funds NEAR storage and gas (N-10) | the bridge operators' treasury; ~0.00125 NEAR per new holder. Measured on the 2.13.4 sandbox (gas burnt, transaction + receipts; NH5): threshold mint (k = 2, registering the receiver) 3.40 TGas, `propose_mint` 2.88, `challenge_mint` 2.85, `execute_mint` 2.71, `burn` 2.61, deploy + `new` 24.09 (297 200-byte wasm); Hawkeye attaches 100 TGas per call (`gas_tgas`) and is refunded the rest |
 | NQ-4 | Direct NEAR ↔ Ethereum wYEC routing | out of scope: each bridge is backed by its own vaults; moving between them is burn on one + lock on the other |
+| NQ-5 | A post-quantum burn recipient. `BurnRecord.ycash_recipient` (§2.4, main plan §4.2) encodes a transparent P2PKH / P2SH hash160 only; a `TX_PQPKH` recipient (`scheme ‖ keyHash`, 33 bytes; the plain-YEC `sq…` address of quantum plan D-Q-20) has no kind and does not fit the 30 bytes a `bytes32` leaves | **not in v1.** A holder burns to a transparent address (a PQ wallet holds one; Yellowback's fee payees stay P2PKH on this line, D-Q-5), so nothing is blocked. If ever wanted: a new recipient *version* in a wider field — on NEAR a `burn` variant with a `Vec<u8>` recipient and a `BurnRecord` v2 (a new borsh layout, so a new `record_hash` and HKN1 `data`), on Ethereum a wyec contract change (`burn(uint256, bytes32)` cannot carry it); `hawkeye-core::recipient` gains the `TX_PQPKH` kind and the release pays the 35-byte script. The main plan (its Q-PQ-1, the Ethereum side of the same question) and this plan change first (rule 3); the two bridges should take it together or not at all |
