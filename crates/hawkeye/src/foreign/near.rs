@@ -107,7 +107,8 @@ fn event(e: &NearEvent) -> ForeignEvent {
             nonce: r.nonce,
             from: Account::Near(r.from.clone()),
             amount: r.amount,
-            ycash_recipient: r.ycash_recipient,
+            // the §4.2 revision-2 bytes (22 or 35) as the contract stored them (BurnRecord v2)
+            ycash_recipient: r.ycash_recipient.clone(),
         },
         NearEvent::Minted {
             lock_id,
@@ -514,7 +515,7 @@ impl ForeignChain for NearChain {
         })
     }
 
-    fn burn(&self, amount: u64, ycash_recipient: Hash32) -> BoxFut<'_, Burned> {
+    fn burn(&self, amount: u64, ycash_recipient: Vec<u8>) -> BoxFut<'_, Burned> {
         Box::pin(async move {
             let (o, nonce) = self
                 .client

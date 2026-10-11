@@ -298,9 +298,8 @@ async fn adapter_against_a_real_sandbox() {
         100 * hawkeye_near::tx::TGAS,
     )
     .unwrap();
-    let mut recipient = [0u8; 32];
-    recipient[0] = 1;
-    recipient[12..].copy_from_slice(&[0x77; 20]);
+    // a 35-byte PQPKH recipient (main plan §4.2 revision 2, scheme 1)
+    let recipient: Vec<u8> = [&[0x02u8, 0x02, 0x01][..], &[0x77; 32]].concat();
     let (burned, nonce) = holder.burn(400_000_000, &recipient).await.expect("burn");
     gas("burn", burned.gas_burnt);
     assert_eq!(nonce, 0);
@@ -317,9 +316,9 @@ async fn adapter_against_a_real_sandbox() {
         (
             burns[0].amount,
             burns[0].from.as_str(),
-            burns[0].ycash_recipient
+            burns[0].ycash_recipient.as_slice()
         ),
-        (400_000_000, alice.as_str(), recipient)
+        (400_000_000, alice.as_str(), recipient.as_slice())
     );
     assert_eq!(c.total_supply().await.unwrap(), 1_100_000_000);
 

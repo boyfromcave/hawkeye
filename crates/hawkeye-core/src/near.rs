@@ -159,9 +159,14 @@ impl AsRef<str> for AccountId {
 // Borsh (the subset §2.3 and §2.4 use)
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
-    let len = u32::try_from(s.len()).expect("a string under 4 GiB");
+    put_bytes(out, s.as_bytes());
+}
+
+/// `borsh(v)` for a `Vec<u8>` (and a `String`'s UTF-8): `u32` LE length ‖ bytes.
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    let len = u32::try_from(b.len()).expect("under 4 GiB");
     out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(s.as_bytes());
+    out.extend_from_slice(b);
 }
 
 /// `borsh(s)` for a `String`: `u32` LE byte length ‖ UTF-8 bytes.
@@ -369,7 +374,9 @@ impl BridgeMessage {
 // Burn records (§2.4)
 
 /// One burn as the contract records it (`get_burns`); the `HKN1` burn-release memo's `data` is
-/// [`BurnRecord::hash`].
+/// [`BurnRecord::hash`]. This is **BurnRecord v2** (NEAR plan §2.4, revision 4): the recipient
+/// is a Borsh `Vec<u8>` (`u32` LE length, then the bytes), so a record with a 22-byte recipient
+/// and one with a 35-byte recipient differ in length, and the hash covers the length.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BurnRecord {
     /// The burn nonce (the memo's `ref`).
@@ -378,8 +385,9 @@ pub struct BurnRecord {
     pub from: AccountId,
     /// zatoshi burned.
     pub amount: u128,
-    /// The raw `ycashRecipient` (plan §4.2), kept undecoded: an orphaned burn still hashes.
-    pub ycash_recipient: [u8; 32],
+    /// The raw `ycashRecipient` (main plan §4.2 revision 2: 22 or 35 bytes as the contract
+    /// validated it), kept undecoded here: an orphaned burn still hashes.
+    pub ycash_recipient: Vec<u8>,
     /// The NEAR block height of the burn.
     pub block_height: u64,
     /// The block timestamp in nanoseconds.
@@ -387,13 +395,15 @@ pub struct BurnRecord {
 }
 
 impl BurnRecord {
-    /// `borsh(self)`, fields in declaration order.
+    /// `borsh(self)`, fields in declaration order; the recipient as `u32` LE length ‖ bytes.
     pub fn borsh(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 4 + self.from.as_str().len() + 16 + 32 + 16);
+        let mut out = Vec::with_capacity(
+            8 + 4 + self.from.as_str().len() + 16 + 4 + self.ycash_recipient.len() + 16,
+        );
         out.extend_from_slice(&self.nonce.to_le_bytes());
         put_str(&mut out, self.from.as_str());
         out.extend_from_slice(&self.amount.to_le_bytes());
-        out.extend_from_slice(&self.ycash_recipient);
+        put_bytes(&mut out, &self.ycash_recipient);
         out.extend_from_slice(&self.block_height.to_le_bytes());
         out.extend_from_slice(&self.timestamp_ns.to_le_bytes());
         out
@@ -605,20 +615,44 @@ mod tests {
         );
     }
 
+    /// BurnRecord v2: the recipient is length-prefixed, so the two §4.2 lengths give records of
+    /// different sizes and the hash commits to the length.
     #[test]
     fn burn_record() {
+        for (recipient, len) in [
+            ([&[0x02u8, 0x00][..], &[0xab; 20]].concat(), 22usize),
+            ([&[0x02u8, 0x02, 0x01][..], &[0xab; 32]].concat(), 35),
+        ] {
+            let r = BurnRecord {
+                nonce: 7,
+                from: acct("alice.near"),
+                amount: 1,
+                ycash_recipient: recipient.clone(),
+                block_height: 100,
+                timestamp_ns: 5,
+            };
+            let b = r.borsh();
+            assert_eq!(b.len(), 8 + 4 + 10 + 16 + 4 + len + 8 + 8);
+            assert_eq!(&b[..8], &7u64.to_le_bytes());
+            assert_eq!(&b[8..12], &[10, 0, 0, 0]);
+            assert_eq!(&b[12..22], b"alice.near");
+            assert_eq!(&b[22..38], &1u128.to_le_bytes());
+            assert_eq!(&b[38..42], &(len as u32).to_le_bytes());
+            assert_eq!(&b[42..42 + len], &recipient[..]);
+            assert_eq!(&b[42 + len..50 + len], &100u64.to_le_bytes());
+            assert_eq!(&b[50 + len..], &5u64.to_le_bytes());
+            assert_eq!(r.hash(), sha256(&b));
+        }
+        // an empty recipient still encodes (a zero length), as borsh does
         let r = BurnRecord {
-            nonce: 7,
-            from: acct("alice.near"),
-            amount: 1,
-            ycash_recipient: [0xab; 32],
-            block_height: 100,
-            timestamp_ns: 5,
+            nonce: 0,
+            from: acct("aa"),
+            amount: 0,
+            ycash_recipient: vec![],
+            block_height: 0,
+            timestamp_ns: 0,
         };
-        let b = r.borsh();
-        assert_eq!(b.len(), 8 + 4 + 10 + 16 + 32 + 8 + 8);
-        assert_eq!(&b[..8], &7u64.to_le_bytes());
-        assert_eq!(r.hash(), sha256(&b));
+        assert_eq!(r.borsh().len(), 8 + 4 + 2 + 16 + 4 + 8 + 8);
     }
 
     #[test]

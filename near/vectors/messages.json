@@ -1,5 +1,5 @@
 {
-  "description": "wyec-near golden vectors (docs/hawkeye-near-plan.md §2.3, §2.4). digest = SHA256(preimage), preimage = \"HawkeyeNear-v1\" || borsh(network_id) || borsh(contract_id) || borsh(message); signature = r || s || v (v in {0,1}, low-S, RFC 6979). Guardian secrets are SHA256(\"wyec-near test guardian \" || index). Written by `WYEC_NEAR_WRITE_VECTORS=1 cargo test vectors_file`.",
+  "description": "wyec-near golden vectors (docs/hawkeye-near-plan.md §2.3, §2.4). digest = SHA256(preimage), preimage = \"HawkeyeNear-v1\" || borsh(network_id) || borsh(contract_id) || borsh(message); signature = r || s || v (v in {0,1}, low-S, RFC 6979). Guardian secrets are SHA256(\"wyec-near test guardian \" || index). burn_records are BurnRecord v2 (ycash_recipient a borsh Vec<u8>: the main plan's §4.2 revision-2 recipient, 22 or 35 bytes); record_hash = SHA256(borsh). Written by `WYEC_NEAR_WRITE_VECTORS=1 cargo test vectors_file`.",
   "domain": "HawkeyeNear-v1",
   "guardians": [
     {
@@ -287,24 +287,48 @@
         "nonce": 0,
         "from": "alice.testnet",
         "amount": "50000000",
-        "ycash_recipient": "010000000000000000000000abababababababababababababababababababab",
+        "ycash_recipient": "0200abababababababababababababababababababab",
         "block_height": 187654321,
         "timestamp_ns": "1760000000123456789"
       },
-      "borsh": "00000000000000000d000000616c6963652e746573746e657480f0fa02000000000000000000000000010000000000000000000000ababababababababababababababababababababb1602f0b0000000015cd0bdcacc66c18",
-      "sha256": "00c2f545a83ca75dde17cf013148c4876755f8c68ab670a8aecd38048a71676e"
+      "borsh": "00000000000000000d000000616c6963652e746573746e657480f0fa02000000000000000000000000160000000200ababababababababababababababababababababb1602f0b0000000015cd0bdcacc66c18",
+      "sha256": "5e9495641e741ec6d40d480e50ead6b64530858c0dae952158d9a7972d06d95f"
     },
     {
       "record": {
         "nonce": 7,
         "from": "98793cd91a3f870fb126f66285808c7e094afcfc4eda8a970f6648cdf0dbd6de",
         "amount": "2100000000000000",
-        "ycash_recipient": "0101000000000000000000001111111111111111111111111111111111111111",
+        "ycash_recipient": "02011111111111111111111111111111111111111111",
         "block_height": 1,
         "timestamp_ns": "0"
       },
-      "borsh": "070000000000000040000000393837393363643931613366383730666231323666363632383538303863376530393461666366633465646138613937306636363438636466306462643664650040075af07507000000000000000000010100000000000000000000111111111111111111111111111111111111111101000000000000000000000000000000",
-      "sha256": "f61f483e25b6038f00fe7cb45aafba86cd80b757bd2992a4535c4a10ab7c53f2"
+      "borsh": "070000000000000040000000393837393363643931613366383730666231323666363632383538303863376530393461666366633465646138613937306636363438636466306462643664650040075af07507000000000000000000160000000201111111111111111111111111111111111111111101000000000000000000000000000000",
+      "sha256": "b6e6aacb160a80e9c8d7107d15de98784f1ceda00564fca6147906e59c9128a9"
+    },
+    {
+      "record": {
+        "nonce": 8,
+        "from": "bob.testnet",
+        "amount": "100000000",
+        "ycash_recipient": "020201b72f2db54e38e15dc9ce2d6e46cb316ad9182c4b1da98a6e6056fd76c62a9e4e",
+        "block_height": 187654400,
+        "timestamp_ns": "1760000100000000000"
+      },
+      "borsh": "08000000000000000b000000626f622e746573746e657400e1f50500000000000000000000000023000000020201b72f2db54e38e15dc9ce2d6e46cb316ad9182c4b1da98a6e6056fd76c62a9e4e00612f0b0000000000e8261dc4c66c18",
+      "sha256": "8dd59e5c04989b469809ad1b31919c0ef4e8f4d4e44af2f19cdfc808793eeadc"
+    },
+    {
+      "record": {
+        "nonce": 9,
+        "from": "0x85f17cf997934a597031b2e18a9ab6ebd4b9f6a4",
+        "amount": "1",
+        "ycash_recipient": "020202bc74f5d4bedf2c7f579f247696f726d9546e49dbf42d26400d8a26c16d3acde8",
+        "block_height": 187654401,
+        "timestamp_ns": "1760000101000000000"
+      },
+      "borsh": "09000000000000002a0000003078383566313763663939373933346135393730333162326531386139616236656264346239663661340100000000000000000000000000000023000000020202bc74f5d4bedf2c7f579f247696f726d9546e49dbf42d26400d8a26c16d3acde801612f0b0000000000b2c158c4c66c18",
+      "sha256": "39569247f0bce64328e68534d639ac3d5fec95a3fa1d04c74c67fc8db99bd14c"
     }
   ]
 }

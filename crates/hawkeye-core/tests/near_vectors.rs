@@ -19,7 +19,7 @@ use hawkeye_core::near::{
     sign_digest, validate_account_id,
 };
 use hawkeye_core::script::op_return_script;
-use hawkeye_core::{EthAddress, SecretKey, YcashRecipient};
+use hawkeye_core::{EthAddress, SecretKey};
 use serde_json::{Value, json};
 
 fn path() -> PathBuf {
@@ -126,13 +126,23 @@ fn domains() -> Vec<Domain> {
     .collect()
 }
 
+/// A main-plan §4.2 revision-2 recipient, spelled out byte by byte (independent of
+/// `hawkeye-core::recipient`): `0x02`, kind, then the 20-byte hash160 (kinds 0 and 1) or
+/// `scheme ‖ keyHash` (kind 2).
+fn recipient_v2(kind: u8, body: &[u8]) -> Vec<u8> {
+    [&[0x02, kind][..], body].concat()
+}
+
+/// BurnRecord v2 cases (NEAR plan §2.4): a 22-byte P2PKH, a 22-byte P2SH, a 35-byte PQPKH of
+/// scheme 1 (SLH-DSA-SHA2-128s) and one of scheme 2 (FN-DSA-512) — every shape the contract
+/// accepts; the last two at the field extremes.
 fn burns() -> Vec<BurnRecord> {
     vec![
         BurnRecord {
             nonce: 0,
             from: acct("alice.near"),
             amount: 250_000_000,
-            ycash_recipient: YcashRecipient::p2pkh([0x77; 20]).to_bytes32(),
+            ycash_recipient: recipient_v2(0x00, &[0x77; 20]),
             block_height: 123_456_789,
             timestamp_ns: 1_760_000_000_000_000_000,
         },
@@ -140,16 +150,23 @@ fn burns() -> Vec<BurnRecord> {
             nonce: 1,
             from: acct(IMPLICIT),
             amount: 1,
-            ycash_recipient: YcashRecipient::p2sh([0x01; 20]).to_bytes32(),
+            ycash_recipient: recipient_v2(0x01, &[0x01; 20]),
             block_height: 1,
             timestamp_ns: 0,
         },
         BurnRecord {
-            // an orphaned burn (recipient does not decode) still hashes
+            nonce: 2,
+            from: acct("bob.near"),
+            amount: 100_000_000,
+            ycash_recipient: recipient_v2(0x02, &[&[0x01][..], &sha256(b"pq key 1")].concat()),
+            block_height: 123_456_790,
+            timestamp_ns: 1_760_000_001_000_000_000,
+        },
+        BurnRecord {
             nonce: u64::MAX,
             from: acct(ETH_IMPLICIT),
             amount: u128::from(u64::MAX) + 1,
-            ycash_recipient: [0xff; 32],
+            ycash_recipient: recipient_v2(0x02, &[&[0x02][..], &[0xff; 32]].concat()),
             block_height: u64::MAX,
             timestamp_ns: u64::MAX,
         },
@@ -438,7 +455,7 @@ fn build() -> Value {
             json!({
                 "record": {"nonce": b.nonce.to_string(), "from": b.from.as_str(),
                            "amount": b.amount.to_string(),
-                           "ycashRecipient": hex::encode(b.ycash_recipient),
+                           "ycashRecipient": hex::encode(&b.ycash_recipient),
                            "blockHeight": b.block_height.to_string(),
                            "timestampNs": b.timestamp_ns.to_string()},
                 "borsh": hex::encode(b.borsh()),
@@ -532,12 +549,14 @@ enum RefMessage {
     },
 }
 
+/// The contract's `BurnRecord` v2 (NEAR plan §2.4), as `near-sdk` serialises it: the recipient
+/// a `Vec<u8>` (u32 LE length, then the bytes).
 #[derive(BorshSerialize)]
 struct RefBurnRecord {
     nonce: u64,
     from: String,
     amount: u128,
-    ycash_recipient: [u8; 32],
+    ycash_recipient: Vec<u8>,
     block_height: u64,
     timestamp_ns: u64,
 }
@@ -641,20 +660,45 @@ fn independent_messages_digests_and_signatures() {
 fn independent_burns() {
     use sha2::Digest;
     let v = load();
-    for case in arr(&v["burns"]) {
+    let burns = arr(&v["burns"]);
+    assert_eq!(burns.len(), 4);
+    let mut shapes = std::collections::BTreeSet::new();
+    for case in burns {
         let r = &case["record"];
+        let recipient = h(&r["ycashRecipient"]);
+        // every recipient is a §4.2 revision-2 shape the contract accepts
+        assert_eq!(recipient[0], 0x02);
+        match (recipient[1], recipient.len()) {
+            (0x00 | 0x01, 22) => {}
+            (0x02, 35) => assert!(recipient[2] == 1 || recipient[2] == 2),
+            other => panic!("not a revision-2 recipient: {other:?}"),
+        }
+        shapes.insert((
+            recipient[1],
+            recipient.get(2).copied().filter(|_| recipient[1] == 2),
+        ));
         let rec = RefBurnRecord {
             nonce: dec(&r["nonce"]),
             from: s(&r["from"]),
             amount: dec(&r["amount"]),
-            ycash_recipient: h32(&r["ycashRecipient"]),
+            ycash_recipient: recipient.clone(),
             block_height: dec(&r["blockHeight"]),
             timestamp_ns: dec(&r["timestampNs"]),
         };
         let b = borsh::to_vec(&rec).unwrap();
         assert_eq!(b, h(&case["borsh"]));
+        // the v2 layout: the recipient's u32 LE length sits right after the amount
+        let off = 8 + 4 + s(&r["from"]).len() + 16;
+        assert_eq!(&b[off..off + 4], &(recipient.len() as u32).to_le_bytes());
+        assert_eq!(&b[off + 4..off + 4 + recipient.len()], &recipient[..]);
+        assert_eq!(b.len(), off + 4 + recipient.len() + 16);
         assert_eq!(sha2::Sha256::digest(&b).to_vec(), h(&case["sha256"]));
     }
+    // P2PKH, P2SH, PQPKH scheme 1, PQPKH scheme 2
+    assert_eq!(
+        shapes.into_iter().collect::<Vec<_>>(),
+        vec![(0, None), (1, None), (2, Some(1)), (2, Some(2))]
+    );
 }
 
 #[test]

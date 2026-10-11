@@ -63,11 +63,18 @@ fn lock(n: u8) -> String {
     hex::encode([n; 32])
 }
 
+/// A 22-byte P2PKH recipient (§4.2 revision 2), as hex.
 fn recipient() -> String {
-    let mut r = [0u8; 32];
-    r[0] = 1;
-    r[12..].copy_from_slice(&[0xab; 20]);
-    hex::encode(r)
+    hex::encode(recipient_bytes())
+}
+
+fn recipient_bytes() -> Vec<u8> {
+    [&[0x02u8, 0x00][..], &[0xab; 20]].concat()
+}
+
+/// A 35-byte PQPKH recipient of `scheme`, as hex.
+fn pq_recipient(scheme: u8) -> String {
+    hex::encode([&[0x02u8, 0x02, scheme][..], &[0xcd; 32]].concat())
 }
 
 /// Parsed `EVENT_JSON` logs of the last call.
@@ -1341,7 +1348,7 @@ fn burn_records_events_and_nonces() {
         nonce: 0,
         from: "alice.near".into(),
         amount: 300,
-        ycash_recipient: decode_hex(&recipient()).unwrap(),
+        ycash_recipient: recipient_bytes(),
         block_height: (T0 + 10) / 2,
         timestamp_ns: (T0 + 10) * NS_PER_SEC,
     };
@@ -1424,33 +1431,192 @@ fn burn_one_yocto_is_below_storage_cost() {
     h.c.burn(U128(1), recipient());
 }
 
+/// Every §4.2 revision-2 shape is accepted, stored at its own length and returned as hex of that
+/// length, with `record_hash` over the v2 borsh layout (length-prefixed recipient).
 #[test]
-#[should_panic(expected = "wyec: ycash_recipient must be 32 bytes of hex")]
-fn burn_bad_recipient_rejected() {
+fn burn_accepts_every_recipient_kind() {
+    let mut h = H::new(3, 2);
+    h.mint(1, 100, &alice(), &[0, 1]);
+    let p2sh = hex::encode([&[0x02u8, 0x01][..], &[0x55; 20]].concat());
+    let cases = [recipient(), p2sh, pq_recipient(1), pq_recipient(2)];
+    for (i, r) in cases.iter().enumerate() {
+        h.caller(alice(), h.c.burn_storage_deposit(alice()));
+        assert_eq!(h.c.burn(U128(1), r.to_uppercase()), i as u64);
+        let ev = bridge_events("burn_to_ycash");
+        assert_eq!(ev[0]["ycash_recipient"], *r);
+    }
+    let all = h.c.get_burns(0, 10);
+    assert_eq!(all.len(), 4);
+    for (view, r) in all.iter().zip(&cases) {
+        assert_eq!(view.ycash_recipient, *r);
+        let bytes = hex::decode(r).unwrap();
+        assert_eq!(bytes.len(), if bytes[1] == 0x02 { 35 } else { 22 });
+        let record = BurnRecord {
+            nonce: view.nonce,
+            from: "alice.near".into(),
+            amount: 1,
+            ycash_recipient: bytes.clone(),
+            block_height: T0 / 2,
+            timestamp_ns: T0 * NS_PER_SEC,
+        };
+        let borsh = burn_record_bytes(&record);
+        // v2 layout: the recipient is length-prefixed, right after the amount
+        // (nonce 8 ‖ len 4 ‖ "alice.near" 10 ‖ amount 16)
+        let off = 8 + 4 + 10 + 16;
+        assert_eq!(&borsh[off..off + 4], &(bytes.len() as u32).to_le_bytes());
+        assert_eq!(&borsh[off + 4..off + 4 + bytes.len()], &bytes[..]);
+        let hash: [u8; 32] = Sha256::digest(&borsh).into();
+        assert_eq!(view.record_hash, hex::encode(hash));
+    }
+}
+
+fn burn_with(recipient: &str) {
     let mut h = H::new(3, 2);
     h.mint(1, 10, &alice(), &[0, 1]);
     h.caller(alice(), NearToken::from_near(1));
-    h.c.burn(U128(1), "00".into());
+    h.c.burn(U128(1), recipient.into());
 }
 
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient must be 44 or 70 digits of hex")]
+fn burn_non_hex_recipient_rejected() {
+    burn_with(&"zz".repeat(22));
+}
+
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient must be 44 or 70 digits of hex")]
+fn burn_odd_hex_recipient_rejected() {
+    burn_with(&recipient()[1..]);
+}
+
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient must be 44 or 70 digits of hex")]
+fn burn_overlong_recipient_rejected() {
+    burn_with(&(pq_recipient(1) + "00"));
+}
+
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient must be 22 or 35 bytes")]
+fn burn_short_recipient_rejected() {
+    burn_with("00");
+}
+
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient must be 22 or 35 bytes")]
+fn burn_revision_1_recipient_rejected() {
+    // the retired bytes32 form: 0x01, kind, 10 zero bytes, hash160
+    let mut r = [0u8; 32];
+    r[0] = 1;
+    r[12..].copy_from_slice(&[0xab; 20]);
+    burn_with(&hex::encode(r));
+}
+
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient must be 22 or 35 bytes")]
+fn burn_between_lengths_recipient_rejected() {
+    burn_with(&(recipient() + "00"));
+}
+
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient version must be 2")]
+fn burn_wrong_version_rejected() {
+    burn_with(&format!("01{}", &recipient()[2..]));
+}
+
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient kind must be 0, 1 or 2")]
+fn burn_unknown_kind_rejected() {
+    burn_with(&format!("0203{}", &recipient()[4..]));
+}
+
+#[test]
+#[should_panic(expected = "wyec: a P2PKH or P2SH ycash_recipient must be 22 bytes")]
+fn burn_hash160_kind_with_pqpkh_length_rejected() {
+    burn_with(&format!("0200{}", &pq_recipient(1)[4..]));
+}
+
+#[test]
+#[should_panic(expected = "wyec: a PQPKH ycash_recipient must be 35 bytes")]
+fn burn_pqpkh_kind_with_hash160_length_rejected() {
+    burn_with(&format!("0202{}", &recipient()[4..]));
+}
+
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient scheme must be 1 or 2")]
+fn burn_pqpkh_scheme_zero_rejected() {
+    burn_with(&pq_recipient(0));
+}
+
+#[test]
+#[should_panic(expected = "wyec: ycash_recipient scheme must be 1 or 2")]
+fn burn_pqpkh_scheme_three_rejected() {
+    burn_with(&pq_recipient(3));
+}
+
+/// A rejected recipient burns nothing: the balance and the burn count are untouched (the mocked
+/// runtime keeps state across the panic, unlike a real receipt, so check it explicitly).
+#[test]
+fn burn_rejected_recipient_changes_nothing() {
+    let mut h = H::new(3, 2);
+    h.mint(1, 10, &alice(), &[0, 1]);
+    h.caller(alice(), NearToken::from_near(1));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.c.burn(U128(1), pq_recipient(0));
+    }));
+    assert!(r.is_err());
+    assert_eq!(h.balance(&alice()), 10);
+    assert_eq!(h.c.get_burn_count(), 0);
+}
+
+/// `burn_storage_deposit` prices the record with the longest recipient (35 bytes) for both
+/// account-id lengths; a 22-byte recipient's record is 13 bytes smaller, and the deposit covers
+/// both.
 #[test]
 fn burn_storage_deposit_matches_actual_storage() {
     let mut h = H::new(3, 2);
     let long: AccountId = format!("{}.near", "a".repeat(59)).parse().unwrap();
     for who in [alice(), long] {
         h.mint(who.len() as u8, 10, &who, &[0, 1]);
-        let dep = h.c.burn_storage_deposit(who.clone());
-        h.caller(who.clone(), dep);
-        let before = env::storage_usage();
-        h.c.burn(U128(1), recipient());
-        h.c.burns.flush();
-        let used = env::storage_usage() - before;
-        assert_eq!(used, BURN_RECORD_FIXED_BYTES + who.len() as u64);
-        assert_eq!(
-            h.c.burn_storage_deposit(who.clone()),
-            env::storage_byte_cost().saturating_mul(u128::from(used))
-        );
+        for (r, len) in [
+            (recipient(), 22u64),
+            (pq_recipient(1), 35),
+            (pq_recipient(2), 35),
+        ] {
+            let dep = h.c.burn_storage_deposit(who.clone());
+            h.caller(who.clone(), dep);
+            let before = env::storage_usage();
+            h.c.burn(U128(1), r);
+            h.c.burns.flush();
+            let used = env::storage_usage() - before;
+            assert_eq!(
+                used,
+                BURN_RECORD_FIXED_BYTES + who.len() as u64 - (35 - len)
+            );
+            let actual_cost = env::storage_byte_cost().saturating_mul(u128::from(used));
+            assert!(dep >= actual_cost);
+            if len == 35 {
+                assert_eq!(dep, actual_cost);
+            } else {
+                assert_eq!(
+                    dep,
+                    actual_cost.saturating_add(env::storage_byte_cost().saturating_mul(13))
+                );
+            }
+        }
     }
+}
+
+/// The refund of a burn to a 22-byte recipient is the attached excess over the priced (35-byte)
+/// record: the 13 unused bytes are not refunded separately (they are the price of one deposit
+/// size for every recipient).
+#[test]
+fn burn_short_recipient_refunds_only_the_excess_over_the_price() {
+    let mut h = H::new(3, 2);
+    h.mint(1, 10, &alice(), &[0, 1]);
+    let dep = h.c.burn_storage_deposit(alice());
+    h.caller(alice(), dep);
+    h.c.burn(U128(1), recipient());
+    assert!(near_sdk::test_utils::get_created_receipts().is_empty());
 }
 
 #[test]

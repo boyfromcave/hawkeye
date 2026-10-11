@@ -64,8 +64,30 @@ pub const PANIC_NAMES: &[(&str, &str)] = &[
     ("wyec: bad signature", "BadSignature"),
     ("wyec: signature must be 65 bytes of hex", "BadSignature"),
     ("wyec: lock_id must be 32 bytes of hex", "BadLockId"),
+    // the §4.2 revision-2 recipient checks of `burn` (`near/src/encoding.rs` `validate_recipient`)
     (
-        "wyec: ycash_recipient must be 32 bytes of hex",
+        "wyec: ycash_recipient must be 44 or 70 digits of hex",
+        "BadRecipient",
+    ),
+    (
+        "wyec: ycash_recipient must be 22 or 35 bytes",
+        "BadRecipient",
+    ),
+    ("wyec: ycash_recipient version must be 2", "BadRecipient"),
+    (
+        "wyec: ycash_recipient kind must be 0, 1 or 2",
+        "BadRecipient",
+    ),
+    (
+        "wyec: a P2PKH or P2SH ycash_recipient must be 22 bytes",
+        "BadRecipient",
+    ),
+    (
+        "wyec: a PQPKH ycash_recipient must be 35 bytes",
+        "BadRecipient",
+    ),
+    (
+        "wyec: ycash_recipient scheme must be 1 or 2",
         "BadRecipient",
     ),
     (

@@ -2,9 +2,10 @@
 //! calls at `finality: final` (or at a given block, for the scanner), and the relayer's
 //! function-call transactions.
 //!
-//! The JSON shapes are the contract's: byte strings are hex without `0x` (`lock_id` and
-//! `ycash_recipient` 32 bytes, guardian keys 64, signatures 65), amounts are NEP-141 `U128`
-//! decimal strings, proposal ids and heights JSON numbers, `timestamp_ns` a `U64` string.
+//! The JSON shapes are the contract's: byte strings are hex without `0x` (`lock_id` 32 bytes,
+//! `ycash_recipient` 22 or 35 — the main plan's §4.2 revision-2 recipient, BurnRecord v2 —,
+//! guardian keys 64, signatures 65), amounts are NEP-141 `U128` decimal strings, proposal ids and
+//! heights JSON numbers, `timestamp_ns` a `U64` string.
 //!
 //! **Sending.** Every call is a `TransactionV0` with one `FunctionCall` from the relayer account
 //! ([`KeyFile`]), signed with its ed25519 key, sent with `send_tx` and returned once `FINAL` (so
@@ -259,13 +260,29 @@ fn parse_proposal(v: &Value) -> Result<Proposal> {
     })
 }
 
-/// A `get_burns` row, checked: its `record_hash` must be the SHA-256 of the record's Borsh.
+/// The lengths a `ycash_recipient` the contract stored can have (main plan §4.2 revision 2:
+/// 22 bytes P2PKH / P2SH, 35 bytes PQPKH), as the contract validated them.
+pub const RECIPIENT_LENS: [usize; 2] = [22, 35];
+
+fn hex_recipient(s: &str) -> Result<Vec<u8>> {
+    hex::decode(s)
+        .ok()
+        .filter(|v| RECIPIENT_LENS.contains(&v.len()))
+        .ok_or_else(|| {
+            Error::Decode(format!(
+                "ycash_recipient {s:?} is not 22 or 35 bytes of hex"
+            ))
+        })
+}
+
+/// A `get_burns` row, checked: its `record_hash` must be the SHA-256 of the record's Borsh (the
+/// v2 layout, the recipient length-prefixed), and the recipient one of the contract's lengths.
 pub fn parse_burn(v: &Value) -> Result<BurnRecord> {
     let r = BurnRecord {
         nonce: u64_of(get(v, "nonce")?, "nonce")?,
         from: account(str_of(v, "from")?)?,
         amount: u128_of(get(v, "amount")?, "amount")?,
-        ycash_recipient: hex32(str_of(v, "ycash_recipient")?, "ycash_recipient")?,
+        ycash_recipient: hex_recipient(str_of(v, "ycash_recipient")?)?,
         block_height: u64_of(get(v, "block_height")?, "block_height")?,
         timestamp_ns: u64_of(get(v, "timestamp_ns")?, "timestamp_ns")?,
     };
@@ -659,8 +676,11 @@ impl WyecNear {
     }
 
     /// `burn(amount, ycash_recipient)` from the relayer account, attaching the record's storage
-    /// deposit (`burn_storage_deposit`) → the outcome and the burn nonce.
-    pub async fn burn(&self, amount: u128, ycash_recipient: &Hash32) -> Result<(CallOutcome, u64)> {
+    /// deposit (`burn_storage_deposit`, priced for the longest recipient; the contract refunds the
+    /// excess) → the outcome and the burn nonce. `ycash_recipient` is the main plan's §4.2
+    /// revision-2 recipient (22 or 35 bytes), sent as hex; the contract validates it and panics
+    /// (`BadRecipient`) on anything else.
+    pub async fn burn(&self, amount: u128, ycash_recipient: &[u8]) -> Result<(CallOutcome, u64)> {
         let who = self
             .relayer_account()
             .ok_or_else(|| Error::Key("no relayer key: this client is read-only".into()))?
@@ -1001,21 +1021,38 @@ mod tests {
 
     #[test]
     fn burn_rows_are_hash_checked() {
-        let r = BurnRecord {
-            nonce: 3,
-            from: AccountId::parse("alice.near").unwrap(),
-            amount: 400_000_000,
-            ycash_recipient: [1; 32],
-            block_height: 77,
-            timestamp_ns: 1_700_000_000_000_000_000,
-        };
-        let row = json!({"nonce": 3, "from": "alice.near", "amount": "400000000",
-            "ycash_recipient": hex::encode([1u8; 32]), "block_height": 77,
-            "timestamp_ns": "1700000000000000000", "record_hash": hex::encode(r.hash())});
-        assert_eq!(parse_burn(&row).unwrap(), r);
-        let mut bad = row.clone();
-        bad["amount"] = json!("400000001");
-        assert!(parse_burn(&bad).is_err());
+        // a 22-byte P2PKH and a 35-byte PQPKH recipient (main plan §4.2 revision 2)
+        let p2pkh: Vec<u8> = [&[0x02u8, 0x00][..], &[1; 20]].concat();
+        let pqpkh: Vec<u8> = [&[0x02u8, 0x02, 0x01][..], &[1; 32]].concat();
+        for recipient in [p2pkh, pqpkh] {
+            let r = BurnRecord {
+                nonce: 3,
+                from: AccountId::parse("alice.near").unwrap(),
+                amount: 400_000_000,
+                ycash_recipient: recipient.clone(),
+                block_height: 77,
+                timestamp_ns: 1_700_000_000_000_000_000,
+            };
+            let row = json!({"nonce": 3, "from": "alice.near", "amount": "400000000",
+                "ycash_recipient": hex::encode(&recipient), "block_height": 77,
+                "timestamp_ns": "1700000000000000000", "record_hash": hex::encode(r.hash())});
+            assert_eq!(parse_burn(&row).unwrap(), r);
+            let mut bad = row.clone();
+            bad["amount"] = json!("400000001");
+            assert!(parse_burn(&bad).is_err());
+            // a 35-byte recipient truncated to 22 is another record: its hash does not match
+            if recipient.len() == 35 {
+                let mut bad = row.clone();
+                bad["ycash_recipient"] = json!(hex::encode(&recipient[..22]));
+                assert!(parse_burn(&bad).is_err());
+            }
+        }
+        // a recipient length the contract never stores (the retired 32-byte revision 1)
+        let row = json!({"nonce": 0, "from": "alice.near", "amount": "1",
+            "ycash_recipient": hex::encode([1u8; 32]), "block_height": 1,
+            "timestamp_ns": "0", "record_hash": "00".repeat(32)});
+        let e = parse_burn(&row).unwrap_err().to_string();
+        assert!(e.contains("not 22 or 35 bytes of hex"), "{e}");
     }
 
     #[test]

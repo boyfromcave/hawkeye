@@ -45,8 +45,10 @@ use near_sdk::{
     require,
 };
 
-pub use encoding::{BridgeMessage, BurnRecord, GuardianKey};
-use encoding::{burn_record_bytes, decode_hex, digest_preimage, encode_hex};
+pub use encoding::{BridgeMessage, BurnRecord, GuardianKey, validate_recipient};
+use encoding::{
+    RECIPIENT_LEN_PQPKH, burn_record_bytes, decode_hex, decode_hex_vec, digest_preimage, encode_hex,
+};
 
 /// NEP-297 `standard` of this contract's own events.
 pub const EVENT_STANDARD: &str = "wyec_bridge";
@@ -54,10 +56,12 @@ pub const EVENT_STANDARD: &str = "wyec_bridge";
 pub const EVENT_VERSION: &str = "1.0.0";
 /// Most records `get_burns` returns per call.
 pub const MAX_BURNS_PER_PAGE: u64 = 100;
-/// Storage bytes a [`BurnRecord`] adds, excluding the `from` account id's length: NEAR's 40-byte
-/// per-record overhead, the 5-byte `Vector` key (prefix + u32 index) and the 76 fixed bytes of the
-/// borsh record (8 + 4 + 16 + 32 + 8 + 8).
-pub const BURN_RECORD_FIXED_BYTES: u64 = 40 + 5 + 76;
+/// Storage bytes the largest [`BurnRecord`] adds, excluding the `from` account id's length: NEAR's
+/// 40-byte per-record overhead, the 5-byte `Vector` key (prefix + u32 index) and the 83 bytes of
+/// the borsh record with the longest recipient (8 + 4 + 16 + (4 + 35) + 8 + 8). A record with a
+/// 22-byte recipient is 13 bytes smaller; `burn` prices every record at this size and refunds the
+/// rest of the deposit (N-11).
+pub const BURN_RECORD_FIXED_BYTES: u64 = 40 + 5 + 83;
 
 const NS_PER_SEC: u64 = 1_000_000_000;
 
@@ -119,7 +123,7 @@ pub struct BurnView {
     pub nonce: u64,
     pub from: AccountId,
     pub amount: U128,
-    /// Hex of the 32-byte Ycash recipient.
+    /// Hex of the Ycash recipient, at its actual length (44 or 70 digits: 22 or 35 bytes).
     pub ycash_recipient: String,
     pub block_height: u64,
     pub timestamp_ns: U64,
@@ -367,13 +371,17 @@ impl Contract {
 
     // ---------------------------------------------------------------------------- burn
 
-    /// Burns `amount` of the caller's wYEC for release to `ycash_recipient` on Ycash (hex of 32
-    /// bytes, Hawkeye plan §4.2: `0x01`, kind `0x00` P2PKH / `0x01` P2SH, 10 zero bytes,
-    /// hash160; opaque here). Unconditional for the holder; stopped only by pause.
+    /// Burns `amount` of the caller's wYEC for release to `ycash_recipient` on Ycash: hex of the
+    /// Hawkeye plan §4.2 revision-2 recipient (44 or 70 digits): `0x02`, kind `0x00` P2PKH /
+    /// `0x01` P2SH followed by the 20-byte hash160 (22 bytes), or kind `0x02` PQPKH followed by
+    /// `scheme ‖ keyHash` (scheme `0x01` SLH-DSA-SHA2-128s or `0x02` FN-DSA-512, a 32-byte key
+    /// hash; 35 bytes). Validated exactly as the Ethereum `WyecBridge` validates it
+    /// ([`validate_recipient`]): a malformed recipient would be an unredeemable burn, so the call
+    /// panics instead. Unconditional for the holder otherwise; stopped only by pause.
     ///
     /// Deposit: at least 1 yoctoNEAR (full-access-key confirmation, NEP-141 style) **and** the
-    /// storage cost of the appended record (`burn_storage_deposit`); the excess is refunded.
-    /// Returns the burn nonce.
+    /// storage cost of the appended record (`burn_storage_deposit`, priced for the longest
+    /// recipient); the excess is refunded. Returns the burn nonce.
     #[payable]
     pub fn burn(&mut self, amount: U128, ycash_recipient: String) -> u64 {
         self.assert_not_paused();
@@ -382,8 +390,7 @@ impl Contract {
             !deposit.is_zero(),
             "Requires attached deposit of at least 1 yoctoNEAR"
         );
-        let ycash_recipient: [u8; 32] = decode_hex(&ycash_recipient)
-            .unwrap_or_else(|| env::panic_str("wyec: ycash_recipient must be 32 bytes of hex"));
+        let ycash_recipient = parse_recipient(&ycash_recipient);
         let from = env::predecessor_account_id();
         let cost = burn_storage_cost(&from);
         require!(
@@ -538,7 +545,8 @@ impl Contract {
         u64::from(self.burns.len())
     }
 
-    /// The deposit `burn` needs from `account_id` (the record's storage cost).
+    /// The deposit `burn` needs from `account_id`: the storage cost of a record with the longest
+    /// recipient (35 bytes); a burn to a 22-byte recipient is refunded the 13-byte difference.
     pub fn burn_storage_deposit(&self, account_id: AccountId) -> NearToken {
         burn_storage_cost(&account_id)
     }
@@ -722,6 +730,16 @@ fn parse_lock_id(s: &str) -> [u8; 32] {
     decode_hex(s).unwrap_or_else(|| env::panic_str("wyec: lock_id must be 32 bytes of hex"))
 }
 
+/// The §4.2 revision-2 recipient from its hex, validated; panics with the `wyec: …` reason.
+fn parse_recipient(s: &str) -> Vec<u8> {
+    let r = decode_hex_vec(s, RECIPIENT_LEN_PQPKH)
+        .unwrap_or_else(|| env::panic_str("wyec: ycash_recipient must be 44 or 70 digits of hex"));
+    if let Err(reason) = validate_recipient(&r) {
+        env::panic_str(reason);
+    }
+    r
+}
+
 fn parse_guardians(keys: &[String]) -> Vec<GuardianKey> {
     keys.iter()
         .map(|k| decode_hex(k).unwrap_or_else(|| env::panic_str("wyec: bad guardian key")))
@@ -738,6 +756,7 @@ fn recover(digest: &[u8; 32], sig_hex: &str) -> GuardianKey {
         .unwrap_or_else(|| env::panic_str("wyec: bad signature"))
 }
 
+/// The storage cost of a record from `from` with the longest (35-byte) recipient.
 fn burn_storage_cost(from: &AccountId) -> NearToken {
     env::storage_byte_cost().saturating_mul(u128::from(BURN_RECORD_FIXED_BYTES + from.len() as u64))
 }

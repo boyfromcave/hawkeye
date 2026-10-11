@@ -10,8 +10,10 @@ Ycash consensus never reads NEAR, and this contract never reads Ycash (R2).
 The Ycash side's vault owners are post-quantum (the `upgrade/quantum-vaults` node line: the owner
 slot `<ownerHash:32> OP_1|OP_2 OP_CHECKPQSIG`); this contract is unaffected. It never sees a vault
 owner, its guardians are the attestors' secp256k1 keys and its attestations are `ecrecover`
-signatures, which stay secp256k1 (quantum plan D-Q-5). `burn`'s `ycash_recipient` stays a
-transparent P2PKH / P2SH recipient (NEAR plan NQ-5).
+signatures, which stay secp256k1 (quantum plan D-Q-5). `burn`'s `ycash_recipient` is the main
+plan's §4.2 **revision-2** recipient (NEAR plan §2.4, NQ-5): a transparent P2PKH / P2SH hash160
+(22 bytes) or the node's post-quantum `TX_PQPKH` `scheme ‖ keyHash` (35 bytes, the plain-YEC
+`sq…` address), validated by the contract exactly as the Ethereum `WyecBridge` validates it.
 
 This is a standalone Cargo project (its own `[workspace]`): the Hawkeye workspace does not build it.
 
@@ -24,7 +26,7 @@ This is a standalone Cargo project (its own `[workspace]`): the Hawkeye workspac
 | `propose_mint(lock_id, amount, receiver_id, sig) → proposal_id` | anyone | one guardian's `Mint` signature; `eta = now + challenge_window_sec` |
 | `challenge_mint(lock_id, proposal_id, sig)` | anyone | one guardian's `Challenge` signature; deletes the proposal, vetoes its proposer for that lock; works while paused |
 | `execute_mint(lock_id)` | anyone | after `eta`, proposer still a guardian; rate limit applies |
-| `burn(amount, ycash_recipient) → nonce` | holder | payable: ≥ 1 yocto **and** the record's storage cost (`burn_storage_deposit`), excess refunded |
+| `burn(amount, ycash_recipient) → nonce` | holder | payable: ≥ 1 yocto **and** the record's storage cost (`burn_storage_deposit`), excess refunded; `ycash_recipient` hex of 22 or 35 bytes, validated (below) |
 | `set_guardians(guardians, threshold, sigs)`, `set_paused(paused, sigs)`, `set_mint_limit(mint_cap, cap_window_sec, sigs)` | anyone | threshold of the current set over the message with the shared `admin_nonce` |
 | `ft_transfer`, `ft_transfer_call`, `ft_total_supply`, `ft_balance_of`, `ft_metadata`, `storage_*` | standard | NEP-141 / 145 / 148 (near-contract-standards) |
 | views | anyone | `get_guardians`, `get_threshold`, `get_admin_nonce`, `is_paused`, `is_consumed`, `is_vetoed`, `get_proposal`, `proposal_status`, `get_burns(from_nonce, limit ≤ 100)`, `get_burn_count`, `burn_storage_deposit`, `mint_available`, `mint_digest`, `challenge_digest`, `config`, `contract_source_metadata` |
@@ -37,14 +39,29 @@ key identities: distinctness is one comparison per signature and a duplicated si
 "not strictly ascending". The submitter (Hawkeye) recovers or knows each signer's key and sorts;
 at least `threshold` signatures, more are accepted (each must be a current guardian).
 
-Byte strings in JSON are lowercase-or-uppercase hex without `0x`: `lock_id` and `ycash_recipient`
-32 bytes, guardian keys 64 bytes, signatures 65 bytes `r ‖ s ‖ v` (`v ∈ {0,1}`, low-S). Amounts are
-zatoshi as NEP-141 `U128` strings.
+Byte strings in JSON are lowercase-or-uppercase hex without `0x`: `lock_id` 32 bytes,
+`ycash_recipient` 22 or 35 bytes (44 or 70 digits), guardian keys 64 bytes, signatures 65 bytes
+`r ‖ s ‖ v` (`v ∈ {0,1}`, low-S). Amounts are zatoshi as NEP-141 `U128` strings.
+
+**`ycash_recipient`** (main plan §4.2 revision 2; `encoding::validate_recipient`): byte 0 the
+version `0x02`; byte 1 the kind — `0x00` P2PKH or `0x01` P2SH, followed by the 20-byte hash160
+(22 bytes in all), or `0x02` PQPKH, followed by the post-quantum scheme (`0x01`
+SLH-DSA-SHA2-128s, `0x02` FN-DSA-512) and the 32-byte key hash (35 bytes in all). `burn` refuses
+anything else — another length, version, kind or scheme, a kind with the other kind's length —
+with a `wyec: ycash_recipient …` panic: a burn to a malformed recipient would be unredeemable, so it
+never happens. The contract cannot know whether Falcon (scheme 2) is active on Ycash; it accepts
+scheme 2 and the burner bears a release the node refuses before activation. `get_burns` and the
+`burn_to_ycash` event return the recipient as hex of its actual length. (Revision 1, the 32-byte
+`0x01 ‖ kind ‖ 10 zero bytes ‖ hash160`, is retired and refused.)
 
 **Digest** (plan §2.3): `SHA256("HawkeyeNear-v1" ‖ borsh(network_id) ‖ borsh(contract_id) ‖
-borsh(BridgeMessage))`, `contract_id = env::current_account_id()`. **Burn record** (plan §2.4):
-`get_burns` returns each record with `record_hash = SHA256(borsh(BurnRecord))`, the `HKN1` memo's
-`data`. Golden vectors: [`vectors/messages.json`](vectors/messages.json).
+borsh(BridgeMessage))`, `contract_id = env::current_account_id()`. **Burn record** (plan §2.4,
+**BurnRecord v2**): `struct BurnRecord { nonce: u64, from: String, amount: u128, ycash_recipient:
+Vec<u8>, block_height: u64, timestamp_ns: u64 }` in borsh — the recipient as a `u32` LE length
+then its bytes, so a record is 8 + 4 + |from| + 16 + 4 + (22 | 35) + 8 + 8 bytes; `get_burns`
+returns each record with `record_hash = SHA256(borsh(BurnRecord))`, the `HKN1` memo's `data`.
+Golden vectors: [`vectors/messages.json`](vectors/messages.json) (`burn_records`: a P2PKH, a P2SH,
+a PQPKH scheme 1 and a PQPKH scheme 2 record).
 
 **Events** (NEP-297, `EVENT_JSON:` logs): `nep141` `ft_mint` / `ft_burn` / `ft_transfer`, and
 `{"standard":"wyec_bridge","version":"1.0.0","event":…,"data":[{…}]}` for `minted`,
@@ -58,9 +75,11 @@ calls at that block (`crates/hawkeye-near/src/contract.rs`).
 - **Burn pays for its record.** On NEAR a contract pays for its own storage, so a 1-yocto burn
   that appends a ~130-byte `BurnRecord` would let anyone drain the contract balance with zero-amount
   burns (and then block mints). `burn` therefore requires the record's storage cost
-  (`burn_storage_deposit(account_id)` = (121 + account id length) bytes × storage price, about
-  0.0013–0.0019 NEAR) and refunds any excess; a 0-yocto call still fails with the standard
-  1-yocto message. Zero-amount burns still consume a nonce, as on Ethereum.
+  (`burn_storage_deposit(account_id)` = (128 + account id length) bytes × storage price, about
+  0.0013–0.0019 NEAR — the record with the longest, 35-byte recipient; a 22-byte recipient's
+  record is 13 bytes smaller and is charged the same price) and refunds any excess over that
+  price; a 0-yocto call still fails with the standard 1-yocto message. Zero-amount burns still
+  consume a nonce, as on Ethereum.
 - **No `setBridge`/successor hand-off**: token and bridge are one contract (N-7) with no upgrade
   path in v1 (N-9, NQ-2).
 - **Times are seconds** of `block_timestamp` (`eta_sec`, rate-limit windows
@@ -112,7 +131,8 @@ NEAR_SANDBOX=1 cargo test --test sandbox -- --nocapture   # prints gas burnt per
 key of each fixed secret, every message's Borsh bytes, tag, preimage and digest (computed by the
 contract in the mocked runtime with `current_account_id` set to the vector's contract id), the key
 each signature recovers to through the host's `ecrecover(…, malleability_flag = true)`, and every
-`BurnRecord`'s Borsh bytes and SHA-256 (also through the contract's `record_hash`).
+`BurnRecord`'s recipient (accepted by `validate_recipient`), Borsh bytes and SHA-256 (also through
+the contract's `record_hash`).
 `vectors_file` keeps this contract's own `vectors/messages.json` byte-stable, and
 `vectors_verify_in_the_contract` re-verifies it through the host functions.
 
@@ -153,7 +173,7 @@ near contract call-function as-read-only $C config json-args '{}' network-config
 near contract call-function as-read-only $C get_burns json-args '{"from_nonce":0,"limit":100}' \
   network-config $NET now
 near contract call-function as-transaction $C burn \
-  json-args '{"amount":"100000000","ycash_recipient":"0100…<hash160>"}' \
+  json-args '{"amount":"100000000","ycash_recipient":"0200<hash160: 40 hex digits>"}' \
   prepaid-gas '30 Tgas' attached-deposit '0.01 NEAR' \
   sign-as <holder>.testnet network-config $NET sign-with-keychain send
 ```

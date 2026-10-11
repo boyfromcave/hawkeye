@@ -5,7 +5,7 @@ use hawkeye_core::near::{BridgeMessage, Domain, guardian_key_of, sign_digest};
 use hawkeye_core::{AccountId, SecretKey};
 use hawkeye_near::contract::{DEFAULT_GAS, ProposalStatus};
 use hawkeye_near::mock::{Contract, MockNear, MockState};
-use hawkeye_near::{KeyFile, NearEvent, WyecNear};
+use hawkeye_near::{BlockRef, KeyFile, NearEvent, WyecNear};
 use serde_json::json;
 
 const WINDOW: u64 = 60;
@@ -143,15 +143,30 @@ async fn views_calls_and_the_scanner() {
     assert_eq!(c.balance_of(&alice).await.unwrap(), 1200);
 
     // a burn from the relayer: needs a balance; the deposit is read from the contract
-    let e = c.burn(1, &[1; 32]).await.unwrap_err();
+    let p2pkh: Vec<u8> = [&[0x02u8, 0x00][..], &[1; 20]].concat();
+    let e = c.burn(1, &p2pkh).await.unwrap_err();
     assert!(e.to_string().contains("is not registered"), "{e}");
     {
         let mut st = mock.state();
         st.contract.balances.insert(r.account_id.to_string(), 300);
         st.contract.total_supply += 300;
     }
-    let (b, nonce) = c.burn(200, &[0x77; 32]).await.unwrap();
+    // a malformed recipient (the retired 32-byte revision 1) is refused by the contract
+    let e = c.burn(1, &[0x77; 32]).await.unwrap_err();
+    assert_eq!(e.revert_name(), Some("BadRecipient"), "{e}");
+    let e = c
+        .burn(1, &[&[0x02u8, 0x02, 0x03][..], &[0; 32]].concat())
+        .await
+        .unwrap_err();
+    assert_eq!(e.revert_name(), Some("BadRecipient"), "{e}");
+    assert_eq!(c.burn_count_at(BlockRef::Final).await.unwrap(), 0);
+    // a 35-byte PQPKH recipient (§4.2 revision 2, scheme 1), read back at its length
+    let pqpkh: Vec<u8> = [&[0x02u8, 0x02, 0x01][..], &[0x77; 32]].concat();
+    let (b, nonce) = c.burn(200, &pqpkh).await.unwrap();
     assert_eq!(nonce, 0);
+    let rows = c.burns_at(BlockRef::Final, 0, 1).await.unwrap();
+    assert_eq!(rows[0].ycash_recipient, pqpkh);
+    assert_eq!(rows[0].amount, 200);
     mock.state().skip_heights(3);
     mock.state().produce_blocks(2);
 

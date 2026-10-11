@@ -36,8 +36,11 @@ use crate::tx::{Action, SignedTransaction};
 
 /// `env::storage_byte_cost()`: 10^19 yoctoNEAR per byte.
 pub const STORAGE_BYTE_COST: u128 = 10_000_000_000_000_000_000;
-/// `BURN_RECORD_FIXED_BYTES` of the contract.
-pub const BURN_RECORD_FIXED_BYTES: u128 = 40 + 5 + 76;
+/// `BURN_RECORD_FIXED_BYTES` of the contract: the record with the longest (35-byte) recipient,
+/// 8 + 4 + 16 + (4 + 35) + 8 + 8 = 83 borsh bytes plus NEAR's 40-byte overhead and the 5-byte key.
+pub const BURN_RECORD_FIXED_BYTES: u128 = 40 + 5 + 83;
+/// The longest `ycash_recipient` (`RECIPIENT_LEN_PQPKH` of the contract).
+pub const RECIPIENT_MAX_LEN: usize = 35;
 /// The first block's timestamp: 2026-01-01T00:00:00Z.
 pub const GENESIS_NS: u64 = 1_767_225_600_000_000_000;
 const NS: u64 = 1_000_000_000;
@@ -150,6 +153,45 @@ fn require(c: bool, msg: &str) -> Result<(), String> {
 
 fn lock_arg(a: &Value) -> Result<[u8; 32], String> {
     decode_hex(arg_str(a, "lock_id")?).ok_or_else(|| "wyec: lock_id must be 32 bytes of hex".into())
+}
+
+/// The contract's `validate_recipient` (`near/src/encoding.rs`): the main plan's §4.2 revision-2
+/// recipient, 22 bytes for kinds 0/1, 35 for kind 2 with scheme 1 or 2, version 2 — the same
+/// checks in the same order with the same panic messages.
+pub fn validate_recipient(r: &[u8]) -> Result<(), String> {
+    require(
+        r.len() == 22 || r.len() == 35,
+        "wyec: ycash_recipient must be 22 or 35 bytes",
+    )?;
+    require(r[0] == 0x02, "wyec: ycash_recipient version must be 2")?;
+    match r[1] {
+        0x00 | 0x01 => require(
+            r.len() == 22,
+            "wyec: a P2PKH or P2SH ycash_recipient must be 22 bytes",
+        ),
+        0x02 => {
+            require(
+                r.len() == 35,
+                "wyec: a PQPKH ycash_recipient must be 35 bytes",
+            )?;
+            require(
+                r[2] == 0x01 || r[2] == 0x02,
+                "wyec: ycash_recipient scheme must be 1 or 2",
+            )
+        }
+        _ => Err("wyec: ycash_recipient kind must be 0, 1 or 2".to_owned()),
+    }
+}
+
+/// The contract's `parse_recipient`: hex (either case, no `0x`) of at most 35 bytes, validated.
+fn recipient_arg(a: &Value) -> Result<Vec<u8>, String> {
+    let s = arg_str(a, "ycash_recipient")?;
+    let r = hex::decode(s)
+        .ok()
+        .filter(|r| r.len() <= RECIPIENT_MAX_LEN)
+        .ok_or("wyec: ycash_recipient must be 44 or 70 digits of hex")?;
+    validate_recipient(&r)?;
+    Ok(r)
 }
 
 fn recover(digest: &[u8; 32], sig_hex: &str) -> Result<GuardianKey, String> {
@@ -371,8 +413,7 @@ impl Contract {
                     "Requires attached deposit of at least 1 yoctoNEAR",
                 )?;
                 let amount = arg_u128(a, "amount")?;
-                let ycash_recipient: [u8; 32] = decode_hex(arg_str(a, "ycash_recipient")?)
-                    .ok_or("wyec: ycash_recipient must be 32 bytes of hex")?;
+                let ycash_recipient = recipient_arg(a)?;
                 let from = env.predecessor;
                 let cost = burn_storage_cost(from);
                 require(
@@ -563,15 +604,83 @@ impl Contract {
     }
 }
 
-/// The deposit `burn` needs from `from`.
+/// The deposit `burn` needs from `from`: the record with the longest (35-byte) recipient, as the
+/// contract prices it (a 22-byte recipient's record is 13 bytes smaller; the excess is refunded).
 pub fn burn_storage_cost(from: &str) -> u128 {
     STORAGE_BYTE_COST * (BURN_RECORD_FIXED_BYTES + from.len() as u128)
 }
 
+/// The contract's `BurnView`: the recipient as hex of its actual length.
 fn burn_view(r: &BurnRecord) -> Value {
     json!({"nonce": r.nonce, "from": r.from.as_str(), "amount": r.amount.to_string(),
-           "ycash_recipient": hex::encode(r.ycash_recipient), "block_height": r.block_height,
+           "ycash_recipient": hex::encode(&r.ycash_recipient), "block_height": r.block_height,
            "timestamp_ns": r.timestamp_ns.to_string(), "record_hash": hex::encode(r.hash())})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The model's recipient checks are the contract's (`near/src/encoding.rs`), message for
+    /// message.
+    #[test]
+    fn recipient_validation_matches_the_contract() {
+        let p2pkh: Vec<u8> = [&[0x02u8, 0x00][..], &[0xab; 20]].concat();
+        let p2sh: Vec<u8> = [&[0x02u8, 0x01][..], &[0xab; 20]].concat();
+        let pq = |s: u8| -> Vec<u8> { [&[0x02u8, 0x02, s][..], &[0xcd; 32]].concat() };
+        for ok in [&p2pkh, &p2sh, &pq(1), &pq(2)] {
+            assert_eq!(validate_recipient(ok), Ok(()));
+            assert_eq!(
+                recipient_arg(&json!({"ycash_recipient": hex::encode(ok).to_uppercase()})),
+                Ok(ok.clone())
+            );
+        }
+        let err = |r: &[u8]| validate_recipient(r).unwrap_err();
+        let mut v1 = vec![0u8; 32];
+        v1[0] = 1;
+        assert_eq!(err(&v1), "wyec: ycash_recipient must be 22 or 35 bytes");
+        assert_eq!(
+            err(&p2pkh[..21]),
+            "wyec: ycash_recipient must be 22 or 35 bytes"
+        );
+        assert_eq!(
+            err(&pq(1)[..34]),
+            "wyec: ycash_recipient must be 22 or 35 bytes"
+        );
+        let mut r = p2pkh.clone();
+        r[0] = 1;
+        assert_eq!(err(&r), "wyec: ycash_recipient version must be 2");
+        let mut r = p2pkh.clone();
+        r[1] = 3;
+        assert_eq!(err(&r), "wyec: ycash_recipient kind must be 0, 1 or 2");
+        let mut r = pq(1);
+        r[1] = 0;
+        assert_eq!(
+            err(&r),
+            "wyec: a P2PKH or P2SH ycash_recipient must be 22 bytes"
+        );
+        let mut r = p2pkh.clone();
+        r[1] = 2;
+        assert_eq!(err(&r), "wyec: a PQPKH ycash_recipient must be 35 bytes");
+        assert_eq!(err(&pq(0)), "wyec: ycash_recipient scheme must be 1 or 2");
+        assert_eq!(err(&pq(3)), "wyec: ycash_recipient scheme must be 1 or 2");
+        // hex shape: odd, non-hex and over 35 bytes
+        for bad in ["0", "zz", &"00".repeat(36)] {
+            assert_eq!(
+                recipient_arg(&json!({"ycash_recipient": bad})).unwrap_err(),
+                "wyec: ycash_recipient must be 44 or 70 digits of hex"
+            );
+        }
+        // every message is one the adapter names
+        for m in [
+            err(&v1),
+            err(&r),
+            err(&pq(0)),
+            recipient_arg(&json!({"ycash_recipient": "0"})).unwrap_err(),
+        ] {
+            assert_eq!(crate::error::panic_name(&m), Some("BadRecipient"), "{m}");
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------- chain

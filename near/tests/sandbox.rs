@@ -12,7 +12,7 @@ use near_workspaces::{Account, Contract};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use wyec_near::BridgeMessage;
-use wyec_near::encoding::digest_preimage;
+use wyec_near::encoding::{burn_record_bytes, digest_preimage};
 
 const NETWORK: &str = "sandbox";
 
@@ -227,34 +227,85 @@ async fn sandbox_threshold_mint_burn_and_transfer() -> anyhow::Result<()> {
         (750, 250)
     );
 
-    // Burn + get_burns.
+    // Burn + get_burns: a 35-byte PQPKH recipient (§4.2 revision 2, scheme 1) and a 22-byte
+    // P2PKH one, each read back at its own length with the v2 record hash.
     let dep: u128 = env
         .view("burn_storage_deposit", json!({"account_id": alice.id()}))
         .await?
         .as_str()
         .unwrap()
         .parse()?;
-    let mut recipient = [0u8; 32];
-    recipient[0] = 1;
-    recipient[12..].copy_from_slice(&[0xab; 20]);
+    let pq_recipient: Vec<u8> = [&[0x02u8, 0x02, 0x01][..], &[0xab; 32]].concat();
+    let p2pkh_recipient: Vec<u8> = [&[0x02u8, 0x00][..], &[0x77; 20]].concat();
+    let before = alice.view_account().await?.balance;
     let nonce = env
         .call(
             &alice,
             "burn",
-            json!({"amount": "300", "ycash_recipient": hex::encode(recipient)}),
+            json!({"amount": "300", "ycash_recipient": hex::encode(&pq_recipient)}),
             NearToken::from_yoctonear(dep),
         )
         .await?;
     assert_eq!(nonce, 0);
+    let nonce = env
+        .call(
+            &alice,
+            "burn",
+            json!({"amount": "100", "ycash_recipient": hex::encode(&p2pkh_recipient)}),
+            NearToken::from_millinear(100),
+        )
+        .await?;
+    assert_eq!(nonce, 1);
+    // the second burn attached 0.1 NEAR and was refunded all but the priced record (and gas);
+    // gas refunds of the earlier calls may land after `before` was read, so `spent` can be
+    // negative — what matters is that the 0.1 NEAR did not stay with the contract
+    let after = alice.view_account().await?.balance;
+    let spent = i128::try_from(before.as_yoctonear())? - i128::try_from(after.as_yoctonear())?;
+    assert!(
+        spent < i128::try_from(2 * dep + NearToken::from_millinear(10).as_yoctonear())?,
+        "alice spent {spent} yocto on two burns (deposit {dep} each)"
+    );
     let burns = env
         .view("get_burns", json!({"from_nonce": 0, "limit": 10}))
         .await?;
-    assert_eq!(burns.as_array().unwrap().len(), 1);
+    assert_eq!(burns.as_array().unwrap().len(), 2);
     assert_eq!(burns[0]["from"], alice.id().as_str());
     assert_eq!(burns[0]["amount"], "300");
-    assert_eq!(burns[0]["ycash_recipient"], hex::encode(recipient));
-    assert_eq!(env.view("get_burn_count", json!({})).await?, 1);
-    assert_eq!(env.view("ft_total_supply", json!({})).await?, "700");
+    assert_eq!(burns[0]["ycash_recipient"], hex::encode(&pq_recipient));
+    assert_eq!(burns[1]["ycash_recipient"], hex::encode(&p2pkh_recipient));
+    for (b, r, amount) in [
+        (&burns[0], &pq_recipient, 300u128),
+        (&burns[1], &p2pkh_recipient, 100),
+    ] {
+        let record = wyec_near::BurnRecord {
+            nonce: b["nonce"].as_u64().unwrap(),
+            from: alice.id().to_string(),
+            amount,
+            ycash_recipient: r.clone(),
+            block_height: b["block_height"].as_u64().unwrap(),
+            timestamp_ns: b["timestamp_ns"].as_str().unwrap().parse()?,
+        };
+        let hash: [u8; 32] = Sha256::digest(burn_record_bytes(&record)).into();
+        assert_eq!(b["record_hash"], hex::encode(hash));
+    }
+    assert_eq!(env.view("get_burn_count", json!({})).await?, 2);
+    assert_eq!(env.view("ft_total_supply", json!({})).await?, "600");
+
+    // A malformed recipient is refused by the contract (an unredeemable burn never happens).
+    let res = alice
+        .call(env.contract.id(), "burn")
+        .args_json(json!({"amount": "1", "ycash_recipient": hex::encode(&pq_recipient[..34])}))
+        .deposit(NearToken::from_yoctonear(dep))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(res.is_failure());
+    assert!(
+        format!("{:?}", res.failures()).contains("wyec: ycash_recipient must be 22 or 35 bytes"),
+        "{:?}",
+        res.failures()
+    );
+    assert_eq!(env.balance(&alice).await?, 350);
     Ok(())
 }
 

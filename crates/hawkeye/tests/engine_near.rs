@@ -452,7 +452,7 @@ async fn mint_then_burn(
     drive_mint(env, engines, &op).await;
     let c = env.client(&env.holder);
     let r = YcashRecipient::p2pkh([0x77; 20]);
-    let (_, nonce) = c.burn(400_000_000, &r.to_bytes32()).await.unwrap();
+    let (_, nonce) = c.burn(400_000_000, &r.to_bytes()).await.unwrap();
     let rec = env.near.state().contract.burns[nonce as usize].clone();
     env.near_blocks(2);
     (nonce, rec)
@@ -808,7 +808,7 @@ async fn s_scanner_crosses_skipped_heights() {
     env.near.state().skip_heights(5);
     let c = env.client(&env.holder);
     let r = YcashRecipient::p2pkh([0x55; 20]);
-    let (_, nonce) = c.burn(100_000_000, &r.to_bytes32()).await.unwrap();
+    let (_, nonce) = c.burn(100_000_000, &r.to_bytes()).await.unwrap();
     env.near.state().skip_heights(3);
     env.near_blocks(1);
     near_rounds(&env, &mut engines, 2).await;

@@ -15,12 +15,14 @@ fn lock_id(n: u8) -> [u8; 32] {
     sha(&[b"wyec-near vector lock ".as_slice(), &[n]].concat())
 }
 
-fn p2pkh(hash160: [u8; 20]) -> [u8; 32] {
-    let mut r = [0u8; 32];
-    r[0] = 0x01;
-    r[1] = 0x00;
-    r[12..].copy_from_slice(&hash160);
-    r
+/// A §4.2 revision-2 P2PKH (kind 0) or P2SH (kind 1) recipient: 22 bytes.
+fn hash160_recipient(kind: u8, hash160: [u8; 20]) -> Vec<u8> {
+    [&[0x02, kind][..], &hash160].concat()
+}
+
+/// A §4.2 revision-2 PQPKH recipient (kind 2) of `scheme`: 35 bytes.
+fn pqpkh_recipient(scheme: u8, key_hash: [u8; 32]) -> Vec<u8> {
+    [&[0x02, 0x02, scheme][..], &key_hash].concat()
 }
 
 fn msg_json(m: &BridgeMessage) -> Value {
@@ -162,13 +164,16 @@ pub(crate) fn cases(
     ]
 }
 
+/// BurnRecord v2 cases: a 22-byte P2PKH, a 22-byte P2SH, and 35-byte PQPKH recipients of scheme
+/// 1 (SLH-DSA-SHA2-128s) and scheme 2 (FN-DSA-512). Every recipient passes
+/// [`crate::validate_recipient`].
 pub(crate) fn burn_cases() -> Vec<BurnRecord> {
-    vec![
+    let cases = vec![
         BurnRecord {
             nonce: 0,
             from: "alice.testnet".into(),
             amount: 50_000_000,
-            ycash_recipient: p2pkh([0xab; 20]),
+            ycash_recipient: hash160_recipient(0x00, [0xab; 20]),
             block_height: 187_654_321,
             timestamp_ns: 1_760_000_000_123_456_789,
         },
@@ -176,15 +181,31 @@ pub(crate) fn burn_cases() -> Vec<BurnRecord> {
             nonce: 7,
             from: "98793cd91a3f870fb126f66285808c7e094afcfc4eda8a970f6648cdf0dbd6de".into(),
             amount: 2_100_000_000_000_000,
-            ycash_recipient: {
-                let mut r = p2pkh([0x11; 20]);
-                r[1] = 0x01; // P2SH
-                r
-            },
+            ycash_recipient: hash160_recipient(0x01, [0x11; 20]),
             block_height: 1,
             timestamp_ns: 0,
         },
-    ]
+        BurnRecord {
+            nonce: 8,
+            from: "bob.testnet".into(),
+            amount: 100_000_000,
+            ycash_recipient: pqpkh_recipient(0x01, sha(b"wyec-near vector pq key 1")),
+            block_height: 187_654_400,
+            timestamp_ns: 1_760_000_100_000_000_000,
+        },
+        BurnRecord {
+            nonce: 9,
+            from: "0x85f17cf997934a597031b2e18a9ab6ebd4b9f6a4".into(),
+            amount: 1,
+            ycash_recipient: pqpkh_recipient(0x02, sha(b"wyec-near vector pq key 2")),
+            block_height: 187_654_401,
+            timestamp_ns: 1_760_000_101_000_000_000,
+        },
+    ];
+    for c in &cases {
+        crate::validate_recipient(&c.ycash_recipient).expect("a valid vector recipient");
+    }
+    cases
 }
 
 pub(crate) fn build() -> Value {
@@ -227,7 +248,7 @@ pub(crate) fn build() -> Value {
             json!({
                 "record": {
                     "nonce": r.nonce, "from": r.from, "amount": r.amount.to_string(),
-                    "ycash_recipient": hex::encode(r.ycash_recipient),
+                    "ycash_recipient": hex::encode(&r.ycash_recipient),
                     "block_height": r.block_height, "timestamp_ns": r.timestamp_ns.to_string(),
                 },
                 "borsh": hex::encode(&b),
@@ -236,7 +257,7 @@ pub(crate) fn build() -> Value {
         })
         .collect();
     json!({
-        "description": "wyec-near golden vectors (docs/hawkeye-near-plan.md §2.3, §2.4). digest = SHA256(preimage), preimage = \"HawkeyeNear-v1\" || borsh(network_id) || borsh(contract_id) || borsh(message); signature = r || s || v (v in {0,1}, low-S, RFC 6979). Guardian secrets are SHA256(\"wyec-near test guardian \" || index). Written by `WYEC_NEAR_WRITE_VECTORS=1 cargo test vectors_file`.",
+        "description": "wyec-near golden vectors (docs/hawkeye-near-plan.md §2.3, §2.4). digest = SHA256(preimage), preimage = \"HawkeyeNear-v1\" || borsh(network_id) || borsh(contract_id) || borsh(message); signature = r || s || v (v in {0,1}, low-S, RFC 6979). Guardian secrets are SHA256(\"wyec-near test guardian \" || index). burn_records are BurnRecord v2 (ycash_recipient a borsh Vec<u8>: the main plan's §4.2 revision-2 recipient, 22 or 35 bytes); record_hash = SHA256(borsh). Written by `WYEC_NEAR_WRITE_VECTORS=1 cargo test vectors_file`.",
         "domain": "HawkeyeNear-v1",
         "guardians": guardians,
         "messages": messages,
@@ -389,10 +410,13 @@ pub(crate) fn check_hawkeye_core() -> usize {
             nonce: dec(&r["nonce"]),
             from: r["from"].as_str().unwrap().into(),
             amount: dec(&r["amount"]),
-            ycash_recipient: arr(&r["ycashRecipient"]),
+            ycash_recipient: h(&r["ycashRecipient"]),
             block_height: dec(&r["blockHeight"]),
             timestamp_ns: dec(&r["timestampNs"]),
         };
+        // hawkeye-core's burns are all recipients this contract would have accepted
+        crate::validate_recipient(&record.ycash_recipient)
+            .unwrap_or_else(|e| panic!("burns[{i}] recipient: {e}"));
         let bytes = burn_record_bytes(&record);
         assert_eq!(
             hex::encode(&bytes),

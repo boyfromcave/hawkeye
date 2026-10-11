@@ -107,7 +107,7 @@ order. Top-level keys:
 | `deployments[]` | `{networkId, contractId, chainId, chainIdLe, bridge}`: `chainId` = `SHA256("near:" ‖ networkId)[0..8]` as u64 LE (`chainIdLe` the 8 bytes), `bridge` = `SHA256(contractId)[0..20]` (§2.2) |
 | `memos[]` | `{bridgeKind, kind, chainId, bridge, ref, data, payload, script}`: `HKN1` burn releases (`data` = a `burns[].sha256`) and a roll, and `HKB1` burn release and roll for contrast; `payload` is the 73 bytes, `script` is `6a 49 ‖ payload` |
 | `messages[]` | `{domain: {networkId, contractId}, message, tag, borsh, preimage, digest, signatures[]}` for every `BridgeMessage` variant (§2.3); `preimage` = `"HawkeyeNear-v1" ‖ borsh(networkId) ‖ borsh(contractId) ‖ borsh`, `digest` = `SHA256(preimage)`; `signatures[]` = `{key, signature, guardian}`, one per `keys[]` entry: 65 bytes `r ‖ s ‖ v`, RFC 6979, low S, `v ∈ {0, 1}`, and the guardian id it recovers to under `env::ecrecover(digest, r‖s, v, true)` |
-| `burns[]` | `{record, borsh, sha256}`: a `BurnRecord` (§2.4; `ycashRecipient` the raw 32 bytes, one of them deliberately undecodable), its Borsh bytes and `SHA256` |
+| `burns[]` | `{record, borsh, sha256}`: a **BurnRecord v2** (§2.4; `ycashRecipient` the raw main-plan §4.2 revision-2 bytes, 22 — P2PKH, P2SH — or 35 — PQPKH scheme 1, PQPKH scheme 2 —, Borsh-encoded as a `Vec<u8>`: `u32` LE length then the bytes), its Borsh bytes and `SHA256`; the four records cover every shape the contract accepts, the last two at the field extremes |
 
 `message` objects by `type` (field names are the JSON spellings of the contract's):
 
