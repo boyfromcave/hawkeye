@@ -15,7 +15,7 @@ starts `hawkeye run` beside each attestor's own node. Each Hawkeye talks only to
 The commands mirror bridge-sim's (ycash-dd contrib/yellowback/devnet/bridge-sim) so the two can be
 compared: up | lock | burn | rogue | rogue-mint | silence | unsilence | mine | pause | resume | status |
 logs | cli | down | clean | scenario demo | roll | dormancy | takeover | double | restart | reorg |
-rogue-mint.  Python 3 standard library only; Foundry (anvil, forge, cast) on PATH.
+rogue-mint | pq-recipient.  Python 3 standard library only; Foundry (anvil, forge, cast) on PATH.
 
 The bridge (wyec @ the pin in eth/tools/fetch-wyec.sh) is deployed with threshold 2 and a 12 s
 challenge window, and the attestors run mint_mode = optimistic (the Foundation's model: one attestor
@@ -26,8 +26,13 @@ runs the k-of-n mint instead (k = 2), `--challenge-window N` changes the window.
 NEAR sandbox node replaces anvil, the wyec-near wasm (near/) is deployed to wyec.test.near with the
 members' 64-byte NEAR guardian keys, threshold 2 and the same window, every attestor gets its own
 relayer account (hawkeye<i>.test.near) and the holder is alice.test.near; the vaults carry the tag
-NYEC, locks the NR1 destination, burn releases the HKN1 memo. `scenario demo` and `scenario
-rogue-mint` run on either bridge; the other drills are Ethereum-only.
+NYEC, locks the NR1 destination, burn releases the HKN1 memo. `scenario demo`, `scenario
+rogue-mint` and `scenario pq-recipient` run on either bridge; the other drills are Ethereum-only.
+
+`scenario pq-recipient` (plan §9.1 R5, NEAR plan NH-R5) burns to a plain-YEC post-quantum address
+(`getnewaddress "" "pq"`, rq… on regtest): the 35-byte §4.2 revision-2 recipient, the intent's
+recipienthash = SHA256 of the TX_PQPKH script, a release the node wallet lists and spends with its
+SLH-DSA key; the PQ owner form (yr…) is refused as a recipient.
 
 Environment:
   YCASHD, YCASH_CLI   the node binaries, built from `upgrade/quantum-vaults` of ycash-dd or ycash6
@@ -221,19 +226,46 @@ def wif_regtest(secret32):
     return b58check_encode(b"\xef" + secret32 + b"\x01")
 
 
-REGTEST_P2PKH, REGTEST_P2SH = b"\x1c\x95", b"\x1c\x2a"   # plan §4.2
+# Address versions (Base58Check, 2 bytes), plan §4.2: transparent P2PKH / P2SH (ycash-dd src/chainparams.cpp), the
+# plain-YEC post-quantum address sq…/tq…/rq… (D-Q-20, src/key_io.cpp PlainPQAddressVersion) and the PQ *owner*
+# address yb…/yt…/yr… (quantum spec §4; doc/yellowback-rpc.md `pqAddressVersion`), which is not a recipient.
+P2PKH_VERSIONS = {b"\x1c\x28": "mainnet", b"\x1c\x95": "testnet/regtest"}
+P2SH_VERSIONS = {b"\x1c\x2c": "mainnet", b"\x1c\x2a": "testnet/regtest"}
+PQ_PLAIN_VERSIONS = {b"\x4d\xd9": "mainnet", b"\x4f\x61": "testnet", b"\x4c\x51": "regtest"}
+PQ_OWNER_VERSIONS = {b"\x56\xab": "mainnet", b"\x57\x1e": "testnet", b"\x57\x10": "regtest"}
+REGTEST_P2PKH, REGTEST_P2SH, REGTEST_PQ_PLAIN = b"\x1c\x95", b"\x1c\x2a", b"\x4c\x51"
+PQ_SCHEMES = {1: "SLH-DSA-SHA2-128s", 2: "FN-DSA-512"}
+RECIPIENT_VERSION = 2
+RECIPIENT_P2PKH, RECIPIENT_P2SH, RECIPIENT_PQPKH = 0, 1, 2
 
 
-def ycash_recipient32(address):
-    """Plan §4.2: version 0x01, kind (0 P2PKH | 1 P2SH), 10 zero bytes, hash160."""
+def ycash_recipient(address):
+    """Plan §4.2 revision 2, the Python mirror of hawkeye-core::recipient + address: `02 ‖ kind ‖ hash160`
+    (22 bytes) for a transparent s1…/t… address (kind 0 P2PKH, 1 P2SH), `02 ‖ 02 ‖ scheme ‖ keyHash` (35 bytes)
+    for a plain-YEC post-quantum address sq…/tq…/rq… (kind 2 PQPKH, scheme 1 or 2). The PQ owner address
+    yb…/yt…/yr… is refused: owner keys are vault owners, not holder addresses."""
     payload = b58check_decode(address)
-    if len(payload) != 22:
-        die("%s is not a transparent address" % address)
-    prefix, h160 = payload[:2], payload[2:]
-    kind = {REGTEST_P2PKH: 0, REGTEST_P2SH: 1}.get(prefix)
-    if kind is None:
-        die("%s is not a regtest t-address" % address)
-    return bytes([1, kind]) + bytes(10) + h160
+    version, body = payload[:2], payload[2:]
+    if len(payload) == 22 and version in P2PKH_VERSIONS:
+        return bytes([RECIPIENT_VERSION, RECIPIENT_P2PKH]) + body
+    if len(payload) == 22 and version in P2SH_VERSIONS:
+        return bytes([RECIPIENT_VERSION, RECIPIENT_P2SH]) + body
+    if len(payload) == 35 and version in PQ_PLAIN_VERSIONS:
+        if body[0] not in PQ_SCHEMES:
+            die("%s names an unknown post-quantum scheme %d" % (address, body[0]))
+        return bytes([RECIPIENT_VERSION, RECIPIENT_PQPKH]) + body
+    if len(payload) == 35 and version in PQ_OWNER_VERSIONS:
+        die("%s is a post-quantum owner address (yb…/yt…/yr…), not a burn recipient: pass the key's plain-YEC "
+            "sq…/tq…/rq… form" % address)
+    die("%s is not a transparent or plain-YEC post-quantum address" % address)
+
+
+def decode_pq_plain_address(address):
+    """(scheme, keyHash) of a plain-YEC post-quantum address sq…/tq…/rq… (53 characters)."""
+    payload = b58check_decode(address)
+    if len(payload) != 35 or payload[:2] not in PQ_PLAIN_VERSIONS:
+        die("%s is not a plain-YEC post-quantum address" % address)
+    return payload[2], payload[3:]
 
 
 # script
@@ -286,6 +318,28 @@ def owner_slot(owner):
     if len(owner) != 33 or owner[0] not in (1, 2):
         die("not a post-quantum owner id: %s" % owner.hex())
     return push(owner[1:]) + push_int(owner[0]) + bytes([OP_CHECKPQSIG])
+
+
+def pqpkh_script(scheme, key_hash32):
+    """The node's TX_PQPKH (35 bytes): `20 <keyHash:32> OP_1|OP_2 OP_CHECKPQSIG` — the scheme as a script
+    number, never the data push `01 01` (quantum spec F-1; ycash-dd src/script/standard.cpp GetScriptForPQKey).
+    The same bytes as a vault's PQ owner slot."""
+    return owner_slot(bytes([scheme]) + key_hash32)
+
+
+def recipient_script(field):
+    """The scriptPubKey a §4.2 revision-2 recipient field names (hawkeye-core::recipient script()):
+    P2PKH, P2SH or TX_PQPKH; recipientHash = SHA256 of it."""
+    if len(field) not in (22, 35) or field[0] != RECIPIENT_VERSION:
+        die("not a revision-2 recipient: %s" % field.hex())
+    kind, body = field[1], field[2:]
+    if kind == RECIPIENT_P2PKH and len(body) == 20:
+        return bytes([OP_DUP, 0xa9]) + push(body) + bytes([OP_EQUALVERIFY, OP_CHECKSIG])
+    if kind == RECIPIENT_P2SH and len(body) == 20:
+        return bytes([0xa9]) + push(body) + bytes([OP_EQUAL])
+    if kind == RECIPIENT_PQPKH and len(body) == 33 and body[0] in PQ_SCHEMES:
+        return pqpkh_script(body[0], body[1:])
+    die("not a revision-2 recipient: %s" % field.hex())
 
 
 def vault_script(tag, set_id, cancel_set_id, delay, owner_height, app_height, owner):
@@ -1526,7 +1580,8 @@ format = "text"
         return {"txid": txid, "outpoint": "%s:0" % txid, "via": "fallback", "ownerheight": owner_height, "hex": signed["hex"]}
 
     def burn(self, amount, recipient=None):
-        """The holder burns wYEC to a Ycash t-address (plan §4.2 recipient encoding)."""
+        """The holder burns wYEC to a Ycash address: a transparent t-address or a plain-YEC post-quantum
+        rq… address (plan §4.2 revision 2: a 22- or 35-byte ycashRecipient)."""
         self.load()
         recipient = recipient or self.node(0).getnewaddress()
         dep = self.s["depositor"]["config"]
@@ -1536,15 +1591,18 @@ format = "text"
             out = self.hawkeye(dep, "burn", str(amount), "--recipient", recipient).stdout.strip()
             self.say("hawkeye burn %s --recipient %s: %s" % (amount, recipient, out.replace("\n", " | ")))
             return {"recipient": recipient, "via": "hawkeye", "output": out}
-        r32 = "0x" + ycash_recipient32(recipient).hex()
+        field = ycash_recipient(recipient)
+        rhex = "0x" + field.hex()
         out = self.cast("send", "--rpc-url", self.anvil_url(), "--private-key", "0x" + self.s["holder"]["secret_hex"],
-                        "--json", self.s["eth"]["bridge"], "burn(uint256,bytes32)", str(zat(amount)), r32, timeout=120)
+                        "--json", self.s["eth"]["bridge"], "burn(uint256,bytes)", str(zat(amount)), rhex, timeout=120)
         receipt = json.loads(out)
         if receipt.get("status") not in ("0x1", 1, "1"):
             die("burn reverted: %s" % out[:500])
-        self.say("burned %s wYEC (fallback: cast send burn) to %s (ycashRecipient %s): tx %s, block %s"
-                 % (amount, recipient, r32, receipt.get("transactionHash"), int(receipt.get("blockNumber"), 16)))
-        return {"recipient": recipient, "via": "fallback", "tx": receipt.get("transactionHash")}
+        self.say("burned %s wYEC (fallback: cast send burn) to %s (ycashRecipient %s, %d bytes): tx %s, block %s"
+                 % (amount, recipient, rhex, len(field), receipt.get("transactionHash"), int(receipt.get("blockNumber"), 16)))
+        return {"recipient": recipient, "via": "fallback", "tx": receipt.get("transactionHash"),
+                "output": json.dumps({"txhash": receipt.get("transactionHash"), "recipient": rhex,
+                                      "recipienthash": sha256(recipient_script(field)).hex()})}
 
     def rogue(self, amount, attestor=1):
         """A member signs an unlock with no burn behind it (drill D-2)."""
@@ -3189,6 +3247,237 @@ format = "text"
         return ("Ycash reorg before C_Y: ledger rewound, no mint, single mint after re-confirmation; Ethereum reorg "
                 "below finality: no ledger row, no intent; the reused nonce released once")
 
+    # ================================================================ plan §9.1 R5: a post-quantum burn recipient
+    SLH_DSA_SCRIPTSIG = 7938      # bytes: the TX_PQPKH scriptSig of an SLH-DSA-SHA2-128s spend (quantum spec §2.1)
+
+    def burn_log_recipient(self, nonce, from_block):
+        """The recipient the bridge recorded for burn `nonce`, read from the chain itself: Ethereum, the
+        `BurnToYcash(nonce, from, amount, ycashRecipient)` log's ABI-encoded `bytes`; NEAR, `get_burns`.
+        Returns (amount_zat, recipient bytes, where, the HKN1 memo's data on NEAR = record_hash, else None)."""
+        if self.is_near():
+            rec = self.near_view("get_burns", {"from_nonce": nonce, "limit": 1})[0]
+            if rec["nonce"] != nonce:
+                die("get_burns(%d) returned burn %s" % (nonce, rec["nonce"]))
+            return int(rec["amount"]), bytes.fromhex(rec["ycash_recipient"]), "NEAR burn record %d from %s, block %s (record_hash %s)" % (
+                nonce, rec["from"], rec["block_height"], rec["record_hash"]), rec["record_hash"]
+        out = self.cast("logs", "--rpc-url", self.anvil_url(), "--from-block", str(from_block), "--address",
+                        self.s["eth"]["bridge"], "--json", "BurnToYcash(uint256,address,uint256,bytes)", str(nonce))
+        logs = [l for l in json.loads(out or "[]") if int(l["topics"][1], 16) == nonce]
+        if len(logs) != 1:
+            die("%d BurnToYcash logs for nonce %d" % (len(logs), nonce))
+        data = bytes.fromhex(logs[0]["data"][2:])
+        amount = int.from_bytes(data[:32], "big")
+        off = int.from_bytes(data[32:64], "big")
+        length = int.from_bytes(data[off:off + 32], "big")
+        return amount, data[off + 32:off + 32 + length], "BurnToYcash log in block %d (from %s, %d data bytes)" % (
+            int(logs[0]["blockNumber"], 16), "0x" + logs[0]["topics"][2][-40:], len(data)), None
+
+    def drill_pq_recipient(self, timeout):
+        """Plan §9.1 R5 (NEAR plan NH-R5): a burn to a plain-YEC post-quantum address. node0 draws
+        `getnewaddress "" "pq"` (an rq… address, D-Q-20), `hawkeye burn` encodes it as the 35-byte revision-2
+        recipient `02 02 ‖ scheme ‖ keyHash`, the bridge records those bytes, the intent commits
+        SHA256(`20 <keyHash> 51 c2`), the release pays that TX_PQPKH output, node0's wallet sees it and spends
+        it with its post-quantum key (the ~8 KB SLH-DSA scriptSig, priced at max(DEFAULT_FEE, -pqfeerate x size));
+        the PQ owner form (yr…) is refused as a recipient. Hawkeye holds no post-quantum key or code throughout."""
+        n0 = self.node(0)
+        set_id = self.s["set"]["setid"]
+        dep = self.s["depositor"]["config"]
+        chain_id, bridge_id = self.memo_deployment()
+        magic = "HKN1" if self.is_near() else "HKB1"
+        if not self.hawkeye_has("burn"):
+            die("the hawkeye binary has no `burn`: the drill burns to an rq… address through it")
+
+        self.step("lock 10 YEC on node0 to the holder %s (a %s vault with a post-quantum owner); wait for the mint"
+                  % (self.holder_account(), self.tag()))
+        lk = self.lock_mint("10", 10 * COIN, timeout)
+        self.report_mint_path()
+        owner_address = None
+        try:
+            owner_address = json.loads(lk["output"].splitlines()[-1]).get("owner_address")
+        except (KeyError, ValueError, TypeError, IndexError):
+            pass
+        if not owner_address:
+            owner_address = n0.vault_getnewowner(1)["address"]
+
+        self.step('node0 draws a plain-YEC post-quantum address: getnewaddress "" "pq" (rq…, D-Q-20) and validateaddress')
+        rq = n0.getnewaddress("", "pq")
+        v = n0.validateaddress(rq)
+        scheme, key_hash = decode_pq_plain_address(rq)
+        spk = bytes.fromhex(v["scriptPubKey"])
+        self.say("  %s (%d characters, version %s, scheme %d %s, keyHash %s)" % (rq, len(rq), b58check_decode(rq)[:2].hex(),
+                                                                               scheme, PQ_SCHEMES.get(scheme), key_hash.hex()))
+        self.say("  validateaddress: isvalid %s, ismine %s, pqscheme %s, pqkeyhash %s.., scriptPubKey %s (%d bytes)"
+                 % (v.get("isvalid"), v.get("ismine"), v.get("pqscheme"), str(v.get("pqkeyhash"))[:16], spk.hex(), len(spk)))
+        if not rq.startswith("rq") or len(rq) != 53 or b58check_decode(rq)[:2] != REGTEST_PQ_PLAIN:
+            die("%s is not a regtest plain-YEC PQ address" % rq)
+        if scheme != 1:
+            die("getnewaddress \"\" \"pq\" drew a scheme-%d key; Falcon is not active on this regtest, so scheme 1 was expected" % scheme)
+        if spk != pqpkh_script(1, key_hash) or len(spk) != 35 or spk[0] != 0x20 or spk[33:] != bytes([OP_1, OP_CHECKPQSIG]):
+            die("the scriptPubKey of %s is %s, not TX_PQPKH `20 <keyHash> 51 c2`" % (rq, spk.hex()))
+        if not v.get("ismine") or v.get("pqscheme") != 1 or v.get("pqkeyhash") != key_hash.hex():
+            die("validateaddress does not report node0's PQ key: %s" % jdump(v))
+        field = ycash_recipient(rq)
+        rhash = sha256(spk).hex()
+        if recipient_script(field) != spk or len(field) != 35 or field[:3] != bytes([2, 2, 1]):
+            die("the Python recipient codec disagrees with the node: field %s, script %s" % (field.hex(), spk.hex()))
+        self.say("  ycashRecipient (plan §4.2 revision 2, kind 2 PQPKH): 0x%s (%d bytes); recipientHash SHA256(script) %s"
+                 % (field.hex(), len(field), rhash))
+
+        self.step("hawkeye burn 4 --recipient %s (node0.toml, the holder); the bridge records the 35-byte recipient" % rq)
+        nonce = self.burn_nonce()
+        from_h = self.tip()
+        from_block = None if self.is_near() else int(self.cast("block-number", "--rpc-url", self.anvil_url()))
+        balance_before = Decimal(n0.getbalance())
+        b = self.burn("4", rq)
+        try:
+            out = json.loads(b["output"].splitlines()[-1])
+        except (ValueError, IndexError, KeyError):
+            die("hawkeye burn printed no JSON: %s" % b.get("output"))
+        if out.get("nonce") not in (None, nonce):
+            die("the burn got nonce %s, expected %d" % (out.get("nonce"), nonce))
+        if out.get("recipient", "").lower() != "0x" + field.hex() or out.get("recipienthash") != rhash \
+                or (out.get("recipient_kind") not in (None, "pqpkh")):
+            die("hawkeye burn's recipient %s / %s / %s is not the 35-byte PQPKH form 0x%s / %s"
+                % (out.get("recipient"), out.get("recipient_kind"), out.get("recipienthash"), field.hex(), rhash))
+        amount, recorded, where, record_hash = self.burn_log_recipient(nonce, from_block or 0)
+        self.say("  %s: amount %d zat, ycashRecipient 0x%s (%d bytes)" % (where, amount, recorded.hex(), len(recorded)))
+        if amount != 4 * COIN or recorded != field:
+            die("the bridge recorded %s for burn %d, not 0x%s" % (recorded.hex(), nonce, field.hex()))
+
+        self.step("negative: the PQ owner address %s.. (yr…, the vault owner form) is refused as a recipient" % owner_address[:12])
+        p = self.hawkeye(dep, "burn", "1", "--recipient", owner_address, check=False)
+        err = (p.stderr.strip() or p.stdout.strip()).splitlines()
+        self.say("  hawkeye burn 1 --recipient %s: exit %d: %s" % (owner_address, p.returncode, (err or ["?"])[-1][:200]))
+        if p.returncode == 0 or "not a recipient" not in (p.stdout + p.stderr):
+            die("a PQ owner address was accepted as a burn recipient (exit %d)" % p.returncode)
+        if self.burn_nonce() != nonce + 1:
+            die("the refused burn consumed a nonce (%d, expected %d)" % (self.burn_nonce(), nonce + 1))
+        self.say("  no nonce consumed (burn count %d)" % (nonce + 1))
+
+        self.step("wait for the intent carrying the %s memo of burn %d; its recipienthash = SHA256(the TX_PQPKH script)" % (magic, nonce))
+        it = self.wait_burn_intent(nonce, from_h, timeout)
+        memo = it["memo"]
+        if memo["magic"] != magic or memo["chainid"] != chain_id or memo["bridge"].lower() != bridge_id.lower():
+            die("memo names another deployment: %s (expected %s chainId %d bridge %s)" % (memo, magic, chain_id, bridge_id))
+        expected_data = record_hash if self.is_near() else out["txhash"][2:].lower()
+        if memo["data"] != expected_data:
+            die("the memo's data %s is not the burn's %s %s" % (memo["data"], "record_hash" if self.is_near() else "tx", expected_data))
+        row = self.wait_for("intent %s confirmed (vault_list)" % it["outpoint"],
+                            lambda: next((r for r in self.intents() if r["outpoint"] == it["outpoint"]), None), timeout)
+        dec = n0.vault_decodescript(row["script"])
+        self.say("  intent %s: %s YEC, recipienthash %s (vault_list) / %s (vault_decodescript), matures at %s; memo %s chainId %d bridge %s nonce %d"
+                 % (row["outpoint"], row["value"], row["recipienthash"], dec.get("recipienthash"), row["matureheight"],
+                    memo["magic"], memo["chainid"], memo["bridge"], memo["ref"]))
+        if row["recipienthash"] != rhash or dec.get("recipienthash") != rhash or row["valuezat"] != 4 * COIN:
+            die("the intent commits %s / %s YEC, not SHA256(%s) = %s / 4" % (row["recipienthash"], row["value"], spk.hex(), rhash))
+        for a in self.s["attestors"]:
+            code, bv = self.api(a, "burns/%d" % nonce)
+            if code == 200:
+                self.say("  attestor%d GET /burns/%d: state %s, recipient %s (%d bytes), recipient_address %s"
+                         % (a["index"], nonce, bv["state"], bv["recipient"], (len(bv["recipient"]) - 2) // 2, bv.get("recipient_address")))
+                if bv["recipient"].lower() != "0x" + field.hex() or bv.get("recipient_address") != rq:
+                    die("attestor%d's ledger holds recipient %s / %s" % (a["index"], bv["recipient"], bv.get("recipient_address")))
+
+        self.step("wait for the release: a TX_PQPKH output of 4 YEC paying %s.., seen by node0's wallet" % spk.hex()[:20])
+
+        def released():
+            sp = self.spender_of(it["outpoint"], it["height"] or from_h)
+            if not sp:
+                return None
+            t, tx = sp
+            types = [n0.vault_decodescript(o["scriptPubKey"]["hex"]).get("type") for o in tx["vout"]]
+            if "vault" in types or "intent" in types:
+                die("the intent %s was spent by %s, which is not a release (outputs %s)" % (it["outpoint"], t, types))
+            outs = [o for o in tx["vout"] if o["scriptPubKey"]["hex"] == spk.hex()]
+            if len(outs) != 1 or zat(outs[0]["value"]) != 4 * COIN:
+                die("the release %s pays %s to the PQ script, not one output of 4 YEC" % (t, [str(o["value"]) for o in outs]))
+            return t, tx, outs[0]
+        rtxid, rtx, ro = self.wait_for("intent %s released" % it["outpoint"][:16], released, timeout + 60)
+        self.wait_for("release %s confirmed" % rtxid[:16], lambda: self.confirmations(rtxid) >= 1, 120)
+        rtx = n0.getrawtransaction(rtxid, 1)
+        self.say("  release %s (%d bytes, %d in / %d out): vout %d pays %s YEC to %s, type %s, addresses %s"
+                 % (rtxid, len(rtx["hex"]) // 2, len(rtx["vin"]), len(rtx["vout"]), ro["n"], ro["value"], ro["scriptPubKey"]["hex"],
+                    ro["scriptPubKey"].get("type"), ro["scriptPubKey"].get("addresses")))
+        self.wait_for("node0 received 4 YEC at %s (getreceivedbyaddress, 1 confirmation)" % rq,
+                      lambda: Decimal(n0.getreceivedbyaddress(rq, 1)) == 4, 60)
+        coins = [u for u in n0.listunspent(1, 9999999, [rq]) if u["txid"] == rtxid and u["vout"] == ro["n"]]
+        if len(coins) != 1 or zat(coins[0]["amount"]) != 4 * COIN or coins[0]["scriptPubKey"] != spk.hex() \
+                or not coins[0].get("spendable", True):
+            die("listunspent does not list the released PQ coin: %s" % jdump(n0.listunspent(1, 9999999, [rq])))
+        balance_after = Decimal(n0.getbalance())
+        self.say("  listunspent [%s]: %s:%d, %s YEC, spendable %s, address %s; getbalance %s -> %s (+%s, coinbase maturity included)"
+                 % (rq, rtxid[:16], ro["n"], coins[0]["amount"], coins[0].get("spendable", True), coins[0].get("address"),
+                    balance_before, balance_after, balance_after - balance_before))
+        if balance_after - balance_before < 4:
+            die("node0's balance grew by %s, less than the 4 YEC released" % (balance_after - balance_before))
+        for a in self.s["attestors"]:
+            def burn_released(a=a):
+                code, bv = self.api(a, "burns/%d" % nonce)
+                return bv if code == 200 and bv.get("state") == "RELEASED" else None
+            bv = self.wait_for("attestor%d GET /burns/%d RELEASED" % (a["index"], nonce), burn_released, 60)
+            if bv["intent"] != it["outpoint"] or bv.get("recipient_address") != rq:
+                die("attestor%d's ledger: %s" % (a["index"], jdump(bv)))
+
+        self.step("node0 spends the PQ coin with its SLH-DSA key: sendtoaddress 1.5 YEC to a fresh node1 t-address "
+                  "(the other coins locked, the miner paused for the build)")
+        dest = self.node(1).getnewaddress()
+        self.pause(True)
+        others = []
+        try:
+            time.sleep(0.5)                  # a block the miner was generating lands before the coins are listed
+            others = [{"txid": u["txid"], "vout": u["vout"]} for u in n0.listunspent(0)
+                      if (u["txid"], u["vout"]) != (rtxid, ro["n"])]
+            if others and not n0.lockunspent(False, others):
+                die("lockunspent refused")
+            spend = n0.sendtoaddress(dest, Decimal("1.5"))
+        finally:
+            if others:
+                try:
+                    n0.lockunspent(True, others)
+                except RPCError as error:
+                    self.say("  lockunspent(true): %s" % error)
+            self.pause(False)
+        stx = n0.getrawtransaction(spend, 1)
+        fee = -Decimal(n0.gettransaction(spend)["fee"])
+        size = len(stx["hex"]) // 2
+        sigs = [(i["txid"], i["vout"], len(i["scriptSig"]["hex"]) // 2) for i in stx["vin"]]
+        self.say("  spend %s: %d bytes, inputs %s, fee %s YEC (%d zat; max(DEFAULT_FEE 1000, -pqfeerate x size) = %d at the "
+                 "default 100 zat/kB); outputs %s"
+                 % (spend, size, ["%s:%d scriptSig %d B" % (t[:16], n, l) for t, n, l in sigs], fee, zat(fee),
+                    max(1000, 100 * size // 1000), ["%s %s" % (o["value"], (o["scriptPubKey"].get("addresses") or [o["scriptPubKey"]["type"]])[0]) for o in stx["vout"]]))
+        if [(t, n) for t, n, _ in sigs] != [(rtxid, ro["n"])]:
+            die("the spend's inputs are %s, not the released PQ coin alone" % sigs)
+        if sigs[0][2] < 7000:
+            die("the PQ input's scriptSig is %d bytes, no SLH-DSA signature (expected about %d)" % (sigs[0][2], self.SLH_DSA_SCRIPTSIG))
+        if zat(fee) < max(1000, 100 * size // 1000):
+            die("the spend's fee %d zat is below max(DEFAULT_FEE, -pqfeerate x size)" % zat(fee))
+        self.wait_for("spend %s confirmed" % spend[:16], lambda: self.confirmations(spend) >= 1, 120)
+        self.wait_for("node1 received 1.5 YEC at %s" % dest, lambda: Decimal(self.node(1).getreceivedbyaddress(dest, 1)) == Decimal("1.5"), 60)
+        left = n0.listunspent(0, 9999999, [rq])
+        if left:
+            die("the PQ coin is still unspent: %s" % jdump(left))
+        self.say("  the PQ coin is spent (listunspent [%s] empty); scriptSig %d bytes = %s"
+                 % (rq, sigs[0][2], "the SLH-DSA-SHA2-128s TX_PQPKH scriptSig of quantum spec §2.1" if sigs[0][2] == self.SLH_DSA_SCRIPTSIG
+                    else "unexpected (spec §2.1 says %d)" % self.SLH_DSA_SCRIPTSIG))
+
+        self.step("the supply invariant holds; nobody slashed")
+        supply, locked = self.wyec_supply(), self.locked_zat()
+        rows = n0.vault_list({"tag": self.tag(), "setid": set_id})
+        self.say("  wYEC %s %s <= %s value under the set %s (%d vaults, %d intents)"
+                 % ("ft_total_supply" if self.is_near() else "totalSupply", yec(supply), self.tag(), yec(locked),
+                    sum(r["kind"] == "vault" for r in rows), sum(r["kind"] == "intent" for r in rows)))
+        if supply != 6 * COIN or supply > locked:
+            die("supply invariant broken (supply %s, locked %s)" % (yec(supply), yec(locked)))
+        self.assert_members()
+        for a in self.s["attestors"]:
+            st = self.hk_status(a)
+            if st.get("alarms"):
+                die("attestor%d alarms: %s" % (a["index"], jdump(st["alarms"])))
+        return ("burn 4 wYEC to node0's %s (35-byte PQPKH recipient, recorded by the bridge) -> %s intent with recipienthash "
+                "SHA256(20 <keyHash> 51 c2) -> release pays the TX_PQPKH output (%d-byte tx) -> node0's wallet lists it and spends "
+                "it (%d-byte SLH-DSA scriptSig, %d-byte tx, fee %d zat); the yr… owner form refused; supply %s = locked - released%s"
+                % (rq, magic, len(rtx["hex"]) // 2, sigs[0][2], size, zat(fee), yec(supply), " (bridge on NEAR)" if self.is_near() else ""))
+
 
 # ====================================================================== CLI
 
@@ -3201,10 +3490,11 @@ DRILLS = {
     # finalized = latest - 16 on anvil, so a burn can be reorged out below finality (D-10)
     "reorg": ("plan §8 D-9 + D-10: Ycash and Ethereum reorgs", "drill_reorg", {"slots": 8}),
     "rogue-mint": ("plan §8 D-5: rogue mint, an optimistic proposal with no lock", "drill_rogue_mint", {}),
+    "pq-recipient": ("plan §9.1 R5: a burn to a plain-YEC post-quantum address, released and spent", "drill_pq_recipient", {}),
 }
 
-# The scenarios that run with --foreign near (NEAR plan NH5).
-NEAR_SCENARIOS = ("demo", "rogue-mint")
+# The scenarios that run with --foreign near (NEAR plan NH5; pq-recipient: NH-R5).
+NEAR_SCENARIOS = ("demo", "rogue-mint", "pq-recipient")
 
 
 def main():
@@ -3244,9 +3534,10 @@ def main():
     p.add_argument("--owner-age", type=int, help="ownerHeight - tip (default MIN_OWNER_AGE + ROLL_MARGIN + 10)")
     p.add_argument("--owner", help="the vault's post-quantum owner: a PQ address (yr… on regtest) or a 66-hex pqkeyid, "
                                    "scheme 1 (default: a new SLH-DSA owner of node0's wallet, vault_getnewowner)")
-    p = sub.add_parser("burn", help="the holder burns wYEC to a Ycash t-address (node0's by default)")
+    p = sub.add_parser("burn", help="the holder burns wYEC to a Ycash address (a fresh node0 t-address by default)")
     p.add_argument("amount")
-    p.add_argument("--recipient")
+    p.add_argument("--recipient", help="a transparent t-address or a plain-YEC post-quantum rq… address "
+                                       "(getnewaddress \"\" \"pq\"); the PQ owner form yr… is refused")
     p = sub.add_parser("rogue", help="attestor1 signs an unlock with no burn (drill D-2)")
     p.add_argument("amount")
     p.add_argument("--attestor", type=int, default=1)

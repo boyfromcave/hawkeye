@@ -10,7 +10,8 @@ node2  ycashd ◀── hawkeye (attestor2.toml, api 127.0.0.1:7802) ──┼�
 node3  ycashd ◀── hawkeye (attestor3.toml, api 127.0.0.1:7803) ──┘     guardians = the members' Ethereum addresses
 ```
 
-The bridge is wyec at the pin in `eth/tools/fetch-wyec.sh` (`cad126a`), deployed with **threshold
+The bridge is wyec at the pin in `eth/tools/fetch-wyec.sh` (`c23849a`: `burn(uint256, bytes)`, the
+§4.2 revision-2 recipient), deployed with **threshold
 2** and a **12 s challenge window**, and the attestors run **`mint_mode = "optimistic"`**, the
 Foundation's model (plan §3.3): the mint leader proposes with its own `Mint` signature
 (`proposeMint`), every other attestor checks the proposal against its own ledger and challenges one
@@ -105,7 +106,7 @@ devnet/hawkeye-devnet up [--attestors 3] [--dir devnet/run] [--activation 110] [
 devnet/hawkeye-devnet status [--json]
 devnet/hawkeye-devnet lock 10 [--dest 0x<holder> | <near account>] [--owner <yr…|pqkeyid>] [--owner-age N]
                                                         # node0 → WYEC (NYEC) vault + dest OP_RETURN; PQ owner
-devnet/hawkeye-devnet burn 4 [--recipient <node0 t-addr>]
+devnet/hawkeye-devnet burn 4 [--recipient <node0 t-addr | rq…>]      # a transparent or plain-YEC PQ address
 devnet/hawkeye-devnet rogue 1 [--attestor 1]            # drill D-2: an unlock with no burn
 devnet/hawkeye-devnet rogue-mint 5 [--attestor 1] [--to 0x..]   # drill D-5: a proposal with no lock
 devnet/hawkeye-devnet silence 2 | unsilence 2           # stop / restart attestor2's hawkeye
@@ -120,6 +121,8 @@ devnet/hawkeye-devnet scenario demo [--fresh] [--keep]  # the end-to-end proof, 
 devnet/hawkeye-devnet scenario roll [--fresh] [--keep]  # drill D-13: a vault rolled before ownerHeight (HK-6)
 devnet/hawkeye-devnet scenario dormancy|takeover|double|restart|reorg|rogue-mint [--fresh]
                                                         # drills D-11, D-7, D-3, D-16, D-9/D-10, D-5
+devnet/hawkeye-devnet scenario pq-recipient [--fresh] [--foreign ethereum|near]
+                                                        # plan §9.1 R5: a burn to a post-quantum rq… address, below
 ```
 
 `--dir` (or `$HAWKEYE_DEVNET_DIR`) works before or after the command. `devnet/run` is gitignored.
@@ -210,7 +213,7 @@ NEAR side never sees them (NEAR plan, "Post-quantum owners").
 | Command | With the binary | Fallback (used while the subcommand is missing, or with `HAWKEYE_DEVNET_FALLBACK=1`) |
 |---|---|---|
 | `lock A [--dest] [--owner]` | `hawkeye --config node0.toml lock A --dest <addr> [--owner <PQ address or pqkeyid>]` (its JSON carries `owner`, `owner_address`, `owner_height`, `txid`, `lockid`) | Builds the WYEC V in Python (the §15.3 template with the PQ owner slot `<ownerHash:32> OP_1 OP_CHECKPQSIG`, the owner a new SLH-DSA key of node0's wallet from `vault_getnewowner` or the `--owner` pqkeyid, `ownerHeight = tip+1+min_owner_age+20`) plus the `OP_RETURN` with the ABI `bytes32` destination. Serialises a v4 transaction, then calls `signrawtransaction` and `sendrawtransaction` on node0, and checks the V with `vault_decodescript`. This is bridge-sim's `lock`. Ethereum only: a NEAR lock (`NR1` destination) needs the binary. |
-| `burn A [--recipient]` | `hawkeye --config node0.toml burn A --recipient <t-addr>` | `cast send <bridge> "burn(uint256,bytes32)"` with the holder key and the §4.2 `ycashRecipient` (`01 00 0…0 hash160`). |
+| `burn A [--recipient]` | `hawkeye --config node0.toml burn A --recipient <t-addr \| rq…>` (its JSON carries `recipient`, `recipient_kind`, `recipienthash`; a PQ owner `yr…` is refused) | `cast send <bridge> "burn(uint256,bytes)"` with the holder key and the §4.2 revision-2 `ycashRecipient` built in Python (`ycash_recipient`, the mirror of `hawkeye-core::recipient`, checked against `crates/hawkeye-core/tests/data/recipient_vectors.json`): `02 ‖ kind ‖ hash160` (22 bytes) for an `s1…`/`t…` address, `02 02 ‖ scheme ‖ keyHash` (35 bytes) for a plain-YEC PQ `sq…`/`tq…`/`rq…` address (Base58Check versions `4DD9`/`4F61`/`4C51`). Ethereum only: a NEAR burn needs the binary. |
 | `rogue A` | `hawkeye --config attestor1.toml rogue-unlock A` (drill D-3: `rogue-unlock --replay-burn <nonce>`, below) | On node1: `vault_buildunlock` to a fresh node1 address, then `set_signunlock` (attestor1's member key alone meets `unlockthreshold 1`), then `vault_send`. No memo. |
 | `rogue-mint A` | `hawkeye --config attestor1.toml rogue-mint A [--to] [--lock-id]`: signs `Mint(lockId, A, to)` for an invented lockId (sign-once drill record), `proposeMint` from its own account | none (needs the binary) |
 | enrolment | `hawkeye --config … enroll` | `importprivkey` of the WIF. |
@@ -301,6 +304,49 @@ writes `<run>/transcripts/<drill>-…-FAILED.txt`. Leaders are computed with the
 | `rogue-mint` | D-5 | lock 10 and wait for its mint (one unchallenged proposal); then attestor1 runs `hawkeye rogue-mint 5`: one `Mint` signature over an invented lockId with no lock behind it, `proposeMint` from its own account (12 s window). Attestor1's own Hawkeye leaves its deliberate proposal to the others (`own_fraudulent_proposal`) | another attestor's `MintChallenged(lockId, proposalId)` lands before `eta` (read from anvil's logs: challenger, block time); after `eta` the proposal is gone (`proposalStatus` None, `consumed` false, `executeMint` reverts `NoProposal`), `vetoed[lockId][attestor1]` is set, no wYEC was minted (supply 10, the rogue recipient holds 0); the others open `FRAUDULENT_MINT` cases and attestor1 is `removed`, `bondfrozen`; the supply invariant holds |
 | `reorg` | D-9, D-10 | anvil with `--slots-in-an-epoch 8` (finalized = latest − 16). (a) Pause the miner; lock 10 (the fallback builder, `nLockTime` = tip, sequence `0xfffffffe`), mine it at 1 confirmation (`C_Y` = 2); `invalidateblock` its *parent* on all nodes, so the lock is not final on the shorter chain and no mempool takes it back; mine a competing chain. Then re-broadcast the same lock. (b) Burn 4, then `anvil_reorg` it out before it is finalized; burn 4 again | (a) every Hawkeye logs `ycash_reorg … locks_deleted=1` and `GET /locks/<id>` is 404; no mint signature, no mint; after re-confirmation exactly one mint (`totalSupply` 10, every ledger `MINTED`). (b) the burn has no receipt, `burnNonce` is back; once finality passes the reorged blocks no ledger holds the nonce and no intent names it; the new burn reuses the nonce, its intent names the *new* tx hash, released once |
 
+## `scenario pq-recipient`: a post-quantum burn recipient (plan §9.1 R5, NEAR plan NH-R5)
+
+```sh
+devnet/hawkeye-devnet scenario pq-recipient [--fresh] [--keep] [--timeout 180] [--foreign ethereum|near]
+```
+
+The burn recipient of plan §4.2 revision 2 end to end, on either bridge, with Hawkeye holding no
+post-quantum key or code: it builds and recognises the node's `TX_PQPKH` script, the node's wallet
+holds the key.
+
+1. `up` with 3 attestors; `lock 10` (a PQ-owned vault) and its mint.
+2. node0 draws a **plain-YEC post-quantum address**: `getnewaddress "" "pq"` → `rq…` (53
+   characters, Base58Check `4C51 ‖ scheme ‖ keyHash`, D-Q-20; scheme 1 SLH-DSA-SHA2-128s while
+   Falcon is inactive on regtest). `validateaddress` must report `ismine`, `pqscheme` 1, `pqkeyhash`
+   and the 35-byte `scriptPubKey` `20 <keyHash> 51 c2` (the scheme as `OP_1`, never a data push,
+   quantum spec F-1). The script's Python recipient codec must agree: field `02 02 01 ‖ keyHash`
+   (35 bytes), `recipientHash = SHA256(script)`.
+3. `hawkeye burn 4 --recipient <rq…>` through `node0.toml`: its JSON must carry that 35-byte
+   `recipient`, `recipient_kind` `pqpkh` and the `recipienthash`; the bridge must have recorded the
+   same bytes — read back from the chain, not from Hawkeye: Ethereum, the `BurnToYcash(nonce, from,
+   amount, bytes)` log's ABI-decoded `bytes` (`cast logs`); NEAR, `get_burns`.
+4. **Negative:** `hawkeye burn 1 --recipient <yr…>` with the vault's PQ *owner* address (from the
+   lock's `owner_address`) must exit non-zero with "not a recipient" and consume no nonce.
+5. **Intent:** the `HKB1`/`HKN1` kind-1 memo of the nonce (data = the burn tx hash / the NEAR
+   `record_hash`); once confirmed, `vault_list` and `vault_decodescript` must give
+   `recipienthash = SHA256(20 <keyHash> 51 c2)` and 4 YEC; every attestor's `GET /burns/<nonce>`
+   holds the 35-byte `recipient` and the `rq…` as `recipient_address`.
+6. **Release:** the transaction spending the intent (not a cancel) pays exactly one output of 4 YEC
+   to that script; node0's wallet sees it: `getreceivedbyaddress(rq, 1)` = 4, `listunspent` filtered
+   by the `rq…` lists the coin as spendable with that `scriptPubKey`, `getbalance` grew by ≥ 4; every
+   attestor's ledger shows the burn `RELEASED` with that intent. The transcript records the release
+   transaction's size.
+7. **Spend (the wallet's Q5 path):** with the miner paused and every other coin `lockunspent`-locked,
+   node0 `sendtoaddress` 1.5 YEC to a fresh node1 t-address. The spend's only input must be the PQ
+   coin, its `scriptSig` an SLH-DSA signature (7,938 bytes, quantum spec §2.1; the transcript records
+   it, the transaction size and the fee, which must be ≥ `max(DEFAULT_FEE, -pqfeerate × size)` at the
+   default 100 zat/kB); mined and confirmed, node1 received 1.5, the `rq…` coin is gone.
+8. `wYEC.totalSupply()` (`ft_total_supply`) = 6 ≤ the value under the set; nobody slashed, no
+   alarm.
+
+A pass writes `devnet/transcripts/pq-recipient-<date>-<line>-<version>[-near].txt`. devnet-e2e runs it after
+`demo` and `rogue-mint` in each of its four jobs (line × foreign) on the real quantum nodes.
+
 `[devnet] drills = true` (refused on mainnet) gates the drill-only daemon features: the
 `rogue-unlock` command (with `--replay-burn <nonce>` for D-3), the `rogue-mint` command (D-5) and the
 crash points armed by
@@ -316,6 +362,7 @@ near/tools/fetch-sandbox.sh                                        # the pinned 
 cargo build --locked --bin hawkeye && cargo build --locked -p hawkeye-near --example near-admin
 devnet/hawkeye-devnet scenario demo --fresh --foreign near         # or HAWKEYE_DEVNET_FOREIGN=near
 devnet/hawkeye-devnet scenario rogue-mint --fresh --foreign near
+devnet/hawkeye-devnet scenario pq-recipient --fresh --foreign near
 ```
 
 The Ycash half is the same devnet (nodes, set, joins, Hawkeyes) on the same post-quantum nodes:
@@ -337,6 +384,7 @@ wYEC (attaching the record's storage deposit).
 |---|---|
 | `demo` | lock to `alice.test.near` (an `NYEC` vault, `NR1` destination); the mint is `propose_mint` → window → `execute_mint`; the burn's intent carries an `HKN1` memo whose chainId / bridge are the hashed domain (NEAR plan §2.2) and whose data equals the burn record's `record_hash` (`get_burns`); supply is `ft_total_supply` vs the NYEC value |
 | `rogue-mint` | `hawkeye rogue-mint 5 --to hawkeye1.test.near`; the challenge is found as Hawkeye finds it (the contract's `EXPERIMENTAL_changes` per block → `EXPERIMENTAL_receipt`), attributed by its relayer account and timed by its block; after `eta`: `proposal_status` None, `is_consumed` false, `is_vetoed` true, `execute_mint` panics `wyec: no such proposal` |
+| `pq-recipient` | alice burns to node0's `rq…` through `hawkeye burn` (the record's storage deposit attached); the recorded recipient is read from `get_burns` (`ycash_recipient`, 70 hex digits) and the `HKN1` memo's data must be that record's `record_hash`; the Ycash half (intent, release, the PQ spend) is identical |
 
 Transcripts are `<scenario>-<date>-<line>-<version>-near.txt`. The other drills are Ethereum-only
 (`scenario <drill> --foreign near` is refused), the dormancy drill's `hawkeye recover` included;

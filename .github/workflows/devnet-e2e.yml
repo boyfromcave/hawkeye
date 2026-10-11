@@ -2,9 +2,11 @@
 # bridges (foreign = ethereum: anvil + wYEC; foreign = near: a NEAR sandbox node + wyec-near, NEAR
 # plan NH5): build the node from the line's post-quantum branch upgrade/quantum-vaults (this
 # Hawkeye reads only the PQ owner slot, quantum spec §1; `node_ref` overrides), start the devnet
-# (regtest nodes + the bridge + one Hawkeye per attestor) and run `scenario demo` and the
+# (regtest nodes + the bridge + one Hawkeye per attestor) and run `scenario demo`, the
 # optimistic-mint drill `scenario rogue-mint` (lock -> mint, burn -> HKB1/HKN1 intent -> release,
-# rogue -> cancel -> slash, supply invariant).
+# rogue -> cancel -> slash, supply invariant) and the post-quantum recipient drill
+# `scenario pq-recipient` (plan §9.1 R5: a burn to the node's rq… address, the 35-byte recipient,
+# a TX_PQPKH release the node wallet spends with its SLH-DSA key).
 # This is the plan's §9 success criterion as a repeatable job; the mock never counts toward it.
 #
 # Slow (a cold node build is ~1 h), so it runs nightly, on demand, and when devnet/ or the
@@ -205,7 +207,7 @@ jobs:
           bin=$(near/tools/fetch-sandbox.sh)
           "$bin" --version
           echo "NEAR_SANDBOX_BIN=$bin" >>"$GITHUB_ENV"
-      - name: scenario demo and rogue-mint
+      - name: scenario demo, rogue-mint and pq-recipient
         env:
           DEVNET_NATIVE_SOLC: "1"
           DAEMON: ${{ matrix.daemon }}
@@ -218,6 +220,7 @@ jobs:
           "$YCASHD" -version | head -1
           python3 devnet/hawkeye-devnet scenario demo --fresh --foreign "$FOREIGN"
           python3 devnet/hawkeye-devnet scenario rogue-mint --fresh --foreign "$FOREIGN"
+          python3 devnet/hawkeye-devnet scenario pq-recipient --fresh --foreign "$FOREIGN"
       - name: stop the devnet
         if: always()
         run: python3 devnet/hawkeye-devnet down || true
