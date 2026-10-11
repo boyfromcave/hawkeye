@@ -314,15 +314,19 @@ lost: the challenged proposer is barred from that lock, the next eligible attest
 same signed `(amount, to)` with a fresh id, and the alarm `matching-proposal-challenged` names the
 challenger. If every live member were barred, a threshold `mint` is the override.
 
-### 3.4 F-4: recipient bytes are opaque on both chains (HK-5)
+### 3.4 F-4: recipient bytes are opaque in meaning on both chains (HK-5)
 
-`burn(amount, bytes32 ycashRecipient)` is unconditional and the contract never parses the
-recipient (R2). A malformed recipient cannot be paid. `burn(0, …)` also succeeds and consumes a
-burn nonce: it is orphaned, never treated as a gap in the nonce sequence. Hawkeye defines the encoding (§4.2), the
+`burn(amount, bytes ycashRecipient)` is unconditional for any well-formed recipient: since §4.2
+revision 2 (CR-W4, wyec `c23849a`; wyec-near likewise) the contract checks the recipient's **shape**
+(length 22 or 35, version, kind, scheme) and refuses anything else, but it never reads Ycash state
+and never interprets the bytes — the meaning stays Hawkeye's (R2). So a malformed recipient can no
+longer be burned to at all. `burn(0, …)` still succeeds and consumes a burn nonce: it is orphaned,
+never treated as a gap in the nonce sequence. Hawkeye defines the encoding (§4.2), the
 `hawkeye burn` CLI and any dapp built on it validate before sending, and a burn whose recipient
-does not decode is held as **orphaned**: never released, reported, and refundable by a threshold
-mint to the burner with the synthetic `lockId = sha256("hawkeye-refund" ‖ chainId ‖ bridge ‖
-nonce)` (Q-3: the Foundation's call; needs `k`-of-n signatures, never one).
+does not decode (possible only from a non-validating contract) is held as **orphaned**: never
+released, reported, and refundable by a threshold mint to the burner with the synthetic
+`lockId = sha256("hawkeye-refund" ‖ chainId ‖ bridge ‖ nonce)` (Q-3: the Foundation's call; needs
+`k`-of-n signatures, never one).
 
 ### 3.5 F-5: one key, two chains, and signing it twice (HK-7)
 
