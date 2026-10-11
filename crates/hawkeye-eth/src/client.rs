@@ -444,8 +444,9 @@ impl EthClient {
     // ------------------------------------------------------------------ burn (CLI / devnet)
 
     /// `burn(amount, ycashRecipient)` from the wallet: no allowance needed. The recipient is the
-    /// plan §4.2 bytes32; this adapter does not validate it (`hawkeye-core` does, before calling).
-    pub async fn burn(&self, amount: U256, ycash_recipient: B256) -> Result<Burned> {
+    /// plan §4.2 `bytes` (22 or 35); this adapter does not validate it (`hawkeye-core` does,
+    /// before calling, and the contract reverts `InvalidRecipient()` otherwise).
+    pub async fn burn(&self, amount: U256, ycash_recipient: Bytes) -> Result<Burned> {
         let r = self
             .send(self.bridge().burn(amount, ycash_recipient))
             .await?;

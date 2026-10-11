@@ -135,7 +135,7 @@ impl Engine {
         let p = self.ctx.params.clone();
         let nonce = b.key.nonce;
         let recipient =
-            YcashRecipient::from_bytes32(&b.recipient).map_err(|e| anyhow!("recipient: {e}"))?;
+            YcashRecipient::from_bytes(&b.recipient).map_err(|e| anyhow!("recipient: {e}"))?;
         let vaults: Vec<VaultRecord> = self.ctx.db(|t| {
             let mut v = t.vaults_in_state(VaultState::Live)?;
             v.extend(t.vaults_in_state(VaultState::RollDue)?);
@@ -283,7 +283,7 @@ impl Engine {
                 let Some(b) = self.ctx.db(|t| t.burn(&k))? else {
                     continue;
                 };
-                let Ok(r) = YcashRecipient::from_bytes32(&b.recipient) else {
+                let Ok(r) = YcashRecipient::from_bytes(&b.recipient) else {
                     continue;
                 };
                 (

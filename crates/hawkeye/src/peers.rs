@@ -42,9 +42,11 @@ pub struct BurnView {
     pub tx_hash: String,
     /// Amount (base units).
     pub amount: u64,
-    /// Raw recipient bytes32.
+    /// The raw `ycashRecipient` (main plan §4.2: 22 or 35 bytes when well-formed), `0x`-hex of
+    /// its actual length.
     pub recipient: String,
-    /// Decoded recipient address, if it decodes.
+    /// The decoded recipient address (`s1…`/`s2…`/`s3…`, or `sq…`/`tq…`/`rq…` for a
+    /// `TX_PQPKH` recipient), if it decodes.
     pub recipient_address: Option<String>,
     /// Burn state.
     pub state: String,

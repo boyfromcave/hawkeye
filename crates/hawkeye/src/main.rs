@@ -55,7 +55,7 @@ enum Cmd {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Holder: burn wYEC to a Ycash transparent address.
+    /// Holder: burn wYEC to a Ycash address (transparent, or plain-YEC post-quantum sq…/tq…/rq…).
     Burn {
         /// YEC (also accepted positionally).
         #[arg(long = "amount", value_name = "YEC")]
@@ -63,7 +63,9 @@ enum Cmd {
         /// YEC, positional form.
         #[arg(value_name = "AMOUNT", conflicts_with = "amount")]
         amount_pos: Option<String>,
-        /// The Ycash t-address.
+        /// The Ycash recipient: a transparent address (s1…/s2…/s3…, testnet sm…/s2…) or a
+        /// plain-YEC post-quantum address (sq…/tq…/rq…; scheme 2 warns until Falcon is active).
+        /// Never a PQ owner address (yb…/yt…/yr…) and never shielded.
         #[arg(long)]
         recipient: String,
         /// Ethereum: the holder's key (default: the config's secret_hex).

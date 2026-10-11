@@ -145,8 +145,10 @@ pub enum ForeignEvent {
         from: Account,
         /// Base units (= zatoshi).
         amount: u128,
-        /// Main plan §4.2 bytes32.
-        ycash_recipient: Hash32,
+        /// The raw `ycashRecipient` the burner passed (main plan §4.2: 22 or 35 bytes when
+        /// well-formed; the contracts validate it, but the engine decodes it again and orphans
+        /// a burn it cannot decode, §3.4).
+        ycash_recipient: Vec<u8>,
     },
     /// A mint happened (threshold mint, or an executed proposal).
     Minted {
@@ -426,8 +428,10 @@ pub trait ForeignChain: AttestationScheme + Send + Sync {
     /// Execute `lock_id`'s proposal (anyone, after its `eta`).
     fn execute_mint(&self, lock_id: Hash32) -> BoxFut<'_, Mined>;
 
-    /// Burn `amount` from the sender to `ycash_recipient` (main plan §4.2; CLI, devnet, drills).
-    fn burn(&self, amount: u64, ycash_recipient: Hash32) -> BoxFut<'_, Burned>;
+    /// Burn `amount` from the sender to `ycash_recipient` — the main plan §4.2 bytes (22 or 35),
+    /// as [`YcashRecipient::to_bytes`](hawkeye_core::YcashRecipient::to_bytes) builds them (CLI,
+    /// devnet, drills). The contract validates them and refuses anything else.
+    fn burn(&self, amount: u64, ycash_recipient: Vec<u8>) -> BoxFut<'_, Burned>;
 }
 
 /// Connect the configured foreign chain. Ethereum: `key`'s account signs and pays gas. NEAR:

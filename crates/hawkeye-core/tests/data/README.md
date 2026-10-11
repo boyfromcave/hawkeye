@@ -75,6 +75,42 @@ JSON array (or an object with the array under `"mint"` or `"cases"`) of
 `amount` and `chainId` may be JSON numbers or decimal strings; `name`/`version` are optional
 and, when present, must be the contract's.
 
+## `recipient_vectors.json`
+
+Hawkeye's own golden vectors for the `ycashRecipient` encoding (`docs/hawkeye-bridge-plan.md`
+§4.2 revision 2, HK-5; phase R4). They were **derived independently in Python** from the plan
+text alone (`gen_recipient_vectors.py` beside this file: a hand-rolled base58, `hashlib` SHA-256,
+the opcode bytes of the three scripts written out; no `hawkeye-core` code), so
+`tests/recipient_vectors.rs` is a cross-check of the Rust codec, not a replay of it. The
+`TX_PQPKH` script bytes (`20 <keyHash> 51|52 c2`) were cross-checked against the node's
+`GetScriptForPQKey` (ycash-dd `upgrade/quantum-vaults` `d41026209` `src/script/standard.cpp:338`:
+`CScript() << ToByteVector(id.hash) << CScript::EncodeOP_N(id.scheme) << OP_CHECKPQSIG`) and the
+`sq…`/`tq…`/`rq…` versions against `src/key_io.cpp:23-27` and `src/test/pq_address_tests.cpp`
+(`sq_roundtrip_per_network`: the leading characters and the 53-character length; the node's
+tests use random hashes, so there is no address literal to compare). The P2PKH/P2SH addresses
+and the PQ owner addresses reproduce the known strings `address.rs` already pins.
+
+- sha256 `b736d9760cd9c6575d80f417a1acdae8793eb6ab35d230fd83bcf524ef6acbe5`
+
+Conventions: hex is lowercase without `0x`; `kind` and `scheme` are small JSON numbers. Top-level
+keys:
+
+| Key | Contents |
+|---|---|
+| `version` | `2` (the encoding revision) |
+| `valid[]` | `{note, kind, kindName, scheme?, hash, bytes, script, recipientHash, addresses}`: P2PKH and P2SH over `20 × 5a` and `20 × ab`, PQPKH scheme 1 over the node vector's `pqOwner` hash, scheme 2 over `32 × ff`, both schemes over the node's D-Q-21 known-answer hash `32 × 5a`, scheme 1 over `32 × 00`; `bytes` is the 22- or 35-byte field, `script` the recipient scriptPubKey, `recipientHash = SHA256(script)`, `addresses` the `mainnet` / `testnet` / `regtest` strings |
+| `invalid[]` | `{note, bytes, reason}`: fields `YcashRecipient::from_bytes` must refuse — revision 1's 32 bytes, versions 0/1/3, kinds 3/0xff, a kind at the other kind's length, schemes 0/3/0xff, lengths 0/1/2/21/23/32/34/36, a left-padded Ethereum address; `reason` is `wrong length` (checked first), `unknown version`, `unknown kind` or `unknown scheme` |
+| `scriptsInvalid[]` | `{note, script}`: scripts `from_script` / `parse_pqpkh` must refuse — the scheme as the data push `01 01` (quantum spec F-1), `OP_0`/`OP_3`/`OP_16` schemes, 31- and 33-byte hashes, a wrong final opcode, a trailing byte, truncations, `OP_RETURN` |
+| `ownerAddressesNotRecipients` | the PQ *owner* address (`yb…`/`yt…`/`yr…`) of the scheme-1 key: decodes as an owner, refused by `decode_address` on every network |
+
+To regenerate after a deliberate encoding change (which changes the plan first):
+
+```sh
+python3 -I crates/hawkeye-core/tests/data/gen_recipient_vectors.py crates/hawkeye-core/tests/data/recipient_vectors.json
+```
+
+then record the new hash here; the file is never written from `hawkeye-core`.
+
 ## `near_vectors.json`
 
 Hawkeye's own golden vectors for the NEAR bridge's encodings (`docs/hawkeye-near-plan.md` §2),

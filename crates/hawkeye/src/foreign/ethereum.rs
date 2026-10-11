@@ -130,7 +130,7 @@ fn event(ev: &BridgeEvent) -> ForeignEvent {
             nonce: u64::try_from(*nonce).unwrap_or(u64::MAX),
             from: account(from),
             amount: sat(*amount),
-            ycash_recipient: ycash_recipient.0,
+            ycash_recipient: ycash_recipient.to_vec(),
         },
         BridgeEvent::Minted {
             lock_id,
@@ -514,11 +514,11 @@ impl ForeignChain for EthereumChain {
         })
     }
 
-    fn burn(&self, amount: u64, ycash_recipient: Hash32) -> BoxFut<'_, Burned> {
+    fn burn(&self, amount: u64, ycash_recipient: Vec<u8>) -> BoxFut<'_, Burned> {
         Box::pin(async move {
             let b = self
                 .client
-                .burn(U256::from(amount), b256(&ycash_recipient))
+                .burn(U256::from(amount), ycash_recipient.into())
                 .await
                 .map_err(fe)?;
             Ok(Burned {

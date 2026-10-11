@@ -6,7 +6,7 @@
 //! rebuild procedure, which v4 uses).
 
 /// Every migration, in order. Entry `i` takes `user_version` from `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
 
 /// Version 1: the H4 ledger.
 const V1: &str = r#"
@@ -499,4 +499,61 @@ CREATE TRIGGER sign_once_drill_mint_immutable_update BEFORE UPDATE ON sign_once_
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
 CREATE TRIGGER sign_once_drill_mint_immutable_delete BEFORE DELETE ON sign_once_drill_mint
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+"#;
+
+/// Version 5 (main plan §4.2 revision 2, phase R4): `burns.recipient` is the variable-length
+/// `ycashRecipient` (22 bytes for P2PKH / P2SH, 35 for `TX_PQPKH`) instead of the retired
+/// revision-1 `bytes32`. The table is rebuilt (SQLite cannot alter a CHECK) and every 32-byte
+/// row converted: a well-formed revision-1 recipient (`01`, kind 0 or 1, ten zero bytes,
+/// hash160) becomes the 22-byte revision-2 form `02 ‖ kind ‖ hash160` **losslessly**; a
+/// malformed one (an orphaned burn, never released) keeps its kind and hash160 slots under the
+/// retired version byte `01`, so it still does not decode (its ten padding bytes are dropped).
+/// Rows of 22 or 35 bytes (none exist before v5) are copied as they are. States, ids, the
+/// intents' `matched_burn` references and the indexes are kept. (The concatenation is `CAST … AS
+/// BLOB`: SQLite's `||` yields TEXT, whose `length()` stops at the first zero byte, and the
+/// CHECK measures the blob.)
+const V5: &str = r#"
+CREATE TABLE burns_v5 (
+    id              INTEGER PRIMARY KEY,
+    chain_id        INTEGER NOT NULL CHECK (chain_id >= 0),
+    bridge          BLOB    NOT NULL CHECK (length(bridge) = 20),
+    nonce           INTEGER NOT NULL CHECK (nonce >= 0),
+    tx_hash         BLOB    NOT NULL CHECK (length(tx_hash) = 32),
+    block_number    INTEGER NOT NULL CHECK (block_number >= 0),
+    block_hash      BLOB    NOT NULL CHECK (length(block_hash) = 32),
+    sender          TEXT    NOT NULL CHECK ((sender GLOB 'ethereum:0x*' AND length(sender) = 51)
+                                            OR (sender GLOB 'near:*' AND length(sender) BETWEEN 7 AND 69)),
+    amount          INTEGER NOT NULL CHECK (amount >= 0),
+    recipient       BLOB    NOT NULL CHECK (length(recipient) IN (22, 35)),
+    state           TEXT    NOT NULL,
+    leader          BLOB    CHECK (leader IS NULL OR length(leader) = 33),
+    assigned_height INTEGER,
+    waiting_epoch   INTEGER,
+    intent_txid     BLOB,
+    intent_vout     INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE (chain_id, bridge, nonce),
+    CHECK ((intent_txid IS NULL) = (intent_vout IS NULL)),
+    FOREIGN KEY (intent_txid, intent_vout) REFERENCES intents (txid, vout)
+);
+INSERT INTO burns_v5
+    SELECT id, chain_id, bridge, nonce, tx_hash, block_number, block_hash, sender, amount,
+           CASE
+               WHEN length(recipient) = 32
+                    AND substr(recipient, 1, 1) = x'01'
+                    AND substr(recipient, 2, 1) IN (x'00', x'01')
+                    AND substr(recipient, 3, 10) = zeroblob(10)
+                   THEN CAST(x'02' || substr(recipient, 2, 1) || substr(recipient, 13, 20) AS BLOB)
+               WHEN length(recipient) = 32
+                   THEN CAST(x'01' || substr(recipient, 2, 1) || substr(recipient, 13, 20) AS BLOB)
+               ELSE recipient
+           END,
+           state, leader, assigned_height, waiting_epoch, intent_txid, intent_vout, created_at,
+           updated_at
+    FROM burns;
+DROP TABLE burns;
+ALTER TABLE burns_v5 RENAME TO burns;
+CREATE INDEX burns_state ON burns (state, nonce);
+CREATE INDEX burns_block ON burns (block_number);
 "#;

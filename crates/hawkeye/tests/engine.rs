@@ -3,7 +3,8 @@
 //! mined by hand on both chains, so every run is deterministic.
 //!
 //! (a) lock → sign → mint observed; (b) burn → unlock with the HKB1 memo → release after the
-//! delay; (c) rogue intent → cancelled + slash case → SET_REMOVE; (d) restart mid-flow: no second
+//! delay; (b2) a burn to a post-quantum `sq…` recipient releases to the `TX_PQPKH` script, (b3) a
+//! malformed recipient is refused by the contract (§4.2 revision 2); (c) rogue intent → cancelled + slash case → SET_REMOVE; (d) restart mid-flow: no second
 //! signature; (e) leader takeover; (f) slash votes verified independently by each peer (refused
 //! for a matched intent, a benign race, a wrong target, one's own removal, a backed mint);
 //! (g) restart resumes a slash case and a deferred mint check without re-asking or re-signing;
@@ -38,8 +39,8 @@ use hawkeye_core::setsig::Role;
 use hawkeye_core::template::{TAG_WYEC, VaultParams};
 use hawkeye_core::{Deployment as CoreDeployment, EthAddress, OutPoint as CoreOutPoint, SecretKey};
 use hawkeye_eth::{
-    Address, B256, DeployParams, Deployment, EthClient, EthConfig, MintMode, PrivateKeySigner,
-    U256, deploy, wallet_provider,
+    Address, B256, Bytes, DeployParams, Deployment, EthClient, EthConfig, MintMode,
+    PrivateKeySigner, U256, deploy, wallet_provider,
 };
 use hawkeye_store::{BurnKey, BurnState, IntentState, LockState, SlashState, Store, VaultState};
 use hawkeye_ycash::mock::{KnownScript, MockState, MockYcashd};
@@ -390,7 +391,7 @@ impl Env {
     async fn burn(&self, amount: u64, recipient: &YcashRecipient) -> u64 {
         let c = self.eth(&self.holder).await;
         let b = c
-            .burn(U256::from(amount), B256::from(recipient.to_bytes32()))
+            .burn(U256::from(amount), Bytes::from(recipient.to_bytes()))
             .await
             .unwrap();
         u64::try_from(b.nonce).unwrap()
@@ -589,6 +590,135 @@ async fn b_burn_unlock_memo_release() {
             .any(|c| c.error.is_none()),
         "a release was broadcast"
     );
+}
+
+/// (b2) Plan §4.2 revision 2, phase R4: a burn to a plain-YEC post-quantum recipient (kind 2,
+/// scheme 1) is released to the node's `TX_PQPKH` script `20 <keyHash> OP_1 OP_CHECKPQSIG`: the
+/// `HKB1` intent commits `recipienthash = SHA256(that 35-byte script)`, `vault_release` is passed
+/// the script, and the release transaction pays it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b2_burn_to_pq_recipient_releases_tx_pqpkh() {
+    use hawkeye_core::bytes::sha256;
+    let Some(env) = setup().await else { return };
+    let mut engines = vec![
+        env.engine(0).await,
+        env.engine(1).await,
+        env.engine(2).await,
+    ];
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::pqpkh(1, [0xc5; 32]).unwrap();
+    let script = r.script();
+    assert_eq!(script.len(), 35);
+    assert_eq!(script[0], 32);
+    assert_eq!(&script[33..], &[0x51, 0xc2]);
+    let nonce = env.burn(400_000_000, &r).await;
+    env.eth_mine(3).await;
+    tick_all(&mut engines).await;
+    tick_all(&mut engines).await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let b = engines[0].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    assert_eq!(b.recipient, r.to_bytes());
+    assert_eq!(b.recipient.len(), 35);
+    env.mine(1);
+    tick_all(&mut engines).await;
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert_eq!(b.state, BurnState::IntentConfirmed);
+        let intent = b.intent.expect("the burn names its intent");
+        let i = e.ctx().db(|t| t.intent(&intent)).unwrap().unwrap();
+        assert_eq!(
+            i.recipient_hash,
+            sha256(&script),
+            "recipienthash = SHA256(TX_PQPKH)"
+        );
+        assert_eq!(i.classification.as_deref(), Some("matched-burn"));
+    }
+    for _ in 0..u32::from(DELAY) {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    env.mine(1);
+    tick_all(&mut engines).await;
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert_eq!(b.state, BurnState::Released, "released after the delay");
+    }
+    let st = env.mock.state();
+    let releases: Vec<_> = st
+        .calls_to("vault_release")
+        .into_iter()
+        .filter(|c| c.error.is_none())
+        .collect();
+    assert!(!releases.is_empty(), "a release was broadcast");
+    for c in &releases {
+        assert_eq!(
+            c.params[1].as_str(),
+            Some(hex::encode(&script).as_str()),
+            "vault_release is passed the 35-byte TX_PQPKH script"
+        );
+    }
+    let pays = st
+        .txs
+        .values()
+        .filter(|(_, block)| block.is_some())
+        .map(|(raw, _)| Transaction::decode(raw).unwrap())
+        .any(|t| {
+            t.outputs
+                .iter()
+                .any(|o| o.script_pubkey == script && o.value == 400_000_000)
+        });
+    assert!(
+        pays,
+        "a mined transaction pays 4 YEC to the TX_PQPKH script"
+    );
+}
+
+/// (b3) A malformed recipient never reaches the ledger from this contract: `burn` reverts
+/// `InvalidRecipient()` (revision 1's 32 bytes, a wrong scheme, a wrong length), spends no nonce,
+/// and the engines see no burn. (A burn the contract did accept but the engine cannot decode is
+/// the orphaned path of plan §3.4; with a validating contract only a zero amount takes it.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b3_malformed_recipient_burn_is_refused_by_the_contract() {
+    let Some(env) = setup().await else { return };
+    let mut engines = vec![
+        env.engine(0).await,
+        env.engine(1).await,
+        env.engine(2).await,
+    ];
+    lock_and_mint(&env, &mut engines).await;
+    let c = env.eth(&env.holder).await;
+    let before = c.burn_nonce().await.unwrap();
+    let mut v1 = vec![0x01u8, 0x00];
+    v1.extend([0u8; 10]);
+    v1.extend([0x77u8; 20]);
+    let mut scheme3 = YcashRecipient::pqpkh(1, [0xc5; 32]).unwrap().to_bytes();
+    scheme3[2] = 3;
+    let mut short = YcashRecipient::p2pkh([0x77; 20]).to_bytes();
+    short.pop();
+    for bad in [v1, scheme3, short, Vec::new()] {
+        let e = c
+            .burn(U256::from(1), Bytes::from(bad.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("InvalidRecipient"),
+            "{}: {e}",
+            hex::encode(&bad)
+        );
+    }
+    assert_eq!(c.burn_nonce().await.unwrap(), before, "no nonce spent");
+    env.eth_mine(3).await;
+    tick_all(&mut engines).await;
+    let burns = engines[0]
+        .ctx()
+        .db(|t| t.burns_in_state(&dep_of(&engines[0]), BurnState::Finalized))
+        .unwrap();
+    assert!(burns.is_empty(), "no burn reached the ledger");
+    // the well-formed form of the same recipient goes through
+    let nonce = env
+        .burn(1, &YcashRecipient::pqpkh(1, [0xc5; 32]).unwrap())
+        .await;
+    assert_eq!(U256::from(nonce), before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

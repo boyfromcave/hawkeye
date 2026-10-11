@@ -15,7 +15,7 @@ use crate::recipient::YcashRecipient;
 use crate::template::{IntentParams, VaultParams};
 
 /// A finalized `BurnToYcash` event as the ledger holds it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Burn {
     /// The burn nonce.
     pub nonce: u64,
@@ -24,8 +24,9 @@ pub struct Burn {
     pub tx_hash: Hash32,
     /// The amount in wYEC base units (= zatoshi).
     pub amount: u64,
-    /// The raw `ycashRecipient` bytes32.
-    pub recipient: [u8; 32],
+    /// The raw `ycashRecipient` (§4.2: 22 or 35 bytes when well-formed; kept undecoded, so an
+    /// orphaned burn is still named).
+    pub recipient: Vec<u8>,
     /// The intent that consumed it, if any.
     pub consumed_by: Option<Consumer>,
 }
@@ -211,7 +212,7 @@ pub fn classify_intent_for(
                     got: obs.value,
                 });
             }
-            let Ok(recipient) = YcashRecipient::from_bytes32(&burn.recipient) else {
+            let Ok(recipient) = YcashRecipient::from_bytes(&burn.recipient) else {
                 return U(Unmatched::OrphanedBurn);
             };
             if recipient.recipient_hash() != obs.intent.recipient_hash {
@@ -284,7 +285,7 @@ mod tests {
             nonce: 9,
             tx_hash: [0xee; 32],
             amount: 5000,
-            recipient: recipient().to_bytes32(),
+            recipient: recipient().to_bytes(),
             consumed_by,
         }
     }
@@ -331,7 +332,7 @@ mod tests {
                     outputs: &self.outputs,
                     spent_vault: Some(&v),
                 },
-                |n| burns.iter().copied().find(|b| b.nonce == n),
+                |n| burns.iter().find(|b| b.nonce == n).cloned(),
             )
         }
     }
@@ -403,11 +404,13 @@ mod tests {
             U(Unmatched::WrongRecipient)
         );
 
-        let orphan = Burn {
-            recipient: [0; 32],
-            ..burn(None)
-        };
-        assert_eq!(c.classify(10, &[orphan]), U(Unmatched::OrphanedBurn));
+        for bad in [vec![0u8; 22], vec![0u8; 32], vec![0x02, 0x03, 0, 0]] {
+            let orphan = Burn {
+                recipient: bad,
+                ..burn(None)
+            };
+            assert_eq!(c.classify(10, &[orphan]), U(Unmatched::OrphanedBurn));
+        }
 
         let sepolia = HawkeyeMemo::burn_release(
             Deployment {

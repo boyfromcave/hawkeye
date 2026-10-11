@@ -219,8 +219,12 @@ async fn burn_is_scanned_once_finalized() {
     let first = scanner.poll(c).await.unwrap();
     assert_eq!(first.from, env.dep.deploy_block);
 
-    let rcpt = B256::left_padding_from(&[0x01, 0x00]); // opaque to the contract
-    let burned = c.burn(U256::from(3_0000_0000u64), rcpt).await.unwrap();
+    // a well-formed §4.2 recipient (the contract validates the shape, not the hash)
+    let rcpt = Bytes::from([&[0x02u8, 0x00][..], &[0x5a; 20][..]].concat());
+    let burned = c
+        .burn(U256::from(3_0000_0000u64), rcpt.clone())
+        .await
+        .unwrap();
     assert_eq!(burned.nonce, U256::ZERO);
     assert_eq!(c.burn_nonce().await.unwrap(), U256::from(1));
     assert_eq!(
@@ -253,7 +257,7 @@ async fn burn_is_scanned_once_finalized() {
             nonce: U256::ZERO,
             from: holder,
             amount: U256::from(3_0000_0000u64),
-            ycash_recipient: rcpt,
+            ycash_recipient: rcpt.clone(),
         }
     );
     assert_eq!(burns[0].meta.tx_hash, burned.mined.tx);
@@ -287,13 +291,23 @@ async fn burn_is_scanned_once_finalized() {
 
     // A second burn gets nonce 1; a zero-amount burn is accepted and spends nonce 2.
     assert_eq!(
-        c.burn(U256::from(1), rcpt).await.unwrap().nonce,
+        c.burn(U256::from(1), rcpt.clone()).await.unwrap().nonce,
         U256::from(1)
     );
     assert_eq!(
-        c.burn(U256::ZERO, B256::ZERO).await.unwrap().nonce,
+        c.burn(U256::ZERO, rcpt.clone()).await.unwrap().nonce,
         U256::from(2)
     );
+    // A malformed recipient (revision 1's 32 bytes) is refused by the contract: no nonce spent.
+    let e = c
+        .burn(U256::from(1), Bytes::from(vec![0x01u8; 32]))
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("InvalidRecipient"),
+        "the revert names InvalidRecipient: {e}"
+    );
+    assert_eq!(c.burn_nonce().await.unwrap(), U256::from(3));
 }
 
 async fn warp(p: &DynProvider, seconds: u64) {
@@ -603,7 +617,7 @@ async fn connect_checks_and_finality_modes() {
     let ro = EthClient::connect(&cfg, None).await.unwrap();
     assert_eq!(ro.token_address(), env.dep.token);
     assert!(matches!(
-        ro.burn(U256::from(1), B256::ZERO).await,
+        ro.burn(U256::from(1), Bytes::new()).await,
         Err(Error::ReadOnly)
     ));
 

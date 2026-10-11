@@ -56,8 +56,8 @@ pub struct NewBurn {
     pub from: Account,
     /// The amount in wYEC base units (= zatoshi).
     pub amount: u64,
-    /// The raw `ycashRecipient` bytes32 (§4.2), decoded or not.
-    pub recipient: [u8; 32],
+    /// The raw `ycashRecipient` (§4.2: 22 or 35 bytes), decoded or not.
+    pub recipient: Vec<u8>,
     /// Whether the block is finalized (`FINALIZED`) or only `latest` (`SEEN`).
     pub finalized: bool,
 }
@@ -77,8 +77,9 @@ pub struct BurnRecord {
     pub from: Account,
     /// The amount in base units.
     pub amount: u64,
-    /// The raw recipient.
-    pub recipient: [u8; 32],
+    /// The raw recipient (§4.2: 22 or 35 bytes; a ledger written under revision 1 migrated its
+    /// 32-byte rows to 22, schema v5).
+    pub recipient: Vec<u8>,
     /// The machine state.
     pub state: BurnState,
     /// The assigned leader's member key (`ASSIGNED` and later).
@@ -306,7 +307,7 @@ impl Tx<'_> {
             nonce,
             tx_hash: b.tx_hash,
             amount: b.amount,
-            recipient: b.recipient,
+            recipient: b.recipient.clone(),
             consumed_by,
         }))
     }

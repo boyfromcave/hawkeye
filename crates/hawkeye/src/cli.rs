@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use hawkeye_core::address::{decode_address, decode_pq_address, encode_pq_address};
 use hawkeye_core::lock::lock_id;
 use hawkeye_core::pq::{PqKeyId, SCHEME_SLH_DSA_SHA2_128S};
+use hawkeye_core::recipient::YcashRecipient;
 use hawkeye_core::template::VaultParams;
 use hawkeye_core::{
     AccountId, BridgeKind, Destination, EthAddress, Guardian, OutPoint as CoreOutPoint,
@@ -17,7 +18,7 @@ use hawkeye_ycash::tx::{Transaction, TxIn, TxOut};
 use hawkeye_ycash::types::{Recipient, TemplateKind, VaultListFilter};
 use hawkeye_ycash::{Amount, HexBytes, YcashRpc};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::attribution::CoreAttributor;
 use crate::config::Settings;
@@ -294,11 +295,14 @@ pub async fn lock(
     }))
 }
 
-/// `hawkeye burn`: the bridge's burn with the §4.2 encoding. Ethereum:
-/// `WyecBridge.burn(amount, ycashRecipient)` from `--eth-key` (default: the config's `[keys]
-/// secret_hex`). NEAR: `wyec-near` `burn(amount, ycash_recipient)` signed by the holder's NEAR
-/// credentials file `--near-key` (default: the config's relayer key), attaching the record's
-/// storage deposit.
+/// `hawkeye burn`: the bridge's burn with the §4.2 encoding (revision 2: 22 bytes for a
+/// transparent `--recipient`, 35 for a plain-YEC post-quantum one, `sq…`/`tq…`/`rq…`; a PQ
+/// *owner* address `yb…`/`yt…`/`yr…` is refused). Ethereum: `WyecBridge.burn(amount,
+/// ycashRecipient)` from `--eth-key` (default: the config's `[keys] secret_hex`). NEAR:
+/// `wyec-near` `burn(amount, ycash_recipient)` signed by the holder's NEAR credentials file
+/// `--near-key` (default: the config's relayer key), attaching the record's storage deposit.
+/// A scheme-2 (FN-DSA-512) recipient is sent with a warning: the release pays it only once Falcon
+/// is active on Ycash (§4.2).
 pub async fn burn(
     s: &Settings,
     amount: &str,
@@ -307,6 +311,10 @@ pub async fn burn(
     near_key: Option<&std::path::Path>,
 ) -> Result<()> {
     let r = decode_address(recipient, s.network).map_err(|e| anyhow!("--recipient: {e}"))?;
+    if let Some(w) = recipient_warning(&r) {
+        warn!(event = "burn_recipient_warning", recipient, warning = w);
+        eprintln!("warning: {w}");
+    }
     let value = zat(amount)?;
     let chain = match s.foreign {
         BridgeKind::Ethereum => {
@@ -325,16 +333,34 @@ pub async fn burn(
             foreign::near::connect_as(s, near_key).await?
         }
     };
+    let bytes = r.to_bytes();
     let b = chain
-        .burn(u64::try_from(value)?, r.to_bytes32())
+        .burn(u64::try_from(value)?, bytes.clone())
         .await
         .map_err(|e| anyhow!("burn: {e}"))?;
-    info!(event = "burn_sent", tx = %b.mined.tx, nonce = %b.nonce, amount = value, recipient);
+    info!(event = "burn_sent", tx = %b.mined.tx, nonce = %b.nonce, amount = value, recipient,
+          kind = r.kind().name(), recipient_hash = %hex::encode(r.recipient_hash()));
     print(&json!({
         "txhash": b.mined.tx.to_string(),
         "nonce": b.nonce,
         "block": b.mined.height,
+        "recipient": format!("0x{}", hex::encode(&bytes)),
+        "recipient_kind": r.kind().name(),
+        "recipienthash": hex::encode(r.recipient_hash()),
     }))
+}
+
+/// The warning `hawkeye burn` prints for a recipient the contract accepts but the node may not
+/// pay yet (§4.2): a `TX_PQPKH` recipient under scheme 2 (FN-DSA-512) is valid only once Falcon
+/// is active at the release.
+pub fn recipient_warning(r: &YcashRecipient) -> Option<&'static str> {
+    match r {
+        YcashRecipient::Pqpkh(id) if id.scheme == hawkeye_core::pq::SCHEME_FN_DSA_512 => Some(
+            "a scheme-2 (FN-DSA-512) recipient is valid only once Falcon is active on Ycash at \
+             the release; before that the node refuses to pay it and the burn waits",
+        ),
+        _ => None,
+    }
 }
 
 /// The drill gate: a drill command needs `[devnet] drills = true` and is refused on mainnet.
@@ -374,7 +400,7 @@ pub fn replay_plan(
         b.state != hawkeye_store::BurnState::Seen,
         "burn {nonce} is not finalized"
     );
-    let r = hawkeye_core::recipient::YcashRecipient::from_bytes32(&b.recipient)
+    let r = YcashRecipient::from_bytes(&b.recipient)
         .map_err(|e| anyhow!("burn {nonce} recipient: {e}"))?;
     Ok(ReplayPlan {
         recipient_script: r.script(),
@@ -608,7 +634,6 @@ mod tests {
     use super::*;
     use crate::config::Params;
     use hawkeye_core::memo::{HawkeyeMemo, MemoKind};
-    use hawkeye_core::recipient::YcashRecipient;
     use hawkeye_store::{BurnKey, NewBurn};
 
     fn params(drills: bool, mainnet: bool) -> Params {
@@ -689,6 +714,29 @@ mod tests {
         assert!(drill_gate(&params(true, true), "rogue-unlock").is_err());
     }
 
+    /// `hawkeye burn` warns for a scheme-2 (Falcon) recipient only (§4.2): the contracts accept
+    /// it, the node pays it once Falcon is active.
+    #[test]
+    fn burn_warns_for_falcon_recipients_only() {
+        assert_eq!(recipient_warning(&YcashRecipient::p2pkh([1; 20])), None);
+        assert_eq!(recipient_warning(&YcashRecipient::p2sh([1; 20])), None);
+        assert_eq!(
+            recipient_warning(&YcashRecipient::pqpkh(1, [1; 32]).unwrap()),
+            None
+        );
+        let w = recipient_warning(&YcashRecipient::pqpkh(2, [1; 32]).unwrap()).unwrap();
+        assert!(w.contains("Falcon"), "{w}");
+        // the CLI decodes sq…/tq…/rq… and refuses the owner form (yb…/yt…/yr…)
+        use hawkeye_core::address::{Network, encode_address, encode_pq_address};
+        let r = YcashRecipient::pqpkh(1, [0xc5; 32]).unwrap();
+        let sq = encode_address(&r, Network::Regtest);
+        assert!(sq.starts_with("rq"));
+        assert_eq!(decode_address(&sq, Network::Regtest).unwrap(), r);
+        let owner = encode_pq_address(r.pq_key().unwrap(), Network::Regtest);
+        assert!(owner.starts_with("yr"));
+        assert!(decode_address(&owner, Network::Regtest).is_err());
+    }
+
     #[test]
     fn replay_plan_carries_the_burns_memo_recipient_and_amount() {
         let p = params(true, false);
@@ -703,7 +751,7 @@ mod tests {
                     block_hash: [1; 32],
                     from: Destination::Ethereum(EthAddress([2; 20])),
                     amount: 400_000_000,
-                    recipient: r.to_bytes32(),
+                    recipient: r.to_bytes(),
                     finalized: true,
                 })
             })
@@ -739,7 +787,7 @@ mod tests {
                     block_hash: [1; 32],
                     from: Destination::Ethereum(EthAddress([2; 20])),
                     amount: 1,
-                    recipient: YcashRecipient::p2pkh([0x11; 20]).to_bytes32(),
+                    recipient: YcashRecipient::p2pkh([0x11; 20]).to_bytes(),
                     finalized: false,
                 })
             })

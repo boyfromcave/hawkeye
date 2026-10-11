@@ -41,7 +41,8 @@ pub enum Error {
     /// A transparent address that does not decode for the network.
     #[error("bad address: {0}")]
     Address(&'static str),
-    /// A `ycashRecipient` bytes32 that does not decode (plan §4.2).
+    /// A `ycashRecipient` that does not decode (plan §4.2: 22 or 35 bytes, version 2, a known
+    /// kind and scheme).
     #[error("bad recipient: {0}")]
     Recipient(&'static str),
     /// A Hawkeye `HKB1` / `HKN1` memo that does not decode (plan §4.3, NEAR plan §2.2).

@@ -229,7 +229,7 @@ fn a_v3_ledger_migrates_to_v4_losslessly() {
         .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 4);
+    assert_eq!(s.schema_version().unwrap() as usize, MIGRATIONS.len());
     assert_eq!(tables(&path), TABLES);
     let eth = |a: [u8; 20]| Destination::Ethereum(EthAddress(a));
     s.tx(|t| {
@@ -320,6 +320,156 @@ fn a_v3_ledger_migrates_to_v4_losslessly() {
     );
 }
 
+/// Schema v5 (main plan §4.2 revision 2): a v4 ledger's 32-byte revision-1 recipients become
+/// the 22-byte revision-2 form losslessly; a malformed one (an orphaned burn) stays undecodable;
+/// the states, ids and the intents' references survive; the new CHECK takes 22 and 35 bytes only.
+#[test]
+fn a_v4_ledger_migrates_to_v5_converting_v1_recipients() {
+    use hawkeye_core::EthAddress;
+    use hawkeye_core::recipient::YcashRecipient;
+    use hawkeye_store::{BurnKey, BurnState};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let dep = hawkeye_core::Deployment {
+        chain_id: 31337,
+        bridge: EthAddress([0xb0; 20]),
+    };
+    let p2pkh = YcashRecipient::p2pkh([0x5a; 20]);
+    let p2sh = YcashRecipient::p2sh([0xab; 20]);
+    // the revision-1 bytes32 of each, as a pre-R4 ledger stored them
+    let v1 = |kind: u8, h: &[u8; 20]| {
+        let mut b = vec![0x01u8, kind];
+        b.extend([0u8; 10]);
+        b.extend_from_slice(h);
+        b
+    };
+    let mut malformed = vec![0x01u8, 0x02]; // kind 2 did not exist under revision 1
+    malformed.extend([0x07u8; 10]);
+    malformed.extend([0xcdu8; 20]);
+    {
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        for m in &MIGRATIONS[..4] {
+            raw.execute_batch(m).unwrap();
+        }
+        raw.pragma_update(None, "user_version", 4).unwrap();
+        raw.execute(
+            "INSERT INTO intents (txid, vout, value_zat, recipient_hash, vault_hash,
+                                  first_seen_height, state, created_at, updated_at)
+             VALUES (?1, 0, 400, ?2, ?3, 8, 'MATCHED', 0, 0)",
+            (
+                vec![6u8; 32],
+                p2pkh.recipient_hash().to_vec(),
+                vec![8u8; 32],
+            ),
+        )
+        .unwrap();
+        let mut ins = raw
+            .prepare(
+                "INSERT INTO burns (id, chain_id, bridge, nonce, tx_hash, block_number,
+                                    block_hash, sender, amount, recipient, state, intent_txid,
+                                    intent_vout, created_at, updated_at)
+                 VALUES (?1, 31337, ?2, ?3, ?4, 160, ?5, 'ethereum:0x' || ?6, 400, ?7, ?8, ?9,
+                         ?10, 0, 0)",
+            )
+            .unwrap();
+        let bridge = vec![0xb0u8; 20];
+        let hash = vec![0xccu8; 32];
+        let sender = "f1".repeat(20);
+        ins.execute((
+            42,
+            &bridge,
+            3,
+            vec![0xabu8; 32],
+            &hash,
+            &sender,
+            v1(0, &[0x5a; 20]),
+            "INTENT_PENDING",
+            Some(vec![6u8; 32]),
+            Some(0),
+        ))
+        .unwrap();
+        ins.execute((
+            43,
+            &bridge,
+            4,
+            vec![0xacu8; 32],
+            &hash,
+            &sender,
+            v1(1, &[0xab; 20]),
+            "FINALIZED",
+            None::<Vec<u8>>,
+            None::<i64>,
+        ))
+        .unwrap();
+        ins.execute((
+            44,
+            &bridge,
+            5,
+            vec![0xadu8; 32],
+            &hash,
+            &sender,
+            malformed.clone(),
+            "ORPHANED",
+            None::<Vec<u8>>,
+            None::<i64>,
+        ))
+        .unwrap();
+        raw.execute(
+            "UPDATE intents SET matched_burn = 42 WHERE txid = ?1",
+            [vec![6u8; 32]],
+        )
+        .unwrap();
+    }
+    let mut s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 5);
+    assert_eq!(tables(&path), TABLES);
+    s.tx(|t| {
+        let b = t.burn(&BurnKey::new(dep, 3))?.unwrap();
+        assert_eq!(b.recipient, p2pkh.to_bytes());
+        assert_eq!(YcashRecipient::from_bytes(&b.recipient).unwrap(), p2pkh);
+        assert_eq!((b.state, b.amount), (BurnState::IntentPending, 400));
+        assert_eq!(b.intent.unwrap().txid, [6; 32]);
+        let m = t.matcher_burn(&dep, 3)?.unwrap();
+        assert_eq!(m.recipient, p2pkh.to_bytes());
+        let b = t.burn(&BurnKey::new(dep, 4))?.unwrap();
+        assert_eq!(YcashRecipient::from_bytes(&b.recipient).unwrap(), p2sh);
+        assert_eq!(b.state, BurnState::Finalized);
+        let b = t.burn(&BurnKey::new(dep, 5))?.unwrap();
+        assert_eq!(b.state, BurnState::Orphaned);
+        assert_eq!(b.recipient.len(), 22);
+        assert_eq!(
+            &b.recipient[..2],
+            &[0x01, 0x02],
+            "retired version, its kind slot"
+        );
+        assert_eq!(&b.recipient[2..], &malformed[12..], "its hash slot");
+        assert!(YcashRecipient::from_bytes(&b.recipient).is_err());
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+    drop(s);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    assert!(
+        raw.execute("DELETE FROM burns", []).is_err(),
+        "intents.matched_burn → burns"
+    );
+    let n: i64 = raw
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(n, 0);
+    // the v5 column takes 22 and 35 bytes and nothing else
+    let set =
+        |blob: Vec<u8>| raw.execute("UPDATE burns SET recipient = ?1 WHERE nonce = 4", [blob]);
+    assert!(set(vec![2; 35]).is_ok());
+    assert!(set(vec![2; 22]).is_ok());
+    for n in [0, 20, 21, 23, 32, 34, 36] {
+        assert!(set(vec![2; n]).is_err(), "{n}");
+    }
+}
+
 /// NEAR accounts and guardians round-trip through every v4 column.
 #[test]
 fn near_accounts_round_trip() {
@@ -352,7 +502,7 @@ fn near_accounts_round_trip() {
             block_hash: [4; 32],
             from: alice.clone(),
             amount: 1,
-            recipient: [1; 32],
+            recipient: vec![2; 22],
             finalized: true,
         })?;
         assert_eq!(b.from, alice);

@@ -10,8 +10,12 @@
 //! `0x56AB` / `0x571E` / `0x5710`, ycash-dd `src/yellowback/params.cpp`, `pqAddressVersion`;
 //! the mainnet version is quantum plan D-Q-21's, `yb…` like the 35-character YED address).
 //!
-//! The node also renders the same key as a plain-YEC PQ address (`sq…`/`tq…`/`rq…`, D-Q-20, a
-//! `TX_PQPKH` output); Hawkeye never builds or decodes those: it names owners, not payees.
+//! The node also renders a post-quantum key as a **plain-YEC PQ address** (`sq…`/`tq…`/`rq…`,
+//! quantum plan D-Q-20, a `TX_PQPKH` output): base58check of `version(2) ‖ scheme ‖ keyHash(32)`,
+//! 53 characters, versions `0x4DD9` / `0x4F61` / `0x4C51` (ycash-dd `src/key_io.cpp:23-27` at
+//! `d41026209`, `PlainPQAddressVersion`). That form names a kind-2 **burn recipient** (plan
+//! §4.2): [`decode_address`] returns it beside P2PKH and P2SH. The owner form never does: owner
+//! keys are vault owners, not holder addresses.
 
 use crate::bytes::sha256d;
 use crate::error::{Error, Result};
@@ -55,10 +59,21 @@ impl Network {
         }
     }
 
+    /// The plain-YEC post-quantum address version (`TX_PQPKH` payees, D-Q-20): `sq…`, `tq…`,
+    /// `rq…` (`src/key_io.cpp:23-27`).
+    pub fn pq_plain_prefix(self) -> [u8; 2] {
+        match self {
+            Self::Mainnet => [0x4d, 0xd9],
+            Self::Testnet => [0x4f, 0x61],
+            Self::Regtest => [0x4c, 0x51],
+        }
+    }
+
     fn prefix(self, kind: RecipientKind) -> [u8; 2] {
         match kind {
             RecipientKind::P2pkh => self.p2pkh_prefix(),
             RecipientKind::P2sh => self.p2sh_prefix(),
+            RecipientKind::Pqpkh => self.pq_plain_prefix(),
         }
     }
 }
@@ -86,26 +101,47 @@ pub fn base58check_decode(s: &str) -> Result<Vec<u8>> {
     Ok(v)
 }
 
-/// The transparent address of `recipient` on `network`.
+/// The address of `recipient` on `network`: transparent (`s1…`/`s2…`/`s3…`, `sm…`), or the
+/// plain-YEC PQ form (`sq…`/`tq…`/`rq…`, 53 characters) of a `TX_PQPKH` recipient.
 pub fn encode_address(recipient: &YcashRecipient, network: Network) -> String {
-    let mut data = network.prefix(recipient.kind).to_vec();
-    data.extend_from_slice(&recipient.hash);
+    let mut data = network.prefix(recipient.kind()).to_vec();
+    match recipient {
+        YcashRecipient::P2pkh(h) | YcashRecipient::P2sh(h) => data.extend_from_slice(h),
+        YcashRecipient::Pqpkh(id) => data.extend_from_slice(&id.to_bytes()),
+    }
     base58check_encode(&data)
 }
 
-/// Decode a transparent address of `network` (P2PKH or P2SH).
+/// Decode a recipient address of `network`: P2PKH or P2SH (22-byte payload), or a plain-YEC PQ
+/// address (`sq…`/`tq…`/`rq…`, 35-byte payload, a registered scheme). The PQ *owner* address
+/// (`yb…`/`yt…`/`yr…`, [`decode_pq_address`]) is refused: it is not a burn recipient.
 pub fn decode_address(s: &str, network: Network) -> Result<YcashRecipient> {
     let v = base58check_decode(s)?;
-    if v.len() != 22 {
-        return Err(Error::Address("wrong payload length"));
-    }
-    let hash: [u8; 20] = v[2..].try_into().expect("20 bytes");
-    if v[..2] == network.p2pkh_prefix() {
-        Ok(YcashRecipient::p2pkh(hash))
-    } else if v[..2] == network.p2sh_prefix() {
-        Ok(YcashRecipient::p2sh(hash))
-    } else {
-        Err(Error::Address("prefix of another network or kind"))
+    match v.len() {
+        22 => {
+            let hash: [u8; 20] = v[2..].try_into().expect("20 bytes");
+            if v[..2] == network.p2pkh_prefix() {
+                Ok(YcashRecipient::p2pkh(hash))
+            } else if v[..2] == network.p2sh_prefix() {
+                Ok(YcashRecipient::p2sh(hash))
+            } else {
+                Err(Error::Address("prefix of another network or kind"))
+            }
+        }
+        35 => {
+            if v[..2] == network.pq_prefix() {
+                return Err(Error::Address(
+                    "a post-quantum owner address is not a recipient",
+                ));
+            }
+            if v[..2] != network.pq_plain_prefix() {
+                return Err(Error::Address("prefix of another network or kind"));
+            }
+            let hash: [u8; 32] = v[3..].try_into().expect("32 bytes");
+            YcashRecipient::pqpkh(v[2], hash)
+                .map_err(|_| Error::Address("unknown post-quantum scheme"))
+        }
+        _ => Err(Error::Address("wrong payload length")),
     }
 }
 
@@ -220,6 +256,92 @@ mod tests {
             assert_eq!(s.len(), 53);
             assert!(s.starts_with("yb"));
         }
+    }
+
+    /// The plain-YEC PQ address (`sq…`/`tq…`/`rq…`, D-Q-20): expected strings computed
+    /// independently (Python base58check over `src/key_io.cpp:23-27`'s versions; the scheme-1
+    /// hash is the node vector's `pqOwner`), 53 characters, the node's leading characters
+    /// (`src/test/pq_address_tests.cpp` `sq_roundtrip_per_network`), decoded as a kind-2
+    /// recipient; the owner form of the same key is refused as a recipient.
+    #[test]
+    fn plain_pq_addresses() {
+        let slh = YcashRecipient::pqpkh(
+            1,
+            hex::decode("c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let falcon = YcashRecipient::pqpkh(2, [0xff; 32]).unwrap();
+        for (net, lead, a1, a2) in [
+            (
+                Network::Mainnet,
+                "sq",
+                "sq4dd1yaBk7vNHKXnkLpBETW9Pd4drGdG7xA4i6miNa93JnE4ucTW",
+                "sq4g1bmrsxBW5H4QKTksBZQLD4s81ubworVRhiU3o1EUWZJ1erUQK",
+            ),
+            (
+                Network::Testnet,
+                "tq",
+                "tq3vo9EppNP4GGAiuY3YFJgb4wwpM6JvDw8MA4Aapr9a3gYCxkyak",
+                "tq3yBj37WaSdyFubSFTbFddR8dBsj9eEmffco4XruUouWw44waFrF",
+            ),
+            (
+                Network::Regtest,
+                "rq",
+                "rq5LStiKZ7rnUJULfxe67AERDqJJvcELJJmxyN2xbtzi2w2A7xSr6",
+                "rq5NqUWcFKvNBJDDCg497VBFHWYNJfZer3KEcNQEgXf3WBY5W1R6q",
+            ),
+        ] {
+            assert_eq!(encode_address(&slh, net), a1);
+            assert_eq!(encode_address(&falcon, net), a2);
+            assert_eq!(a1.len(), 53);
+            assert!(a1.starts_with(lead) && a2.starts_with(lead), "{net:?}");
+            assert_eq!(decode_address(a1, net).unwrap(), slh);
+            assert_eq!(decode_address(a2, net).unwrap(), falcon);
+            // the same key's owner address (yb…/yt…/yr…) is not a recipient
+            let owner = encode_pq_address(slh.pq_key().unwrap(), net);
+            assert_eq!(
+                decode_address(&owner, net),
+                Err(Error::Address(
+                    "a post-quantum owner address is not a recipient"
+                ))
+            );
+            // and the sq… form is not an owner address
+            assert!(decode_pq_address(a1, net).is_err());
+        }
+        // the node's D-Q-21 known-answer hash under the plain versions (Python)
+        let h5a = YcashRecipient::pqpkh(1, [0x5a; 32]).unwrap();
+        assert_eq!(
+            encode_address(&h5a, Network::Mainnet),
+            "sq4couNBfnJoRxqXF89SWjiPh5wktFi5bb5S4F89xMMsCrqRf2L4z"
+        );
+        assert_eq!(
+            encode_address(
+                &YcashRecipient::pqpkh(2, [0x5a; 32]).unwrap(),
+                Network::Mainnet
+            ),
+            "sq4ekeYR7pAE7ByLpq428jfiHrrsVyMnSTs58MNJeFMXDFL63vTbT"
+        );
+        // another network's form; scheme 3 under the right version; a 34-byte payload
+        let main = encode_address(&slh, Network::Mainnet);
+        assert!(decode_address(&main, Network::Regtest).is_err());
+        assert!(decode_address(&main, Network::Testnet).is_err());
+        let mut d = Network::Mainnet.pq_plain_prefix().to_vec();
+        d.push(3);
+        d.extend([0; 32]);
+        assert_eq!(
+            decode_address(&base58check_encode(&d), Network::Mainnet),
+            Err(Error::Address("unknown post-quantum scheme"))
+        );
+        let mut d = Network::Mainnet.pq_plain_prefix().to_vec();
+        d.push(1);
+        d.extend([0; 31]);
+        assert_eq!(
+            decode_address(&base58check_encode(&d), Network::Mainnet),
+            Err(Error::Address("wrong payload length"))
+        );
     }
 
     /// Expected strings computed independently (Python base58check over the same prefixes).

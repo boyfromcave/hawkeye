@@ -84,8 +84,8 @@ async fn burn(State(ctx): State<Ctx>, Path(nonce): Path<u64>) -> Response {
             nonce,
             tx_hash: format!("0x{}", hex::encode(b.tx_hash)),
             amount: b.amount,
-            recipient: format!("0x{}", hex::encode(b.recipient)),
-            recipient_address: YcashRecipient::from_bytes32(&b.recipient)
+            recipient: format!("0x{}", hex::encode(&b.recipient)),
+            recipient_address: YcashRecipient::from_bytes(&b.recipient)
                 .ok()
                 .map(|r| encode_address(&r, ctx.params.network)),
             state: b.state.to_string(),

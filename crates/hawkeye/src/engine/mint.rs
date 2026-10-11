@@ -185,13 +185,13 @@ impl Engine {
                             block_hash: m.block_hash,
                             from: from.clone(),
                             amount,
-                            recipient: *ycash_recipient,
+                            recipient: ycash_recipient.clone(),
                             finalized: true,
                         })?;
                         if existed {
                             continue;
                         }
-                        let recipient = YcashRecipient::from_bytes32(ycash_recipient);
+                        let recipient = YcashRecipient::from_bytes(ycash_recipient);
                         info!(event = "burn_finalized", nonce, amount, tx = %m.tx,
                               block = m.height,
                               recipient = ?recipient.as_ref().ok().map(|r| hawkeye_core::address::encode_address(r, p.network)));

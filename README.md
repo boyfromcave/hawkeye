@@ -37,11 +37,11 @@ guardian keys stay secp256k1 (quantum plan D-Q-5), so the Ethereum EIP-712 and t
 
 | Path | What |
 |---|---|
-| `crates/hawkeye-core` | pure encodings and rules: templates, memo, recipient, lockId, EIP-712, policy, matching |
+| `crates/hawkeye-core` | pure encodings and rules: templates, memo, recipient (§4.2: transparent or `TX_PQPKH`), lockId, EIP-712, policy, matching |
 | `crates/hawkeye-ycash` | ycashd JSON-RPC client (`set_*`, `vault_*`, stock), v4 tx codec, mock node |
 | `crates/hawkeye-eth` | Ethereum adapter (alloy): bindings, finalized scanner, signer, mint submitter |
 | `crates/hawkeye-near` | NEAR adapter (NEAR plan NH4/NH5): JSON-RPC client, hand-rolled Borsh transaction codec (golden-vectored against `near-primitives`), relayer key, `wyec-near` client and block scanner, mock NEAR node, a test against a real sandbox (`tests/sandbox.rs`) and the devnet's set-up helper (`examples/near-admin.rs`) |
-| `crates/hawkeye-store` | SQLite ledger, sign-once records, evidence (v4: chain-neutral accounts) |
+| `crates/hawkeye-store` | SQLite ledger, sign-once records, evidence (v4: chain-neutral accounts; v5: 22/35-byte burn recipients) |
 | `crates/hawkeye` | the daemon and CLI (`[foreign] kind = "ethereum"` or `"near"`) |
 | `eth/` | Foundry project: wyec at a pinned commit, deploy scripts (anvil, Sepolia), vectors |
 | `near/` | the `wyec-near` contract (NEP-141 wYEC + bridge policy), its own cargo project; `tools/fetch-sandbox.sh` pins the NEAR sandbox node |

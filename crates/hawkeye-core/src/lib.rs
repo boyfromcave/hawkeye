@@ -18,8 +18,8 @@
 //! | [`bridge`] | [`BridgeKind`]: Ethereum (`WYEC`, `HKB1`) or NEAR (`NYEC`, `HKN1`) |
 //! | [`near`] | NEAR account ids, the `wyec-near` domain, Borsh messages and digests, burn records, `r‖s‖v` (v 0/1) signatures (NEAR plan §2) |
 //! | [`lock`] | `lockId` and the lock destination `OP_RETURN` (§4.1; NEAR `"NR1"` ‖ account id) |
-//! | [`recipient`] | the `ycashRecipient` bytes32 codec (§4.2) |
-//! | [`address`] | Ycash transparent addresses and PQ owner addresses (base58check) |
+//! | [`recipient`] | the `ycashRecipient` codec (§4.2 revision 2: 22 or 35 bytes; P2PKH, P2SH, `TX_PQPKH`) |
+//! | [`address`] | Ycash transparent, plain-YEC PQ (`sq…`) and PQ owner addresses (base58check) |
 //! | [`memo`] | the `HKB1` / `HKN1` memo (§4.3, NEAR plan §2.2) |
 //! | [`policy`] | the lock policy (§4.1) |
 //! | [`matcher`] | intent classification (§3.2) |
