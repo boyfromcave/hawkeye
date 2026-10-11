@@ -786,7 +786,7 @@ pub struct NewOwner {
     pub keyhash: HexBytes,
     /// `scheme ‖ keyhash`.
     pub owner: PqKeyId,
-    /// The 53-character post-quantum address (`ye…` / `yt…` / `yr…`).
+    /// The 53-character post-quantum address (`yb…` / `yt…` / `yr…`, D-Q-21).
     pub address: String,
 }
 

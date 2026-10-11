@@ -174,6 +174,31 @@ async fn burn_release_flow_with_memo() {
     );
     assert_eq!(e.rpc().unwrap().matures_at_height(), Some(i.matureheight));
     c.generate(5).await.unwrap();
+    // a pqkeyid is not a recipient (vault-rpc.md, vault_release's -8; the node's message)
+    for scheme in ["01", "02"] {
+        let pqkeyid = format!("{scheme}{}", "c5".repeat(32));
+        let e = c
+            .vault_release(&i.outpoint, Some(&pqkeyid))
+            .await
+            .unwrap_err();
+        let rpc = e.rpc().unwrap();
+        assert_eq!(rpc.code, -8, "{pqkeyid}");
+        assert!(
+            rpc.message
+                .ends_with("pass the address or the script, not a pqkeyid"),
+            "{}",
+            rpc.message
+        );
+    }
+    // a 33-byte hex script of an unregistered scheme byte is just a wrong script
+    let e = c
+        .vault_release(&i.outpoint, Some(&format!("03{}", "c5".repeat(32))))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.rpc().unwrap().message,
+        "that script is not the intent's recipient"
+    );
     let rel = c
         .vault_release(&i.outpoint, Some(&recipient))
         .await

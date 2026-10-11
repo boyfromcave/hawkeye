@@ -14,8 +14,11 @@ and the [wYEC contract design](https://github.com/boyfromcave/wyec/blob/main/doc
 line every vault's owner is post-quantum, bridge vaults included (the owner's decision; the
 workspace's `yellowback-quantum-spec.md` §1, §4, §6.2): the owner slot of V and I is
 `<ownerHash:32> OP_1|OP_2 OP_CHECKPQSIG` (35 bytes; V 45 tokens, I 32), the owner is a `pqkeyid`
-(`scheme ‖ SHA256(scheme ‖ pk)`) or a 53-character PQ address (`ye…`/`yt…`/`yr…`), and the
-secp256k1 owner shape is not a template. Hawkeye still holds no owner key and no post-quantum
+(`scheme ‖ SHA256(scheme ‖ pk)`) or a 53-character PQ address (`yb…`/`yt…`/`yr…`; the mainnet
+version is `0x56AB`, quantum plan D-Q-21), and the secp256k1 owner shape is not a template. The
+node also renders a PQ key as a plain-YEC address (`sq…`/`tq…`/`rq…`, D-Q-20, a `TX_PQPKH`
+output) and takes one wherever it takes an address; Hawkeye's recipient codec (§4.2) stays
+P2PKH/P2SH — a PQ burn recipient is an open question (Q-7), not a codec change. Hawkeye still holds no owner key and no post-quantum
 code: `hawkeye lock` takes the owner from `vault_getnewowner` (or `--owner`), the depositor's node
 signs `vault_ownerspend`, rolls copy the owner slot byte for byte, and the lock policy mints for
 SLH-DSA-SHA2-128s (scheme 1) owners only (§4.1 rule 1). Wherever this plan says "owner key" read
@@ -661,6 +664,7 @@ from the members' compressed keys.
 | Q-4 | Bridge fee (O-2 "bps fee") and who pays Ethereum gas | v1: none; attestors absorb fees (a proposal ~111k gas, an execute ~107k, a challenge ~38k: wyec-contract-design.md §4.5.5); revisit before mainnet |
 | Q-5 | Who may be an attestor (Foundation-chosen operators?) and the admission key's custody | the Foundation picks the first set; `admitKey` retires once `slashThreshold` members are current |
 | Q-6 | Ethereum L1 only (O-4) or also an L2 | L1 first; the memo's `chainId` keeps deployments apart |
+| Q-7 | Post-quantum burn recipients: the node (quantum line, D-Q-20) pays `TX_PQPKH` outputs (`sq…`/`tq…`/`rq…`) wherever it takes an address, and from the Falcon height a YED holder must be one (TOK-PQ), but `ycashRecipient` (§4.2, HK-5) encodes P2PKH/P2SH only, so a burner cannot name a PQ address and a released intent pays a secp256k1 script | leave the codec as is in v1 (a bridge release pays plain YEC, which has no holder rule); a `TX_PQPKH` recipient kind (`scheme ‖ keyHash` is 33 bytes, one more than the 32 the record carries, so it needs a new encoding, not a new `kind` byte) is a plan change on both bridges and the wyec/wyec-near contracts, decided with the owner before mainnet |
 
 ---
 

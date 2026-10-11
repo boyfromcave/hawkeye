@@ -6,8 +6,12 @@
 //! Decoding goes by prefix bytes, never by the leading characters.
 //!
 //! A vault owner is named by a **post-quantum address** (quantum spec §4): base58check of
-//! `pqVersion(2) ‖ scheme ‖ keyHash(32)`, 53 characters, `ye…` / `yt…` / `yr…` (versions
-//! `0x56BF` / `0x571E` / `0x5710`, ycash-dd `src/yellowback/params.cpp`, `pqAddressVersion`).
+//! `pqVersion(2) ‖ scheme ‖ keyHash(32)`, 53 characters, `yb…` / `yt…` / `yr…` (versions
+//! `0x56AB` / `0x571E` / `0x5710`, ycash-dd `src/yellowback/params.cpp`, `pqAddressVersion`;
+//! the mainnet version is quantum plan D-Q-21's, `yb…` like the 35-character YED address).
+//!
+//! The node also renders the same key as a plain-YEC PQ address (`sq…`/`tq…`/`rq…`, D-Q-20, a
+//! `TX_PQPKH` output); Hawkeye never builds or decodes those: it names owners, not payees.
 
 use crate::bytes::sha256d;
 use crate::error::{Error, Result};
@@ -42,10 +46,10 @@ impl Network {
         }
     }
 
-    /// The post-quantum (owner) address version: `ye…`, `yt…`, `yr…`.
+    /// The post-quantum (owner) address version: `yb…`, `yt…`, `yr…`.
     pub fn pq_prefix(self) -> [u8; 2] {
         match self {
-            Self::Mainnet => [0x56, 0xbf],
+            Self::Mainnet => [0x56, 0xab],
             Self::Testnet => [0x57, 0x1e],
             Self::Regtest => [0x57, 0x10],
         }
@@ -131,7 +135,7 @@ mod tests {
     use super::*;
 
     /// Expected strings computed independently (Python base58check over the quantum spec §4
-    /// versions); the scheme-1 hash is the node vector's `pqOwner`.
+    /// versions, mainnet `0x56AB` per D-Q-21); the scheme-1 hash is the node vector's `pqOwner`.
     #[test]
     fn pq_addresses() {
         let owner =
@@ -141,8 +145,8 @@ mod tests {
         for (net, a1, a2) in [
             (
                 Network::Mainnet,
-                "ye3W1TcRQYJwa47heYwxWkw1eKQidXYKExKCyNt1NtcxQiqLtXn6o",
-                "ye3YQ3Qi6kNXH3raBGN1X5sqhzen1asdngrUcPFHTXHHsyMAHi8gj",
+                "yb5uQ2PDR3EcpZmSHVS4eqT7uLihaqAthhUkNBo5V53tB6DJDyVow",
+                "yb5wncBW7FJCXZWJpCr7fAPwy1xkxtWDFS221CAMZhiDeLjBHdsWi",
             ),
             (
                 Network::Testnet,
@@ -163,6 +167,14 @@ mod tests {
         }
         let main = encode_pq_address(&owner, Network::Mainnet);
         assert!(decode_pq_address(&main, Network::Testnet).is_err());
+        // the former mainnet version 0x56BF (`ye…`) is another network's now
+        assert!(
+            decode_pq_address(
+                "ye3W1TcRQYJwa47heYwxWkw1eKQidXYKExKCyNt1NtcxQiqLtXn6o",
+                Network::Mainnet
+            )
+            .is_err()
+        );
         // a transparent address is not an owner address, nor the other way round
         let t = encode_address(&YcashRecipient::p2pkh([7; 20]), Network::Mainnet);
         assert!(decode_pq_address(&t, Network::Mainnet).is_err());
@@ -175,6 +187,39 @@ mod tests {
             decode_pq_address(&base58check_encode(&d), Network::Mainnet),
             Err(Error::Address("unknown post-quantum scheme"))
         );
+    }
+
+    /// The node's own mainnet known answers (ycash-dd `d41026209` `src/test/pq_standard_tests.cpp`,
+    /// "D-Q-21 known answers"): `Hash32(0x5a)` under each scheme, and the extreme payloads
+    /// (33 × `00`, 33 × `ff`) that pin the `yb` leading characters and the 53-character length.
+    #[test]
+    fn node_known_answers() {
+        let main = Network::Mainnet;
+        assert_eq!(
+            encode_pq_address(&PqKeyId::new(1, [0x5a; 32]).unwrap(), main),
+            "yb5taumpu5RVtFHRjsEgzLi1T33PqEcM3Ac2MipTj3qcLeGaSRJGu"
+        );
+        assert_eq!(
+            encode_pq_address(&PqKeyId::new(2, [0x5a; 32]).unwrap(), main),
+            "yb5vXex4M7GvZURFKa9GcLfL3oxWSxG3t3PfRq4cQwqGM2mH4L3Kg"
+        );
+        for (fill, want) in [
+            (
+                0x00u8,
+                "yb5qxNeom9jvVt6r568NoAXzAhDR7jZ6iof6nsRuW1jFdBFSvPpBv",
+            ),
+            (
+                0xff,
+                "ybERawpAfKtqdrcrqeCmgxi5ewecmZyNSy6ivRtFbWD1LTaaj8eCA",
+            ),
+        ] {
+            let mut d = main.pq_prefix().to_vec();
+            d.extend([fill; 33]);
+            let s = base58check_encode(&d);
+            assert_eq!(s, want);
+            assert_eq!(s.len(), 53);
+            assert!(s.starts_with("yb"));
+        }
     }
 
     /// Expected strings computed independently (Python base58check over the same prefixes).

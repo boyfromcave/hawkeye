@@ -4,23 +4,34 @@
 
 The vault primitive's golden vector, copied verbatim from the node:
 
-- source: `boyfromcave/ycash-dd` `src/test/data/vault_vectors.json` at commit **`a8572900f`**
-  (branch `q/tmpl`, the post-quantum line `upgrade/quantum-vaults`; the file last changed in
-  `926268c3b`; the same blob `b7d164f` on `q/wallet` `e37a8c3b4`). Every V and I owner is a
-  post-quantum key id (quantum spec §1): `pqOwner`, the scheme-2 case, the owner-slot invalid
-  cases and the SLH-DSA owner spend `ownerSpends` are new. The `upgrade/vault` copy was ycash-dd
-  `dbc1ab0`, sha256 `b9681ac0…6f97`.
-- sha256 `29633de74cc8c67dfa0f78327a33fdb03700532297d3d90c95349e674d47b131`; it must be
-  byte-identical in `ycash6` once the port lands there (the vector is the same on both node lines)
-- schema and conventions: ycash-dd `qa/rpc-tests/test_framework/VAULT_VECTORS.md`
+- source: `boyfromcave/ycash-dd` `src/test/data/vault_vectors.json` at commit **`d41026209`**
+  (the head of the post-quantum line `upgrade/quantum-vaults`), byte-identical to
+  `boyfromcave/ycash6` `upgrade/quantum-vaults` **`0c6c5fdf2`** (checked by sha256 when copied:
+  the vector is the same on both node lines). Every V and I owner is a post-quantum key id
+  (quantum spec §1). New since the previous copy (ycash-dd `a8572900f`, sha256 `29633de7…7b131`):
+  the Falcon owner `falconOwner` (scheme 2: seed, the 897-byte `pk`, `owner`) now owns the
+  `owner-falcon-scheme-2` V, and an I of that name is new; `intentsInvalid` gains the owner-slot
+  cases `owner-scheme-as-data-push`, `owner-scheme-0`, `owner-hash-31-bytes`,
+  `owner-hash-33-bytes`; `ownerSpends` grows from one to four (`kind` and `verify` fields;
+  OWNER-RELEASED selector-3 spends of a V and of an I, and the Falcon owner spend with its
+  `falconEntropy`); the former secp256k1 owner key is relabelled `ec-legacy` in `keys` and
+  `signatures`, so the `owner-ec-key-checksig` scripts changed. The `upgrade/vault` copy was
+  ycash-dd `dbc1ab0`, sha256 `b9681ac0…6f97`.
+- sha256 `4ba212836eed05b9021ccca7d9ae151848ac79f40064fbe33d06f66438780d03`
+- schema and conventions: ycash-dd `qa/rpc-tests/test_framework/VAULT_VECTORS.md`; generator
+  `qa/rpc-tests/test_framework/gen_vault_vectors.py` (both at the same commit)
 
-Do not edit it. To update, copy the node's file again, record the new commit and hash here, and
-re-run `cargo test -p hawkeye-core`.
+Do not edit it. To update, copy the node's file again (from either line, after checking the two
+are identical), record the new commit and hash here, and re-run `cargo test -p hawkeye-core`.
 
-`tests/vault_vectors.rs` replays `pqOwner`, `vaults`, `vaultsInvalid`, `intents`,
-`intentsInvalid`, `bonds`, `selectors`, `selectorsInvalid`, `setSigMsgs`, `signatures`,
-`signaturesInvalid`, the act messages and signatures of `acts`, the set signatures inside
-`spends`, and the owner spend's selector, chunks and ZIP-243 sighash in `ownerSpends`.
+`tests/vault_vectors.rs` replays `pqOwner`, `falconOwner` (the id of the public key), `vaults`,
+`vaultsInvalid`, `intents`, `intentsInvalid`, `bonds`, `selectors`, `selectorsInvalid`,
+`setSigMsgs`, `signatures`, `signaturesInvalid`, the act messages and signatures of `acts`, the
+set signatures inside `spends`, and in every `ownerSpends` case the selector, the chunked
+scriptSig shape, the reassembled public key against the template's owner and the ZIP-243
+sighash. The SLH-DSA and Falcon signatures themselves are **not** verified: Hawkeye has no
+post-quantum signature code (the node signs owner spends), and `verify` (`script` /
+`signature`) needs the node's interpreter and set state.
 
 `tests/attribution.rs` runs every `spends` case through `attribution::attribute_template_input`
 (it must name exactly the recorded signers, with the recorded sighash and `setSigMsg`) and the

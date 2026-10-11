@@ -1903,11 +1903,11 @@ impl MockState {
                 format!("the intent matures at height {}", h + fields.delay),
             );
         }
-        let dest = match to {
-            Some(a) => match self.address_script(&a) {
+        let dest = match &to {
+            Some(a) => match self.address_script(a) {
                 Some(s) if !a.chars().all(|c| c.is_ascii_hexdigit()) => s,
                 _ => {
-                    hex::decode(&a).map_err(|_| (-5, format!("not an address or a script: {a}")))?
+                    hex::decode(a).map_err(|_| (-5, format!("not an address or a script: {a}")))?
                 }
             },
             None => self.recipients.get(&fields.recipienthash).cloned().ok_or((
@@ -1916,6 +1916,17 @@ impl MockState {
             ))?,
         };
         if Bytes32(sha256(&dest)) != fields.recipienthash {
+            // the node (src/rpc/vault.cpp, d41026209): a 66-hex `scheme || keyhash` of a
+            // registered scheme, as vault_list and z_importpqkey print it, is not a script
+            if to.as_ref().is_some_and(|a| a.len() == 66)
+                && dest.len() == 33
+                && (dest[0] == 1 || dest[0] == 2)
+            {
+                return err(
+                    -8,
+                    "that looks like a pqkeyid: pass the address or the script, not a pqkeyid",
+                );
+            }
             return err(-8, "that script is not the intent's recipient");
         }
         let mut tx = Transaction::new_v4(

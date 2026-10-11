@@ -123,7 +123,9 @@ fn contract_is_the_node_copy() {
     assert_eq!(c["branchid"], "6d5b7a31");
     assert_eq!(
         c["source"]["sha256"],
-        "b3e9c414b92c55c38ed4da0cdb04412eba4e56c77c344075cd8f2beb7a612a1a"
+        // doc/vault-rpc.md at ycash-dd d41026209 (= ycash6 0c6c5fdf2): the sq…/tq…/rq… address
+        // revision (Owners/Addresses bullets, vault_release's -8 "not a pqkeyid")
+        "ea81c888a8bd262f72700644a723e262b0e6962dd83c5b5377cff87a723ab880"
     );
     assert_eq!(c["methods"].as_object().unwrap().len(), 22);
     assert_eq!(c["types"]["pqkeyid"]["json"], "string");
