@@ -189,6 +189,26 @@ impl Error {
         }
     }
 
+    /// The access key's nonce the node reported with an `InvalidNonce` refusal (`ak_nonce`): the
+    /// key's nonce as the node sees it now, which is ahead of a `view_access_key` at `final`
+    /// while the transaction that took it is not final yet. `None` for any other error.
+    pub fn invalid_nonce_ak(&self) -> Option<u64> {
+        fn find(v: &serde_json::Value) -> Option<u64> {
+            match v {
+                serde_json::Value::Object(m) => match m.get("InvalidNonce") {
+                    Some(n) => n.get("ak_nonce").and_then(|a| a.as_u64()),
+                    None => m.values().find_map(find),
+                },
+                serde_json::Value::Array(a) => a.iter().find_map(find),
+                _ => None,
+            }
+        }
+        match self {
+            Error::Rpc { data: Some(d), .. } if self.is_invalid_nonce() => find(d),
+            _ => None,
+        }
+    }
+
     /// Whether the node gave up waiting for the transaction (it may still execute).
     pub fn is_timeout(&self) -> bool {
         matches!(self, Error::Rpc { cause: Some(c), .. } if c == "TIMEOUT_ERROR")
@@ -256,5 +276,16 @@ mod tests {
                 {"InvalidNonce": {"tx_nonce": 5, "ak_nonce": 9}}}})),
         };
         assert!(nonce.is_invalid_nonce() && !nonce.is_unknown_block() && !nonce.is_timeout());
+        assert_eq!(nonce.invalid_nonce_ak(), Some(9));
+        assert_eq!(unknown.invalid_nonce_ak(), None);
+        // the refusal named in the message only (no data): refused, but no nonce to take
+        let bare = Error::Rpc {
+            name: "HANDLER_ERROR".into(),
+            cause: Some("INVALID_TRANSACTION".into()),
+            message: "InvalidNonce".into(),
+            data: None,
+        };
+        assert!(bare.is_invalid_nonce());
+        assert_eq!(bare.invalid_nonce_ak(), None);
     }
 }

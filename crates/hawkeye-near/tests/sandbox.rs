@@ -391,7 +391,7 @@ async fn adapter_against_a_real_sandbox() {
             .is_none()
     );
 
-    // ---- a reused nonce is refused as InvalidNonce (the client re-reads and retries once)
+    // ---- a reused nonce is refused as InvalidNonce, naming the key's nonce (the client continues from it)
     let ak = rpc
         .access_key(alice.as_str(), &alice_key.public_key_text())
         .await
@@ -409,4 +409,5 @@ async fn adapter_against_a_real_sandbox() {
     let e = rpc.send_tx(&stale.borsh()).await.unwrap_err();
     println!("reused nonce: {e}");
     assert!(e.is_invalid_nonce(), "{e:?}");
+    assert_eq!(e.invalid_nonce_ak(), Some(ak.nonce), "{e:?}");
 }

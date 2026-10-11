@@ -279,17 +279,53 @@ async fn nonces_are_sequential_and_a_refused_one_is_retried() {
     }
     let nonce = |m: &MockNear| m.state().access_keys[&(r.account_id.to_string(), r.public_key())];
     assert_eq!(nonce(&mock), 3);
-    // another process used nonces meanwhile: the node refuses, the client re-reads and retries
-    mock.state().send_errors.push(json!({"name": "HANDLER_ERROR",
-        "cause": {"name": "INVALID_TRANSACTION", "info": {}}, "code": -32000,
-        "message": "Server error",
-        "data": {"TxExecutionError": {"InvalidTxError": {"InvalidNonce": {"tx_nonce": 4, "ak_nonce": 9}}}}}));
+    // another process used nonces meanwhile (the node holds them, `final` does not show them
+    // yet): the node refuses with its view of the key, the client continues from that nonce
+    let refused = |tx: u64, ak: u64| {
+        json!({"name": "HANDLER_ERROR",
+            "cause": {"name": "INVALID_TRANSACTION", "info": {}}, "code": -32000,
+            "message": "Server error",
+            "data": {"TxExecutionError": {"InvalidTxError": {"InvalidNonce": {"tx_nonce": tx, "ak_nonce": ak}}}}})
+    };
+    mock.state().send_errors.push(refused(4, 9));
     let lock = [9u8; 32];
     c.mint(&lock, 1, &alice, &[mint_sig(1, &lock, 1, &alice)])
         .await
         .unwrap();
-    assert_eq!(nonce(&mock), 4);
+    assert_eq!(
+        nonce(&mock),
+        10,
+        "the retry takes the node's ak_nonce + 1, not final + 1"
+    );
     assert_eq!(mock.state().calls_to("send_tx"), 5);
+    // the race repeated (the other process sent again): up to NONCE_RETRIES refusals are survived
+    mock.state().send_errors.push(refused(11, 11));
+    mock.state().send_errors.push(refused(12, 12));
+    mock.state().send_errors.push(refused(13, 13));
+    let lock = [10u8; 32];
+    c.mint(&lock, 1, &alice, &[mint_sig(1, &lock, 1, &alice)])
+        .await
+        .unwrap();
+    assert_eq!(nonce(&mock), 14);
+    assert_eq!(mock.state().calls_to("send_tx"), 9);
+    // one refusal more than the retries: the error reaches the caller, nothing is sent again
+    for n in 15..=18 {
+        mock.state().send_errors.push(refused(n, n));
+    }
+    let lock = [11u8; 32];
+    let e = c
+        .mint(&lock, 1, &alice, &[mint_sig(1, &lock, 1, &alice)])
+        .await
+        .unwrap_err();
+    assert!(e.is_invalid_nonce(), "{e}");
+    assert_eq!(mock.state().calls_to("send_tx"), 13);
+    assert_eq!(nonce(&mock), 14);
+    // and the next send takes a nonce above the last refused one
+    let lock = [12u8; 32];
+    c.mint(&lock, 1, &alice, &[mint_sig(1, &lock, 1, &alice)])
+        .await
+        .unwrap();
+    assert_eq!(nonce(&mock), 19);
     // a read-only client cannot send
     let ro = WyecNear::new(&mock.url(), domain(), None, DEFAULT_GAS).unwrap();
     assert!(ro.execute_mint(&lock).await.is_err());

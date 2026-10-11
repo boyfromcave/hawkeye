@@ -2408,7 +2408,7 @@ format = "text"
         return {"nonce": nonce, "recipient": recipient, "rhash": rhash, "out": out}
 
     def wait_burn_intent(self, nonce, from_h, timeout):
-        return self.wait_for("an intent carrying the HKB1 kind-1 memo of burn %d" % nonce,
+        return self.wait_for("an intent carrying the %s kind-1 memo of burn %d" % ("HKN1" if self.is_near() else "HKB1", nonce),
                              lambda: (self.burn_intents(nonce, from_h) or [None])[0], timeout)
 
     def assert_members(self, statuses=("active",), frozen=False):

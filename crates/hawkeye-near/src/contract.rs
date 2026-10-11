@@ -11,7 +11,9 @@
 //! ([`KeyFile`]), signed with its ed25519 key, sent with `send_tx` and returned once `FINAL` (so
 //! the next view at `final` sees it). Calls are serialised: the nonce is the access key's nonce
 //! at the final block, never below the last nonce this client used, plus one; a refused nonce
-//! (`InvalidNonce`) is re-read and retried once. The envelope is rebuilt on every retry; what it
+//! (`InvalidNonce`: another process on the same key, or an earlier send the node has not
+//! finalised) is retried from the nonce the refusal names, up to `admin::NONCE_RETRIES` times.
+//! The envelope is rebuilt on every retry; what it
 //! carries — the guardians' attestation signatures — comes from the caller (the engine's
 //! sign-once records), never signed here.
 

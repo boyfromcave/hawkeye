@@ -18,10 +18,18 @@ use crate::tx::{Action, FunctionCall, TGAS, Transaction};
 /// 1 NEAR in yoctoNEAR.
 pub const NEAR: u128 = 1_000_000_000_000_000_000_000_000;
 
+/// How many `InvalidNonce` refusals one send survives (each retry continues from the nonce the
+/// node named). Three: a daemon and a one-off command on the same key race once, rarely twice.
+pub const NONCE_RETRIES: u32 = 3;
+
 /// Build, sign and send `actions` from `key` to `receiver`, wait until `FINAL`.
 ///
 /// The nonce is the access key's nonce at the final block, never below `*last` (the last nonce
-/// this sender used), plus one; a refused nonce (`InvalidNonce`) is re-read and retried once.
+/// this sender used), plus one. A refused nonce (`InvalidNonce`: another process signing with
+/// the same key took it — the running daemon beside a one-off `hawkeye rogue-mint`, or a
+/// previous send of ours the node holds but has not finalised) is retried up to
+/// [`NONCE_RETRIES`] times from the nonce the refusal names (`ak_nonce`, the key's nonce as the
+/// node sees it now, ahead of the `final` view), never from the stale `final` read alone.
 /// `*last` is updated whenever the transaction may have used its nonce (success, or a final
 /// failure), so the next one takes a higher nonce.
 pub async fn send_actions(
@@ -31,7 +39,7 @@ pub async fn send_actions(
     receiver: &AccountId,
     actions: Vec<Action>,
 ) -> Result<TxOutcome> {
-    let mut retried = false;
+    let mut retries = 0;
     loop {
         let ak = rpc
             .access_key(key.account_id.as_str(), &key.public_key_text())
@@ -51,9 +59,11 @@ pub async fn send_actions(
                 *last = Some(nonce);
                 return Ok(o);
             }
-            Err(e) if e.is_invalid_nonce() && !retried => {
-                retried = true;
-                *last = None;
+            Err(e) if e.is_invalid_nonce() && retries < NONCE_RETRIES => {
+                retries += 1;
+                // the node's view of the key is ahead of `final`: continue from it (or, without
+                // it, from our own refused nonce, which the node also holds as used)
+                *last = Some(e.invalid_nonce_ak().unwrap_or(nonce));
             }
             Err(e) => {
                 // final and failed (a panic), or not known to have landed: either way the next

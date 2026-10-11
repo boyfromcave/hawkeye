@@ -160,7 +160,7 @@ business step, not code.
    with `FunctionCall` actions, signed with the relayer's ed25519 key from a NEAR credentials JSON
    (byte-for-byte golden vectors built and signed by `near-primitives` / `near-crypto` 0.37.4 in
    `near/tests/tx_vectors.rs`); the `wyec-near` client (nonce = access-key nonce at `final`, never
-   below the last used, + 1; an `InvalidNonce` is re-read and retried once; the envelope is
+   below the last used, + 1; an `InvalidNonce` is retried from the `ak_nonce` the refusal names, up to 3 times — the `final` view lags a transaction the node already holds, e.g. the daemon's beside a one-off `hawkeye rogue-mint` on the same relayer key, NH-R5; the envelope is
    rebuilt, the attestation in it is the engine's sign-once record); the N-8 scanner (cursor =
    final block height; a height NEAR skipped has no changes; a burn's id is
    `SHA256(borsh(BurnRecord))`, a mint's or proposal's its receipt id); contract panics mapped to
