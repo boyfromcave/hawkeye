@@ -2,7 +2,7 @@
   "contract": "vault-rpc",
   "source": {
     "file": "doc/vault-rpc.md",
-    "sha256": "662ac36d7410d7c0434fccdef91edf659acbdf430911d552f5610eceda498e55"
+    "sha256": "b3e9c414b92c55c38ed4da0cdb04412eba4e56c77c344075cd8f2beb7a612a1a"
   },
   "branchid": "6d5b7a31",
   "units": {
@@ -2140,6 +2140,14 @@
         "vault_list"
       ],
       "provokedBy": "an `owner` with scheme `03`"
+    },
+    {
+      "code": -8,
+      "message": "a scheme-2 (FN-DSA-512) owner before Falcon is active",
+      "raisedBy": [
+        "vault_lock"
+      ],
+      "provokedBy": "an `owner` with scheme `02` while Falcon is inactive at the next block"
     },
     {
       "code": -4,
