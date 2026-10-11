@@ -5,7 +5,7 @@ at a **pinned commit**, which are fetched and never copied in (AGENTS.md rule 2)
 
 | Path | What |
 |---|---|
-| `tools/fetch-wyec.sh` | fetches `boyfromcave/wyec` @ `c23849a6ccdc754eca34d10887dc5c38044d5e8f` (branch `claude/hawkeye-bridge-plan-uedxax`: CR-W4, `burn(uint256, bytes)` with the §4.2 revision-2 recipient validated, `InvalidRecipient()`; move the pin to the merge commit once that PR merges — was `cad126a`, main at the merge of PR #1: CR-W1 optimistic mint and rate limit, CR-W2, CR-W3) into `vendor/wyec` (gitignored), verifies the commit and records file checksums; `WYEC_SRC=<clone>` to export from a local clone instead |
+| `tools/fetch-wyec.sh` | fetches `boyfromcave/wyec` @ `be177c5762019c2521ea43c81e90d59f972973b7` (branch `claude/hawkeye-bridge-plan-uedxax`: CR-W4, `burn(uint256, bytes)` with the §4.2 revision-2 recipient validated, `InvalidRecipient()`; move the pin to the merge commit once that PR merges — was `cad126a`, main at the merge of PR #1: CR-W1 optimistic mint and rate limit, CR-W2, CR-W3) into `vendor/wyec` (gitignored), verifies the commit and records file checksums; `WYEC_SRC=<clone>` to export from a local clone instead |
 | `package.json` | pinned dependencies: `@openzeppelin/contracts` 5.6.1 (wyec's compile check), `forge-std` v1.17.0 (git commit `f3dae6e`), `solc` 0.8.37 (solc-js, only for the shim) |
 | `foundry.toml` | `src` = `vendor/wyec/contracts`, solc 0.8.37, optimizer 200 runs (as wyec's `compile.js`), remappings `@openzeppelin/contracts/`, `forge-std/`, `wyec/` |
 | `tools/solc`, `tools/solc-shim.js` | a native-`solc` stand-in over solc-js, for machines where Foundry cannot download the compiler |
@@ -36,7 +36,7 @@ forge test -vvv                # also fails if vectors/eip712.json is stale
 **Restricted environments (opt-in).** Where the native solc download is blocked (this is how
 the H3 work was done), point Foundry at the solc-js shim from `package.json`. It is the same
 compiler version, so the bytecode is identical (the wYEC sizes match wyec-contract-design.md §4.5.5:
-10,015 bytes bridge at `c23849a`, 4,683 bytes token). Every command above works with it:
+10,015 bytes bridge at `be177c5`, the merge of wyec#2, 4,683 bytes token). Every command above works with it:
 
 ```sh
 export FOUNDRY_SOLC=./tools/solc FOUNDRY_OFFLINE=true

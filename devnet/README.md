@@ -10,7 +10,7 @@ node2  ycashd ◀── hawkeye (attestor2.toml, api 127.0.0.1:7802) ──┼�
 node3  ycashd ◀── hawkeye (attestor3.toml, api 127.0.0.1:7803) ──┘     guardians = the members' Ethereum addresses
 ```
 
-The bridge is wyec at the pin in `eth/tools/fetch-wyec.sh` (`c23849a`: `burn(uint256, bytes)`, the
+The bridge is wyec at the pin in `eth/tools/fetch-wyec.sh` (`be177c5`, the merge of wyec#2: `burn(uint256, bytes)`, the
 §4.2 revision-2 recipient), deployed with **threshold
 2** and a **12 s challenge window**, and the attestors run **`mint_mode = "optimistic"`**, the
 Foundation's model (plan §3.3): the mint leader proposes with its own `Mint` signature
