@@ -345,7 +345,12 @@ holds the key.
    alarm.
 
 A pass writes `devnet/transcripts/pq-recipient-<date>-<line>-<version>[-near].txt`. devnet-e2e runs it after
-`demo` and `rogue-mint` in each of its four jobs (line × foreign) on the real quantum nodes.
+`demo` and `rogue-mint` in each of its four jobs (line × foreign) on the real quantum nodes; the first
+green round is run 38162162277 (2026-10-11, ycash-dd `d41026209` and ycash6 `0c6c5fdf2`, transcripts in
+the `devnet-<line>-<foreign>` artifacts). Measured there, identical on both lines and both bridges: the
+release is a 296-byte transaction (297 once) whose `TX_PQPKH` output decodes as type `pqpubkeyhash`
+with the `rq…` in `addresses`; the PQ spend is 8,078 bytes with a 7,938-byte scriptSig and pays
+8,078 zat (the wallet's `-mintxfee` 1,000 zat/kB prices it above the `-pqfeerate` floor).
 
 `[devnet] drills = true` (refused on mainnet) gates the drill-only daemon features: the
 `rogue-unlock` command (with `--replay-burn <nonce>` for D-3), the `rogue-mint` command (D-5) and the
