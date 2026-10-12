@@ -98,6 +98,27 @@ pub fn sign_compact(key: &SecretKey, msg: &Hash32) -> Result<[u8; 65]> {
     Ok(out)
 }
 
+/// A transaction-input signature (`CKey::Sign`): DER-encoded, low S, **without** the hashtype
+/// byte. Used for the one spend Hawkeye signs itself: its own bond's withdrawal
+/// ([`crate::template::bond_withdrawal_script_sig`]).
+pub fn sign_der(key: &SecretKey, msg: &Hash32) -> Result<Vec<u8>> {
+    let (sig, _) = key
+        .signing_key()
+        .sign_prehash_recoverable(msg)
+        .map_err(|_| Error::Signature("signing failed"))?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    Ok(sig.to_der().as_bytes().to_vec())
+}
+
+/// Whether `der` (DER, no hashtype byte) is `key`'s low-S signature over `msg`.
+pub fn verify_der(key: &PubKey33, msg: &Hash32, der: &[u8]) -> bool {
+    use k256::ecdsa::signature::hazmat::PrehashVerifier;
+    let (Ok(vk), Ok(sig)) = (VerifyingKey::from_sec1_bytes(key), Signature::from_der(der)) else {
+        return false;
+    };
+    sig.normalize_s().is_none() && vk.verify_prehash(msg, &sig).is_ok()
+}
+
 fn split(sig: &[u8]) -> Result<(u8, [u8; 32], [u8; 32])> {
     let sig: [u8; 65] = array("signature", sig)?;
     let r: [u8; 32] = sig[1..33].try_into().expect("32");

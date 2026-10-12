@@ -1,7 +1,7 @@
 //! A mock `ycashd` (feature `mock`): an in-process HTTP JSON-RPC server with a scriptable
 //! in-memory chain, for this crate's tests and for other crates' engine tests.
 //!
-//! It answers the 21 `set_*` / `vault_*` RPCs with the contract's shapes and the stock RPCs
+//! It answers the 23 `set_*` / `vault_*` RPCs with the contract's shapes and the stock RPCs
 //! Hawkeye uses, keeps blocks, a mempool, sets and a template-output index, and applies a
 //! simplified version of the node's rules: thresholds, the sign-once record (`set-sign-once`), the
 //! cancel window, maturity, the owner branch, the rate limit, double spends. It is not consensus:
@@ -12,6 +12,14 @@
 //!   (SHA256d of the transaction with every scriptSig cleared), act transactions carry a mock
 //!   payload, fee inputs come from an unlimited mock wallet;
 //! - a join is current as soon as it is mined (no maturity).
+//!
+//! The bond rules are modelled (owner 2026-10-11, quantum plan D-Q-29..D-Q-31): bonds are real
+//! P2SH bond outputs ([`mock_bond_spk`]) in a bond index ([`MockState::bonds`]); a bond is
+//! spendable only after its member left without a freeze (`set_leave`, or a `SET_REMOVE` without
+//! burn) and the set's `maturity` has passed since (`bad-vault-bond-locked` before,
+//! `bad-vault-bond-frozen` once frozen), with the script's CLTV on top; one unspent bond per
+//! (set, key) (`bad-vault-act-join`); a cosigned burn `SET_REMOVE` reaches a member already in its
+//! exit delay; `set_create` refuses a `maturity` below the network's floor ([`MockState::min_set_maturity`]).
 //!
 //! Every call is recorded ([`MockState::calls`]); [`MockState::queue_result`] and
 //! [`MockState::inject_error`] script the next answer of a method, [`MockState::fail_http`] the
@@ -122,6 +130,11 @@ enum PendingAct {
         member: PubKey,
         burn: bool,
     },
+    /// The member's own `SET_REMOVE` (burn 0, signed by itself alone): `set_leave`.
+    Leave {
+        setid: SetId,
+        member: PubKey,
+    },
     Equivocation {
         setid: SetId,
         member: PubKey,
@@ -129,6 +142,19 @@ enum PendingAct {
     Winddown {
         setid: SetId,
     },
+}
+
+/// A bond in the mock's bond index (the node's `BondRecord` plus the output it names).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MockBond {
+    pub setid: SetId,
+    pub member: PubKey,
+    pub value: Amount,
+    /// The bond script's CLTV height.
+    pub locktime: u32,
+    pub frozen: bool,
+    /// The height its member left the set without a freeze; 0 = still a member's bond.
+    pub exitheight: u32,
 }
 
 /// The mock node's state. Lock it with [`MockYcashd::state`] and edit it freely.
@@ -145,6 +171,10 @@ pub struct MockState {
     /// Every transaction seen: raw bytes and the block it is in.
     pub txs: HashMap<Txid, (Vec<u8>, Option<BlockHash>)>,
     pub sets: BTreeMap<SetId, SetInfo>,
+    /// The bond index: every unspent member bond (frozen ones included).
+    pub bonds: BTreeMap<OutPoint, MockBond>,
+    /// D-Q-31: the least `maturity` `set_create` accepts (2 on regtest, 16,128 elsewhere).
+    pub min_set_maturity: u32,
     /// The confirmed template-output index (`vault_list`); dynamic fields are refreshed on read.
     pub templates: BTreeMap<OutPoint, TemplateOut>,
     pub scripts: HashMap<Vec<u8>, KnownScript>,
@@ -288,6 +318,43 @@ pub fn mock_pq_owner_script_sig(owner: &PqKeyId, selector: u8) -> Vec<u8> {
 }
 
 /// A mock set signature by `key` over `sighash`.
+/// The bond redeem script `<locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP <memberKey> OP_CHECKSIG`.
+pub fn mock_bond_redeem(member: &PubKey, locktime: u32) -> Vec<u8> {
+    // a minimal CScriptNum push of the locktime
+    let mut n = Vec::new();
+    let mut v = u64::from(locktime);
+    while v > 0 {
+        n.push((v & 0xff) as u8);
+        v >>= 8;
+    }
+    if n.last().is_some_and(|b| b & 0x80 != 0) {
+        n.push(0);
+    }
+    let mut s = Vec::new();
+    match locktime {
+        0 => s.push(0x00),
+        1..=16 => s.push(0x50 + locktime as u8),
+        _ => {
+            s.push(n.len() as u8);
+            s.extend(&n);
+        }
+    }
+    s.extend([0xb1, 0x75, 33]);
+    s.extend(member.0);
+    s.push(0xac);
+    s
+}
+
+/// The bond's P2SH scriptPubKey (`OP_HASH160 <HASH160(redeem)> OP_EQUAL`).
+pub fn mock_bond_spk(member: &PubKey, locktime: u32) -> Vec<u8> {
+    use ripemd::Ripemd160;
+    let h = Ripemd160::digest(sha256(&mock_bond_redeem(member, locktime)));
+    let mut s = vec![0xa9, 20];
+    s.extend(h);
+    s.push(0x87);
+    s
+}
+
 pub fn mock_set_sig(key: &PubKey, sighash: &Bytes32) -> Vec<u8> {
     let mut s = vec![0x1f];
     s.extend(key.0);
@@ -358,6 +425,8 @@ impl MockState {
             mempool: vec![],
             txs: HashMap::new(),
             sets: BTreeMap::new(),
+            bonds: BTreeMap::new(),
+            min_set_maturity: REGTEST_MIN_SET_MATURITY,
             templates: BTreeMap::new(),
             scripts: HashMap::new(),
             wallet_keys: BTreeSet::new(),
@@ -566,6 +635,14 @@ impl MockState {
             }
             self.unspent
                 .retain(|u| OutPoint::new(u.txid, u.vout) != i.prevout);
+            if let Some(b) = self.bonds.remove(&i.prevout) {
+                let op = i.prevout;
+                self.with_member(&b.setid, &b.member, |m| {
+                    if m.status == MemberStatus::Active && m.bondoutpoint == op {
+                        m.status = MemberStatus::Withdrawn;
+                    }
+                });
+            }
         }
         for (n, o) in tx.outputs.iter().enumerate() {
             let op = OutPoint::new(txid, n as u32);
@@ -668,20 +745,120 @@ impl MockState {
                 setid,
                 member,
                 burn,
-            } => self.with_member(&setid, &member, |m| {
-                m.status = MemberStatus::Removed;
-                m.bondfrozen = burn;
-            }),
-            PendingAct::Equivocation { setid, member } => self.with_member(&setid, &member, |m| {
-                m.status = MemberStatus::Ejected;
-                m.bondfrozen = true;
-            }),
+            } => {
+                let Some(m) = self.member_of(&setid, &member) else {
+                    return;
+                };
+                let bond = self.bonds.get(&m.bondoutpoint).cloned();
+                if m.status == MemberStatus::Active {
+                    self.with_member(&setid, &member, |m| {
+                        m.status = MemberStatus::Removed;
+                        m.bondfrozen = burn;
+                    });
+                    if let Some(b) = self.bonds.get_mut(&m.bondoutpoint) {
+                        if burn {
+                            b.frozen = true;
+                        } else {
+                            b.exitheight = height; // the bond exit delay starts
+                        }
+                    }
+                } else if m.status == MemberStatus::Removed
+                    && burn
+                    && bond.is_some_and(|b| !b.frozen && b.exitheight != 0)
+                {
+                    // a slash after the exit (review A1): the bond in its exit delay is frozen
+                    self.with_member(&setid, &member, |m| m.bondfrozen = true);
+                    if let Some(b) = self.bonds.get_mut(&m.bondoutpoint) {
+                        b.frozen = true;
+                    }
+                }
+            }
+            PendingAct::Leave { setid, member } => {
+                let Some(m) = self.member_of(&setid, &member) else {
+                    return;
+                };
+                if m.status != MemberStatus::Active {
+                    return;
+                }
+                self.with_member(&setid, &member, |m| m.status = MemberStatus::Removed);
+                if let Some(b) = self.bonds.get_mut(&m.bondoutpoint) {
+                    b.exitheight = height;
+                }
+            }
+            PendingAct::Equivocation { setid, member } => {
+                self.with_member(&setid, &member, |m| {
+                    m.status = MemberStatus::Ejected;
+                    m.bondfrozen = true;
+                });
+                if let Some(m) = self.member_of(&setid, &member)
+                    && let Some(b) = self.bonds.get_mut(&m.bondoutpoint)
+                {
+                    b.frozen = true;
+                }
+            }
             PendingAct::Winddown { setid } => {
                 if let Some(s) = self.set_mut(&setid) {
                     s.winddownheight = height;
                 }
             }
         }
+    }
+
+    fn member_of(&self, setid: &SetId, key: &PubKey) -> Option<Member> {
+        self.sets
+            .get(setid)
+            .and_then(|s| s.memberlist.iter().find(|m| &m.key == key).cloned())
+    }
+
+    /// `bad-vault-act-join` for a key that is an ACTIVE member or still has an unspent bond in
+    /// the set (one unspent bond per (set, key), review B1).
+    fn join_refusal(&self, setid: &SetId, key: &PubKey) -> Option<(i64, String)> {
+        let m = self.member_of(setid, key)?;
+        (m.status == MemberStatus::Active || self.bonds.contains_key(&m.bondoutpoint))
+            .then(|| (-26, "16: bad-vault-act-join".to_owned()))
+    }
+
+    /// `bad-vault-act-remove` unless `key` is ACTIVE, or REMOVED with its bond in the exit
+    /// delay and the removal burns (a slash after the exit, review A1).
+    fn remove_refusal(&self, setid: &SetId, key: &PubKey, burn: bool) -> Option<(i64, String)> {
+        let ok = self.member_of(setid, key).is_some_and(|m| {
+            m.status == MemberStatus::Active
+                || (m.status == MemberStatus::Removed
+                    && burn
+                    && self
+                        .bonds
+                        .get(&m.bondoutpoint)
+                        .is_some_and(|b| !b.frozen && b.exitheight != 0))
+        });
+        (!ok).then(|| (-26, "16: bad-vault-act-remove".to_owned()))
+    }
+
+    /// The bond rules of a spend at the next block: frozen, the exit delay, the CLTV.
+    fn bond_refusal(&self, tx: &Transaction) -> Option<(i64, String)> {
+        let next = self.next_height();
+        for (n, i) in tx.inputs.iter().enumerate() {
+            let Some(b) = self.bonds.get(&i.prevout) else {
+                continue;
+            };
+            if b.frozen {
+                return Some((-26, "16: bad-vault-bond-frozen".into()));
+            }
+            let maturity = self.set(&b.setid).map_or(0, |s| s.set.params.maturity);
+            if b.exitheight == 0 || next < b.exitheight + maturity {
+                return Some((-26, "16: bad-vault-bond-locked".into()));
+            }
+            if tx.lock_time < b.locktime || tx.inputs[n].sequence == u32::MAX {
+                return Some((
+                    -26,
+                    "16: mandatory-script-verify-flag-failed (Locktime requirement not satisfied)"
+                        .into(),
+                ));
+            }
+            if tx.lock_time >= next {
+                return Some((-26, "64: non-final".into()));
+            }
+        }
+        None
     }
 
     fn with_member(&mut self, setid: &SetId, key: &PubKey, f: impl FnOnce(&mut Member)) {
@@ -718,6 +895,19 @@ impl MockState {
         self.add_member_at(setid, key, bondmin, h + 1000, bond, h);
     }
 
+    /// Mark `key`'s bond as left at `height` (its exit delay starts), as `set_leave` would, and
+    /// make it REMOVED: for tests that start from a member already in its exit delay.
+    pub fn leave_member(&mut self, setid: &SetId, key: &PubKey, height: u32) {
+        self.apply_act(
+            Hash256::default(),
+            PendingAct::Leave {
+                setid: *setid,
+                member: *key,
+            },
+            height,
+        );
+    }
+
     fn add_member_at(
         &mut self,
         setid: &SetId,
@@ -731,6 +921,20 @@ impl MockState {
             return;
         };
         s.memberlist.retain(|m| m.key != key);
+        self.bonds.insert(
+            bondoutpoint,
+            MockBond {
+                setid: *setid,
+                member: key,
+                value: bond,
+                locktime,
+                frozen: false,
+                exitheight: 0,
+            },
+        );
+        let Some(s) = self.sets.get_mut(setid) else {
+            return;
+        };
         s.memberlist.push(Member {
             key,
             status: MemberStatus::Active,
@@ -822,6 +1026,9 @@ impl MockState {
             if self.spent_on_chain(&i.prevout) {
                 return err(-25, "Missing inputs");
             }
+        }
+        if let Some(e) = self.bond_refusal(&tx) {
+            return Err(e);
         }
         self.txs.insert(txid, (raw, None));
         self.mempool.push(txid);
@@ -1018,6 +1225,7 @@ impl MockState {
             "set_create" => self.set_create(p),
             "set_join" => self.set_join(p),
             "set_heartbeat" => self.set_heartbeat(p),
+            "set_leave" => self.set_leave(p),
             "set_buildact" => self.set_buildact(p),
             "set_signact" => self.set_signact(p),
             "set_sendact" => self.set_sendact(p),
@@ -1087,6 +1295,7 @@ impl MockState {
                 Ok(a.into())
             }
             "listunspent" => to_json(&self.unspent),
+            "gettxout" => self.gettxout(p),
             "generate" => {
                 let n: u32 = arg(p, 0, "numblocks")?;
                 to_json(&self.mine(n))
@@ -1190,7 +1399,7 @@ impl MockState {
             livenesswindow: o.livenesswindow.unwrap_or(1000),
             bondmin: o.bondmin.unwrap_or(Amount(COIN)),
             bondlockmin: o.bondlockmin.unwrap_or(0),
-            maturity: o.maturity.unwrap_or(0),
+            maturity: o.maturity.unwrap_or(self.min_set_maturity),
             admitkey: match o.admitkey {
                 Some(k) => k,
                 None => self.new_wallet_key(),
@@ -1201,6 +1410,15 @@ impl MockState {
             && (1..=p.seats).contains(&p.cancelthreshold)
             && (1..=p.seats).contains(&p.slashthreshold)
             && p.ratelimitbps <= 10_000;
+        if p.maturity < self.min_set_maturity {
+            return err(
+                -8,
+                format!(
+                    "maturity must be at least {} blocks (D-Q-31)",
+                    self.min_set_maturity
+                ),
+            );
+        }
         if !ok {
             return err(
                 -8,
@@ -1277,6 +1495,9 @@ impl MockState {
             Some(k) => k,
             None => self.new_wallet_key(),
         };
+        if let Some(e) = self.join_refusal(&setid, &key) {
+            return Err(e);
+        }
         let (required, sigs) = if s.set.params.open {
             (1, 1)
         } else {
@@ -1284,7 +1505,7 @@ impl MockState {
             (2, 1 + admit)
         };
         let payload = Self::act_payload(2, required, sigs, false, &setid, &key);
-        let bond_spk = p2pkh(&sha256(&key.0));
+        let bond_spk = mock_bond_spk(&key, locktime);
         let mut tx = self.act_tx(
             payload,
             vec![TxOut {
@@ -1350,6 +1571,96 @@ impl MockState {
         to_json(&HeartbeatResult {
             txid,
             memberkey: key,
+        })
+    }
+
+    fn set_leave(&mut self, p: &[Value]) -> RpcResult {
+        self.ensure_active()?;
+        let setid: SetId = arg(p, 0, "setid")?;
+        let key: Option<PubKey> = opt_arg(p, 1, "memberkey")?;
+        let Some(s) = self.set(&setid).cloned() else {
+            return err(-5, format!("unknown set {setid}"));
+        };
+        let mine: Vec<PubKey> = s
+            .memberlist
+            .iter()
+            .filter(|m| m.status == MemberStatus::Active && self.wallet_keys.contains(&m.key))
+            .map(|m| m.key)
+            .collect();
+        let key = match key {
+            Some(k) if self.wallet_keys.contains(&k) => k,
+            Some(_) => return err(-4, "the member key is not in this wallet"),
+            None => *mine.first().ok_or((
+                -4,
+                "this wallet holds no active member key of the set".to_owned(),
+            ))?,
+        };
+        if !mine.contains(&key) {
+            return err(-26, "16: bad-vault-act-remove");
+        }
+        let mut tx = self.act_tx(Self::act_payload(4, 1, 1, false, &setid, &key), vec![]);
+        self.sign_wallet_inputs(&mut tx);
+        let txid = self.submit(tx.encode())?;
+        self.pending
+            .insert(txid, PendingAct::Leave { setid, member: key });
+        let exitheight = self.next_height();
+        to_json(&LeaveResult {
+            txid,
+            memberkey: key,
+            exitheight,
+            bondspendableat: exitheight + s.set.params.maturity,
+        })
+    }
+
+    /// `gettxout`: bonds of the index, template outputs, the wallet's coins; `null` otherwise
+    /// (and for an output a mempool transaction spends, when `includemempool`, the default).
+    fn gettxout(&self, p: &[Value]) -> RpcResult {
+        let txid: Txid = arg(p, 0, "txid")?;
+        let vout: u32 = arg(p, 1, "n")?;
+        let mempool = opt_arg::<bool>(p, 2, "includemempool")?.unwrap_or(true);
+        let op = OutPoint::new(txid, vout);
+        if mempool && self.spent_in_mempool(&op) {
+            return Ok(Value::Null);
+        }
+        let found = if let Some(b) = self.bonds.get(&op) {
+            Some((b.value.0, mock_bond_spk(&b.member, b.locktime)))
+        } else if let Some(t) = self.templates.get(&op) {
+            let spk = match t {
+                TemplateOut::Vault(v) => v.script.0.clone(),
+                TemplateOut::Intent(i) => i.script.0.clone(),
+            };
+            Some((t.valuezat(), spk))
+        } else {
+            self.unspent
+                .iter()
+                .find(|u| u.txid == txid && u.vout == vout)
+                .map(|u| (u.amount_zat, u.script_pub_key.0.clone()))
+        };
+        let Some((value, spk)) = found else {
+            return Ok(Value::Null);
+        };
+        let height = self
+            .txs
+            .get(&txid)
+            .and_then(|(_, b)| *b)
+            .and_then(|b| self.blocks.iter().find(|x| x.hash == b))
+            .map_or(self.tip_height(), |b| b.height);
+        Ok(json!({
+            "bestblock": self.tip_hash(),
+            "confirmations": self.tip_height() - height + 1,
+            "value": Amount(value).to_string(),
+            "scriptPubKey": {"asm": "", "hex": hex::encode(&spk), "type": "scripthash"},
+            "version": 4,
+            "coinbase": false,
+        }))
+    }
+
+    fn spent_in_mempool(&self, op: &OutPoint) -> bool {
+        self.mempool.iter().any(|m| {
+            self.txs
+                .get(m)
+                .and_then(|(r, _)| Transaction::decode(r).ok())
+                .is_some_and(|t| t.inputs.iter().any(|j| &j.prevout == op))
         })
     }
 
@@ -1481,11 +1792,18 @@ impl MockState {
         let Some((_, d)) = Self::find_act(&tx) else {
             return err(-8, "the transaction carries no YV act");
         };
+        let setid = Hash256(d[6..38].try_into().expect("32"));
+        let key = PubKey(d[38..71].try_into().expect("33"));
+        // the node judges a removal's target before its co-signers
+        if d[2] == 4
+            && self.set(&setid).is_some()
+            && let Some(e) = self.remove_refusal(&setid, &key, d[5] == 1)
+        {
+            return Err(e);
+        }
         if i32::from(d[4]) < d[3] as i8 as i32 {
             return err(-26, "16: bad-vault-act-sigs");
         }
-        let setid = Hash256(d[6..38].try_into().expect("32"));
-        let key = PubKey(d[38..71].try_into().expect("33"));
         if d[2] != 1 && self.set(&setid).is_none() {
             return err(-26, "16: bad-vault-act-noset");
         }
@@ -1498,6 +1816,11 @@ impl MockState {
                 >= s.set.params.seats
         {
             return err(-26, "16: bad-vault-act-seats");
+        }
+        if d[2] == 2
+            && let Some(e) = self.join_refusal(&setid, &key)
+        {
+            return Err(e);
         }
         self.sign_wallet_inputs(&mut tx);
         let txid = self.submit(tx.encode())?;

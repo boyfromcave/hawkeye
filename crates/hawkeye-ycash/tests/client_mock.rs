@@ -860,3 +860,196 @@ async fn mock_state_is_shareable() {
     assert_eq!(c.vault_getinfo().await.unwrap().dbtip.unwrap().height, 5);
     assert_eq!(m.state().calls.len(), 6);
 }
+
+async fn member(c: &YcashRpc, set: &SetId, k: &PubKey) -> Member {
+    c.set_getinfo(set, None)
+        .await
+        .unwrap()
+        .memberlist
+        .into_iter()
+        .find(|mb| &mb.key == k)
+        .unwrap()
+}
+
+/// A hand-built spend of a bond (the mock checks the bond rules, not the signature).
+fn bond_spend(bond: hawkeye_ycash::OutPoint, value: i64, tip: u32) -> HexBytes {
+    let tx = Transaction::new_v4(
+        vec![tx::TxIn {
+            prevout: bond,
+            script_sig: vec![0x51],
+            sequence: 0xffff_fffe,
+        }],
+        vec![tx::TxOut {
+            value: value - 10_000,
+            script_pubkey: vec![0x51],
+        }],
+        tip,
+        tip + 40,
+    );
+    HexBytes(tx.encode())
+}
+
+/// The signer-set exit rules (owner 2026-10-11, quantum plan D-Q-29..D-Q-31): the maturity
+/// floor, `set_leave` and the bond exit delay, one unspent bond per (set, key), a cosigned burn
+/// reaching a member in its exit delay, and no griefing removal of a member that left.
+#[tokio::test]
+async fn bond_exit_delay_and_slashing_after_exit() {
+    let m = MockYcashd::start().await.unwrap();
+    let c = m.client();
+    let params = |maturity| SetCreateParams {
+        seats: 3,
+        unlockthreshold: 1,
+        slashthreshold: Some(2),
+        maturity,
+        ..Default::default()
+    };
+    // D-Q-31: the floor (regtest 2; mainnet/testnet 16,128 — the old 1,152 proposal is refused)
+    let e = c.set_create(&params(Some(1))).await.unwrap_err();
+    assert!(
+        e.to_string().contains("maturity must be at least 2 blocks"),
+        "{e}"
+    );
+    m.state().min_set_maturity = MIN_SET_MATURITY;
+    let e = c.set_create(&params(Some(1_152))).await.unwrap_err();
+    assert!(e.to_string().contains("at least 16128 blocks"), "{e}");
+    c.set_create(&params(Some(16_128))).await.unwrap();
+    m.state().min_set_maturity = REGTEST_MIN_SET_MATURITY;
+    assert_eq!(min_set_maturity("main"), 16_128);
+    assert_eq!(min_set_maturity("testnet"), 16_128);
+    assert_eq!(min_set_maturity("regtest"), 2);
+
+    let created = c.set_create(&params(Some(3))).await.unwrap();
+    let set = created.setid;
+    c.generate(1).await.unwrap();
+    let mut keys = vec![];
+    for _ in 0..3 {
+        let j = c
+            .set_join(&set, Amount(100_000_000), 5, None)
+            .await
+            .unwrap();
+        keys.push(j.memberkey);
+    }
+    c.generate(5).await.unwrap();
+    let refusal = |r: Result<hawkeye_ycash::Hash256, Error>| {
+        r.unwrap_err().rpc().unwrap().bad_vault().map(str::to_owned)
+    };
+
+    // an ACTIVE member's bond is locked whatever its CLTV
+    let b1 = member(&c, &set, &keys[1]).await;
+    let tip = c.getblockcount().await.unwrap();
+    assert_eq!(
+        refusal(
+            c.sendrawtransaction(&bond_spend(b1.bondoutpoint, b1.bondvalue.zat(), tip), false)
+                .await
+        )
+        .as_deref(),
+        Some("bad-vault-bond-locked")
+    );
+
+    // keys[0] leaves: removed from the next block, its bond in the exit delay
+    let left = c.set_leave(&set, Some(&keys[0])).await.unwrap();
+    assert_eq!(left.exitheight, c.getblockcount().await.unwrap() + 1);
+    assert_eq!(left.bondspendableat, left.exitheight + 3);
+    assert_eq!(
+        m.state().calls_to("set_leave")[0].params[1],
+        json!(keys[0].to_string())
+    );
+    c.generate(1).await.unwrap();
+    let b0 = member(&c, &set, &keys[0]).await;
+    assert_eq!(
+        (b0.status, b0.current, b0.bondfrozen),
+        (MemberStatus::Removed, false, false)
+    );
+    assert!(
+        c.gettxout(&b0.bondoutpoint.txid, b0.bondoutpoint.vout, true)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let e = c.set_leave(&set, Some(&keys[0])).await.unwrap_err();
+    assert_eq!(e.rpc().unwrap().bad_vault(), Some("bad-vault-act-remove"));
+    let tip = c.getblockcount().await.unwrap();
+    assert_eq!(
+        refusal(
+            c.sendrawtransaction(&bond_spend(b0.bondoutpoint, b0.bondvalue.zat(), tip), false)
+                .await
+        )
+        .as_deref(),
+        Some("bad-vault-bond-locked")
+    );
+    // one unspent bond per (set, key): no rejoin while the old bond is unspent
+    let e = c
+        .set_join(&set, Amount(100_000_000), 5, Some(&keys[0]))
+        .await
+        .unwrap_err();
+    assert_eq!(e.rpc().unwrap().bad_vault(), Some("bad-vault-act-join"));
+    // from exitheight + maturity the bond is spendable (the mempool judges at the next block)
+    while c.getblockcount().await.unwrap() + 1 < left.bondspendableat {
+        c.generate(1).await.unwrap();
+    }
+    let tip = c.getblockcount().await.unwrap();
+    c.sendrawtransaction(&bond_spend(b0.bondoutpoint, b0.bondvalue.zat(), tip), false)
+        .await
+        .unwrap();
+    assert!(
+        c.gettxout(&b0.bondoutpoint.txid, b0.bondoutpoint.vout, true)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    c.generate(1).await.unwrap();
+    // spent: the key may join again
+    c.set_join(&set, Amount(100_000_000), 5, Some(&keys[0]))
+        .await
+        .unwrap();
+    c.generate(1).await.unwrap();
+
+    // keys[1] leaves, then is slashed during its exit delay by a cosigned SET_REMOVE burn=1
+    c.set_leave(&set, Some(&keys[1])).await.unwrap();
+    c.generate(1).await.unwrap();
+    let built = c
+        .set_buildact(&BuildAct::Remove {
+            setid: set,
+            memberkey: keys[1],
+            burn: true,
+        })
+        .await
+        .unwrap();
+    let signed = c.set_signact(&built.hex, Some(&set)).await.unwrap();
+    assert!(signed.complete, "keys[0] and keys[2] co-sign");
+    c.set_sendact(&signed.hex).await.unwrap();
+    c.generate(1).await.unwrap();
+    let b1 = member(&c, &set, &keys[1]).await;
+    assert_eq!((b1.status, b1.bondfrozen), (MemberStatus::Removed, true));
+    c.generate(5).await.unwrap();
+    let tip = c.getblockcount().await.unwrap();
+    assert_eq!(
+        refusal(
+            c.sendrawtransaction(&bond_spend(b1.bondoutpoint, b1.bondvalue.zat(), tip), false)
+                .await
+        )
+        .as_deref(),
+        Some("bad-vault-bond-frozen")
+    );
+    // a frozen key never rejoins
+    let e = c
+        .set_join(&set, Amount(100_000_000), 5, Some(&keys[1]))
+        .await
+        .unwrap_err();
+    assert_eq!(e.rpc().unwrap().bad_vault(), Some("bad-vault-act-join"));
+
+    // a griefing removal (burn 0) of a member that already left is refused
+    c.set_leave(&set, Some(&keys[2])).await.unwrap();
+    c.generate(1).await.unwrap();
+    let built = c
+        .set_buildact(&BuildAct::Remove {
+            setid: set,
+            memberkey: keys[2],
+            burn: false,
+        })
+        .await
+        .unwrap();
+    let signed = c.set_signact(&built.hex, Some(&set)).await.unwrap();
+    let e = c.set_sendact(&signed.hex).await.unwrap_err();
+    assert_eq!(e.rpc().unwrap().bad_vault(), Some("bad-vault-act-remove"));
+}

@@ -139,6 +139,20 @@ pub struct TxOutInfo {
     pub script_pub_key: ScriptPubKeyInfo,
 }
 
+/// `gettxout <txid> <n> ( includemempool )` for an unspent output (`src/rpc/blockchain.cpp:840`);
+/// the node answers `null` for a spent or unknown one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnspentOutInfo {
+    pub bestblock: BlockHash,
+    /// 0 for an output of a mempool transaction.
+    pub confirmations: i64,
+    pub value: Amount,
+    #[serde(rename = "scriptPubKey")]
+    pub script_pub_key: ScriptPubKeyInfo,
+    pub version: i64,
+    pub coinbase: bool,
+}
+
 /// `getrawtransaction <txid> 1`, `decoderawtransaction`, and `getblock <h> 2`'s `tx[]`
 /// (`TxToJSON`, `src/rpc/rawtransaction.cpp:159`). Shielded descriptions are kept as JSON.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
