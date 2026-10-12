@@ -140,6 +140,9 @@ pub(crate) struct Memory {
     pub set: Option<SetInfo>,
     pub members: Vec<Member>,
     pub live: Vec<PubKey33>,
+    /// The members a slash still reaches (D-Q-31): the current ones, and those that already
+    /// left (`removed`, bond not frozen) whose bond is unspent — in its exit delay.
+    pub slashable: Vec<PubKey33>,
     pub vault_scripts: HashMap<CoreOutPoint, (Vec<u8>, u64)>,
     pub locked_value: u64,
     pub intent_rows: HashMap<CoreOutPoint, IntentOutput>,
@@ -303,6 +306,8 @@ impl Engine {
             .map(|m| m.key.0)
             .collect();
         sort_members(&mut live);
+        let slashable = slashable_members(&self.ctx, &info.memberlist).await;
+        self.mem.slashable = slashable;
         self.mem.tip = tip;
         self.mem.members = info.memberlist.clone();
         self.mem.live = live;
@@ -337,6 +342,13 @@ impl Engine {
             .filter(|m| m.current)
             .map(|m| m.key.0)
             .collect()
+    }
+
+    /// The keys a slash still reaches (the `slashable` cache): fault attribution (a
+    /// fraudulent intent's or mint's signer, an equivocation) looks here, not only at the
+    /// current members, so a member cannot escape a fault by leaving (owner 2026-10-11).
+    pub(crate) fn slashable_member_keys(&self) -> Vec<PubKey33> {
+        self.mem.slashable.clone()
     }
 
     async fn heartbeat(&mut self) -> Result<()> {
@@ -499,13 +511,37 @@ impl Engine {
     pub(crate) fn member(&self, key: &PubKey33) -> Option<&Member> {
         self.mem.members.iter().find(|m| &m.key.0 == key)
     }
+}
 
-    /// Whether `key` was removed or ejected.
-    pub(crate) fn is_removed(&self, key: &PubKey33) -> bool {
-        self.member(key).is_some_and(|m| {
-            matches!(m.status, MemberStatus::Removed | MemberStatus::Ejected) || !m.current
-        })
+/// The members of `members` a slash still reaches (D-Q-31, the bond exit delay): every current
+/// member, and every member that already left without a freeze (`removed`, `bondfrozen` false)
+/// while its bond is unspent (`gettxout`, mempool included): its bond is in the exit delay, and
+/// a cosigned `SET_REMOVE` with burn, or a `SET_EQUIVOCATION`, still freezes it. A `gettxout`
+/// failure counts the member in (the node is the judge of the act).
+pub async fn slashable_members(ctx: &Ctx, members: &[Member]) -> Vec<PubKey33> {
+    let mut out = vec![];
+    for m in members {
+        if m.current {
+            out.push(m.key.0);
+            continue;
+        }
+        if m.status != MemberStatus::Removed || m.bondfrozen {
+            continue;
+        }
+        match ctx
+            .ycash
+            .gettxout(&m.bondoutpoint.txid, m.bondoutpoint.vout, true)
+            .await
+        {
+            Ok(None) => {}
+            Ok(Some(_)) => out.push(m.key.0),
+            Err(e) => {
+                warn!(event = "bond_check_failed", member = %m.key, error = %e);
+                out.push(m.key.0);
+            }
+        }
     }
+    out
 }
 
 /// `None` if the contract's guardians equal the current members' Ethereum addresses, else a

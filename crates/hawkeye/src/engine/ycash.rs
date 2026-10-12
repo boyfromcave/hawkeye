@@ -486,7 +486,7 @@ impl Engine {
         }
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
-        let members = self.current_member_keys();
+        let members = self.slashable_member_keys();
         for (_, txid, obs, cancels) in &txs {
             if let Some(o) = obs {
                 self.note_signatures(o).await;
@@ -740,7 +740,7 @@ impl Engine {
         if a.set_id != self.ctx.params.set_id {
             return;
         }
-        let members = self.current_member_keys();
+        let members = self.slashable_member_keys();
         let mut proofs = vec![];
         for s in &a.signers {
             if !members.contains(&s.pubkey) {

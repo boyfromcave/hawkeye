@@ -220,7 +220,7 @@ async fn setup_with(opts: Opts) -> Option<Env> {
         livenesswindow: 1000,
         bondmin: Amount(100_000_000),
         bondlockmin: 0,
-        maturity: 0,
+        maturity: 2,
         admitkey: admit,
     });
     for k in &keys {
@@ -1068,6 +1068,64 @@ async fn f_slash_votes_verified_independently() {
         .unwrap_err(),
     );
     assert!(e.contains("matches finalized burn"), "{e}");
+}
+
+/// The bond exit delay (owner 2026-10-11, D-Q-31): a member that signs a fraudulent unlock and
+/// leaves the set at once (`set_leave`, its bond now in the exit delay) is still attributed,
+/// voted on and slashed: the cosigned `SET_REMOVE burn=1` freezes the bond in its delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f3_a_signer_that_leaves_is_still_slashed() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let (_intent, rogue) = rogue_unlock(&env).await;
+    let left = env
+        .mock
+        .client()
+        .set_leave(&env.set, Some(&PubKey(rogue)))
+        .await
+        .unwrap();
+    env.mine(1);
+    let rogue_idx = index_of(&env, &rogue);
+    {
+        let st = env.mock.state();
+        let m = st.sets[&env.set]
+            .memberlist
+            .iter()
+            .find(|m| m.key.0 == rogue)
+            .unwrap();
+        assert_eq!((m.status, m.bondfrozen), (MemberStatus::Removed, false));
+        assert!(
+            st.next_height() < left.bondspendableat,
+            "still in the exit delay"
+        );
+    }
+    for _ in 0..4 {
+        tick_all(&mut engines).await;
+        env.mine(1);
+    }
+    tick_all(&mut engines).await;
+    let st = env.mock.state();
+    let m = st.sets[&env.set]
+        .memberlist
+        .iter()
+        .find(|m| m.key.0 == rogue)
+        .unwrap()
+        .clone();
+    drop(st);
+    assert_eq!(m.status, MemberStatus::Removed);
+    assert!(m.bondfrozen, "the slash reached the bond in its exit delay");
+    for (i, e) in engines.iter().enumerate() {
+        if i == rogue_idx {
+            continue;
+        }
+        let slashed = e
+            .ctx()
+            .db(|t| t.slash_cases_in_state(SlashState::Slashed))
+            .unwrap();
+        assert_eq!(slashed.len(), 1, "attestor {i} records the slash");
+        assert_eq!(slashed[0].target_key, rogue);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -142,17 +142,11 @@ fn parse_outpoint(s: &str) -> Result<CoreOutPoint> {
     ))
 }
 
-/// The current members, from this attestor's own node.
-async fn current_members(ctx: &Ctx) -> Result<Vec<PubKey33>> {
-    Ok(ctx
-        .ycash
-        .set_getinfo(&ctx.set_hash(), None)
-        .await?
-        .memberlist
-        .iter()
-        .filter(|m| m.current)
-        .map(|m| m.key.0)
-        .collect())
+/// The members a slash still reaches, from this attestor's own node: the current members and
+/// those in their bond exit delay (D-Q-31, [`super::slashable_members`]).
+async fn slashable_members(ctx: &Ctx) -> Result<Vec<PubKey33>> {
+    let info = ctx.ycash.set_getinfo(&ctx.set_hash(), None).await?;
+    Ok(super::slashable_members(ctx, &info.memberlist).await)
 }
 
 /// The scriptPubKey and value of `op`, from this attestor's own node.
@@ -234,13 +228,18 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
         .attributor
         .attribute(&raw, idx, &spk, value, hawkeye_core::VAULT_BRANCH_ID)
         .map_err(|e| anyhow!("the unlock does not attribute: {e}"))?;
-    let members = current_members(ctx).await?;
+    let members = slashable_members(ctx).await?;
     let signer = attribution
         .signers
         .iter()
         .map(|s| s.pubkey)
         .find(|k| members.contains(k))
-        .ok_or_else(|| anyhow!("no set signature of the unlock recovers to a current member"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "no set signature of the unlock recovers to a member a slash still reaches \
+                 (current, or in its bond exit delay)"
+            )
+        })?;
     let claimed: PubKey33 = hex::decode(ev_str(ev, "target")?)?
         .as_slice()
         .try_into()
@@ -361,8 +360,8 @@ async fn verify_mint(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
         want.to_checksum()
     );
     ensure!(
-        current_members(ctx).await?.contains(&claimed),
-        "the accused is not a current member here"
+        slashable_members(ctx).await?.contains(&claimed),
+        "the accused is neither a current member nor in its bond exit delay here"
     );
     let tip = ctx.ycash.getblockcount().await?;
     let (lock, cursor) = ctx.db(|t| Ok((t.lock(&lock_id)?, t.cursor(Chain::Ycash)?)))?;
@@ -453,7 +452,42 @@ pub async fn verify_and_sign(ctx: &Ctx, req: &SlashSignRequest) -> Result<SlashS
     })
 }
 
+/// Where a case's target stands (the bond exit delay, owner 2026-10-11; D-Q-31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaseTarget {
+    /// The fault's consequence has landed: the bond is frozen (or, for griefing, the member is
+    /// out of the set).
+    Done(&'static str),
+    /// Nothing is left to slash: the bond was withdrawn after the member's exit delay.
+    Gone(&'static str),
+    /// Still to do: a current member, or one that left and whose bond is in its exit delay — a
+    /// cosigned `SET_REMOVE` with burn still freezes that bond.
+    Reachable,
+}
+
 impl Engine {
+    /// [`CaseTarget`] of a case, from the last `set_getinfo` and the slashable-member cache.
+    pub(crate) fn case_target(&self, c: &SlashCaseRecord) -> CaseTarget {
+        let Some(m) = self.member(&c.target_key) else {
+            return CaseTarget::Reachable;
+        };
+        if m.bondfrozen {
+            return CaseTarget::Done("member removed, bond frozen");
+        }
+        if m.current {
+            return CaseTarget::Reachable;
+        }
+        if c.fault == FaultKind::Griefing {
+            // a removal without burn: the member is out, which is all a griefing case asks
+            return CaseTarget::Done("member removed");
+        }
+        if self.mem.slashable.contains(&c.target_key) {
+            CaseTarget::Reachable
+        } else {
+            CaseTarget::Gone("the member left and its bond was spent before the slash")
+        }
+    }
+
     /// Advance every open case.
     pub(crate) async fn slash(&mut self) -> Result<()> {
         let tip = self.mem.tip;
@@ -465,12 +499,22 @@ impl Engine {
             Ok(())
         })?;
         for c in cases {
-            if self.is_removed(&c.target_key) {
-                self.ctx
-                    .db(|t| t.slash_slashed(c.id, tip, Some("member removed")))?;
-                warn!(event = "slash_done", case = c.id, target = %hex::encode(c.target_key),
-                      fault = %c.fault);
-                continue;
+            match self.case_target(&c) {
+                CaseTarget::Done(why) => {
+                    self.ctx.db(|t| t.slash_slashed(c.id, tip, Some(why)))?;
+                    warn!(event = "slash_done", case = c.id, target = %hex::encode(c.target_key),
+                          fault = %c.fault, why);
+                    continue;
+                }
+                CaseTarget::Gone(why) => {
+                    self.ctx.db(|t| {
+                        t.transition_slash(c.id, SlashState::Expired, Some(tip), Some(why))
+                    })?;
+                    warn!(event = "slash_moot", case = c.id, target = %hex::encode(c.target_key),
+                          fault = %c.fault, why);
+                    continue;
+                }
+                CaseTarget::Reachable => {}
             }
             let opened = c.opened_height.unwrap_or(tip);
             if tip > opened + CASE_EXPIRY_BLOCKS && c.state != SlashState::Submitted {

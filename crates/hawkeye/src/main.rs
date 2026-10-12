@@ -104,6 +104,17 @@ enum Cmd {
     },
     /// Owner: vault_ownerspend of every WYEC vault/intent this wallet owns.
     Recover,
+    /// Attestor: leave the set (set_leave: the member's own SET_REMOVE, no burn). The bond stays
+    /// locked and slashable for the set's maturity (>= 16,128 blocks on mainnet), then
+    /// `withdraw-bond` returns it. Stop the daemon first.
+    Leave,
+    /// Attestor: after `leave` and the set's maturity, spend the bond to --to (default a new
+    /// address of the node wallet).
+    WithdrawBond {
+        /// The Ycash t-address to pay the bond to.
+        #[arg(long)]
+        to: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -214,6 +225,8 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Recover => cli::recover(&s).await,
+        Cmd::Leave => cli::leave(&s).await,
+        Cmd::WithdrawBond { to } => cli::withdraw_bond(&s, to.as_deref()).await,
         Cmd::Keys { .. } => unreachable!(),
     }
 }

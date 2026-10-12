@@ -46,7 +46,8 @@ pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributo
     })
 }
 
-/// The start-up checks: the node's network, the set exists, this key is a current member, the
+/// The start-up checks: the node's network, the set exists with at least the network's minimum
+/// `maturity` (D-Q-31: 16,128 on mainnet/testnet, 2 on regtest), this key is a current member, the
 /// guardian set matches the members (refused on mainnet, warned elsewhere), and the live bridge's
 /// threshold is ≥ 2 on mainnet in every mint mode (plan §3.3; warned elsewhere when it is 1).
 pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
@@ -68,6 +69,15 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
         .set_getinfo(&ctx.set_hash(), None)
         .await
         .with_context(|| format!("the set {} does not exist on this node", ctx.set_hash()))?;
+    let floor = hawkeye_ycash::types::min_set_maturity(&info.chain);
+    if set.set.params.maturity < floor {
+        bail!(
+            "set {} has maturity {} < {floor}, the network's minimum exit window (D-Q-31): \
+             a node that created it does not follow the current rules",
+            ctx.set_hash(),
+            set.set.params.maturity
+        );
+    }
     if !set
         .memberlist
         .iter()

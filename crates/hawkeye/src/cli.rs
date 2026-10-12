@@ -1,5 +1,5 @@
 //! The one-shot commands: `enroll`, `status`, `lock`, `burn`, `rogue-unlock`, `rogue-mint`,
-//! `recover`.
+//! `recover`, `leave`, `withdraw-bond`.
 //! Each prints one JSON document on stdout (logs go to stderr).
 
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use hawkeye_core::{EthAddress, OutPoint as CoreOutPoint};
 use hawkeye_eth::{B256, EthClient, EthConfig, U256};
 use hawkeye_store::{SignDomain, Store, YcashSignKey};
 use hawkeye_ycash::tx::{Transaction, TxIn, TxOut};
-use hawkeye_ycash::types::{Recipient, TemplateKind, VaultListFilter};
+use hawkeye_ycash::types::{MemberStatus, Recipient, TemplateKind, VaultListFilter};
 use hawkeye_ycash::{Amount, HexBytes, YcashRpc};
 use serde_json::json;
 use tracing::info;
@@ -26,6 +26,9 @@ use crate::keys::{eth_signer, key_info, parse_secret, wif};
 
 /// The flat fee of a hand-built lock transaction (the node's vault RPCs use the same).
 pub const LOCK_FEE: i64 = 10_000;
+
+/// The flat fee of the bond withdrawal (one P2SH input, one output: about 250 bytes).
+pub const BOND_WITHDRAW_FEE: i64 = 10_000;
 
 fn ycash(s: &Settings) -> Result<YcashRpc> {
     Ok(YcashRpc::new(s.ycash_url.clone(), s.ycash_auth.clone())?)
@@ -544,6 +547,183 @@ pub async fn recover(s: &Settings) -> Result<()> {
         }
     }
     print(&json!({"recovered": out}))
+}
+
+/// `hawkeye leave`: this attestor's member key leaves the set by its own `SET_REMOVE` (burn 0,
+/// signed by the key alone: `set_leave`, owner 2026-10-11). From the next block the member is
+/// `removed`; its bond stays locked — and slashable — for the set's `maturity` (at least 16,128
+/// blocks, 14 days, on mainnet and testnet: D-Q-31), then `hawkeye withdraw-bond` returns it.
+/// Stop the daemon first: it refuses to start once the key is no longer a current member.
+pub async fn leave(s: &Settings) -> Result<()> {
+    let key = s.load_key()?;
+    let node = ycash(s)?;
+    print(&leave_set(&node, &key, &s.params.set_hash()).await?)
+}
+
+/// [`leave`] against `node`: checks the key is an ACTIVE member, calls `set_leave`, and answers
+/// `{txid, memberkey, exitheight, bondspendableat, bondoutpoint, maturity}`.
+pub async fn leave_set(
+    node: &YcashRpc,
+    key: &hawkeye_core::SecretKey,
+    setid: &hawkeye_ycash::Hash256,
+) -> Result<serde_json::Value> {
+    let me = hawkeye_ycash::PubKey(key.public_key());
+    let info = node.set_getinfo(setid, None).await.context("set_getinfo")?;
+    let m = info
+        .memberlist
+        .iter()
+        .find(|m| m.key == me)
+        .ok_or_else(|| anyhow!("member key {me} is not in set {setid}"))?;
+    ensure!(
+        m.status == MemberStatus::Active,
+        "member key {me} is {:?} in set {setid}: there is nothing to leave",
+        m.status
+    );
+    let r = node
+        .set_leave(setid, Some(&me))
+        .await
+        .context("set_leave")?;
+    info!(event = "left_set", txid = %r.txid, member = %me, exitheight = r.exitheight,
+          bondspendableat = r.bondspendableat, maturity = info.set.params.maturity);
+    Ok(json!({
+        "txid": r.txid.to_string(),
+        "memberkey": me.to_string(),
+        "exitheight": r.exitheight,
+        "bondspendableat": r.bondspendableat,
+        "bondoutpoint": m.bondoutpoint.to_string(),
+        "maturity": info.set.params.maturity,
+    }))
+}
+
+/// `hawkeye withdraw-bond [--to <t-address>]`: after `hawkeye leave` and the set's `maturity`,
+/// spend this attestor's bond (`P2SH(<locktime> CLTV DROP <memberKey> CHECKSIG)`) to `--to`
+/// (default a new address of the node wallet). Hawkeye signs the bond input itself with the
+/// member key (the node wallet has no signer for the bond script); the node judges the exit
+/// delay (`bad-vault-bond-locked` until `exitHeight + maturity`) and refuses a frozen bond.
+pub async fn withdraw_bond(s: &Settings, to: Option<&str>) -> Result<()> {
+    let key = s.load_key()?;
+    let node = ycash(s)?;
+    print(&withdraw_bond_with(&node, &key, &s.params.set_hash(), to).await?)
+}
+
+/// [`withdraw_bond`] against `node`.
+pub async fn withdraw_bond_with(
+    node: &YcashRpc,
+    key: &hawkeye_core::SecretKey,
+    setid: &hawkeye_ycash::Hash256,
+    to: Option<&str>,
+) -> Result<serde_json::Value> {
+    let me = hawkeye_ycash::PubKey(key.public_key());
+    let info = node.set_getinfo(setid, None).await.context("set_getinfo")?;
+    let m = info
+        .memberlist
+        .iter()
+        .find(|m| m.key == me)
+        .ok_or_else(|| anyhow!("member key {me} is not in set {setid}"))?
+        .clone();
+    ensure!(
+        !m.bondfrozen,
+        "the bond {} is frozen (slashed): it is never spendable",
+        m.bondoutpoint
+    );
+    ensure!(
+        m.status != MemberStatus::Active,
+        "an active member's bond is locked (bad-vault-bond-locked): run `hawkeye leave` first, \
+         then wait the set's maturity ({} blocks)",
+        info.set.params.maturity
+    );
+    let op = m.bondoutpoint;
+    let out = node
+        .gettxout(&op.txid, op.vout, true)
+        .await
+        .context("gettxout")?
+        .ok_or_else(|| anyhow!("the bond {op} is already spent"))?;
+    let tip = node.getblockcount().await?;
+    ensure!(
+        tip >= m.bondlocktime,
+        "the bond script's CLTV holds it until height {} (tip {tip})",
+        m.bondlocktime + 1
+    );
+    let to_spk = match to {
+        Some(a) => node.validateaddress(a).await?,
+        None => node.validateaddress(&node.getnewaddress().await?).await?,
+    }
+    .script_pub_key
+    .ok_or_else(|| anyhow!("validateaddress gave no scriptPubKey"))?;
+    let branch = node.getblockchaininfo().await?.consensus.nextblock;
+    let branch = u32::from_str_radix(&branch, 16)
+        .map_err(|e| anyhow!("consensus.nextblock {branch:?}: {e}"))?;
+    let tx = build_bond_withdrawal(
+        key,
+        &op,
+        m.bondlocktime,
+        &out.script_pub_key.hex.0,
+        out.value.zat(),
+        to_spk.0,
+        tip,
+        branch,
+    )?;
+    let txid = match node.sendrawtransaction(&HexBytes(tx.encode()), false).await {
+        Ok(t) => t,
+        Err(e) if e.rpc().and_then(|r| r.bad_vault()) == Some("bad-vault-bond-locked") => bail!(
+            "the bond is still in its exit delay: spendable from exitHeight + maturity ({} \
+             blocks; `hawkeye leave` printed bondspendableat): {e}",
+            info.set.params.maturity
+        ),
+        Err(e) => return Err(e).context("sendrawtransaction"),
+    };
+    let value = out.value.zat() - BOND_WITHDRAW_FEE;
+    info!(event = "bond_withdrawn", txid = %txid, bond = %op, value);
+    Ok(json!({"txid": txid.to_string(), "bondoutpoint": op.to_string(), "value_zat": value}))
+}
+
+/// The signed bond withdrawal: input `bond` (whose output is `bond_spk`, `value_zat`), one
+/// output of `value_zat − BOND_WITHDRAW_FEE` to `to_spk`, `nLockTime` = `tip` (≥ the CLTV
+/// `locktime`, final at the next block), sequence `0xfffffffe`, expiry `tip + 40`, signed for
+/// `branch_id` (the next block's). Refuses a `bond_spk` that is not this key's bond script.
+#[allow(clippy::too_many_arguments)]
+pub fn build_bond_withdrawal(
+    key: &hawkeye_core::SecretKey,
+    bond: &hawkeye_ycash::OutPoint,
+    locktime: u32,
+    bond_spk: &[u8],
+    value_zat: i64,
+    to_spk: Vec<u8>,
+    tip: u32,
+    branch_id: u32,
+) -> Result<Transaction> {
+    use hawkeye_core::template::{bond_spk as bond_script, bond_withdrawal_script_sig};
+    ensure!(
+        bond_spk == bond_script(&key.public_key(), locktime),
+        "the bond output {bond} is not this member key's bond script (locktime {locktime})"
+    );
+    ensure!(
+        value_zat > BOND_WITHDRAW_FEE,
+        "the bond ({value_zat} zat) does not cover the fee"
+    );
+    ensure!(
+        tip >= locktime,
+        "the bond's CLTV ({locktime}) is above the tip ({tip})"
+    );
+    let mut tx = Transaction::new_v4(
+        vec![TxIn {
+            prevout: *bond,
+            script_sig: vec![],
+            sequence: 0xffff_fffe,
+        }],
+        vec![TxOut {
+            value: value_zat - BOND_WITHDRAW_FEE,
+            script_pubkey: to_spk,
+        }],
+        tip,
+        tip + 40,
+    );
+    let core = hawkeye_core::tx::Transaction::parse(&tx.encode())
+        .map_err(|e| anyhow!("bond withdrawal: {e}"))?;
+    tx.inputs[0].script_sig =
+        bond_withdrawal_script_sig(&core, 0, key, locktime, value_zat as u64, branch_id)
+            .map_err(|e| anyhow!("bond withdrawal: {e}"))?;
+    Ok(tx)
 }
 
 #[cfg(test)]

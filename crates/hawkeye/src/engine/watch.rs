@@ -32,7 +32,7 @@ impl Engine {
     pub(crate) async fn watch(&mut self) -> Result<()> {
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
-        let members = self.current_member_keys();
+        let members = self.slashable_member_keys();
         // a. confirmed, unspent intents of the set
         let rows = self
             .ctx

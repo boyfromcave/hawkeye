@@ -467,7 +467,7 @@ impl Engine {
             }
         }
         let tip = self.mem.tip;
-        let members = self.current_member_keys();
+        let members = self.slashable_member_keys();
         for (a, sig) in signers {
             let Some(key) = members
                 .iter()
