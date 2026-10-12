@@ -21,6 +21,18 @@ signs `vault_ownerspend`, rolls copy the owner slot byte for byte, and the lock 
 SLH-DSA-SHA2-128s (scheme 1) owners only (§4.1 rule 1). Wherever this plan says "owner key" read
 "post-quantum owner" on that line; member, bond and guardian keys stay secp256k1.
 
+**Signer-set exit rules (quantum line, owner 2026-10-11; quantum plan D-Q-29..D-Q-31).** The vault
+primitive changed how a member leaves, and Hawkeye follows (§2.4): a member bond is spendable only
+after its member **left** the set (its own `SET_REMOVE` with burn 0 — `set_leave`, `hawkeye leave` —
+or a removal without burn) **and** the set's `maturity` has passed since (`bad-vault-bond-locked`
+before; the bond script's CLTV still applies on top); every set's `maturity` is at least
+`MIN_SET_MATURITY` = **16,128 blocks (14 days)** on mainnet and testnet (2 on regtest), so the
+mainnet row's 1,152 is now 16,128 (§2); one unspent bond per (set, key) — a key cannot rejoin while
+its old bond is unspent; a cosigned `SET_REMOVE` with burn (and `SET_EQUIVOCATION`) still reaches a
+member in its exit delay, so Hawkeye's watchers attribute faults to, and its slash votes target,
+those members too (§5.3). Liveness of the bridge set is `SET_HEARTBEAT` only: attestations count
+as liveness, and the minimum `livenessWindow` applies, for the Yellowback attestor set alone.
+
 Naming: **Hawkeye** is the software. An **attestor** is a Ycash participant who runs it and holds a
 seat in the bridge's signer set. **wYEC** is the ERC-20 on Ethereum. A **lock** is a `WYEC`-tagged
 vault output on Ycash, a **burn** is a `BurnToYcash` event on Ethereum, an **intent** is the
@@ -186,10 +198,10 @@ Holder                 Ethereum                Hawkeye (leader for nonce n)     
 | `open` | permissioned | false | false | false |
 | vault `delay` = **challenge window** | blocks an intent waits | 6 | 60 (75 min) | 1,152 (24 h) |
 | `ratelimitbps` / `ratewindow` | cap per epoch | 5,000 / 20 | 2,000 / 288 | ≤ `bondMin` / locked, per 1,152 |
-| `livenessWindow` | silence → DORMANT | 60 | 2,304 | 8,064 (7 d); ≥ 4 × heartbeat (D-U5) |
+| `livenessWindow` | silence → DORMANT (heartbeats only: attestations, and the node's minimum, are the Yellowback set's) | 60 | 2,304 | 8,064 (7 d); ≥ 4 × heartbeat (D-U5) |
 | `heartbeat_blocks` (Hawkeye) | | 10 | 288 | 288 (6 h) |
 | `bondMin` | stake per seat | 1 YEC | 10 YEC | ≥ one epoch's cap (§2.2) |
-| `maturity` | blocks before a joiner counts | 2 | 20 | 1,152 |
+| `maturity` | blocks before a joiner counts **and** the bond exit delay: a leaving member's bond stays locked and slashable this long (§2.4) | 2 (regtest floor 2) | 20 (regtest node) | **16,128** (14 d; the node's floor `MIN_SET_MATURITY`, D-Q-31; was 1,152) |
 
 The vault's `cancelSetId` is the attestor set itself (HK-2).
 
@@ -228,6 +240,33 @@ mainnet row (Q-1).
 
 Ycash consensus records the slash, never the reason (upgrade plan §3.6); Hawkeye records the reason
 in its ledger and publishes the evidence bundle (§5.3).
+
+### 2.4 Leaving the set and the bond exit delay (owner 2026-10-11, D-Q-29..D-Q-31)
+
+An ACTIVE member's bond is never spendable (`bad-vault-bond-locked`), whatever its CLTV. An attestor
+leaves in two steps:
+
+1. **`hawkeye leave`** (stop the daemon first): `set_leave` broadcasts the member's own
+   `SET_REMOVE` (burn 0, signed by its key alone). From the next block (`exitheight`) the member is
+   `removed`, no longer current, and its bond enters the exit delay; the command prints
+   `bondspendableat` = `exitheight + maturity`. Rotate its Ethereum guardian out of the contract in
+   the same governance round (§3.3): a guardian that is no longer a member is reported by the
+   guardian-drift alarm.
+2. **`hawkeye withdraw-bond [--to <t-address>]`** after `bondspendableat` (and the bond script's
+   CLTV): Hawkeye builds the spend of `P2SH(<locktime> CLTV DROP <memberKey> CHECKSIG)` itself
+   (one input, `nLockTime` = tip, one output, fee 10,000 zat), signs the bond input with the member
+   key (ZIP-243 over the redeem script, for the next block's branch id: the node wallet has no
+   signer for the bond script, and no `yed_*` call is involved), and sends it. Before the delay the
+   node answers `bad-vault-bond-locked`; a frozen bond is refused. A plain transaction spend has no
+   slashing consequence, so it is outside the sign-once record (AGENTS.md rule 7 covers set
+   signatures, EIP-712 and acts).
+
+During the delay the member is still slashable: a fault found then (a fraudulent intent or mint
+it signed while a member, an equivocation) is judged as before, and the cosigned `SET_REMOVE` with
+burn freezes the bond in its delay (the member stays `removed`). With `maturity` ≥ 16,128 blocks
+on mainnet, an attestor that leaves right after a fault stays reachable for 14 days, far longer
+than detection (`C_Y` blocks), the vote and submission take. A key cannot rejoin while its old bond
+is unspent (`bad-vault-act-join`), so the member record always names the bond a slash freezes.
 
 ---
 
@@ -478,6 +517,11 @@ takeover overlap are a benign race: the later one is cancelled, nobody is slashe
    `set_signact` on each verifying peer's node → `set_sendact` once `slashThreshold` is reached.
    `auto_slash = true|false` per operator (default false on mainnet: an operator confirms).
 4. Equivocation proofs (`set_equivocation`) need no vote and are submitted automatically.
+5. **Members in their exit delay** (§2.4): attribution (the unlock's signer, the Mint signer, an
+   equivocation) and each peer's independent verification accept a member that is current **or**
+   `removed` with an unfrozen bond that `gettxout` still shows unspent; the slash vote is the same
+   `SET_REMOVE burn=1`. A case closes as `SLASHED` once the bond is frozen (for griefing: once the
+   member is out), and as `EXPIRED` ("bond spent before the slash") when the bond was withdrawn first.
 
 ### 5.4 Reorgs
 
@@ -525,7 +569,7 @@ the index only works for transactions the attestor's own ledger already saw.
 
 **Interfaces only (workspace rule 2).** `ycashd`: `getblockchaininfo`, `getbestblockhash`,
 `getblock`, `getrawtransaction`, `getrawmempool`, `validateaddress`, `importprivkey`, `listunspent`,
-the 21 `set_*`/`vault_*` RPCs (22 on the quantum line: `vault_getnewowner`, used by `hawkeye lock`). Ethereum: standard JSON-RPC (`eth_getLogs` with `finalized`,
+the 21 `set_*`/`vault_*` RPCs (23 on the quantum line: `vault_getnewowner`, used by `hawkeye lock`, and `set_leave`, used by `hawkeye leave`; plus the stock `gettxout` for bonds in their exit delay). Ethereum: standard JSON-RPC (`eth_getLogs` with `finalized`,
 `eth_call`, `eth_sendRawTransaction`, `eth_chainId`). No `yed_*` call: `WYEC` is not a module tag.
 
 **Config** (`hawkeye.toml`): network; ycashd URL and cookie; Ethereum URL, chain id, bridge and
@@ -679,3 +723,4 @@ from the members' compressed keys.
 | HK-9 | Deterministic leader by `nonce mod |live|`, takeover after `TAKEOVER` blocks; every attestor verifies everything |
 | HK-11 | Contract facts Hawkeye relies on (Foundry-tested in `eth/test/`): mint signatures carry no nonce (the `lockId` is the only replay key, valid across rotations while the signers remain guardians); one shared `adminNonce` serialises admin rounds (run one at a time); `setPaused` to the current state reverts; high-S signatures are rejected |
 | HK-10 | Hawkeye reaches the node only through stock and `set_*`/`vault_*` RPCs, and Ethereum only through standard JSON-RPC |
+| HK-12 | (2026-10-11, D-Q-29..D-Q-31) An attestor leaves by `hawkeye leave` (`set_leave`) and recovers its bond by `hawkeye withdraw-bond` after the set's `maturity` (≥ 16,128 on mainnet: the mainnet row's 1,152 became 16,128); slashing reaches members in their exit delay (§2.4, §5.3 step 5) |

@@ -147,7 +147,8 @@ as a current member, so it is not affected.
 4. Funds each attestor wallet with 8 coins of 2.5 YEC. Every act and unlock spends a whole
    confirmed coin (finding (76)).
 5. `set_create` on node0 with the plan §2 regtest row: seats N, unlock 1, cancel 1, slash
-   max(1, N−1), rate 5000 bps / 20, liveness 60, maturity 2, bondmin 1, bondlockmin 50.
+   max(1, N−1), rate 5000 bps / 20, liveness 60, maturity 2 (regtest's D-Q-31 floor; mainnet and testnet
+   refuse a set below 16,128 blocks), bondmin 1, bondlockmin 50.
    `SET_REMOVE` needs `slashThreshold` current members *other than the target*, so with 3
    attestors the slash threshold is 2. node0 holds the admit key.
 6. Starts anvil (`--slots-in-an-epoch 1`, so finalized = latest − 2; `--block-time 1`; state

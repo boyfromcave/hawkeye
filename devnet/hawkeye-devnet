@@ -94,6 +94,7 @@ def set_params(n):
     """The plan §2 regtest row for n attestors. SET_REMOVE needs slashThreshold distinct current members
     other than the target, so slashthreshold = n - 1 (at least 1)."""
     return {"seats": n, "unlockthreshold": 1, "cancelthreshold": 1, "slashthreshold": max(1, n - 1),
+            # maturity 2 = regtest's D-Q-31 floor (mainnet/testnet: >= 16,128, the 14-day exit window)
             "ratelimitbps": 5000, "ratewindow": 20, "livenesswindow": 60, "maturity": 2, "bondmin": 1,
             "bondlockmin": 50}
 
