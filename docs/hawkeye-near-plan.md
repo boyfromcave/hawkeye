@@ -1,8 +1,9 @@
 # Wrapped Ycash on NEAR — the third vault application
 
 **Revision 4, 2026-10-11 (post-quantum burn recipients: §2.4 BurnRecord v2, NQ-5 decided, §5 NH-R3/NH-R5; revision 3, 2026-10-11: post-quantum owners, below and §5; revision 2, 2026-10-10: NH5 as built,
-§4 item 6). Branch `claude/hawkeye-near-wyec` (exploratory: built so the option is ready, not a
-commitment to ship).** Extends the Hawkeye plan of record
+§4 item 6). Built on branch `claude/hawkeye-near-wyec`; **integrated on `upgrade/quantum-vaults`**
+(merged into `q/attest` 2026-10-11, owner instruction: Hawkeye supports both the Ethereum wYEC and
+the NEAR nYEC bridge). The open questions (§6) stay open.** Extends the Hawkeye plan of record
 ([`hawkeye-bridge-plan.md`](hawkeye-bridge-plan.md), "the main plan") from one foreign chain
 (Ethereum) to two. Decisions are numbered **N-\***, phases **NH0–NH6**, open questions **NQ-\***.
 
@@ -26,6 +27,17 @@ D-Q-21). **Node requirement:** this branch parses only the post-quantum owner
 shape, so it runs against `upgrade/quantum-vaults` nodes only, on both lines (at the merge:
 ycash-dd `d41026209`, ycash6 `0c6c5fdf2`; an `upgrade/vault` node has no vault template this
 Hawkeye recognises); `devnet-e2e` builds the node from that branch by default (`NODE_REF`).
+
+**Signer-set exit rules (owner 2026-10-11, quantum plan D-Q-29..D-Q-31) apply to the NEAR bridge
+set exactly as to the Ethereum one** (main plan §2.4, §5.3 step 5): the `NYEC` set's `maturity` is at
+least 16,128 blocks (14 days) on mainnet and testnet (the node refuses less; regtest 2), and it is
+also the bond exit delay; an attestor leaves with `hawkeye leave` (`set_leave`) and recovers its bond
+with `hawkeye withdraw-bond` after `exitheight + maturity`; one unspent bond per (set, key); a member
+in its exit delay is still attributed (a NEAR mint attestation recovers to its guardian key) and
+slashed by the cosigned `SET_REMOVE burn=1`. The bridge set's liveness is `SET_HEARTBEAT` only (the
+attestation liveness hook and the minimum `livenessWindow` are the Yellowback attestor set's). On
+leaving, rotate the member's guardian key out of `wyec-near` in the same governance round. The node
+fee structure is rpcversion 8 (`hawkeye recover`'s `vault_ownerspend` fee at the attested price).
 
 ## 0. The answer in one page
 

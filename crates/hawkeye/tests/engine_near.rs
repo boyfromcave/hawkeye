@@ -167,7 +167,7 @@ async fn setup(mode: MintMode) -> Env {
         livenesswindow: 1000,
         bondmin: Amount(100_000_000),
         bondlockmin: 0,
-        maturity: 0,
+        maturity: 2,
         admitkey: admit,
     });
     for k in &keys {
