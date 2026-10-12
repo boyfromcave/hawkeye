@@ -594,16 +594,21 @@ impl rusqlite::types::FromSql for SignDomain {
 pub enum Chain {
     /// Ycash (active chain tip, reorgs rewound by height).
     Ycash,
-    /// Ethereum (finalized blocks only).
-    Ethereum,
+    /// The bridge's foreign chain (final blocks only): Ethereum block numbers, NEAR block
+    /// heights. Stored as `foreign` (schema v4; `ethereum` before).
+    Foreign,
 }
 
+#[allow(non_upper_case_globals)]
 impl Chain {
+    /// The foreign chain's cursor under its pre-v4 name (an Ethereum bridge's).
+    pub const Ethereum: Chain = Chain::Foreign;
+
     /// The stored name.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ycash => "ycash",
-            Self::Ethereum => "ethereum",
+            Self::Foreign => "foreign",
         }
     }
 }
@@ -619,7 +624,7 @@ impl FromStr for Chain {
     fn from_str(s: &str) -> Result<Self, StoreError> {
         match s {
             "ycash" => Ok(Self::Ycash),
-            "ethereum" => Ok(Self::Ethereum),
+            "foreign" => Ok(Self::Foreign),
             _ => Err(StoreError::corrupt(format!("unknown chain {s:?}"))),
         }
     }

@@ -174,6 +174,31 @@ async fn burn_release_flow_with_memo() {
     );
     assert_eq!(e.rpc().unwrap().matures_at_height(), Some(i.matureheight));
     c.generate(5).await.unwrap();
+    // a pqkeyid is not a recipient (vault-rpc.md, vault_release's -8; the node's message)
+    for scheme in ["01", "02"] {
+        let pqkeyid = format!("{scheme}{}", "c5".repeat(32));
+        let e = c
+            .vault_release(&i.outpoint, Some(&pqkeyid))
+            .await
+            .unwrap_err();
+        let rpc = e.rpc().unwrap();
+        assert_eq!(rpc.code, -8, "{pqkeyid}");
+        assert!(
+            rpc.message
+                .ends_with("pass the address or the script, not a pqkeyid"),
+            "{}",
+            rpc.message
+        );
+    }
+    // a 33-byte hex script of an unregistered scheme byte is just a wrong script
+    let e = c
+        .vault_release(&i.outpoint, Some(&format!("03{}", "c5".repeat(32))))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.rpc().unwrap().message,
+        "that script is not the intent's recipient"
+    );
     let rel = c
         .vault_release(&i.outpoint, Some(&recipient))
         .await
@@ -191,6 +216,112 @@ async fn burn_release_flow_with_memo() {
         .unwrap()
         .is_empty()
     );
+}
+
+/// Plain-YEC post-quantum addresses (quantum plan D-Q-20; Hawkeye plan §4.2 revision 2):
+/// `getnewaddress "" "pq"` files a PQ key (the node's `rq…`, the mock's `rqMock…`),
+/// `validateaddress` gives its 35-byte `TX_PQPKH` script `20 <keyHash> OP_1 OP_CHECKPQSIG`, an
+/// unlock pays it by script, and `vault_release` takes the script in hex (or the address) and
+/// pays that exact output — the node pays a `TX_PQPKH` output wherever it takes an address.
+#[tokio::test]
+async fn pq_recipient_released_to_tx_pqpkh() {
+    let (m, _set, vault) = bridge(0).await;
+    let c = m.client();
+    let pq = c
+        .call_value("getnewaddress", vec![json!(""), json!("pq")])
+        .await
+        .unwrap();
+    let pq = pq.as_str().unwrap().to_owned();
+    assert!(pq.starts_with("rq"), "{pq}");
+    let va = c.validateaddress(&pq).await.unwrap();
+    assert!(va.isvalid && va.ismine == Some(true));
+    let spk = va.script_pub_key.unwrap().0;
+    assert_eq!(spk.len(), 35);
+    assert_eq!(spk[0], 32);
+    assert_eq!(&spk[33..], &[0x51, 0xc2], "OP_1 OP_CHECKPQSIG");
+    let plain = c.getnewaddress().await.unwrap();
+    assert!(plain.starts_with("tm"), "{plain}: no type is a P2PKH");
+
+    let amount: Amount = "3".parse().unwrap();
+    let built = c
+        .vault_buildunlock(&vault, &[Recipient::script(spk.clone(), amount)])
+        .await
+        .unwrap();
+    let expected = {
+        use sha2::Digest;
+        let d: [u8; 32] = sha2::Sha256::digest(&spk).into();
+        d
+    };
+    assert_eq!(
+        built.intents[0].recipienthash.0, expected,
+        "recipienthash = SHA256(TX_PQPKH script)"
+    );
+    let signed = c.set_signunlock(&built.hex).await.unwrap();
+    c.vault_send(&signed.hex).await.unwrap();
+    c.generate(1).await.unwrap();
+    let intents = c
+        .vault_list(Some(&VaultListFilter {
+            kind: Some(TemplateKind::Intent),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let i = intents[0].as_intent().unwrap().clone();
+    c.generate(i.fields.delay).await.unwrap();
+    // a pqkeyid is still not a recipient; the script (hex) and the address both are
+    let e = c
+        .vault_release(
+            &i.outpoint,
+            Some(&format!("01{}", hex::encode(&spk[1..33]))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.rpc().unwrap().code, -8);
+    let rel = c
+        .vault_release(&i.outpoint, Some(&hex::encode(&spk)))
+        .await
+        .unwrap();
+    c.generate(1).await.unwrap();
+    let tx = c.getrawtransaction_verbose(&rel, None).await.unwrap();
+    assert_eq!(tx.vout[0].value, amount);
+    let raw = c.getrawtransaction(&rel).await.unwrap();
+    let t = Transaction::decode(raw.as_slice()).unwrap();
+    assert_eq!(
+        t.outputs[0].script_pubkey, spk,
+        "the release pays the TX_PQPKH script"
+    );
+    // the same by address, on a second intent (from the relocked vault)
+    let relock = c
+        .vault_list(Some(&VaultListFilter {
+            kind: Some(TemplateKind::Vault),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let built = c
+        .vault_buildunlock(
+            &relock[0].outpoint(),
+            &[Recipient::address(pq.clone(), amount)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(built.intents[0].recipienthash.0, expected);
+    let signed = c.set_signunlock(&built.hex).await.unwrap();
+    c.vault_send(&signed.hex).await.unwrap();
+    c.generate(1 + i.fields.delay).await.unwrap();
+    let intents = c
+        .vault_list(Some(&VaultListFilter {
+            kind: Some(TemplateKind::Intent),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let i2 = intents[0].as_intent().unwrap().clone();
+    let rel2 = c.vault_release(&i2.outpoint, Some(&pq)).await.unwrap();
+    c.generate(1).await.unwrap();
+    let raw = c.getrawtransaction(&rel2).await.unwrap();
+    let t = Transaction::decode(raw.as_slice()).unwrap();
+    assert_eq!(t.outputs[0].script_pubkey, spk);
 }
 
 #[tokio::test]

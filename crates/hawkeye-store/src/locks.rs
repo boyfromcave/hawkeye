@@ -1,10 +1,12 @@
-//! `WYEC` locks (plan §1.2, §4.1; the Lock machine of §5.1).
+//! The bridge's locks (plan §1.2, §4.1; the Lock machine of §5.1): `WYEC` (Ethereum) or `NYEC`
+//! (NEAR) vaults with a destination.
 
+use hawkeye_core::OutPoint;
 use hawkeye_core::bytes::Hash32;
 use hawkeye_core::lock::lock_id;
-use hawkeye_core::{EthAddress, OutPoint};
 use rusqlite::{Row, params};
 
+use crate::accounts::{Account, SqlAccount};
 use crate::state::{LockState, ObjectKind, check_forward};
 use crate::{Result, StoreError, Tx, hx};
 
@@ -17,9 +19,10 @@ pub struct NewLock {
     pub value_zat: u64,
     /// The V's `ownerHeight`.
     pub owner_height: u32,
-    /// The destination `OP_RETURN`'s address, when it decodes (a lock whose destination does not
-    /// decode is still recorded, and rejected by policy).
-    pub destination: Option<EthAddress>,
+    /// The destination `OP_RETURN`'s account (an Ethereum address or a NEAR account id), when it
+    /// decodes (a lock whose destination does not decode is still recorded, and rejected by
+    /// policy).
+    pub destination: Option<Account>,
     /// The block that contains it.
     pub block_hash: Hash32,
     /// That block's height.
@@ -38,7 +41,7 @@ pub struct LockRecord {
     /// The V's `ownerHeight`.
     pub owner_height: u32,
     /// The mint recipient, if the destination decodes.
-    pub destination: Option<EthAddress>,
+    pub destination: Option<Account>,
     /// The containing block (the latest one, if the lock was re-mined after a reorg).
     pub block_hash: Hash32,
     /// The containing block's height.
@@ -64,7 +67,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<LockRecord> {
         outpoint: OutPoint::new(r.get(1)?, r.get(2)?),
         value_zat: r.get(3)?,
         owner_height: r.get(4)?,
-        destination: r.get::<_, Option<[u8; 20]>>(5)?.map(EthAddress),
+        destination: r.get::<_, Option<SqlAccount>>(5)?.map(|a| a.0),
         block_hash: r.get(6)?,
         block_height: r.get(7)?,
         state: r.get(8)?,
@@ -140,7 +143,7 @@ impl Tx<'_> {
                 new.outpoint.vout,
                 new.value_zat,
                 new.owner_height,
-                new.destination.map(|d| d.0),
+                new.destination.clone().map(SqlAccount),
                 new.block_hash,
                 new.block_height,
                 LockState::Seen,

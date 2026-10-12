@@ -1,6 +1,6 @@
 {
  "generator": "crates/hawkeye-ycash/tests/data/gen_fixtures.py",
- "ycash-dd": "a8572900fd0d82d88a7f530cb26f2e0e514ecbb1",
+ "ycash-dd": "d410262099d7e8fc700c5e0e03e92a6f6534e464",
  "spends": [
   {
    "name": "unlock",

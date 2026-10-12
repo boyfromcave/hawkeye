@@ -6,6 +6,7 @@
 //! | [`config`] | `hawkeye.toml` and its checked form |
 //! | [`keys`] | the member key: compressed key, WIF, Ethereum signer |
 //! | [`engine`] | the tick: Ycash follower, mint, burns, watcher, slash, heartbeat, status |
+//! | [`foreign`] | the foreign-chain adapter (`ForeignChain`; Ethereum today, NEAR plan §4) |
 //! | [`attribution`] | set-signature attribution behind a trait |
 //! | [`peers`] | the peer channel v1 and the API's wire types |
 //! | [`api`] | the axum status / peer API |
@@ -21,6 +22,7 @@ pub mod config;
 pub mod convert;
 pub mod daemon;
 pub mod engine;
+pub mod foreign;
 pub mod keys;
 pub mod peers;
 pub mod status;

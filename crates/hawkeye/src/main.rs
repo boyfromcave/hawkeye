@@ -34,7 +34,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: KeysCmd,
     },
-    /// Depositor: lock YEC in a WYEC vault with an Ethereum destination.
+    /// Depositor: lock YEC in a vault of the bridge's tag (WYEC / NYEC) with a destination on
+    /// the foreign chain.
     Lock {
         /// YEC (also accepted positionally).
         #[arg(long = "amount", value_name = "YEC")]
@@ -42,7 +43,8 @@ enum Cmd {
         /// YEC, positional form.
         #[arg(value_name = "AMOUNT", conflicts_with = "amount")]
         amount_pos: Option<String>,
-        /// The Ethereum address to mint to.
+        /// The account to mint to: an Ethereum address (Ethereum bridge) or a NEAR account id
+        /// (NEAR bridge).
         #[arg(long)]
         dest: String,
         /// ownerHeight − tip (default MIN_OWNER_AGE + ROLL_MARGIN + 10).
@@ -53,7 +55,7 @@ enum Cmd {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Holder: burn wYEC to a Ycash transparent address.
+    /// Holder: burn wYEC to a Ycash address (transparent, or plain-YEC post-quantum sq…/tq…/rq…).
     Burn {
         /// YEC (also accepted positionally).
         #[arg(long = "amount", value_name = "YEC")]
@@ -61,12 +63,18 @@ enum Cmd {
         /// YEC, positional form.
         #[arg(value_name = "AMOUNT", conflicts_with = "amount")]
         amount_pos: Option<String>,
-        /// The Ycash t-address.
+        /// The Ycash recipient: a transparent address (s1…/s2…/s3…, testnet sm…/s2…) or a
+        /// plain-YEC post-quantum address (sq…/tq…/rq…; scheme 2 warns until Falcon is active).
+        /// Never a PQ owner address (yb…/yt…/yr…) and never shielded.
         #[arg(long)]
         recipient: String,
-        /// The holder's Ethereum key (default: the config's secret_hex).
+        /// Ethereum: the holder's key (default: the config's secret_hex).
         #[arg(long)]
         eth_key: Option<String>,
+        /// NEAR: the holder's credentials JSON (`account_id`, `public_key`, `private_key`;
+        /// default: the config's relayer key file).
+        #[arg(long)]
+        near_key: Option<PathBuf>,
     },
     /// DRILL ONLY: sign an unlock with no burn behind it (or, with --replay-burn, a second
     /// unlock for an already-released burn, carrying its valid memo).
@@ -95,14 +103,14 @@ enum Cmd {
         /// YEC, positional form.
         #[arg(value_name = "AMOUNT", conflicts_with = "amount")]
         amount_pos: Option<String>,
-        /// The Ethereum recipient (default: this attestor's own address).
+        /// The recipient (default on Ethereum: this attestor's own address; required on NEAR).
         #[arg(long)]
         to: Option<String>,
         /// The lockId, 32 bytes hex (default: an invented one no lock has).
         #[arg(long)]
         lock_id: Option<String>,
     },
-    /// Owner: vault_ownerspend of every WYEC vault/intent this wallet owns.
+    /// Owner: vault_ownerspend of every vault/intent of the bridge's tag this wallet owns.
     Recover,
     /// Attestor: leave the set (set_leave: the member's own SET_REMOVE, no burn). The bond stays
     /// locked and slashable for the set's maturity (>= 16,128 blocks on mainnet), then
@@ -119,7 +127,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum KeysCmd {
-    /// Print the member key and Ethereum address of a secret.
+    /// Print the member key, its Ethereum address and its NEAR guardian key.
     Derive {
         /// 64 hex digits.
         #[arg(long)]
@@ -192,12 +200,14 @@ async fn main() -> Result<()> {
             amount_pos,
             recipient,
             eth_key,
+            near_key,
         } => {
             cli::burn(
                 &s,
                 &need(amount, amount_pos)?,
                 recipient,
                 eth_key.as_deref(),
+                near_key.as_deref(),
             )
             .await
         }

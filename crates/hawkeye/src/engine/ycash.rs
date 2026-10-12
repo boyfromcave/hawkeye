@@ -4,11 +4,11 @@
 use anyhow::{Context, Result, anyhow};
 use hawkeye_core::attribution::Attribution;
 use hawkeye_core::bytes::Hash32;
-use hawkeye_core::lock::parse_destination;
-use hawkeye_core::matcher::{Classification, MatchContext, ObservedIntent, classify_intent};
+use hawkeye_core::lock::Destination;
+use hawkeye_core::matcher::{Classification, MatchContext, ObservedIntent, classify_intent_for};
 use hawkeye_core::policy::TxOut as CoreTxOut;
 use hawkeye_core::script::{is_op_return, op_return_single_push, parse_p2pkh, parse_p2sh};
-use hawkeye_core::template::{TAG_WYEC, TemplateKind, parse_intent, parse_selector, parse_vault};
+use hawkeye_core::template::{TemplateKind, parse_intent, parse_selector, parse_vault};
 use hawkeye_core::{IntentParams, OutPoint as CoreOutPoint, PubKey33, VaultParams};
 use hawkeye_store::{
     BurnKey, BurnState, Chain, IntentState, NewIntent, NewLock, NewVault, SeenSetSig, StoreError,
@@ -105,7 +105,8 @@ pub struct IntentFacts<'a> {
 /// minted; rolling it would only postpone its owner's recovery, §3.1).
 pub fn classify(t: &Tx<'_>, p: &Params, f: &IntentFacts<'_>) -> Classification {
     let mctx = match_context(p, f.first_seen);
-    let c = classify_intent(
+    let c = classify_intent_for(
+        p.bridge_kind,
         &mctx,
         &ObservedIntent {
             txid: f.txid,
@@ -130,16 +131,17 @@ pub fn classify(t: &Tx<'_>, p: &Params, f: &IntentFacts<'_>) -> Classification {
 
 /// The roll memo (kind 2, this deployment) among `outputs`, if any.
 pub fn roll_memo(p: &Params, outputs: &[CoreTxOut]) -> Option<hawkeye_core::memo::HawkeyeMemo> {
-    outputs.iter().find_map(
-        |o| match hawkeye_core::memo::parse_memo_script(&o.script_pubkey) {
+    outputs.iter().find_map(|o| {
+        match hawkeye_core::memo::parse_memo_script_for(p.bridge_kind, &o.script_pubkey) {
             Ok(Some(m))
-                if m.kind == hawkeye_core::memo::MemoKind::Roll && m.deployment == p.deployment =>
+                if m.kind == hawkeye_core::memo::MemoKind::Roll
+                    && m.is_for(p.bridge_kind, &p.deployment) =>
             {
                 Some(m)
             }
             _ => None,
-        },
-    )
+        }
+    })
 }
 
 /// Link a matched intent to its burn (and confirm it).
@@ -185,7 +187,7 @@ pub fn apply_unlock(
     members: &[PubKey33],
 ) -> Result<(), StoreError> {
     for (vout, ip, value) in &obs.intents {
-        if ip.tag != TAG_WYEC || ip.set_id != p.set_id || ip.cancel_set_id != p.set_id {
+        if ip.tag != p.tag() || ip.set_id != p.set_id || ip.cancel_set_id != p.set_id {
             continue;
         }
         let op = CoreOutPoint::new(obs.txid, *vout);
@@ -360,14 +362,15 @@ fn apply_outputs(
         .filter(|o| is_op_return(&o.script_pubkey))
         .collect();
     let destination = match returns.as_slice() {
-        [one] => parse_destination(&one.script_pubkey).ok(),
+        // the bridge kind's destination: an Ethereum address or a NEAR account id (ledger v4)
+        [one] => Destination::parse(p.bridge_kind, &one.script_pubkey).ok(),
         _ => None,
     };
     for (n, o) in tx.outputs.iter().enumerate() {
         let Ok(v) = parse_vault(&o.script_pubkey) else {
             continue;
         };
-        if v.tag != TAG_WYEC || v.set_id != p.set_id {
+        if v.tag != p.tag() || v.set_id != p.set_id {
             continue;
         }
         let op = CoreOutPoint::new(*txid, n as u32);
@@ -386,13 +389,13 @@ fn apply_outputs(
                 outpoint: op,
                 value_zat: value,
                 owner_height: v.owner_height,
-                destination,
+                destination: destination.clone(),
                 block_hash: *block_hash,
                 block_height: h,
             })?;
             info!(event = "lock_seen", lock_id = %format!("0x{}", hex::encode(rec.lock_id)),
                   outpoint = %op, value, height = h,
-                  to = ?destination.map(|d| d.to_checksum()));
+                  to = ?destination.as_ref().map(|d| d.to_string()));
         }
     }
     Ok(())
@@ -516,7 +519,7 @@ impl Engine {
     fn cache_vault_outputs(&mut self, tx: &Transaction, txid: Hash32) {
         for (n, o) in tx.outputs.iter().enumerate() {
             if let Ok(v) = parse_vault(&o.script_pubkey)
-                && v.tag == TAG_WYEC
+                && v.tag == self.ctx.params.tag()
                 && v.set_id == self.ctx.params.set_id
             {
                 self.mem.vault_scripts.insert(
@@ -828,7 +831,7 @@ impl Engine {
             .ctx
             .ycash
             .vault_list(Some(&VaultListFilter {
-                tag: Some("WYEC".into()),
+                tag: Some(self.ctx.params.tag_text()),
                 setid: Some(self.ctx.set_hash()),
                 kind: Some(RpcKind::Vault),
                 ..VaultListFilter::default()
@@ -843,7 +846,7 @@ impl Engine {
             let Ok(vp) = vault_params(&r.fields) else {
                 continue;
             };
-            if vp.tag != TAG_WYEC {
+            if vp.tag != self.ctx.params.tag() {
                 continue;
             }
             let op = op_core(&r.outpoint);
@@ -875,5 +878,40 @@ impl Engine {
             Ok(())
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hawkeye_core::BridgeKind;
+    use hawkeye_core::memo::HawkeyeMemo;
+
+    /// A memo of the other bridge's magic never matches, even naming this deployment (the
+    /// engine parses memos for its own kind only).
+    #[test]
+    fn roll_memo_is_kind_aware() {
+        let p = crate::config::sample_params(false, false);
+        let v = VaultParams {
+            tag: p.tag(),
+            set_id: p.set_id,
+            cancel_set_id: p.set_id,
+            delay: p.delay,
+            owner_height: 7000,
+            app_height: 0,
+            // a placeholder: the memo never reads the owner
+            owner: hawkeye_core::PqKeyId {
+                scheme: hawkeye_core::pq::SCHEME_SLH_DSA_SHA2_128S,
+                hash: [0; 32],
+            },
+        };
+        let out = |m: HawkeyeMemo| CoreTxOut {
+            value: 0,
+            script_pubkey: m.to_script(),
+        };
+        let ours = HawkeyeMemo::roll_for(BridgeKind::Ethereum, p.deployment, &v).unwrap();
+        let theirs = HawkeyeMemo::roll_for(BridgeKind::Near, p.deployment, &v).unwrap();
+        assert_eq!(roll_memo(&p, &[out(ours)]), Some(ours));
+        assert_eq!(roll_memo(&p, &[out(theirs)]), None);
     }
 }

@@ -14,8 +14,11 @@ and the [wYEC contract design](https://github.com/boyfromcave/wyec/blob/main/doc
 line every vault's owner is post-quantum, bridge vaults included (the owner's decision; the
 workspace's `yellowback-quantum-spec.md` §1, §4, §6.2): the owner slot of V and I is
 `<ownerHash:32> OP_1|OP_2 OP_CHECKPQSIG` (35 bytes; V 45 tokens, I 32), the owner is a `pqkeyid`
-(`scheme ‖ SHA256(scheme ‖ pk)`) or a 53-character PQ address (`ye…`/`yt…`/`yr…`), and the
-secp256k1 owner shape is not a template. Hawkeye still holds no owner key and no post-quantum
+(`scheme ‖ SHA256(scheme ‖ pk)`) or a 53-character PQ address (`yb…`/`yt…`/`yr…`; the mainnet
+version is `0x56AB`, quantum plan D-Q-21), and the secp256k1 owner shape is not a template. The
+node also renders a PQ key as a plain-YEC address (`sq…`/`tq…`/`rq…`, D-Q-20, a `TX_PQPKH`
+output) and takes one wherever it takes an address; Hawkeye's recipient codec (§4.2) stays
+P2PKH/P2SH — a PQ burn recipient is an open question (Q-7), not a codec change. Hawkeye still holds no owner key and no post-quantum
 code: `hawkeye lock` takes the owner from `vault_getnewowner` (or `--owner`), the depositor's node
 signs `vault_ownerspend`, rolls copy the owner slot byte for byte, and the lock policy mints for
 SLH-DSA-SHA2-128s (scheme 1) owners only (§4.1 rule 1). Wherever this plan says "owner key" read
@@ -350,15 +353,19 @@ lost: the challenged proposer is barred from that lock, the next eligible attest
 same signed `(amount, to)` with a fresh id, and the alarm `matching-proposal-challenged` names the
 challenger. If every live member were barred, a threshold `mint` is the override.
 
-### 3.4 F-4: recipient bytes are opaque on both chains (HK-5)
+### 3.4 F-4: recipient bytes are opaque in meaning on both chains (HK-5)
 
-`burn(amount, bytes32 ycashRecipient)` is unconditional and the contract never parses the
-recipient (R2). A malformed recipient cannot be paid. `burn(0, …)` also succeeds and consumes a
-burn nonce: it is orphaned, never treated as a gap in the nonce sequence. Hawkeye defines the encoding (§4.2), the
+`burn(amount, bytes ycashRecipient)` is unconditional for any well-formed recipient: since §4.2
+revision 2 (CR-W4, wyec `be177c5`; wyec-near likewise) the contract checks the recipient's **shape**
+(length 22 or 35, version, kind, scheme) and refuses anything else, but it never reads Ycash state
+and never interprets the bytes — the meaning stays Hawkeye's (R2). So a malformed recipient can no
+longer be burned to at all. `burn(0, …)` still succeeds and consumes a burn nonce: it is orphaned,
+never treated as a gap in the nonce sequence. Hawkeye defines the encoding (§4.2), the
 `hawkeye burn` CLI and any dapp built on it validate before sending, and a burn whose recipient
-does not decode is held as **orphaned**: never released, reported, and refundable by a threshold
-mint to the burner with the synthetic `lockId = sha256("hawkeye-refund" ‖ chainId ‖ bridge ‖
-nonce)` (Q-3: the Foundation's call; needs `k`-of-n signatures, never one).
+does not decode (possible only from a non-validating contract) is held as **orphaned**: never
+released, reported, and refundable by a threshold mint to the burner with the synthetic
+`lockId = sha256("hawkeye-refund" ‖ chainId ‖ bridge ‖ nonce)` (Q-3: the Foundation's call; needs
+`k`-of-n signatures, never one).
 
 ### 3.5 F-5: one key, two chains, and signing it twice (HK-7)
 
@@ -403,19 +410,42 @@ A confirmed output is a mintable lock iff all hold:
 `lockId = SHA256(txid_internal(32) ‖ vout(u32 LE))` (wyec design E-5, made exact here). Mint
 `to` = the last 20 bytes of the destination; `amount` = the V's value in zatoshi.
 
-### 4.2 `ycashRecipient` (bytes32)
+### 4.2 `ycashRecipient` (version 2: variable length, 22 or 35 bytes; owner decision 2026-10-11, Q-7)
 
 ```
-byte 0      version = 0x01
-byte 1      kind    = 0x00 P2PKH | 0x01 P2SH
-bytes 2..11 zero
-bytes 12..31 hash160
+byte 0      version = 0x02
+byte 1      kind    = 0x00 P2PKH | 0x01 P2SH | 0x02 PQPKH
+bytes 2..   kind 0x00 / 0x01: hash160 (20 bytes)                         → 22 bytes in all
+            kind 0x02:        scheme (1 byte: 0x01 SLH-DSA-SHA2-128s |
+                              0x02 FN-DSA-512) ‖ keyHash (32 bytes)        → 35 bytes in all
 ```
-The recipient script is `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG` or
-`OP_HASH160 <20> OP_EQUAL`; `recipientHash = SHA256(script)`. Shielded recipients are out of scope
-(intents commit a transparent script; cf. upgrade D-U1): the user shields after release. Ycash
-address prefixes: mainnet `{0x1C,0x28}` P2PKH / `{0x1C,0x2C}` P2SH; testnet and regtest
-`{0x1C,0x95}` / `{0x1C,0x2A}` (ycash-dd `src/chainparams.cpp:155,157,420,422`).
+The field is `bytes` on Ethereum (`WyecBridge.burn(uint256, bytes)`, event `BurnToYcash(…, bytes)`),
+a hex string on NEAR (`wyec-near::burn`, `BurnRecord.ycash_recipient: Vec<u8>`, NEAR plan §2.4) and
+`Vec<u8>` in `hawkeye-core::recipient`. **Both contracts validate it strictly and refuse anything
+else** (length 22 or 35, version `0x02`, a known kind, scheme 1 or 2 for kind 2): a burn to a
+malformed recipient would be an unredeemable burn, so it never happens. Version 1 (the former
+`bytes32`: `0x01`, kind, 10 zero bytes, hash160) is retired — no deployment carries it; a Hawkeye
+ledger written under it migrates its rows to the 22-byte form losslessly.
+
+The recipient script is `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG` (kind 0),
+`OP_HASH160 <20> OP_EQUAL` (kind 1) or the node's `TX_PQPKH`
+`<keyHash:32> OP_1|OP_2 OP_CHECKPQSIG` (kind 2; `20 <hash> 51|52 c2`, 35 bytes, the scheme as a
+script number, never the data push `01 01` — quantum spec F-1; ycash-dd
+`src/script/standard.cpp:338` at `d41026209`); `recipientHash = SHA256(script)`. The intent commits
+only that hash and `vault_release` takes the script, so **the node needs no change**: on the
+quantum line it already pays `TX_PQPKH` wherever it takes an address (quantum plan D-Q-20) and its
+wallet spends such outputs (Q5). A kind-2 recipient with scheme 2 is valid once Falcon is active
+at the release (day one on mainnet and testnet, `-nuparams`/`pqfalconheight` on regtest); the
+contracts cannot know Ycash's state, so they accept scheme 2 and the burner bears a release the
+node refuses before activation (`hawkeye burn` warns). Shielded recipients are out of scope
+(intents commit a transparent script; cf. upgrade D-U1): the user shields after release.
+
+Ycash address prefixes: mainnet `{0x1C,0x28}` P2PKH / `{0x1C,0x2C}` P2SH; testnet and regtest
+`{0x1C,0x95}` / `{0x1C,0x2A}` (ycash-dd `src/chainparams.cpp:155,157,420,422`); the plain-YEC
+post-quantum address (`sq…` / `tq…` / `rq…`, 53 characters, Base58Check of `version(2) ‖ scheme ‖
+keyHash` with versions `0x4DD9` / `0x4F61` / `0x4C51`, D-Q-20, `src/key_io.cpp:23-27`) names a
+kind-2 recipient; the PQ *owner* address (`yb…`/`yt…`/`yr…`, §1 "Post-quantum owners") is not
+accepted as a burn recipient — owner keys are vault owners, not holder addresses.
 
 ### 4.3 The Hawkeye memo (`OP_RETURN`, 73 data bytes ≤ 80, script 75 bytes `6a 49 …`, `MAX_OP_RETURN_RELAY`)
 
@@ -679,6 +709,16 @@ from the members' compressed keys.
 
 ---
 
+### 9.1 Post-quantum burn recipients (Q-7; §4.2 revision 2) — phases R1–R5
+
+| Phase | Content | Exit |
+|---|---|---|
+| R1 ✅ | this revision of §4.2 / HK-5 / Q-7 and NEAR plan §2.4 / NQ-5 (2026-10-11) | the encoding is normative before any code (rule 3) |
+| R2 ✅ | wyec: `burn(uint256, bytes)`, `BurnToYcash(…, bytes)`, strict validation, tests, docs (CR-W4) — wyec#2 merged as `be177c5` (contracts = `c23849a`), 96 tests | PR green ✅; Hawkeye pins the merge `be177c5` (`eth/tools/fetch-wyec.sh`), ABI re-exported ✅ |
+| R3 ✅ | wyec-near: `burn` takes the 22/35-byte recipient, `BurnRecord` v2 (`ycash_recipient: Vec<u8>`, a new borsh layout so a new `record_hash` = HKN1 `data`), storage priced by the record's size; golden vectors regenerated in `near/vectors` and `hawkeye-core/tests/data/near_vectors.json`; unit + sandbox tests | all green on the real NEAR sandbox (CI) |
+| R4 ✅ | Hawkeye: `hawkeye-core::recipient` v2 (kinds, `TX_PQPKH` script build/parse, vectors), `address` decodes `sq…`/`tq…`/`rq…`, the ledger's recipient columns widen (migration, v1 rows → 22 bytes), the Ethereum and NEAR adapters carry `Vec<u8>`, `hawkeye burn --recipient <sq…>` on both bridges, engine tests on both mocks (burn to PQ → intent → release pays the 35-byte script) | workspace green; both devnet demos unchanged |
+| R5 ✅ | devnet drill `pq-recipient` on both bridges: node0 draws `getnewaddress "" "pq"` (`rq…`), `hawkeye burn` to it, the intent's `recipienthash` = SHA256(`20 <hash> 51 c2`), the release pays a `TX_PQPKH` output the node wallet sees (`listunspent`) and can spend; devnet-e2e runs it on the real quantum nodes, both lines. **Built (2026-10-11, `5be632f`, `a78ffcd`; devnet/README.md "scenario pq-recipient"):** `devnet/hawkeye-devnet scenario pq-recipient [--foreign near]`, after `demo` and `rogue-mint` in every devnet-e2e job. The Python recipient codec (`ycash_recipient`, the mirror of `hawkeye-core::recipient` + `address`, checked against `recipient_vectors.json`: 8 valid, 20 invalid, the owner addresses refused) also fixed the Ethereum fallback burn, stale since R4 (`burn(uint256,bytes)`). What the real quantum nodes (ycash-dd `d41026209`, ycash6 `0c6c5fdf2`) did, identical on both lines and both bridges: `getnewaddress "" "pq"` → a 53-character `rq…`, version `4c51`, scheme 1 (Falcon inactive on regtest); `validateaddress` reports `ismine`, `pqscheme` 1, `pqkeyhash`, the 35-byte `scriptPubKey` `20 <keyHash> 51 c2`; `hawkeye burn` carried `02 02 01 ‖ keyHash` and the bridges recorded exactly those bytes (the `BurnToYcash` log's `bytes`, 160 data bytes; NEAR `get_burns` 70 hex digits); `hawkeye burn --recipient <yr…>` exits 1 ("--recipient: bad address: a post-quantum owner address is not a recipient"), no nonce consumed; the intent's `recipienthash` (vault_list = vault_decodescript) = SHA256(script); every attestor's `GET /burns/0` shows the 35-byte recipient and the `rq…` as `recipient_address`, later `RELEASED`; the **release** is a 296-byte transaction (297 on ycash-dd/NEAR) with 2 inputs / 2 outputs whose `TX_PQPKH` output decodes as type `pqpubkeyhash` with the `rq…` in `addresses`; `getreceivedbyaddress`, `listunspent [rq…]` (spendable) and `getbalance` see it; the **PQ spend** (`sendtoaddress` 1.5 YEC, the other coins locked) is an 8,078-byte transaction with one input whose scriptSig is 7,938 bytes (SLH-DSA-SHA2-128s, quantum spec §2.1), fee 8,078 zat — the wallet's `-mintxfee` (1,000 zat/kB) prices it above the `-pqfeerate` floor (max(1,000, 100 zat/kB × size) = 1,000 at the default); it confirms and node1 receives 1.5 YEC; supply 6 ≤ locked, nobody slashed, no alarm. A NEAR adapter defect surfaced on the way (run 38161537258, `rogue-mint` on ycash6/NEAR: the one-off `hawkeye rogue-mint` and attestor1's daemon share the relayer key; an `InvalidNonce` was retried once from the same stale `final` view) and is fixed in `a78ffcd`: retries continue from the `ak_nonce` the refusal names, up to 3 times. | **PASS** on ycash-dd v4.5.0 and ycash6 v6.22.0-rc1, Ethereum and NEAR: devnet-e2e run 38162162277 (6/6 jobs: node × 2, demo line × foreign × 4, each `demo` + `rogue-mint` + `pq-recipient`; transcripts `pq-recipient-2026-10-11-<line>-<ver>[-near].txt` in the artifacts `devnet-<line>-<foreign>`), after run 38161537258 (3/4 PASS, the ycash6/NEAR job lost to the nonce race before `pq-recipient` ran); `ci` run 38162162287 (12 jobs) |
+
 ## 10. Change requests outside this repository (owner / coordinator; Hawkeye commits none of them)
 
 | # | Repo | Change | Why | Blocking? |
@@ -686,6 +726,7 @@ from the members' compressed keys.
 | CR-W1 | wyec | **Done** (wyec#1, `cad126a`). Optimistic mint: `proposeMint(lockId, amount, to, sig)` by one guardian's signature → `challengeWindow` (immutable) → `executeMint(lockId)` by anyone; `challengeMint(lockId, proposalId, sig)` by any guardian's EIP-712 `Challenge(bytes32 lockId,uint256 proposalId)` signature, submittable by anyone, deletes the proposal and bars its proposer from the lock (`vetoed`); events `MintProposed(lockId, proposalId, proposer, to, amount, eta)`, `MintChallenged(lockId, proposalId, challenger)`; fixed-window mint rate limit (`setMintLimit`, E-6); the k-of-n `mint` kept. Hawkeye binds it (its test double is gone) | the Foundation's model on the mint side (§3.3) | done |
 | CR-W2 | wyec | **Done** (wyec#1, `cad126a`). Foundry project (replacing `compile.js`), `Deploy.s.sol` with the predicted-address assertion and the mainnet threshold rule | Hawkeye binds the ABI; Sepolia deploy | done (Hawkeye keeps its own `eth/script/Deploy.s.sol`, the same checks plus `mintMode`, and exports the ABI from the pinned build) |
 | CR-W3 | wyec | **Done** (wyec#1, `cad126a`). §4.2's recipient encoding in `burn`'s NatSpec | one definition | done |
+| CR-W4 | wyec | §4.2 revision 2: `burn(uint256 amount, bytes ycashRecipient)` and `BurnToYcash(…, bytes ycashRecipient)`, the recipient validated in the contract (22 or 35 bytes, version 2, kinds 0–2, scheme 1–2), the design doc and NatSpec updated, Foundry tests, the deploy script unchanged in shape (R2) | post-quantum burn recipients (Q-7) | **Done** (wyec#2, `be177c5`) |
 | CR-N1 | ycash-dd, ycash6 | `vault_lock` `"data"` parameter (finding (73)) | wallets write the destination without hand-built transactions | no |
 | CR-N4 | ycash-dd, ycash6 | quantum line: a post-quantum owner through the `vault_*` surface (client survey C-4) | `hawkeye lock` builds the V itself (CR-N1) and may not call `yed_*` | **done** on ycash-dd `q/wallet` (`vault_getnewowner`, Q5); ycash6 to follow |
 | CR-N2 | ycash-dd, ycash6 | `vault_buildunlock` `"data"` parameter (an OP_RETURN output) | the memo without a tx codec in Hawkeye | no |
@@ -705,6 +746,7 @@ from the members' compressed keys.
 | Q-4 | Bridge fee (O-2 "bps fee") and who pays Ethereum gas | v1: none; attestors absorb fees (a proposal ~111k gas, an execute ~107k, a challenge ~38k: wyec-contract-design.md §4.5.5); revisit before mainnet |
 | Q-5 | Who may be an attestor (Foundation-chosen operators?) and the admission key's custody | the Foundation picks the first set; `admitKey` retires once `slashThreshold` members are current |
 | Q-6 | Ethereum L1 only (O-4) or also an L2 | L1 first; the memo's `chainId` keeps deployments apart |
+| Q-7 | Post-quantum burn recipients: the node (quantum line, D-Q-20) pays `TX_PQPKH` outputs (`sq…`/`tq…`/`rq…`) wherever it takes an address, and from the Falcon height a YED holder must be one (TOK-PQ), but `ycashRecipient` revision 1 encoded P2PKH/P2SH only (32 bytes; `scheme ‖ keyHash` is 33) | **Decided (owner, 2026-10-11): do it, on both bridges together.** §4.2 revision 2: one widened, versioned recipient field (22 or 35 bytes) and a `PQPKH` kind, validated by both contracts; phases R1–R5 (§9.1). No node change (the intent commits `SHA256(script)`; `vault_release` takes the script). |
 
 ---
 
@@ -716,7 +758,7 @@ from the members' compressed keys.
 | HK-2 | The vault's `cancelSetId` is the attestor set itself; no open challenger set |
 | HK-3 | One `WYEC` V per lock transaction is mintable; others are refused by policy |
 | HK-4 | Every unlock carries the 73-byte `HKB1` memo; one burn pays once |
-| HK-5 | `ycashRecipient` = version, kind, 10 zero bytes, hash160; transparent only |
+| HK-5 | `ycashRecipient` version 2 (§4.2): `0x02`, kind (P2PKH, P2SH, PQPKH), then a 20-byte hash160 or `scheme ‖ keyHash` (33 bytes); 22 or 35 bytes, validated by both contracts; transparent or `TX_PQPKH`, never shielded. (Revision 1 was the 32-byte transparent-only form; retired 2026-10-11, Q-7.) |
 | HK-6 | Minimum owner age, drain-nearest-expiry, rolls, and a supply alarm answer F-1 |
 | HK-7 | One key on both chains; Ycash signing via the node wallet (its sign-once guard), EIP-712 via Hawkeye with its own sign-once record |
 | HK-8 | No batching and no burn splitting in v1 (one burn ↔ one intent ↔ one vault input) |

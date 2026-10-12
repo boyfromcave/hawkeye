@@ -49,11 +49,21 @@ pub struct Status {
     pub set_id: String,
     /// This attestor's member key.
     pub member_key: String,
-    /// Its guardian address.
+    /// The bridge's foreign chain: `ethereum` or `near` (`[foreign] kind`).
+    pub foreign_kind: String,
+    /// This attestor's guardian on the foreign chain: the member key's Ethereum address
+    /// (EIP-55), or on NEAR its 64-byte secp256k1 key `0x` ‖ `x ‖ y`.
+    pub guardian: String,
+    /// The guardian, under its pre-NEAR name (kept for the Ethereum devnet scripts; equals
+    /// `guardian`).
     pub eth_address: String,
     /// Ycash heights.
     pub ycash: Heights,
-    /// Ethereum heights (finalized block, scan cursor).
+    /// Foreign-chain heights (final block, scan cursor): Ethereum block numbers or NEAR block
+    /// heights.
+    pub foreign: Heights,
+    /// The foreign heights under their pre-NEAR name (kept for the Ethereum devnet scripts;
+    /// equals `foreign`).
     pub ethereum: Heights,
     /// Lock counts by state.
     pub locks: BTreeMap<String, u64>,
@@ -115,6 +125,23 @@ pub fn render_metrics(s: &Status) -> String {
         "hawkeye_eth_lag_blocks",
         "Finalized Ethereum blocks not yet scanned",
         &[(String::new(), s.ethereum.lag as f64)],
+    );
+    let chain = format!("chain=\"{}\"", esc(&s.foreign_kind));
+    gauge(
+        "hawkeye_foreign_block",
+        "Foreign chain (Ethereum or NEAR) final block and scan cursor",
+        &[
+            (format!("{{{chain},kind=\"final\"}}"), s.foreign.tip as f64),
+            (
+                format!("{{{chain},kind=\"cursor\"}}"),
+                s.foreign.cursor as f64,
+            ),
+        ],
+    );
+    gauge(
+        "hawkeye_foreign_lag_blocks",
+        "Final foreign-chain blocks not yet scanned",
+        &[(format!("{{{chain}}}"), s.foreign.lag as f64)],
     );
     for (name, help, map) in [
         ("hawkeye_locks", "Locks by state", &s.locks),
@@ -184,5 +211,22 @@ mod tests {
         assert!(m.contains("hawkeye_locks{state=\"MINTED\"} 2"));
         assert!(m.contains("hawkeye_alarm{name=\"supply\"} 1"));
         assert!(m.contains("# TYPE hawkeye_supply_ok gauge"));
+    }
+
+    #[test]
+    fn foreign_metrics_name_the_chain() {
+        let s = Status {
+            foreign_kind: "near".into(),
+            foreign: Heights {
+                tip: 9,
+                cursor: 7,
+                lag: 2,
+            },
+            ..Status::default()
+        };
+        let m = render_metrics(&s);
+        assert!(m.contains("hawkeye_foreign_block{chain=\"near\",kind=\"final\"} 9"));
+        assert!(m.contains("hawkeye_foreign_block{chain=\"near\",kind=\"cursor\"} 7"));
+        assert!(m.contains("hawkeye_foreign_lag_blocks{chain=\"near\"} 2"));
     }
 }

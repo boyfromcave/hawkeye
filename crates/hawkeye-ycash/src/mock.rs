@@ -254,6 +254,18 @@ pub fn owner_spend_fee(pq_fee_rate: i64, price_micro_usd: Option<i64>, size: i64
     FEE.max(sized).min(cap)
 }
 
+/// The node's `TX_PQPKH` script (`GetScriptForPQKey`, ycash-dd `src/script/standard.cpp:338` at
+/// `d41026209`): `20 <keyHash:32> OP_1|OP_2 OP_CHECKPQSIG`, the scheme as a script number.
+fn pqpkh(h: &[u8; 32], scheme: u8) -> Vec<u8> {
+    let mut s = vec![32];
+    s.extend_from_slice(h);
+    s.extend([OP_1 + scheme - 1, OP_CHECKPQSIG]);
+    s
+}
+
+/// `OP_CHECKPQSIG` (quantum spec §0).
+const OP_CHECKPQSIG: u8 = 0xc2;
+
 fn err<T>(code: i64, msg: impl Into<String>) -> Result<T, (i64, String)> {
     Err((code, msg.into()))
 }
@@ -537,6 +549,17 @@ impl MockState {
         let h = self.fresh("addr");
         let a = format!("tmMock{}", hex::encode(&h[..10]));
         self.addresses.insert(a.clone(), p2pkh(&h));
+        a
+    }
+
+    /// A new plain-YEC post-quantum address of the wallet (`getnewaddress "" "pq"`, quantum
+    /// plan D-Q-20): the node's is base58check `rq…` (53 characters) and pays the `TX_PQPKH`
+    /// script `20 <keyHash> OP_1 OP_CHECKPQSIG`; the mock's is `rqMock<hex>` over the same
+    /// 35-byte script (scheme 1), which `validateaddress` and `vault_release` resolve.
+    pub fn new_pq_address(&mut self) -> String {
+        let h = self.fresh("pqaddr");
+        let a = format!("rqMock{}", hex::encode(&h[..10]));
+        self.addresses.insert(a.clone(), pqpkh(&h, 1));
         a
     }
 
@@ -1283,7 +1306,15 @@ impl MockState {
                     None => json!({"isvalid": false}),
                 })
             }
-            "getnewaddress" => Ok(self.new_address().into()),
+            "getnewaddress" => {
+                // `getnewaddress "" "pq"` files a plain-YEC PQ key (`rq…`, D-Q-20); any other
+                // type (or none) is a transparent P2PKH address
+                let kind: Option<String> = opt_arg(p, 1, "type")?;
+                Ok(match kind.as_deref() {
+                    Some("pq") => self.new_pq_address().into(),
+                    _ => self.new_address().into(),
+                })
+            }
             "importprivkey" => {
                 let wif: String = arg(p, 0, "privkey")?;
                 let h = sha256(wif.as_bytes());
@@ -2276,11 +2307,14 @@ impl MockState {
                 format!("the intent matures at height {}", h + fields.delay),
             );
         }
-        let dest = match to {
-            Some(a) => match self.address_script(&a) {
+        // an address of this wallet (a mock `tmMock…`/`rqMock…`, or anything alphanumeric as
+        // a mock P2PKH), or the script itself in hex: P2PKH, P2SH or the 35-byte `TX_PQPKH`
+        // `20 <hash> 51|52 c2`, which the node pays wherever it takes an address (D-Q-20)
+        let dest = match &to {
+            Some(a) => match self.address_script(a) {
                 Some(s) if !a.chars().all(|c| c.is_ascii_hexdigit()) => s,
                 _ => {
-                    hex::decode(&a).map_err(|_| (-5, format!("not an address or a script: {a}")))?
+                    hex::decode(a).map_err(|_| (-5, format!("not an address or a script: {a}")))?
                 }
             },
             None => self.recipients.get(&fields.recipienthash).cloned().ok_or((
@@ -2289,6 +2323,17 @@ impl MockState {
             ))?,
         };
         if Bytes32(sha256(&dest)) != fields.recipienthash {
+            // the node (src/rpc/vault.cpp, d41026209): a 66-hex `scheme || keyhash` of a
+            // registered scheme, as vault_list and z_importpqkey print it, is not a script
+            if to.as_ref().is_some_and(|a| a.len() == 66)
+                && dest.len() == 33
+                && (dest[0] == 1 || dest[0] == 2)
+            {
+                return err(
+                    -8,
+                    "that looks like a pqkeyid: pass the address or the script, not a pqkeyid",
+                );
+            }
             return err(-8, "that script is not the intent's recipient");
         }
         let mut tx = Transaction::new_v4(
