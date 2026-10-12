@@ -513,7 +513,10 @@ pub async fn rogue_mint(
 /// `hawkeye recover`: `vault_ownerspend` of every `WYEC` vault and intent of the set this
 /// wallet owns (selector 2 after `ownerHeight`, 3 once the set is released). The owner is a
 /// post-quantum key of the node wallet (`vault_list` `mine`); the node signs the SLH-DSA spend
-/// (a 7,939-byte scriptSig, about 8.1 KB) and charges `max(10,000 zat, -pqfeerate × size)`.
+/// (a 7,939-byte scriptSig, about 8.1 KB) and charges `max(10,000 zat, rate × size)`: on a
+/// node with the fee structure (rpcversion 8) the rate is $0.05/KB at the attested tip price
+/// (at least 5,000 zat/KB), `-pqfeerate` without a price, the fee capped at
+/// `min(max(-maxtxfee, $2), -yellowbackmaxtxfee)` (`hawkeye_ycash::mock::owner_spend_fee`).
 /// Hawkeye holds no owner key and no post-quantum code.
 pub async fn recover(s: &Settings) -> Result<()> {
     let node = ycash(s)?;

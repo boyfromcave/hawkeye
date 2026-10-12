@@ -44,8 +44,20 @@ use crate::types::*;
 pub const VAULT_BRANCH_ID: &str = "6d5b7a31";
 /// The flat fee of every transaction the vault RPCs build.
 pub const FEE: i64 = 10_000;
-/// The node's default `-pqfeerate` (zat per 1000 bytes: the relay floor, quantum plan §4.5).
+/// The node's default `-pqfeerate` (zat per 1000 bytes: the relay floor, quantum plan §4.5). Since
+/// the fee structure (ycash-dd rpcversion 8, quantum plan D-Q-23 (b)) it is the rate only while no
+/// attested price exists ([`MockState::fee_price_micro_usd`] `None`).
 pub const PQ_FEE_RATE: i64 = 100;
+/// `-yellowbackfeeusdperkb`: the vault/Yellowback network fee, $0.05 per KB at the attested price.
+pub const YED_FEE_USD_PER_KB_MICRO: i64 = 50_000;
+/// `DEFAULT_ATTESTED_FEE_FLOOR_PER_KB`: with a price the rate never goes below max(this, `-pqfeerate`).
+pub const ATTESTED_FEE_FLOOR_PER_KB: i64 = 5_000;
+/// `-maxtxfee` (`DEFAULT_TRANSACTION_MAXFEE`, 0.1 YEC).
+pub const MAX_TX_FEE: i64 = 10_000_000;
+/// `-yellowbackmaxtxfeeusd`: the vault/Yellowback cap is max(`-maxtxfee`, $2 at the price).
+pub const YED_MAX_TX_FEE_USD_MICRO: i64 = 2_000_000;
+/// `-yellowbackmaxtxfee`: the absolute YEC ceiling of that cap (10 YEC).
+pub const YED_MAX_TX_FEE_CEILING: i64 = 10 * 100_000_000;
 /// The bytes of an SLH-DSA owner scriptSig (quantum spec §1.5): 15 chunks of 520 and one of 57,
 /// `OP_16`, the 32-byte key, `OP_1`, the selector.
 pub const PQ_OWNER_SCRIPTSIG_LEN: usize = 7939;
@@ -140,8 +152,13 @@ pub struct MockState {
     pub wallet_keys: BTreeSet<PubKey>,
     /// Post-quantum owner keys in the mock wallet (`vault_getnewowner`).
     pub wallet_owners: BTreeSet<PqKeyId>,
-    /// `-pqfeerate` in zat per 1000 bytes (owner spends pay `max(FEE, rate × size)`).
+    /// `-pqfeerate` in zat per 1000 bytes (owner spends pay `max(FEE, rate × size)` while no
+    /// attested price exists; with one it is part of the floor).
     pub pq_fee_rate: i64,
+    /// The attested tip price the node's fee policy uses (µUSD per YEC; ycash-dd rpcversion 8,
+    /// `yed_getinfo.params.fees.network.priceMicroUsd`): `None` = no price (the `-pqfeerate`
+    /// fallback). With a price an owner spend pays `$0.05/KB × size` at it ([`owner_spend_fee`]).
+    pub fee_price_micro_usd: Option<i64>,
     /// Address → scriptPubKey for addresses the mock handed out or was told about.
     pub addresses: BTreeMap<String, Vec<u8>>,
     /// `listunspent`'s answer.
@@ -173,6 +190,38 @@ fn p2pkh(h: &[u8]) -> Vec<u8> {
     s.extend_from_slice(&h[..20]);
     s.extend([0x88, 0xac]);
     s
+}
+
+/// `ceil(usd_micro × COIN / price)` bounded below by `floor` (ycash-dd `AttestedRateZatPerKB`).
+fn attested_rate(usd_micro: i64, price_micro_usd: i64, floor: i64) -> i64 {
+    let r = (i128::from(usd_micro) * 100_000_000 + i128::from(price_micro_usd) - 1)
+        / i128::from(price_micro_usd);
+    i64::try_from(r).unwrap_or(i64::MAX).max(floor.max(0))
+}
+
+/// The fee `vault_ownerspend` charges an owner spend of `size` bytes (ycash-dd `src/rpc/vault.cpp`,
+/// `src/policy/policy.cpp`, rpcversion 8; quantum plan D-Q-23 (b)): `max(FEE, rate × size / 1000)`
+/// (`CFeeRate::GetFee`), the rate `pq_fee_rate` without a price, else $0.05/KB at the price with
+/// the floor `max(5,000, pq_fee_rate)`; capped at `min(max(-maxtxfee, $2 at the price), 10 YEC)`.
+pub fn owner_spend_fee(pq_fee_rate: i64, price_micro_usd: Option<i64>, size: i64) -> i64 {
+    let (rate, cap) = match price_micro_usd.filter(|p| *p > 0) {
+        None => (pq_fee_rate, MAX_TX_FEE.min(YED_MAX_TX_FEE_CEILING)),
+        Some(p) => (
+            attested_rate(
+                YED_FEE_USD_PER_KB_MICRO,
+                p,
+                ATTESTED_FEE_FLOOR_PER_KB.max(pq_fee_rate),
+            ),
+            MAX_TX_FEE
+                .max(attested_rate(YED_MAX_TX_FEE_USD_MICRO, p, 0))
+                .min(YED_MAX_TX_FEE_CEILING),
+        ),
+    };
+    let mut sized = rate.saturating_mul(size) / 1000;
+    if sized == 0 && rate > 0 {
+        sized = rate;
+    }
+    FEE.max(sized).min(cap)
 }
 
 fn err<T>(code: i64, msg: impl Into<String>) -> Result<T, (i64, String)> {
@@ -314,6 +363,7 @@ impl MockState {
             wallet_keys: BTreeSet::new(),
             wallet_owners: BTreeSet::new(),
             pq_fee_rate: PQ_FEE_RATE,
+            fee_price_micro_usd: None,
             addresses: BTreeMap::new(),
             unspent: vec![],
             sign_once: HashMap::new(),
@@ -1987,11 +2037,11 @@ impl MockState {
             lock_time,
             0,
         );
-        // max(VAULT_RPC_FEE, -pqfeerate × size) (quantum plan §4.5)
+        // max(VAULT_RPC_FEE, the vault/Yellowback rate × size) capped (ycash-dd vault_ownerspend, rpcversion 8)
         let size = i64::try_from(tx.encode().len()).unwrap_or(i64::MAX);
-        let fee = FEE.max(self.pq_fee_rate.saturating_mul(size) / 1000);
+        let fee = owner_spend_fee(self.pq_fee_rate, self.fee_price_micro_usd, size);
         if value <= fee {
-            return err(-8, "the output does not cover the fee");
+            return err(-8, format!("the output does not cover the fee {fee}"));
         }
         tx.outputs[0].value = value - fee;
         let txid = self.submit(tx.encode())?;

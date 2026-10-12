@@ -577,6 +577,56 @@ async fn pq_owners() {
     assert!(fee > 10_000);
 }
 
+/// The fee structure (ycash-dd rpcversion 8): with an attested price the owner spend pays the
+/// vault/Yellowback rate ($0.05/KB at the price, at least 5,000 zat/KB) × size, capped.
+#[tokio::test]
+async fn owner_spend_fee_at_the_attested_price() {
+    use hawkeye_ycash::mock::owner_spend_fee;
+    // no price: the -pqfeerate fallback, unchanged
+    assert_eq!(owner_spend_fee(100, None, 8_200), 10_000);
+    assert_eq!(owner_spend_fee(5_000, None, 8_200), 41_000);
+    // $0.40: 12,500,000 zat/KB (the contract's sample), 8.2 KB = 102,500,000 > -maxtxfee, under $2 = 5 YEC
+    assert_eq!(owner_spend_fee(100, Some(400_000), 8_200), 102_500_000);
+    // $400: 12,500 zat/KB
+    assert_eq!(owner_spend_fee(100, Some(400_000_000), 8_200), 102_500);
+    // $40,000: the floor 5,000 zat/KB binds; -pqfeerate above it is the floor
+    assert_eq!(owner_spend_fee(100, Some(40_000_000_000), 8_200), 41_000);
+    assert_eq!(owner_spend_fee(6_000, Some(40_000_000_000), 8_200), 49_200);
+    // $0.001: 50 YEC/KB, capped at 10 YEC (-yellowbackmaxtxfee)
+    assert_eq!(owner_spend_fee(100, Some(1_000), 8_200), 1_000_000_000);
+
+    let (m, set, _vault) = bridge(0).await;
+    let c = m.client();
+    let n = c.vault_getnewowner(None).await.unwrap();
+    let tip = c.getblockcount().await.unwrap();
+    let lock = c
+        .vault_lock(&VaultLockParams {
+            tag: "WYEC".into(),
+            setid: set,
+            cancelsetid: None,
+            delay: 6,
+            ownerheight: tip,
+            appheight: None,
+            amount: "1".parse().unwrap(),
+            owner: Some(n.owner),
+        })
+        .await
+        .unwrap();
+    c.generate(1).await.unwrap();
+    m.state().fee_price_micro_usd = Some(400_000_000);
+    let a = c.getnewaddress().await.unwrap();
+    let spent = c.vault_ownerspend(&lock.outpoint, &a).await.unwrap();
+    let raw = c.getrawtransaction(&spent.txid).await.unwrap();
+    let fee = 100_000_000
+        - hawkeye_ycash::tx::Transaction::decode(raw.as_slice())
+            .unwrap()
+            .outputs[0]
+            .value;
+    let size = i64::try_from(raw.as_slice().len()).unwrap();
+    assert_eq!(fee, 12_500 * size / 1000);
+    assert_eq!(fee, owner_spend_fee(100, Some(400_000_000), size));
+}
+
 #[tokio::test]
 async fn stock_rpcs() {
     let (m, _set, _vault) = bridge(0).await;
