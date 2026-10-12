@@ -1,8 +1,12 @@
-# Hawkeye beside a real node, on both node lines (ycash-dd v4.5.0, ycash6 6.2x): build the node
-# from the line's branch matching this one (upgrade/quantum-vaults -> upgrade/quantum-vaults, else
-# upgrade/vault), start the devnet (regtest nodes + anvil with wYEC + one Hawkeye per attestor) and run `scenario demo`
-# and the optimistic-mint drill `scenario rogue-mint`
-# (lock -> mint, burn -> HKB1 intent -> release, rogue -> cancel -> slash, supply invariant).
+# Hawkeye beside a real node, on both node lines (ycash-dd v4.5.0, ycash6 6.2x) and on both
+# bridges (foreign = ethereum: anvil + wYEC; foreign = near: a NEAR sandbox node + wyec-near, NEAR
+# plan NH5): build the node from the line's post-quantum branch upgrade/quantum-vaults (this
+# Hawkeye reads only the PQ owner slot, quantum spec §1; `node_ref` overrides), start the devnet
+# (regtest nodes + the bridge + one Hawkeye per attestor) and run `scenario demo`, the
+# optimistic-mint drill `scenario rogue-mint` (lock -> mint, burn -> HKB1/HKN1 intent -> release,
+# rogue -> cancel -> slash, supply invariant) and the post-quantum recipient drill
+# `scenario pq-recipient` (plan §9.1 R5: a burn to the node's rq… address, the 35-byte recipient,
+# a TX_PQPKH release the node wallet spends with its SLH-DSA key).
 # This is the plan's §9 success criterion as a repeatable job; the mock never counts toward it.
 #
 # Slow (a cold node build is ~1 h), so it runs nightly, on demand, and when devnet/ or the
@@ -15,11 +19,11 @@ on:
   workflow_dispatch:
     inputs:
       node_ref:
-        description: node branch, tag or commit to build (both lines; empty = the branch matching this one)
+        description: node branch, tag or commit to build (both lines; empty = upgrade/quantum-vaults)
         default: ""
   push:
     branches: [main, upgrade/vault, upgrade/quantum-vaults, "claude/**"]
-    paths: ["devnet/**", "crates/**", "eth/**", ".github/workflows/devnet-e2e.yml"]
+    paths: ["devnet/**", "crates/**", "eth/**", "near/**", ".github/workflows/devnet-e2e.yml"]
 
 permissions:
   contents: read
@@ -31,20 +35,18 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   FOUNDRY_VERSION: v1.7.1
-  # The quantum line's Hawkeye needs the PQ-owner node (vault_getnewowner, the PQ owner slot).
-  NODE_REF: ${{ inputs.node_ref || (github.ref_name == 'upgrade/quantum-vaults' && 'upgrade/quantum-vaults') || 'upgrade/vault' }}
+  # This Hawkeye needs the PQ-owner node (vault_getnewowner, the PQ owner slot): the quantum line
+  # on every branch of it (an upgrade/vault node has no template this Hawkeye parses).
+  NODE_REF: ${{ inputs.node_ref || 'upgrade/quantum-vaults' }}
 
 jobs:
-  demo:
-    name: demo on ${{ matrix.line }}
+  # The node binaries per line, built on ubuntu-22.04 (the depends toolchain needs libtinfo5) and
+  # cached per line + node commit; the demo jobs restore them from that cache. They link only libc,
+  # libm and libgcc_s, so the NEAR jobs run them on ubuntu-24.04 (the sandbox needs glibc 2.39).
+  node:
+    name: node ${{ matrix.line }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
-    # Hawkeye and the node are checked out side by side, never one inside the other: the node's
-    # depends step runs `cargo vendor`, which would otherwise find Hawkeye's workspace manifest
-    # (resolver 3) above the node and fail with the node's older cargo.
-    defaults:
-      run:
-        working-directory: hawkeye
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -58,10 +60,8 @@ jobs:
             daemon: src/ycashd
             cli: src/ycash-cli
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: hawkeye
-          persist-credentials: false
+      # Only the node is checked out here: its depends step runs `cargo vendor`, which would find
+      # Hawkeye's workspace manifest (resolver 3) above the node and fail with the node's cargo.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ matrix.repo }}
@@ -72,19 +72,19 @@ jobs:
         id: node
         working-directory: node
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: build prerequisites
-        working-directory: .
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libc6-dev m4 g++-multilib \
-            autoconf libtool ncurses-dev unzip git python3 zlib1g-dev curl bsdmainutils \
-            automake libtinfo5
       - name: cached node binaries
         id: bin
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: node-bin
           key: node-bin-${{ matrix.line }}-${{ steps.node.outputs.sha }}
+      - name: build prerequisites
+        if: steps.bin.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libc6-dev m4 g++-multilib \
+            autoconf libtool ncurses-dev unzip git python3 zlib1g-dev curl bsdmainutils \
+            automake libtinfo5
       - name: cached depends
         if: steps.bin.outputs.cache-hit != 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -114,6 +114,56 @@ jobs:
           make -C src -j"$(nproc)" "$(basename "$DAEMON")" "$(basename "$CLI")"
           mkdir -p ../node-bin
           cp "$DAEMON" "$CLI" ../node-bin/
+
+  demo:
+    name: demo on ${{ matrix.line }} (${{ matrix.foreign }})
+    needs: node
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    # Hawkeye and the node are checked out side by side, never one inside the other (see `node`).
+    defaults:
+      run:
+        working-directory: hawkeye
+    strategy:
+      fail-fast: false
+      matrix:
+        line: [ycash-dd, ycash6]
+        foreign: [ethereum, near]
+        include:
+          - line: ycash-dd
+            repo: boyfromcave/ycash-dd
+            daemon: src/ycashd
+            cli: src/ycash-cli
+          - line: ycash6
+            repo: boyfromcave/ycash6
+            daemon: src/ycashd
+            cli: src/ycash-cli
+          - foreign: ethereum
+            runner: ubuntu-22.04
+          # the pinned NEAR sandbox (nearcore 2.13.4) needs glibc >= 2.39
+          - foreign: near
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: hawkeye
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ env.NODE_REF }}
+          path: node
+          persist-credentials: false
+      - name: node commit
+        id: node
+        working-directory: node
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: node binaries (from the node job)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: node-bin
+          key: node-bin-${{ matrix.line }}-${{ steps.node.outputs.sha }}
+          fail-on-cache-miss: true
       - name: zk parameters
         if: matrix.line == 'ycash-dd'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -126,34 +176,51 @@ jobs:
         working-directory: node
         run: ./zcutil/fetch-params.sh
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        if: matrix.foreign == 'ethereum'
         with:
           version: ${{ env.FOUNDRY_VERSION }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: matrix.foreign == 'ethereum'
         with:
           node-version: 22
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: devnet
-          workspaces: hawkeye
+          shared-key: devnet-${{ matrix.foreign }}
+          workspaces: |
+            hawkeye -> target
+            hawkeye/near -> target
       - name: build hawkeye
         run: cargo build --locked --bin hawkeye
       - name: contracts
+        if: matrix.foreign == 'ethereum'
         working-directory: hawkeye/eth
         run: |
           npm ci --ignore-scripts
           ./tools/fetch-wyec.sh
-      - name: scenario demo
+      # NEAR: the wyec-near wasm (near/rust-toolchain.toml brings the wasm target), the set-up helper
+      # (near-admin: accounts, deploy) and the pinned sandbox node (SHA-256 checked).
+      - name: NEAR contract, helper and sandbox
+        if: matrix.foreign == 'near'
+        run: |
+          (cd near && cargo build --locked --target wasm32-unknown-unknown --release)
+          cargo build --locked -p hawkeye-near --example near-admin
+          bin=$(near/tools/fetch-sandbox.sh)
+          "$bin" --version
+          echo "NEAR_SANDBOX_BIN=$bin" >>"$GITHUB_ENV"
+      - name: scenario demo, rogue-mint and pq-recipient
         env:
           DEVNET_NATIVE_SOLC: "1"
           DAEMON: ${{ matrix.daemon }}
           CLI: ${{ matrix.cli }}
+          FOREIGN: ${{ matrix.foreign }}
         run: |
           YCASHD="$GITHUB_WORKSPACE/node-bin/$(basename "$DAEMON")"
           YCASH_CLI="$GITHUB_WORKSPACE/node-bin/$(basename "$CLI")"
           export YCASHD YCASH_CLI
           "$YCASHD" -version | head -1
-          python3 devnet/hawkeye-devnet scenario demo --fresh
-          python3 devnet/hawkeye-devnet scenario rogue-mint --fresh
+          python3 devnet/hawkeye-devnet scenario demo --fresh --foreign "$FOREIGN"
+          python3 devnet/hawkeye-devnet scenario rogue-mint --fresh --foreign "$FOREIGN"
+          python3 devnet/hawkeye-devnet scenario pq-recipient --fresh --foreign "$FOREIGN"
       - name: stop the devnet
         if: always()
         run: python3 devnet/hawkeye-devnet down || true
@@ -161,7 +228,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: devnet-${{ matrix.line }}
+          name: devnet-${{ matrix.line }}-${{ matrix.foreign }}
           path: |
             hawkeye/devnet/transcripts/
             hawkeye/devnet/run/transcripts/

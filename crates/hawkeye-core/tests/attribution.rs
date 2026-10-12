@@ -1,6 +1,7 @@
 //! `attribute_template_input` against the node's template spends (`vault_vectors.json`
-//! `spends`, ycash-dd `dbc1ab0`): each attributes to exactly its recorded signers with the
-//! recorded sighash; every way the input can be wrong is refused or names other keys.
+//! `spends`, ycash-dd `d41026209`, the quantum line; the two cases are unchanged since the PQ
+//! owner landed): each attributes to exactly its recorded signers with the recorded sighash;
+//! every way the input can be wrong is refused or names other keys.
 
 use hawkeye_core::attribution::{VAULT_BRANCH_ID, attribute_template_input};
 use hawkeye_core::bytes::{OutPoint, from_hex, from_hex_array};

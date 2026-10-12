@@ -15,11 +15,10 @@
 
 use anyhow::{Result, anyhow, bail, ensure};
 use hawkeye_core::bytes::{Hash32, sha256d, txid_from_display};
-use hawkeye_core::eip712::Domain;
 use hawkeye_core::leader::leader_for;
 use hawkeye_core::matcher::Classification;
-use hawkeye_core::template::{TAG_WYEC, parse_intent, parse_vault};
-use hawkeye_core::{EthAddress, IntentParams, OutPoint as CoreOutPoint, PubKey33};
+use hawkeye_core::template::{parse_intent, parse_vault};
+use hawkeye_core::{IntentParams, OutPoint as CoreOutPoint, PubKey33};
 use hawkeye_store::{
     Chain, FaultKind, LockState, SignDomain, SlashCaseRecord, SlashProgress, SlashState, VoteGiven,
     YcashSignKey, classification_code,
@@ -142,17 +141,11 @@ fn parse_outpoint(s: &str) -> Result<CoreOutPoint> {
     ))
 }
 
-/// The current members, from this attestor's own node.
-async fn current_members(ctx: &Ctx) -> Result<Vec<PubKey33>> {
-    Ok(ctx
-        .ycash
-        .set_getinfo(&ctx.set_hash(), None)
-        .await?
-        .memberlist
-        .iter()
-        .filter(|m| m.current)
-        .map(|m| m.key.0)
-        .collect())
+/// The members a slash still reaches, from this attestor's own node: the current members and
+/// those in their bond exit delay (D-Q-31, [`super::slashable_members`]).
+async fn slashable_members(ctx: &Ctx) -> Result<Vec<PubKey33>> {
+    let info = ctx.ycash.set_getinfo(&ctx.set_hash(), None).await?;
+    Ok(super::slashable_members(ctx, &info.memberlist).await)
 }
 
 /// The scriptPubKey and value of `op`, from this attestor's own node.
@@ -220,27 +213,36 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
             continue;
         };
         if let Ok(v) = parse_vault(&spk)
-            && v.tag == TAG_WYEC
+            && v.tag == p.tag()
             && v.set_id == p.set_id
         {
             found = Some((idx, prev, spk, value, v));
             break;
         }
     }
-    let (idx, vault, spk, value, vp) =
-        found.ok_or_else(|| anyhow!("the transaction spends no WYEC vault of this set"))?;
+    let (idx, vault, spk, value, vp) = found.ok_or_else(|| {
+        anyhow!(
+            "the transaction spends no {} vault of this set",
+            p.tag_text()
+        )
+    })?;
     // who signed it: recovered here, a current member here
     let attribution = ctx
         .attributor
         .attribute(&raw, idx, &spk, value, hawkeye_core::VAULT_BRANCH_ID)
         .map_err(|e| anyhow!("the unlock does not attribute: {e}"))?;
-    let members = current_members(ctx).await?;
+    let members = slashable_members(ctx).await?;
     let signer = attribution
         .signers
         .iter()
         .map(|s| s.pubkey)
         .find(|k| members.contains(k))
-        .ok_or_else(|| anyhow!("no set signature of the unlock recovers to a current member"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "no set signature of the unlock recovers to a member a slash still reaches \
+                 (current, or in its bond exit delay)"
+            )
+        })?;
     let claimed: PubKey33 = hex::decode(ev_str(ev, "target")?)?
         .as_slice()
         .try_into()
@@ -298,7 +300,9 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
     })?;
     let code = classification_code(&c);
     match c {
-        Classification::Foreign => bail!("the intent is not a WYEC intent of this set"),
+        Classification::Foreign => {
+            bail!("the intent is not a {} intent of this set", p.tag_text())
+        }
         Classification::MatchedBurn { nonce } => {
             bail!("the intent matches finalized burn {nonce} here: not a fault")
         }
@@ -307,18 +311,19 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
             bail!("{code}: a benign race (§5.2) is cancelled, never slashed")
         }
         Classification::Unmatched(hawkeye_core::matcher::Unmatched::UnknownBurn) => {
-            // this attestor's Ethereum view may lag the burn's finality
+            // this attestor's foreign-chain view may lag the burn's finality
             let fin = ctx
-                .eth
-                .finalized_block_number()
+                .foreign
+                .finalized_height()
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
             let cursor = ctx
-                .db(|t| t.cursor(Chain::Ethereum))?
+                .db(|t| t.cursor(Chain::Foreign))?
                 .map_or(0, |c| c.height);
             ensure!(
                 cursor >= fin,
-                "{code}, but this attestor's Ethereum view lags (cursor {cursor} < finalized {fin})"
+                "{code}, but this attestor's {} view lags (cursor {cursor} < finalized {fin})",
+                p.bridge_kind.title()
             );
         }
         Classification::Unmatched(_) => {}
@@ -331,10 +336,9 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
     })
 }
 
-/// A fraudulent mint signature: it recovers to the accused member's guardian address, and no
-/// policy-OK lock with that `(lockId, amount, to)` is in this ledger, whose Ycash view is current.
+/// A fraudulent mint signature: it recovers to the accused member's guardian, and no policy-OK
+/// lock with that `(lockId, amount, to)` is in this ledger, whose Ycash view is current.
 async fn verify_mint(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
-    let p = &ctx.params;
     let lock_id: Hash32 = hex::decode(ev_str(ev, "lock_id")?.trim_start_matches("0x"))?
         .as_slice()
         .try_into()
@@ -342,27 +346,34 @@ async fn verify_mint(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
     let amount = ev["amount"]
         .as_u64()
         .ok_or_else(|| anyhow!("evidence without amount"))?;
-    let to = EthAddress::parse(ev_str(ev, "to")?).map_err(|e| anyhow!("to: {e}"))?;
+    let to = ctx
+        .foreign
+        .parse_account(ev_str(ev, "to")?)
+        .map_err(|e| anyhow!("to: {e}"))?;
     let sig = hex::decode(ev_str(ev, "signature")?.trim_start_matches("0x"))?;
     let claimed: PubKey33 = hex::decode(ev_str(ev, "target")?)?
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("evidence target is not a 33-byte key"))?;
-    let digest =
-        Domain::new(p.deployment.chain_id, p.deployment.bridge).mint_digest(&lock_id, amount, &to);
-    let signer = hawkeye_core::eth::recover_address(&digest, &sig)
+    let digest = ctx
+        .foreign
+        .mint_digest(&lock_id, amount, &to)
+        .map_err(|e| anyhow!("to: {e}"))?;
+    let signer = ctx
+        .foreign
+        .recover(&digest, &sig)
         .map_err(|e| anyhow!("the mint signature does not recover: {e}"))?;
-    let want = hawkeye_core::eth::address_from_pubkey(&claimed)
+    let want = ctx
+        .foreign
+        .guardian_of(&claimed)
         .map_err(|e| anyhow!("evidence target: {e}"))?;
     ensure!(
         signer == want,
-        "the Mint signature recovers to {}, not to the accused's guardian address {}",
-        signer.to_checksum(),
-        want.to_checksum()
+        "the Mint signature recovers to {signer}, not to the accused's guardian address {want}"
     );
     ensure!(
-        current_members(ctx).await?.contains(&claimed),
-        "the accused is not a current member here"
+        slashable_members(ctx).await?.contains(&claimed),
+        "the accused is neither a current member nor in its bond exit delay here"
     );
     let tip = ctx.ycash.getblockcount().await?;
     let (lock, cursor) = ctx.db(|t| Ok((t.lock(&lock_id)?, t.cursor(Chain::Ycash)?)))?;
@@ -374,12 +385,13 @@ async fn verify_mint(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
             "lock refused by policy here: {}",
             l.rejection_reason.unwrap_or_default()
         ),
-        Some(l) if l.value_zat != amount || l.destination != Some(to) => format!(
-            "lock is {} zat to {:?} here, signed {amount} to {}",
-            l.value_zat,
-            l.destination.map(|d| d.to_checksum()),
-            to.to_checksum()
-        ),
+        Some(l) if l.value_zat != amount || l.destination.as_ref() != Some(&to) => {
+            format!(
+                "lock is {} zat to {:?} here, signed {amount} to {to}",
+                l.value_zat,
+                l.destination.as_ref().map(|d| d.to_string()),
+            )
+        }
         Some(l) => bail!(
             "a lock with this (lockId, amount, to) is {} here: not a fault",
             l.state
@@ -453,7 +465,42 @@ pub async fn verify_and_sign(ctx: &Ctx, req: &SlashSignRequest) -> Result<SlashS
     })
 }
 
+/// Where a case's target stands (the bond exit delay, owner 2026-10-11; D-Q-31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaseTarget {
+    /// The fault's consequence has landed: the bond is frozen (or, for griefing, the member is
+    /// out of the set).
+    Done(&'static str),
+    /// Nothing is left to slash: the bond was withdrawn after the member's exit delay.
+    Gone(&'static str),
+    /// Still to do: a current member, or one that left and whose bond is in its exit delay — a
+    /// cosigned `SET_REMOVE` with burn still freezes that bond.
+    Reachable,
+}
+
 impl Engine {
+    /// [`CaseTarget`] of a case, from the last `set_getinfo` and the slashable-member cache.
+    pub(crate) fn case_target(&self, c: &SlashCaseRecord) -> CaseTarget {
+        let Some(m) = self.member(&c.target_key) else {
+            return CaseTarget::Reachable;
+        };
+        if m.bondfrozen {
+            return CaseTarget::Done("member removed, bond frozen");
+        }
+        if m.current {
+            return CaseTarget::Reachable;
+        }
+        if c.fault == FaultKind::Griefing {
+            // a removal without burn: the member is out, which is all a griefing case asks
+            return CaseTarget::Done("member removed");
+        }
+        if self.mem.slashable.contains(&c.target_key) {
+            CaseTarget::Reachable
+        } else {
+            CaseTarget::Gone("the member left and its bond was spent before the slash")
+        }
+    }
+
     /// Advance every open case.
     pub(crate) async fn slash(&mut self) -> Result<()> {
         let tip = self.mem.tip;
@@ -465,12 +512,22 @@ impl Engine {
             Ok(())
         })?;
         for c in cases {
-            if self.is_removed(&c.target_key) {
-                self.ctx
-                    .db(|t| t.slash_slashed(c.id, tip, Some("member removed")))?;
-                warn!(event = "slash_done", case = c.id, target = %hex::encode(c.target_key),
-                      fault = %c.fault);
-                continue;
+            match self.case_target(&c) {
+                CaseTarget::Done(why) => {
+                    self.ctx.db(|t| t.slash_slashed(c.id, tip, Some(why)))?;
+                    warn!(event = "slash_done", case = c.id, target = %hex::encode(c.target_key),
+                          fault = %c.fault, why);
+                    continue;
+                }
+                CaseTarget::Gone(why) => {
+                    self.ctx.db(|t| {
+                        t.transition_slash(c.id, SlashState::Expired, Some(tip), Some(why))
+                    })?;
+                    warn!(event = "slash_moot", case = c.id, target = %hex::encode(c.target_key),
+                          fault = %c.fault, why);
+                    continue;
+                }
+                CaseTarget::Reachable => {}
             }
             let opened = c.opened_height.unwrap_or(tip);
             if tip > opened + CASE_EXPIRY_BLOCKS && c.state != SlashState::Submitted {

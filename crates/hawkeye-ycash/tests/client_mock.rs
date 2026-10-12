@@ -174,6 +174,31 @@ async fn burn_release_flow_with_memo() {
     );
     assert_eq!(e.rpc().unwrap().matures_at_height(), Some(i.matureheight));
     c.generate(5).await.unwrap();
+    // a pqkeyid is not a recipient (vault-rpc.md, vault_release's -8; the node's message)
+    for scheme in ["01", "02"] {
+        let pqkeyid = format!("{scheme}{}", "c5".repeat(32));
+        let e = c
+            .vault_release(&i.outpoint, Some(&pqkeyid))
+            .await
+            .unwrap_err();
+        let rpc = e.rpc().unwrap();
+        assert_eq!(rpc.code, -8, "{pqkeyid}");
+        assert!(
+            rpc.message
+                .ends_with("pass the address or the script, not a pqkeyid"),
+            "{}",
+            rpc.message
+        );
+    }
+    // a 33-byte hex script of an unregistered scheme byte is just a wrong script
+    let e = c
+        .vault_release(&i.outpoint, Some(&format!("03{}", "c5".repeat(32))))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.rpc().unwrap().message,
+        "that script is not the intent's recipient"
+    );
     let rel = c
         .vault_release(&i.outpoint, Some(&recipient))
         .await
@@ -191,6 +216,112 @@ async fn burn_release_flow_with_memo() {
         .unwrap()
         .is_empty()
     );
+}
+
+/// Plain-YEC post-quantum addresses (quantum plan D-Q-20; Hawkeye plan §4.2 revision 2):
+/// `getnewaddress "" "pq"` files a PQ key (the node's `rq…`, the mock's `rqMock…`),
+/// `validateaddress` gives its 35-byte `TX_PQPKH` script `20 <keyHash> OP_1 OP_CHECKPQSIG`, an
+/// unlock pays it by script, and `vault_release` takes the script in hex (or the address) and
+/// pays that exact output — the node pays a `TX_PQPKH` output wherever it takes an address.
+#[tokio::test]
+async fn pq_recipient_released_to_tx_pqpkh() {
+    let (m, _set, vault) = bridge(0).await;
+    let c = m.client();
+    let pq = c
+        .call_value("getnewaddress", vec![json!(""), json!("pq")])
+        .await
+        .unwrap();
+    let pq = pq.as_str().unwrap().to_owned();
+    assert!(pq.starts_with("rq"), "{pq}");
+    let va = c.validateaddress(&pq).await.unwrap();
+    assert!(va.isvalid && va.ismine == Some(true));
+    let spk = va.script_pub_key.unwrap().0;
+    assert_eq!(spk.len(), 35);
+    assert_eq!(spk[0], 32);
+    assert_eq!(&spk[33..], &[0x51, 0xc2], "OP_1 OP_CHECKPQSIG");
+    let plain = c.getnewaddress().await.unwrap();
+    assert!(plain.starts_with("tm"), "{plain}: no type is a P2PKH");
+
+    let amount: Amount = "3".parse().unwrap();
+    let built = c
+        .vault_buildunlock(&vault, &[Recipient::script(spk.clone(), amount)])
+        .await
+        .unwrap();
+    let expected = {
+        use sha2::Digest;
+        let d: [u8; 32] = sha2::Sha256::digest(&spk).into();
+        d
+    };
+    assert_eq!(
+        built.intents[0].recipienthash.0, expected,
+        "recipienthash = SHA256(TX_PQPKH script)"
+    );
+    let signed = c.set_signunlock(&built.hex).await.unwrap();
+    c.vault_send(&signed.hex).await.unwrap();
+    c.generate(1).await.unwrap();
+    let intents = c
+        .vault_list(Some(&VaultListFilter {
+            kind: Some(TemplateKind::Intent),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let i = intents[0].as_intent().unwrap().clone();
+    c.generate(i.fields.delay).await.unwrap();
+    // a pqkeyid is still not a recipient; the script (hex) and the address both are
+    let e = c
+        .vault_release(
+            &i.outpoint,
+            Some(&format!("01{}", hex::encode(&spk[1..33]))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.rpc().unwrap().code, -8);
+    let rel = c
+        .vault_release(&i.outpoint, Some(&hex::encode(&spk)))
+        .await
+        .unwrap();
+    c.generate(1).await.unwrap();
+    let tx = c.getrawtransaction_verbose(&rel, None).await.unwrap();
+    assert_eq!(tx.vout[0].value, amount);
+    let raw = c.getrawtransaction(&rel).await.unwrap();
+    let t = Transaction::decode(raw.as_slice()).unwrap();
+    assert_eq!(
+        t.outputs[0].script_pubkey, spk,
+        "the release pays the TX_PQPKH script"
+    );
+    // the same by address, on a second intent (from the relocked vault)
+    let relock = c
+        .vault_list(Some(&VaultListFilter {
+            kind: Some(TemplateKind::Vault),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let built = c
+        .vault_buildunlock(
+            &relock[0].outpoint(),
+            &[Recipient::address(pq.clone(), amount)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(built.intents[0].recipienthash.0, expected);
+    let signed = c.set_signunlock(&built.hex).await.unwrap();
+    c.vault_send(&signed.hex).await.unwrap();
+    c.generate(1 + i.fields.delay).await.unwrap();
+    let intents = c
+        .vault_list(Some(&VaultListFilter {
+            kind: Some(TemplateKind::Intent),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let i2 = intents[0].as_intent().unwrap().clone();
+    let rel2 = c.vault_release(&i2.outpoint, Some(&pq)).await.unwrap();
+    c.generate(1).await.unwrap();
+    let raw = c.getrawtransaction(&rel2).await.unwrap();
+    let t = Transaction::decode(raw.as_slice()).unwrap();
+    assert_eq!(t.outputs[0].script_pubkey, spk);
 }
 
 #[tokio::test]
@@ -859,4 +990,197 @@ async fn mock_state_is_shareable() {
     c.generate(1).await.unwrap();
     assert_eq!(c.vault_getinfo().await.unwrap().dbtip.unwrap().height, 5);
     assert_eq!(m.state().calls.len(), 6);
+}
+
+async fn member(c: &YcashRpc, set: &SetId, k: &PubKey) -> Member {
+    c.set_getinfo(set, None)
+        .await
+        .unwrap()
+        .memberlist
+        .into_iter()
+        .find(|mb| &mb.key == k)
+        .unwrap()
+}
+
+/// A hand-built spend of a bond (the mock checks the bond rules, not the signature).
+fn bond_spend(bond: hawkeye_ycash::OutPoint, value: i64, tip: u32) -> HexBytes {
+    let tx = Transaction::new_v4(
+        vec![tx::TxIn {
+            prevout: bond,
+            script_sig: vec![0x51],
+            sequence: 0xffff_fffe,
+        }],
+        vec![tx::TxOut {
+            value: value - 10_000,
+            script_pubkey: vec![0x51],
+        }],
+        tip,
+        tip + 40,
+    );
+    HexBytes(tx.encode())
+}
+
+/// The signer-set exit rules (owner 2026-10-11, quantum plan D-Q-29..D-Q-31): the maturity
+/// floor, `set_leave` and the bond exit delay, one unspent bond per (set, key), a cosigned burn
+/// reaching a member in its exit delay, and no griefing removal of a member that left.
+#[tokio::test]
+async fn bond_exit_delay_and_slashing_after_exit() {
+    let m = MockYcashd::start().await.unwrap();
+    let c = m.client();
+    let params = |maturity| SetCreateParams {
+        seats: 3,
+        unlockthreshold: 1,
+        slashthreshold: Some(2),
+        maturity,
+        ..Default::default()
+    };
+    // D-Q-31: the floor (regtest 2; mainnet/testnet 16,128 — the old 1,152 proposal is refused)
+    let e = c.set_create(&params(Some(1))).await.unwrap_err();
+    assert!(
+        e.to_string().contains("maturity must be at least 2 blocks"),
+        "{e}"
+    );
+    m.state().min_set_maturity = MIN_SET_MATURITY;
+    let e = c.set_create(&params(Some(1_152))).await.unwrap_err();
+    assert!(e.to_string().contains("at least 16128 blocks"), "{e}");
+    c.set_create(&params(Some(16_128))).await.unwrap();
+    m.state().min_set_maturity = REGTEST_MIN_SET_MATURITY;
+    assert_eq!(min_set_maturity("main"), 16_128);
+    assert_eq!(min_set_maturity("testnet"), 16_128);
+    assert_eq!(min_set_maturity("regtest"), 2);
+
+    let created = c.set_create(&params(Some(3))).await.unwrap();
+    let set = created.setid;
+    c.generate(1).await.unwrap();
+    let mut keys = vec![];
+    for _ in 0..3 {
+        let j = c
+            .set_join(&set, Amount(100_000_000), 5, None)
+            .await
+            .unwrap();
+        keys.push(j.memberkey);
+    }
+    c.generate(5).await.unwrap();
+    let refusal = |r: Result<hawkeye_ycash::Hash256, Error>| {
+        r.unwrap_err().rpc().unwrap().bad_vault().map(str::to_owned)
+    };
+
+    // an ACTIVE member's bond is locked whatever its CLTV
+    let b1 = member(&c, &set, &keys[1]).await;
+    let tip = c.getblockcount().await.unwrap();
+    assert_eq!(
+        refusal(
+            c.sendrawtransaction(&bond_spend(b1.bondoutpoint, b1.bondvalue.zat(), tip), false)
+                .await
+        )
+        .as_deref(),
+        Some("bad-vault-bond-locked")
+    );
+
+    // keys[0] leaves: removed from the next block, its bond in the exit delay
+    let left = c.set_leave(&set, Some(&keys[0])).await.unwrap();
+    assert_eq!(left.exitheight, c.getblockcount().await.unwrap() + 1);
+    assert_eq!(left.bondspendableat, left.exitheight + 3);
+    assert_eq!(
+        m.state().calls_to("set_leave")[0].params[1],
+        json!(keys[0].to_string())
+    );
+    c.generate(1).await.unwrap();
+    let b0 = member(&c, &set, &keys[0]).await;
+    assert_eq!(
+        (b0.status, b0.current, b0.bondfrozen),
+        (MemberStatus::Removed, false, false)
+    );
+    assert!(
+        c.gettxout(&b0.bondoutpoint.txid, b0.bondoutpoint.vout, true)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let e = c.set_leave(&set, Some(&keys[0])).await.unwrap_err();
+    assert_eq!(e.rpc().unwrap().bad_vault(), Some("bad-vault-act-remove"));
+    let tip = c.getblockcount().await.unwrap();
+    assert_eq!(
+        refusal(
+            c.sendrawtransaction(&bond_spend(b0.bondoutpoint, b0.bondvalue.zat(), tip), false)
+                .await
+        )
+        .as_deref(),
+        Some("bad-vault-bond-locked")
+    );
+    // one unspent bond per (set, key): no rejoin while the old bond is unspent
+    let e = c
+        .set_join(&set, Amount(100_000_000), 5, Some(&keys[0]))
+        .await
+        .unwrap_err();
+    assert_eq!(e.rpc().unwrap().bad_vault(), Some("bad-vault-act-join"));
+    // from exitheight + maturity the bond is spendable (the mempool judges at the next block)
+    while c.getblockcount().await.unwrap() + 1 < left.bondspendableat {
+        c.generate(1).await.unwrap();
+    }
+    let tip = c.getblockcount().await.unwrap();
+    c.sendrawtransaction(&bond_spend(b0.bondoutpoint, b0.bondvalue.zat(), tip), false)
+        .await
+        .unwrap();
+    assert!(
+        c.gettxout(&b0.bondoutpoint.txid, b0.bondoutpoint.vout, true)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    c.generate(1).await.unwrap();
+    // spent: the key may join again
+    c.set_join(&set, Amount(100_000_000), 5, Some(&keys[0]))
+        .await
+        .unwrap();
+    c.generate(1).await.unwrap();
+
+    // keys[1] leaves, then is slashed during its exit delay by a cosigned SET_REMOVE burn=1
+    c.set_leave(&set, Some(&keys[1])).await.unwrap();
+    c.generate(1).await.unwrap();
+    let built = c
+        .set_buildact(&BuildAct::Remove {
+            setid: set,
+            memberkey: keys[1],
+            burn: true,
+        })
+        .await
+        .unwrap();
+    let signed = c.set_signact(&built.hex, Some(&set)).await.unwrap();
+    assert!(signed.complete, "keys[0] and keys[2] co-sign");
+    c.set_sendact(&signed.hex).await.unwrap();
+    c.generate(1).await.unwrap();
+    let b1 = member(&c, &set, &keys[1]).await;
+    assert_eq!((b1.status, b1.bondfrozen), (MemberStatus::Removed, true));
+    c.generate(5).await.unwrap();
+    let tip = c.getblockcount().await.unwrap();
+    assert_eq!(
+        refusal(
+            c.sendrawtransaction(&bond_spend(b1.bondoutpoint, b1.bondvalue.zat(), tip), false)
+                .await
+        )
+        .as_deref(),
+        Some("bad-vault-bond-frozen")
+    );
+    // a frozen key never rejoins
+    let e = c
+        .set_join(&set, Amount(100_000_000), 5, Some(&keys[1]))
+        .await
+        .unwrap_err();
+    assert_eq!(e.rpc().unwrap().bad_vault(), Some("bad-vault-act-join"));
+
+    // a griefing removal (burn 0) of a member that already left is refused
+    c.set_leave(&set, Some(&keys[2])).await.unwrap();
+    c.generate(1).await.unwrap();
+    let built = c
+        .set_buildact(&BuildAct::Remove {
+            setid: set,
+            memberkey: keys[2],
+            burn: false,
+        })
+        .await
+        .unwrap();
+    let signed = c.set_signact(&built.hex, Some(&set)).await.unwrap();
+    let e = c.set_sendact(&signed.hex).await.unwrap_err();
+    assert_eq!(e.rpc().unwrap().bad_vault(), Some("bad-vault-act-remove"));
 }

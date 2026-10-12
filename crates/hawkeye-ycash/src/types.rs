@@ -616,7 +616,7 @@ impl<'de> Deserialize<'de> for DecodedScript {
 /// `set_create`'s parameters (and `set_buildact "create"`'s). Unset fields take the node's
 /// defaults: `cancelthreshold` 1, `slashthreshold` = `unlockthreshold`, `open` false,
 /// `ratelimitbps` 0, `ratewindow` 144, `livenesswindow` 1000, `bondmin` 1, `bondlockmin` 0,
-/// `maturity` 0, `admitkey` a new wallet key.
+/// `maturity` the network's minimum ([`min_set_maturity`]), `admitkey` a new wallet key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetCreateParams {
     pub seats: u32,
@@ -669,6 +669,34 @@ pub struct SetJoinResult {
 pub struct HeartbeatResult {
     pub txid: Txid,
     pub memberkey: PubKey,
+}
+
+/// `set_leave`'s result: the member's own `SET_REMOVE` (burn 0) was broadcast; the member is
+/// `removed` from `exitheight` (the next block) and its bond spendable from `bondspendableat`
+/// = `exitheight + maturity` (the bond exit delay, owner 2026-10-11). Slashable until then.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaveResult {
+    pub txid: Txid,
+    pub memberkey: PubKey,
+    pub exitheight: u32,
+    pub bondspendableat: u32,
+}
+
+/// D-Q-31 (owner, 2026-10-11): `MIN_SET_MATURITY`, the least `maturity` (the bond exit delay and
+/// the joiners' wait) a set may be created with on mainnet and testnet: 16,128 blocks (14 days).
+/// A smaller one is refused by `set_create` and is `bad-vault-act-params` in a block.
+pub const MIN_SET_MATURITY: u32 = 16_128;
+
+/// The regtest floor of the same rule (`nVaultMinSetMaturity`).
+pub const REGTEST_MIN_SET_MATURITY: u32 = 2;
+
+/// The least set `maturity` on a network named as `getblockchaininfo.chain` (`main`, `test`,
+/// `regtest`) or as Hawkeye's config (`mainnet`, `testnet`, `regtest`).
+pub fn min_set_maturity(chain: &str) -> u32 {
+    match chain {
+        "regtest" => REGTEST_MIN_SET_MATURITY,
+        _ => MIN_SET_MATURITY,
+    }
 }
 
 /// `set_buildact`'s act and parameters (type is the first parameter, the object the second).
@@ -786,7 +814,7 @@ pub struct NewOwner {
     pub keyhash: HexBytes,
     /// `scheme ‖ keyhash`.
     pub owner: PqKeyId,
-    /// The 53-character post-quantum address (`ye…` / `yt…` / `yr…`).
+    /// The 53-character post-quantum address (`yb…` / `yt…` / `yr…`, D-Q-21).
     pub address: String,
 }
 

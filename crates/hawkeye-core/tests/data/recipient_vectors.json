@@ -1,0 +1,283 @@
+{
+  "version": 2,
+  "description": "Hawkeye ycashRecipient revision 2 (docs/hawkeye-bridge-plan.md \u00a74.2, HK-5): field bytes, recipient script, recipientHash = SHA256(script), and the Ycash addresses naming each recipient. Derived independently in Python (tests/data/README.md).",
+  "valid": [
+    {
+      "note": "P2PKH, hash160 = 20 \u00d7 5a (the address tests' hash)",
+      "kind": 0,
+      "kindName": "P2PKH",
+      "hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "bytes": "02005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "script": "76a9145a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a88ac",
+      "recipientHash": "a7ca4460e373cc5df6ce2657118eba5ace111785fdda702644d4eb1c3405d827",
+      "addresses": {
+        "mainnet": "s1VSVGo8TZzsSi5ndRWudtZpy8xmeA3dnno",
+        "testnet": "smMHEbdcrxfNwrKz56FDNkEVijwrTdKCFFv",
+        "regtest": "smMHEbdcrxfNwrKz56FDNkEVijwrTdKCFFv"
+      }
+    },
+    {
+      "note": "P2SH, same hash160",
+      "kind": 1,
+      "kindName": "P2SH",
+      "hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "bytes": "02015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "script": "a9145a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a87",
+      "recipientHash": "35e43d30deeebc5ba7e98b44793c530df15085045e0f77e382afe6ce52688b85",
+      "addresses": {
+        "mainnet": "s36nuDEKcQiiwypLyXCEuq4v7eyoR1P5SEW",
+        "testnet": "s2J7hF1j2zMoCLx4oUMaGrpNYPyHXbc3Sab",
+        "regtest": "s2J7hF1j2zMoCLx4oUMaGrpNYPyHXbc3Sab"
+      }
+    },
+    {
+      "note": "P2PKH, hash160 = 20 \u00d7 ab (the former bytes32 test's hash)",
+      "kind": 0,
+      "kindName": "P2PKH",
+      "hash": "abababababababababababababababababababab",
+      "bytes": "0200abababababababababababababababababababab",
+      "script": "76a914abababababababababababababababababababab88ac",
+      "recipientHash": "9b3d17f20d5a288ba906c5207090556eecb2f89622150e55a50d06b65ad297c5",
+      "addresses": {
+        "mainnet": "s1crTRPCavauA6f27dZruKCFmhiBVadkgta",
+        "testnet": "smUhCkDgzKFQfEuDZJJAeArvXJhGK3CFShw",
+        "regtest": "smUhCkDgzKFQfEuDZJJAeArvXJhGK3CFShw"
+      }
+    },
+    {
+      "note": "PQPKH scheme 1 (SLH-DSA-SHA2-128s), keyHash = the node vector's pqOwner hash",
+      "kind": 2,
+      "kindName": "PQPKH",
+      "hash": "c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258",
+      "bytes": "020201c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258",
+      "script": "20c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b25851c2",
+      "recipientHash": "f68ce7da966cdea9294f6474c396ed63afab43afb1220adbb78e778a710c366e",
+      "addresses": {
+        "mainnet": "sq4dd1yaBk7vNHKXnkLpBETW9Pd4drGdG7xA4i6miNa93JnE4ucTW",
+        "testnet": "tq3vo9EppNP4GGAiuY3YFJgb4wwpM6JvDw8MA4Aapr9a3gYCxkyak",
+        "regtest": "rq5LStiKZ7rnUJULfxe67AERDqJJvcELJJmxyN2xbtzi2w2A7xSr6"
+      },
+      "scheme": 1
+    },
+    {
+      "note": "PQPKH scheme 2 (FN-DSA-512), keyHash = 32 \u00d7 ff",
+      "kind": 2,
+      "kindName": "PQPKH",
+      "hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "bytes": "020202ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "script": "20ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff52c2",
+      "recipientHash": "3bec2d433e4d42cfab15f4f614d3d41965ca0ae1f947d4db4616a41d82561991",
+      "addresses": {
+        "mainnet": "sq4g1bmrsxBW5H4QKTksBZQLD4s81ubworVRhiU3o1EUWZJ1erUQK",
+        "testnet": "tq3yBj37WaSdyFubSFTbFddR8dBsj9eEmffco4XruUouWw44waFrF",
+        "regtest": "rq5NqUWcFKvNBJDDCg497VBFHWYNJfZer3KEcNQEgXf3WBY5W1R6q"
+      },
+      "scheme": 2
+    },
+    {
+      "note": "PQPKH scheme 1, keyHash = 32 \u00d7 5a (the node's D-Q-21 known-answer hash)",
+      "kind": 2,
+      "kindName": "PQPKH",
+      "hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "bytes": "0202015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "script": "205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a51c2",
+      "recipientHash": "68ce4eadb217fb2344d6e1eae03dde4c8821e3289ea3f85a232dfded0f3b6448",
+      "addresses": {
+        "mainnet": "sq4couNBfnJoRxqXF89SWjiPh5wktFi5bb5S4F89xMMsCrqRf2L4z",
+        "testnet": "tq3uz2dSJQZwKwgiMurAaowUceGWbVkNZQFd9bBy4pwJDEbVRn79A",
+        "regtest": "rq5Kdn6w3A3fXyzL8LSiSfVJmXd1B1fndmuExu4LqsnSCV5XgxPS9"
+      },
+      "scheme": 1
+    },
+    {
+      "note": "PQPKH scheme 2, keyHash = 32 \u00d7 5a",
+      "kind": 2,
+      "kindName": "PQPKH",
+      "hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "bytes": "0202025a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "script": "205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a52c2",
+      "recipientHash": "92012959c0f371202ae2d35f31c4b6355d069c95e1cc657e47a53097488b7f03",
+      "addresses": {
+        "mainnet": "sq4ekeYR7pAE7ByLpq428jfiHrrsVyMnSTs58MNJeFMXDFL63vTbT",
+        "testnet": "tq3wvmofkSRN1ApXwckkCotoDRBdDDQ5QH3GDhS7kivxDd62xcj3F",
+        "regtest": "rq5MaXHAVBu6DD89i3MJ4fSdNJY7njKVUegt31JVXmn6Csa3sdQfi"
+      },
+      "scheme": 2
+    },
+    {
+      "note": "PQPKH scheme 1, keyHash = 32 \u00d7 00",
+      "kind": 2,
+      "kindName": "PQPKH",
+      "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "bytes": "0202010000000000000000000000000000000000000000000000000000000000000000",
+      "script": "20000000000000000000000000000000000000000000000000000000000000000051c2",
+      "recipientHash": "7c628529201db819c8e1940cb3896e20dfcbd7475dc875500576f92f3ab5d7a6",
+      "addresses": {
+        "mainnet": "sq4c87RPytUeipnmA3whwZVh1X2tnUJY86v9ZVykRDFAVnJuRzNDT",
+        "testnet": "tq3uJEgecWjncodxGqeS1dimw5MeViLq5v6Ler3ZXgpbWA4t1z2wh",
+        "regtest": "rq5JwzA9MGDWpqwa3GEysVGc5xi95EGFAHjxU9uwJjfjVQYzoGhd2"
+      },
+      "scheme": 1
+    }
+  ],
+  "invalid": [
+    {
+      "note": "version 1 (the retired bytes32 form), kind 0",
+      "bytes": "0100000000000000000000005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "reason": "wrong length"
+    },
+    {
+      "note": "version 1 with a 22-byte body",
+      "bytes": "01005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "reason": "unknown version"
+    },
+    {
+      "note": "version 0",
+      "bytes": "00005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "reason": "unknown version"
+    },
+    {
+      "note": "version 3",
+      "bytes": "03005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "reason": "unknown version"
+    },
+    {
+      "note": "kind 3",
+      "bytes": "02035a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "reason": "unknown kind"
+    },
+    {
+      "note": "kind 0xff",
+      "bytes": "02ff5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "reason": "unknown kind"
+    },
+    {
+      "note": "kind 0 with a 35-byte body (a PQ hash under a transparent kind)",
+      "bytes": "020001c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258",
+      "reason": "wrong length"
+    },
+    {
+      "note": "kind 1 with a 35-byte body",
+      "bytes": "020101c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258",
+      "reason": "wrong length"
+    },
+    {
+      "note": "kind 2 with a 22-byte body (hash160 under the PQ kind)",
+      "bytes": "02025a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "reason": "wrong length"
+    },
+    {
+      "note": "kind 2, scheme 0",
+      "bytes": "020200c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258",
+      "reason": "unknown scheme"
+    },
+    {
+      "note": "kind 2, scheme 3",
+      "bytes": "020203c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258",
+      "reason": "unknown scheme"
+    },
+    {
+      "note": "kind 2, scheme 0xff",
+      "bytes": "0202ffc554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b258",
+      "reason": "unknown scheme"
+    },
+    {
+      "note": "21 bytes (hash160 short by one)",
+      "bytes": "02005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "reason": "wrong length"
+    },
+    {
+      "note": "23 bytes (hash160 long by one)",
+      "bytes": "02005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a00",
+      "reason": "wrong length"
+    },
+    {
+      "note": "34 bytes (keyHash short by one)",
+      "bytes": "020201c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b2",
+      "reason": "wrong length"
+    },
+    {
+      "note": "36 bytes (keyHash long by one)",
+      "bytes": "020201c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b25800",
+      "reason": "wrong length"
+    },
+    {
+      "note": "32 bytes: an Ethereum address left-padded",
+      "bytes": "0000000000000000000000001111111111111111111111111111111111111111",
+      "reason": "wrong length"
+    },
+    {
+      "note": "empty",
+      "bytes": "",
+      "reason": "wrong length"
+    },
+    {
+      "note": "one byte",
+      "bytes": "02",
+      "reason": "wrong length"
+    },
+    {
+      "note": "two bytes (a header without a body)",
+      "bytes": "0200",
+      "reason": "wrong length"
+    }
+  ],
+  "scriptsInvalid": [
+    {
+      "note": "TX_PQPKH with the scheme as the data push 01 01 (quantum spec F-1)",
+      "script": "20c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b2580101c2"
+    },
+    {
+      "note": "TX_PQPKH with OP_0 as the scheme",
+      "script": "20c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b25800c2"
+    },
+    {
+      "note": "TX_PQPKH with OP_3 as the scheme",
+      "script": "20c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b25853c2"
+    },
+    {
+      "note": "TX_PQPKH with OP_16 as the scheme",
+      "script": "20c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b25860c2"
+    },
+    {
+      "note": "TX_PQPKH with a 31-byte hash",
+      "script": "1fc554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b251c2"
+    },
+    {
+      "note": "TX_PQPKH with a 33-byte hash",
+      "script": "21c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b2580051c2"
+    },
+    {
+      "note": "TX_PQPKH ending in OP_CHECKSIG",
+      "script": "20c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b25851ac"
+    },
+    {
+      "note": "TX_PQPKH with a trailing byte",
+      "script": "20c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b25851c200"
+    },
+    {
+      "note": "an OP_RETURN",
+      "script": "6a"
+    },
+    {
+      "note": "a P2PKH with a 19-byte hash",
+      "script": "76a9135a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a88ac"
+    },
+    {
+      "note": "a bare OP_CHECKPQSIG",
+      "script": "c2"
+    },
+    {
+      "note": "empty",
+      "script": ""
+    }
+  ],
+  "ownerAddressesNotRecipients": {
+    "note": "the PQ owner address (yb\u2026/yt\u2026/yr\u2026) of the scheme-1 pqOwner key: refused as a burn recipient on every network",
+    "addresses": {
+      "mainnet": "yb5uQ2PDR3EcpZmSHVS4eqT7uLihaqAthhUkNBo5V53tB6DJDyVow",
+      "testnet": "yt6aumwesAuyddGxd69TMPTzuxgobqJ5JRHPMY2vNY5Z2UHDaLMVu",
+      "regtest": "yr2U5mgcGim9hz2msM5vrF2g6UbzU9SH896fXhg53fP14XePwX6PL"
+    }
+  }
+}

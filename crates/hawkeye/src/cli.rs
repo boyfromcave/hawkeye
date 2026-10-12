@@ -1,31 +1,37 @@
 //! The one-shot commands: `enroll`, `status`, `lock`, `burn`, `rogue-unlock`, `rogue-mint`,
-//! `recover`.
+//! `recover`, `leave`, `withdraw-bond`.
 //! Each prints one JSON document on stdout (logs go to stderr).
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hawkeye_core::address::{decode_address, decode_pq_address, encode_pq_address};
-use hawkeye_core::lock::{destination_script, lock_id};
+use hawkeye_core::lock::lock_id;
 use hawkeye_core::pq::{PqKeyId, SCHEME_SLH_DSA_SHA2_128S};
-use hawkeye_core::template::{TAG_WYEC, VaultParams};
-use hawkeye_core::{EthAddress, OutPoint as CoreOutPoint};
-use hawkeye_eth::{B256, EthClient, EthConfig, U256};
+use hawkeye_core::recipient::YcashRecipient;
+use hawkeye_core::template::VaultParams;
+use hawkeye_core::{
+    AccountId, BridgeKind, Destination, EthAddress, Guardian, OutPoint as CoreOutPoint,
+};
 use hawkeye_store::{SignDomain, Store, YcashSignKey};
 use hawkeye_ycash::tx::{Transaction, TxIn, TxOut};
-use hawkeye_ycash::types::{Recipient, TemplateKind, VaultListFilter};
+use hawkeye_ycash::types::{MemberStatus, Recipient, TemplateKind, VaultListFilter};
 use hawkeye_ycash::{Amount, HexBytes, YcashRpc};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::attribution::CoreAttributor;
 use crate::config::Settings;
 use crate::convert::op_core;
 use crate::engine::{Engine, block_on};
-use crate::keys::{eth_signer, key_info, parse_secret, wif};
+use crate::foreign::{self, Account};
+use crate::keys::{key_info, parse_secret, wif};
 
 /// The flat fee of a hand-built lock transaction (the node's vault RPCs use the same).
 pub const LOCK_FEE: i64 = 10_000;
+
+/// The flat fee of the bond withdrawal (one P2SH input, one output: about 250 bytes).
+pub const BOND_WITHDRAW_FEE: i64 = 10_000;
 
 fn ycash(s: &Settings) -> Result<YcashRpc> {
     Ok(YcashRpc::new(s.ycash_url.clone(), s.ycash_auth.clone())?)
@@ -67,15 +73,19 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
         "hawkeye {} on {} — set {}",
         st.version, st.network, st.set_id
     );
-    println!("member {}  eth {}", st.member_key, st.eth_address);
     println!(
-        "ycash tip {} cursor {} (lag {}); ethereum finalized {} cursor {} (lag {})",
+        "member {}  {} guardian {}",
+        st.member_key, st.foreign_kind, st.guardian
+    );
+    println!(
+        "ycash tip {} cursor {} (lag {}); {} final {} cursor {} (lag {})",
         st.ycash.tip,
         st.ycash.cursor,
         st.ycash.lag,
-        st.ethereum.tip,
-        st.ethereum.cursor,
-        st.ethereum.lag
+        st.foreign_kind,
+        st.foreign.tip,
+        st.foreign.cursor,
+        st.foreign.lag
     );
     println!("live members {}", st.live_members);
     for (name, m) in [
@@ -111,6 +121,34 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// A `--dest` for a lock of the `kind` bridge: an Ethereum address (`0x` + 40 hex, EIP-55
+/// checked when mixed case, not zero) for Ethereum, a NEAR account id for NEAR (NEAR plan §2.1;
+/// a lowercase `0x` + 40 hex is NEAR's EVM-implicit account there). A destination of the other
+/// chain is refused by name.
+pub fn parse_destination(kind: BridgeKind, text: &str) -> Result<Destination> {
+    let eth = EthAddress::parse(text);
+    let near = AccountId::parse(text);
+    match kind {
+        BridgeKind::Ethereum => match (eth, near) {
+            (Ok(a), _) => {
+                ensure!(a != EthAddress::ZERO, "--dest is the zero address");
+                Ok(Destination::Ethereum(a))
+            }
+            (Err(_), Ok(n)) => bail!(
+                "--dest {n} is a NEAR account id; this Hawkeye's bridge is on Ethereum ([foreign] kind)"
+            ),
+            (Err(e), Err(_)) => bail!("--dest: {e}"),
+        },
+        BridgeKind::Near => match (near, eth) {
+            (Ok(n), _) => Ok(Destination::Near(n)),
+            (Err(_), Ok(a)) => bail!(
+                "--dest {a} is an Ethereum address; this Hawkeye's bridge is on NEAR ([foreign] kind)"
+            ),
+            (Err(e), Err(_)) => bail!("--dest: {e}"),
+        },
+    }
+}
+
 /// `--owner`: a post-quantum address of the configured network (53 characters) or a `pqkeyid`
 /// (66 hex digits). The bridge's lock policy mints for SLH-DSA (scheme 1) owners only.
 pub fn parse_owner(text: &str, network: hawkeye_core::address::Network) -> Result<PqKeyId> {
@@ -127,8 +165,9 @@ pub fn parse_owner(text: &str, network: hawkeye_core::address::Network) -> Resul
     Ok(owner)
 }
 
-/// `hawkeye lock`: the depositor's lock (plan §1.2): a `WYEC` V of the configured set plus the
-/// destination `OP_RETURN`, funded and signed by this node's wallet. The owner is post-quantum:
+/// `hawkeye lock`: the depositor's lock (plan §1.2): a V of the bridge's tag (`WYEC` or `NYEC`)
+/// and the configured set plus the destination `OP_RETURN` (an Ethereum address, or `"NR1"` ‖ a
+/// NEAR account id), funded and signed by this node's wallet. The owner is post-quantum:
 /// `--owner` (an address or `pqkeyid`, possibly another wallet's), else a new SLH-DSA key of
 /// this node's wallet from `vault_getnewowner`, which then also signs `hawkeye recover`.
 pub async fn lock(
@@ -139,8 +178,7 @@ pub async fn lock(
     owner: Option<&str>,
 ) -> Result<()> {
     let p = &s.params;
-    let to = EthAddress::parse(dest).map_err(|e| anyhow!("--dest: {e}"))?;
-    ensure!(to != EthAddress::ZERO, "--dest is the zero address");
+    let to = parse_destination(p.bridge_kind, dest)?;
     let value = zat(amount)?;
     let owner = owner.map(|o| parse_owner(o, s.network)).transpose()?;
     let node = ycash(s)?;
@@ -169,7 +207,7 @@ pub async fn lock(
         }
     };
     let v = VaultParams {
-        tag: TAG_WYEC,
+        tag: p.tag(),
         set_id: p.set_id,
         cancel_set_id: p.set_id,
         delay: p.delay,
@@ -226,7 +264,7 @@ pub async fn lock(
         },
         TxOut {
             value: 0,
-            script_pubkey: destination_script(&to),
+            script_pubkey: to.script(),
         },
     ];
     if total - value - LOCK_FEE > 0 {
@@ -246,7 +284,7 @@ pub async fn lock(
     );
     let txid = node.sendrawtransaction(&signed.hex, false).await?;
     let id = lock_id(&CoreOutPoint::new(txid.0, 0));
-    info!(event = "lock_sent", txid = %txid, value, to = %to.to_checksum(),
+    info!(event = "lock_sent", txid = %txid, value, to = %to,
           owner_height = v.owner_height, owner = %owner, lockid = %format!("0x{}", hex::encode(id)));
     print(&json!({
         "txid": txid.to_string(),
@@ -255,44 +293,77 @@ pub async fn lock(
         "owner_height": v.owner_height,
         "owner": owner.to_hex(),
         "owner_address": encode_pq_address(&owner, s.network),
-        "to": to.to_checksum(),
+        "to": to.to_string(),
         "amount_zat": value,
     }))
 }
 
-/// `hawkeye burn`: `WyecBridge.burn(amount, ycashRecipient)` with the §4.2 encoding, from
-/// `--eth-key` (default: the config's `[keys] secret_hex`).
+/// `hawkeye burn`: the bridge's burn with the §4.2 encoding (revision 2: 22 bytes for a
+/// transparent `--recipient`, 35 for a plain-YEC post-quantum one, `sq…`/`tq…`/`rq…`; a PQ
+/// *owner* address `yb…`/`yt…`/`yr…` is refused). Ethereum: `WyecBridge.burn(amount,
+/// ycashRecipient)` from `--eth-key` (default: the config's `[keys] secret_hex`). NEAR:
+/// `wyec-near` `burn(amount, ycash_recipient)` signed by the holder's NEAR credentials file
+/// `--near-key` (default: the config's relayer key), attaching the record's storage deposit.
+/// A scheme-2 (FN-DSA-512) recipient is sent with a warning: the release pays it only once Falcon
+/// is active on Ycash (§4.2).
 pub async fn burn(
     s: &Settings,
     amount: &str,
     recipient: &str,
     eth_key: Option<&str>,
+    near_key: Option<&std::path::Path>,
 ) -> Result<()> {
     let r = decode_address(recipient, s.network).map_err(|e| anyhow!("--recipient: {e}"))?;
+    if let Some(w) = recipient_warning(&r) {
+        warn!(event = "burn_recipient_warning", recipient, warning = w);
+        eprintln!("warning: {w}");
+    }
     let value = zat(amount)?;
-    let key = match eth_key {
-        Some(k) => parse_secret(k)?,
-        None => s.load_key().context("no --eth-key and no [keys] key")?,
+    let chain = match s.foreign {
+        BridgeKind::Ethereum => {
+            ensure!(near_key.is_none(), "--near-key is for a NEAR bridge");
+            let key = match eth_key {
+                Some(k) => parse_secret(k)?,
+                None => s.load_key().context("no --eth-key and no [keys] key")?,
+            };
+            foreign::connect(s, &key).await?
+        }
+        BridgeKind::Near => {
+            ensure!(
+                eth_key.is_none(),
+                "--eth-key is for an Ethereum bridge; use --near-key"
+            );
+            foreign::near::connect_as(s, near_key).await?
+        }
     };
-    let mut ec = EthConfig::new(
-        s.eth_url.clone(),
-        s.deployment.chain_id,
-        s.deployment.bridge,
-    );
-    ec.token = Some(s.deployment.token);
-    let eth = EthClient::connect(&ec, Some(eth_signer(&key)?))
-        .await
-        .map_err(|e| anyhow!("ethereum: {e}"))?;
-    let b = eth
-        .burn(U256::from(value as u64), B256::from(r.to_bytes32()))
+    let bytes = r.to_bytes();
+    let b = chain
+        .burn(u64::try_from(value)?, bytes.clone())
         .await
         .map_err(|e| anyhow!("burn: {e}"))?;
-    info!(event = "burn_sent", tx = %b.mined.tx, nonce = %b.nonce, amount = value, recipient);
+    info!(event = "burn_sent", tx = %b.mined.tx, nonce = %b.nonce, amount = value, recipient,
+          kind = r.kind().name(), recipient_hash = %hex::encode(r.recipient_hash()));
     print(&json!({
         "txhash": b.mined.tx.to_string(),
-        "nonce": u64::try_from(b.nonce).unwrap_or(u64::MAX),
-        "block": b.mined.block_number,
+        "nonce": b.nonce,
+        "block": b.mined.height,
+        "recipient": format!("0x{}", hex::encode(&bytes)),
+        "recipient_kind": r.kind().name(),
+        "recipienthash": hex::encode(r.recipient_hash()),
     }))
+}
+
+/// The warning `hawkeye burn` prints for a recipient the contract accepts but the node may not
+/// pay yet (§4.2): a `TX_PQPKH` recipient under scheme 2 (FN-DSA-512) is valid only once Falcon
+/// is active at the release.
+pub fn recipient_warning(r: &YcashRecipient) -> Option<&'static str> {
+    match r {
+        YcashRecipient::Pqpkh(id) if id.scheme == hawkeye_core::pq::SCHEME_FN_DSA_512 => Some(
+            "a scheme-2 (FN-DSA-512) recipient is valid only once Falcon is active on Ycash at \
+             the release; before that the node refuses to pay it and the burn waits",
+        ),
+        _ => None,
+    }
 }
 
 /// The drill gate: a drill command needs `[devnet] drills = true` and is refused on mainnet.
@@ -332,14 +403,19 @@ pub fn replay_plan(
         b.state != hawkeye_store::BurnState::Seen,
         "burn {nonce} is not finalized"
     );
-    let r = hawkeye_core::recipient::YcashRecipient::from_bytes32(&b.recipient)
+    let r = YcashRecipient::from_bytes(&b.recipient)
         .map_err(|e| anyhow!("burn {nonce} recipient: {e}"))?;
     Ok(ReplayPlan {
         recipient_script: r.script(),
         amount: amount.unwrap_or(b.amount),
-        memo: hawkeye_core::memo::HawkeyeMemo::burn_release(p.deployment, nonce, b.tx_hash)
-            .encode()
-            .to_vec(),
+        memo: hawkeye_core::memo::HawkeyeMemo::burn_release_for(
+            p.bridge_kind,
+            p.deployment,
+            nonce,
+            b.tx_hash,
+        )
+        .encode()
+        .to_vec(),
     })
 }
 
@@ -375,7 +451,7 @@ pub async fn rogue_unlock(
     };
     let rows = node
         .vault_list(Some(&VaultListFilter {
-            tag: Some("WYEC".into()),
+            tag: Some(s.params.tag_text()),
             setid: Some(s.params.set_hash()),
             kind: Some(TemplateKind::Vault),
             ..VaultListFilter::default()
@@ -396,7 +472,12 @@ pub async fn rogue_unlock(
             break;
         }
     }
-    let (vault, key) = chosen.ok_or_else(|| anyhow!("no unsigned WYEC vault holds {value} zat"))?;
+    let (vault, key) = chosen.ok_or_else(|| {
+        anyhow!(
+            "no unsigned {} vault holds {value} zat",
+            s.params.tag_text()
+        )
+    })?;
     let built = node
         .vault_buildunlock(&vault, std::slice::from_ref(&recipient))
         .await?;
@@ -430,10 +511,24 @@ pub fn invented_lock_id(signer: &EthAddress, nanos: u128) -> [u8; 32] {
     hawkeye_core::bytes::sha256(&pre)
 }
 
+/// [`invented_lock_id`] of a guardian: an Ethereum guardian's address as there; a NEAR
+/// guardian's 64-byte key in its place.
+pub fn invented_lock_id_for(signer: &Guardian, nanos: u128) -> [u8; 32] {
+    match signer {
+        Guardian::Ethereum(a) => invented_lock_id(a, nanos),
+        Guardian::Secp256k1(k) => {
+            let mut pre = b"hawkeye/rogue-mint/".to_vec();
+            pre.extend_from_slice(k);
+            pre.extend_from_slice(&nanos.to_be_bytes());
+            hawkeye_core::bytes::sha256(&pre)
+        }
+    }
+}
+
 /// `hawkeye rogue-mint` (drill D-5 only): this attestor signs `Mint(lockId, amount, to)` for a
-/// lockId with no lock behind it (sign-once, `eip712-drill-mint`) and opens an optimistic
-/// proposal with it (`proposeMint`, gas from its own account) — the fraud the other attestors
-/// must challenge within the window and slash on Ycash.
+/// lockId with no lock behind it (sign-once, `eip712-drill-mint`, through the bridge's
+/// attestation scheme) and opens an optimistic proposal with it (`proposeMint`, gas from its own
+/// account) — the fraud the other attestors must challenge within the window and slash on Ycash.
 pub async fn rogue_mint(
     s: &Settings,
     amount: &str,
@@ -443,86 +538,80 @@ pub async fn rogue_mint(
     drill_gate(&s.params, "rogue-mint")?;
     let value = u64::try_from(zat(amount)?)?;
     let key = s.load_key()?;
-    let me = key.eth_address();
-    let to = match to {
-        Some(t) => EthAddress::parse(t).map_err(|e| anyhow!("--to: {e}"))?,
-        None => me,
+    let chain = foreign::connect(s, &key).await?;
+    let me = chain
+        .guardian_of(&key.public_key())
+        .map_err(|e| anyhow!("member key: {e}"))?;
+    let to: Account = match to {
+        Some(t) => chain.parse_account(t).map_err(|e| anyhow!("--to: {e}"))?,
+        None => me.account().ok_or_else(|| {
+            anyhow!(
+                "--to is required on {}: a guardian key is no account",
+                s.foreign.title()
+            )
+        })?,
     };
-    ensure!(to != EthAddress::ZERO, "--to is the zero address");
+    ensure!(
+        to.ethereum() != Some(&EthAddress::ZERO),
+        "--to is the zero address"
+    );
     let lock_id: [u8; 32] = match lock_id {
         Some(h) => hawkeye_core::bytes::from_hex_array("--lock-id", h)
             .map_err(|e| anyhow!("--lock-id: {e}"))?,
-        None => invented_lock_id(
+        None => invented_lock_id_for(
             &me,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos(),
         ),
     };
-    let mut ec = EthConfig::new(
-        s.eth_url.clone(),
-        s.deployment.chain_id,
-        s.deployment.bridge,
-    );
-    ec.token = Some(s.deployment.token);
-    let eth = EthClient::connect(&ec, Some(eth_signer(&key)?))
-        .await
-        .map_err(|e| anyhow!("ethereum: {e}"))?;
-    let digest = hawkeye_core::eip712::Domain::new(
-        s.deployment.chain_id,
-        EthAddress(s.deployment.bridge.0.0),
-    )
-    .mint_digest(&lock_id, value, &to);
+    let digest = chain
+        .mint_digest(&lock_id, value, &to)
+        .map_err(|e| anyhow!("{e}"))?;
     let mut store = Store::open(&s.store_path)?;
-    let rec = store.tx(|t| {
-        t.sign_once_drill_mint(&lock_id, value, &to, &digest, |d| {
-            hawkeye_core::eth::sign_digest(&key, d)
-        })
-    })?;
-    let out = eth
-        .propose_mint(
-            B256::from(lock_id),
-            U256::from(value),
-            crate::convert::addr(&to),
-            &rec.signature,
-        )
-        .await
-        .map_err(|e| anyhow!("proposeMint: {e}"))?;
-    let hawkeye_eth::MintSubmitted::Proposed {
+    let rec = store
+        .tx(|t| t.sign_once_drill_mint(&lock_id, value, &to, &digest, |d| chain.sign(&key, d)))?;
+    let foreign::Proposed {
         mined,
         proposal_id,
         eta,
-    } = out
-    else {
-        bail!("proposeMint returned no proposal");
-    };
+    } = chain
+        .propose_mint(lock_id, value, to.clone(), rec.signature)
+        .await
+        .map_err(|e| {
+            let call = match s.foreign {
+                BridgeKind::Ethereum => "proposeMint",
+                BridgeKind::Near => "propose_mint",
+            };
+            anyhow!("{call}: {e}")
+        })?;
     info!(event = "rogue_mint_proposed", lock_id = %format!("0x{}", hex::encode(lock_id)),
-          proposal_id, amount = value, to = %to.to_checksum(), tx = %mined.tx, eta);
+          proposal_id, amount = value, to = %to, tx = %mined.tx, eta);
     print(&json!({
         "lockid": format!("0x{}", hex::encode(lock_id)),
         "proposal_id": proposal_id.to_string(),
-        "proposer": me.to_checksum(),
+        "proposer": me.to_string(),
         "amount_zat": value,
-        "to": to.to_checksum(),
+        "to": to.to_string(),
         "eta": eta,
         "txhash": mined.tx.to_string(),
-        "block": mined.block_number,
+        "block": mined.height,
     }))
 }
 
-/// `hawkeye recover`: `vault_ownerspend` of every `WYEC` vault and intent of the set this
-/// wallet owns (selector 2 after `ownerHeight`, 3 once the set is released). The owner is a
-/// post-quantum key of the node wallet (`vault_list` `mine`); the node signs the SLH-DSA spend
-/// (a 7,939-byte scriptSig, about 8.1 KB) and charges `max(10,000 zat, rate × size)`: on a
-/// node with the fee structure (rpcversion 8) the rate is $0.05/KB at the attested tip price
-/// (at least 5,000 zat/KB), `-pqfeerate` without a price, the fee capped at
-/// `min(max(-maxtxfee, $2), -yellowbackmaxtxfee)` (`hawkeye_ycash::mock::owner_spend_fee`).
-/// Hawkeye holds no owner key and no post-quantum code.
+/// `hawkeye recover`: `vault_ownerspend` of every vault and intent of the bridge's tag (`WYEC` or
+/// `NYEC`) and the set this wallet owns (selector 2 after `ownerHeight`, 3 once the set is
+/// released). The owner is a post-quantum key of the node wallet (`vault_list` `mine`); the node
+/// signs the SLH-DSA spend (a 7,939-byte scriptSig, about 8.1 KB) and charges
+/// `max(10,000 zat, rate × size)`: on a node with the fee structure (rpcversion 8) the rate is
+/// $0.05/KB at the attested tip price (at least 5,000 zat/KB), `-pqfeerate` without a price, the
+/// fee capped at `min(max(-maxtxfee, $2), -yellowbackmaxtxfee)`
+/// (`hawkeye_ycash::mock::owner_spend_fee`). Hawkeye holds no owner key and no post-quantum code.
 pub async fn recover(s: &Settings) -> Result<()> {
     let node = ycash(s)?;
     let rows = node
         .vault_list(Some(&VaultListFilter {
-            tag: Some("WYEC".into()),
+            tag: Some(s.params.tag_text()),
             setid: Some(s.params.set_hash()),
             mine: Some(true),
             ..VaultListFilter::default()
@@ -546,12 +635,188 @@ pub async fn recover(s: &Settings) -> Result<()> {
     print(&json!({"recovered": out}))
 }
 
+/// `hawkeye leave`: this attestor's member key leaves the set by its own `SET_REMOVE` (burn 0,
+/// signed by the key alone: `set_leave`, owner 2026-10-11). From the next block the member is
+/// `removed`; its bond stays locked — and slashable — for the set's `maturity` (at least 16,128
+/// blocks, 14 days, on mainnet and testnet: D-Q-31), then `hawkeye withdraw-bond` returns it.
+/// Stop the daemon first: it refuses to start once the key is no longer a current member.
+pub async fn leave(s: &Settings) -> Result<()> {
+    let key = s.load_key()?;
+    let node = ycash(s)?;
+    print(&leave_set(&node, &key, &s.params.set_hash()).await?)
+}
+
+/// [`leave`] against `node`: checks the key is an ACTIVE member, calls `set_leave`, and answers
+/// `{txid, memberkey, exitheight, bondspendableat, bondoutpoint, maturity}`.
+pub async fn leave_set(
+    node: &YcashRpc,
+    key: &hawkeye_core::SecretKey,
+    setid: &hawkeye_ycash::Hash256,
+) -> Result<serde_json::Value> {
+    let me = hawkeye_ycash::PubKey(key.public_key());
+    let info = node.set_getinfo(setid, None).await.context("set_getinfo")?;
+    let m = info
+        .memberlist
+        .iter()
+        .find(|m| m.key == me)
+        .ok_or_else(|| anyhow!("member key {me} is not in set {setid}"))?;
+    ensure!(
+        m.status == MemberStatus::Active,
+        "member key {me} is {:?} in set {setid}: there is nothing to leave",
+        m.status
+    );
+    let r = node
+        .set_leave(setid, Some(&me))
+        .await
+        .context("set_leave")?;
+    info!(event = "left_set", txid = %r.txid, member = %me, exitheight = r.exitheight,
+          bondspendableat = r.bondspendableat, maturity = info.set.params.maturity);
+    Ok(json!({
+        "txid": r.txid.to_string(),
+        "memberkey": me.to_string(),
+        "exitheight": r.exitheight,
+        "bondspendableat": r.bondspendableat,
+        "bondoutpoint": m.bondoutpoint.to_string(),
+        "maturity": info.set.params.maturity,
+    }))
+}
+
+/// `hawkeye withdraw-bond [--to <t-address>]`: after `hawkeye leave` and the set's `maturity`,
+/// spend this attestor's bond (`P2SH(<locktime> CLTV DROP <memberKey> CHECKSIG)`) to `--to`
+/// (default a new address of the node wallet). Hawkeye signs the bond input itself with the
+/// member key (the node wallet has no signer for the bond script); the node judges the exit
+/// delay (`bad-vault-bond-locked` until `exitHeight + maturity`) and refuses a frozen bond.
+pub async fn withdraw_bond(s: &Settings, to: Option<&str>) -> Result<()> {
+    let key = s.load_key()?;
+    let node = ycash(s)?;
+    print(&withdraw_bond_with(&node, &key, &s.params.set_hash(), to).await?)
+}
+
+/// [`withdraw_bond`] against `node`.
+pub async fn withdraw_bond_with(
+    node: &YcashRpc,
+    key: &hawkeye_core::SecretKey,
+    setid: &hawkeye_ycash::Hash256,
+    to: Option<&str>,
+) -> Result<serde_json::Value> {
+    let me = hawkeye_ycash::PubKey(key.public_key());
+    let info = node.set_getinfo(setid, None).await.context("set_getinfo")?;
+    let m = info
+        .memberlist
+        .iter()
+        .find(|m| m.key == me)
+        .ok_or_else(|| anyhow!("member key {me} is not in set {setid}"))?
+        .clone();
+    ensure!(
+        !m.bondfrozen,
+        "the bond {} is frozen (slashed): it is never spendable",
+        m.bondoutpoint
+    );
+    ensure!(
+        m.status != MemberStatus::Active,
+        "an active member's bond is locked (bad-vault-bond-locked): run `hawkeye leave` first, \
+         then wait the set's maturity ({} blocks)",
+        info.set.params.maturity
+    );
+    let op = m.bondoutpoint;
+    let out = node
+        .gettxout(&op.txid, op.vout, true)
+        .await
+        .context("gettxout")?
+        .ok_or_else(|| anyhow!("the bond {op} is already spent"))?;
+    let tip = node.getblockcount().await?;
+    ensure!(
+        tip >= m.bondlocktime,
+        "the bond script's CLTV holds it until height {} (tip {tip})",
+        m.bondlocktime + 1
+    );
+    let to_spk = match to {
+        Some(a) => node.validateaddress(a).await?,
+        None => node.validateaddress(&node.getnewaddress().await?).await?,
+    }
+    .script_pub_key
+    .ok_or_else(|| anyhow!("validateaddress gave no scriptPubKey"))?;
+    let branch = node.getblockchaininfo().await?.consensus.nextblock;
+    let branch = u32::from_str_radix(&branch, 16)
+        .map_err(|e| anyhow!("consensus.nextblock {branch:?}: {e}"))?;
+    let tx = build_bond_withdrawal(
+        key,
+        &op,
+        m.bondlocktime,
+        &out.script_pub_key.hex.0,
+        out.value.zat(),
+        to_spk.0,
+        tip,
+        branch,
+    )?;
+    let txid = match node.sendrawtransaction(&HexBytes(tx.encode()), false).await {
+        Ok(t) => t,
+        Err(e) if e.rpc().and_then(|r| r.bad_vault()) == Some("bad-vault-bond-locked") => bail!(
+            "the bond is still in its exit delay: spendable from exitHeight + maturity ({} \
+             blocks; `hawkeye leave` printed bondspendableat): {e}",
+            info.set.params.maturity
+        ),
+        Err(e) => return Err(e).context("sendrawtransaction"),
+    };
+    let value = out.value.zat() - BOND_WITHDRAW_FEE;
+    info!(event = "bond_withdrawn", txid = %txid, bond = %op, value);
+    Ok(json!({"txid": txid.to_string(), "bondoutpoint": op.to_string(), "value_zat": value}))
+}
+
+/// The signed bond withdrawal: input `bond` (whose output is `bond_spk`, `value_zat`), one
+/// output of `value_zat − BOND_WITHDRAW_FEE` to `to_spk`, `nLockTime` = `tip` (≥ the CLTV
+/// `locktime`, final at the next block), sequence `0xfffffffe`, expiry `tip + 40`, signed for
+/// `branch_id` (the next block's). Refuses a `bond_spk` that is not this key's bond script.
+#[allow(clippy::too_many_arguments)]
+pub fn build_bond_withdrawal(
+    key: &hawkeye_core::SecretKey,
+    bond: &hawkeye_ycash::OutPoint,
+    locktime: u32,
+    bond_spk: &[u8],
+    value_zat: i64,
+    to_spk: Vec<u8>,
+    tip: u32,
+    branch_id: u32,
+) -> Result<Transaction> {
+    use hawkeye_core::template::{bond_spk as bond_script, bond_withdrawal_script_sig};
+    ensure!(
+        bond_spk == bond_script(&key.public_key(), locktime),
+        "the bond output {bond} is not this member key's bond script (locktime {locktime})"
+    );
+    ensure!(
+        value_zat > BOND_WITHDRAW_FEE,
+        "the bond ({value_zat} zat) does not cover the fee"
+    );
+    ensure!(
+        tip >= locktime,
+        "the bond's CLTV ({locktime}) is above the tip ({tip})"
+    );
+    let mut tx = Transaction::new_v4(
+        vec![TxIn {
+            prevout: *bond,
+            script_sig: vec![],
+            sequence: 0xffff_fffe,
+        }],
+        vec![TxOut {
+            value: value_zat - BOND_WITHDRAW_FEE,
+            script_pubkey: to_spk,
+        }],
+        tip,
+        tip + 40,
+    );
+    let core = hawkeye_core::tx::Transaction::parse(&tx.encode())
+        .map_err(|e| anyhow!("bond withdrawal: {e}"))?;
+    tx.inputs[0].script_sig =
+        bond_withdrawal_script_sig(&core, 0, key, locktime, value_zat as u64, branch_id)
+            .map_err(|e| anyhow!("bond withdrawal: {e}"))?;
+    Ok(tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Params;
     use hawkeye_core::memo::{HawkeyeMemo, MemoKind};
-    use hawkeye_core::recipient::YcashRecipient;
     use hawkeye_store::{BurnKey, NewBurn};
 
     fn params(drills: bool, mainnet: bool) -> Params {
@@ -570,6 +835,58 @@ mod tests {
     }
 
     #[test]
+    fn destinations_follow_the_bridge_kind() {
+        let a = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+        assert_eq!(
+            parse_destination(BridgeKind::Ethereum, a).unwrap(),
+            Destination::Ethereum(EthAddress::parse(a).unwrap())
+        );
+        let e = parse_destination(BridgeKind::Near, a)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is an Ethereum address"), "{e}");
+        let n = parse_destination(BridgeKind::Near, "alice.near").unwrap();
+        assert_eq!(n.near().unwrap().as_str(), "alice.near");
+        assert_eq!(n.script()[..5], [0x6a, 0x0d, b'N', b'R', b'1']);
+        let e = parse_destination(BridgeKind::Ethereum, "alice.near")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is a NEAR account id"), "{e}");
+        // lowercase 0x + 40 hex: an Ethereum address there, NEAR's EVM-implicit account here
+        let lower = a.to_lowercase();
+        assert!(matches!(
+            parse_destination(BridgeKind::Ethereum, &lower).unwrap(),
+            Destination::Ethereum(_)
+        ));
+        assert!(matches!(
+            parse_destination(BridgeKind::Near, &lower).unwrap(),
+            Destination::Near(_)
+        ));
+        let zero = format!("0x{}", "0".repeat(40));
+        assert!(parse_destination(BridgeKind::Ethereum, &zero).is_err());
+        for bad in ["", "Alice.near", "a", "a..b"] {
+            assert!(parse_destination(BridgeKind::Near, bad).is_err(), "{bad}");
+            assert!(
+                parse_destination(BridgeKind::Ethereum, bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn invented_lock_ids_per_guardian_kind() {
+        let a = EthAddress([1; 20]);
+        assert_eq!(
+            invented_lock_id_for(&Guardian::Ethereum(a), 5),
+            invented_lock_id(&a, 5)
+        );
+        assert_ne!(
+            invented_lock_id_for(&Guardian::Secp256k1([1; 64]), 5),
+            invented_lock_id_for(&Guardian::Secp256k1([2; 64]), 5)
+        );
+    }
+
+    #[test]
     fn drill_gate_needs_drills_and_refuses_mainnet() {
         assert!(drill_gate(&params(true, false), "rogue-mint").is_ok());
         assert!(drill_gate(&params(true, true), "rogue-mint").is_err());
@@ -578,6 +895,29 @@ mod tests {
         let off = drill_gate(&params(false, false), "rogue-unlock").unwrap_err();
         assert!(off.to_string().contains("[devnet] drills = true"), "{off}");
         assert!(drill_gate(&params(true, true), "rogue-unlock").is_err());
+    }
+
+    /// `hawkeye burn` warns for a scheme-2 (Falcon) recipient only (§4.2): the contracts accept
+    /// it, the node pays it once Falcon is active.
+    #[test]
+    fn burn_warns_for_falcon_recipients_only() {
+        assert_eq!(recipient_warning(&YcashRecipient::p2pkh([1; 20])), None);
+        assert_eq!(recipient_warning(&YcashRecipient::p2sh([1; 20])), None);
+        assert_eq!(
+            recipient_warning(&YcashRecipient::pqpkh(1, [1; 32]).unwrap()),
+            None
+        );
+        let w = recipient_warning(&YcashRecipient::pqpkh(2, [1; 32]).unwrap()).unwrap();
+        assert!(w.contains("Falcon"), "{w}");
+        // the CLI decodes sq…/tq…/rq… and refuses the owner form (yb…/yt…/yr…)
+        use hawkeye_core::address::{Network, encode_address, encode_pq_address};
+        let r = YcashRecipient::pqpkh(1, [0xc5; 32]).unwrap();
+        let sq = encode_address(&r, Network::Regtest);
+        assert!(sq.starts_with("rq"));
+        assert_eq!(decode_address(&sq, Network::Regtest).unwrap(), r);
+        let owner = encode_pq_address(r.pq_key().unwrap(), Network::Regtest);
+        assert!(owner.starts_with("yr"));
+        assert!(decode_address(&owner, Network::Regtest).is_err());
     }
 
     #[test]
@@ -592,9 +932,9 @@ mod tests {
                     tx_hash: [0xab; 32],
                     block_number: 9,
                     block_hash: [1; 32],
-                    from: EthAddress([2; 20]),
+                    from: Destination::Ethereum(EthAddress([2; 20])),
                     amount: 400_000_000,
-                    recipient: r.to_bytes32(),
+                    recipient: r.to_bytes(),
                     finalized: true,
                 })
             })
@@ -628,9 +968,9 @@ mod tests {
                     tx_hash: [0xab; 32],
                     block_number: 9,
                     block_hash: [1; 32],
-                    from: EthAddress([2; 20]),
+                    from: Destination::Ethereum(EthAddress([2; 20])),
                     amount: 1,
-                    recipient: YcashRecipient::p2pkh([0x11; 20]).to_bytes32(),
+                    recipient: YcashRecipient::p2pkh([0x11; 20]).to_bytes(),
                     finalized: false,
                 })
             })

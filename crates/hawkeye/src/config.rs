@@ -1,8 +1,13 @@
 //! `hawkeye.toml` (plan §6 "Config"): the file as written ([`Config`]) and its checked, resolved
 //! form ([`Settings`]).
 //!
-//! Relative paths in the file (`eth.deployment`, `store.path`, `keys.keystore`,
-//! `ycash.cookie_file`) resolve against the directory of the config file.
+//! The foreign chain is `[foreign] kind` (`"ethereum"`, the default when the section is absent,
+//! so every existing config keeps working, with `[eth]`; or `"near"`, with `[near]`, NEAR plan
+//! §4 item 4), and the bridge's vault tag is `[bridge] tag` (default: the kind's, `"WYEC"` or
+//! `"NYEC"`; NEAR plan §0 item 2).
+//!
+//! Relative paths in the file (`eth.deployment`, `near.relayer_key_file`, `store.path`,
+//! `keys.keystore`, `ycash.cookie_file`) resolve against the directory of the config file.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -10,10 +15,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hawkeye_core::address::Network;
 use hawkeye_core::bytes::Hash32;
-use hawkeye_core::{Deployment as CoreDeployment, EthAddress, SecretKey};
+use hawkeye_core::{AccountId, Deployment as CoreDeployment, EthAddress, SecretKey};
 use hawkeye_eth::{Deployment, Finality, MintMode};
 use hawkeye_ycash::{Amount, Auth, Hash256};
 use serde::Deserialize;
+
+use crate::foreign::BridgeKind;
 
 /// The config file as written.
 #[derive(Debug, Clone, Deserialize)]
@@ -23,8 +30,13 @@ pub struct Config {
     pub network: NetworkSection,
     /// `[ycash]`.
     pub ycash: YcashSection,
-    /// `[eth]`.
-    pub eth: EthSection,
+    /// `[foreign]` (absent: Ethereum).
+    #[serde(default)]
+    pub foreign: ForeignSection,
+    /// `[eth]` (required when `foreign.kind = "ethereum"`).
+    pub eth: Option<EthSection>,
+    /// `[near]` (required when `foreign.kind = "near"`).
+    pub near: Option<NearSection>,
     /// `[bridge]`.
     pub bridge: BridgeSection,
     /// `[keys]`.
@@ -75,6 +87,55 @@ pub struct YcashSection {
     pub start_height: Option<u32>,
 }
 
+/// `[foreign]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForeignSection {
+    /// `"ethereum"` (default) or `"near"`.
+    pub kind: Option<String>,
+}
+
+/// `[near]` (NEAR plan §4 item 4): the `wyec-near` deployment and the operator's relayer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NearSection {
+    /// NEAR JSON-RPC endpoint (`https://rpc.mainnet.near.org`, `http://127.0.0.1:3030`).
+    pub rpc_url: String,
+    /// The network id bound into every digest (`mainnet`, `testnet`, `sandbox`, …): the
+    /// contract's `config().network_id`.
+    pub network_id: String,
+    /// The `wyec-near` contract account.
+    pub contract_id: String,
+    /// The operator's NEAR account that sends (and pays for) this attestor's transactions.
+    pub relayer_account: String,
+    /// Its credentials JSON (`account_id`, `public_key`, `private_key`, as near-cli writes it).
+    pub relayer_key_file: PathBuf,
+    /// The first NEAR block height to scan: the contract's deployment block.
+    pub start_block: u64,
+    /// Gas attached to each call, TGas (default 100; NEAR's per-transaction maximum is 300).
+    pub gas_tgas: Option<u64>,
+}
+
+/// The checked `[near]` section.
+#[derive(Debug, Clone)]
+pub struct NearSettings {
+    /// RPC endpoint.
+    pub rpc_url: String,
+    /// The digest domain: network id and contract account.
+    pub domain: hawkeye_core::near::Domain,
+    /// The relayer account.
+    pub relayer_account: AccountId,
+    /// Its key file (resolved).
+    pub relayer_key_file: PathBuf,
+    /// Gas per call.
+    pub gas: u64,
+    /// First block to scan.
+    pub start_block: u64,
+}
+
+/// The default `[near] gas_tgas`.
+pub const DEFAULT_NEAR_GAS_TGAS: u64 = 100;
+
 /// `[eth]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +155,9 @@ pub struct EthSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeSection {
+    /// The bridge's vault tag: four printable ASCII characters (default `"WYEC"`; NEAR's bridge
+    /// is `"NYEC"`). Every vault, intent and lock Hawkeye follows carries it.
+    pub tag: Option<String>,
     /// The attestor set id (display hex, as the RPCs print it).
     pub set_id: String,
     /// The vaults' `delay`: the challenge window D.
@@ -256,12 +320,16 @@ pub struct Settings {
     pub ycash_auth: Auth,
     /// First height to follow from (extension).
     pub ycash_start_height: Option<u32>,
-    /// Ethereum endpoint.
+    /// The foreign chain (`[foreign] kind`).
+    pub foreign: BridgeKind,
+    /// Ethereum endpoint (empty on NEAR).
     pub eth_url: String,
-    /// The deployment file's contents.
-    pub deployment: Deployment,
-    /// Finality rule for the scanner.
+    /// The `[eth]` deployment file's contents (Ethereum only).
+    pub deployment: Option<Deployment>,
+    /// Finality rule for the Ethereum scanner (NEAR is always read at `final`).
     pub finality: Finality,
+    /// `[near]` (NEAR only).
+    pub near: Option<NearSettings>,
     /// Engine parameters.
     pub params: Params,
     /// The key source.
@@ -287,9 +355,14 @@ pub struct Params {
     pub mainnet: bool,
     /// The attestor set, internal byte order.
     pub set_id: Hash32,
-    /// The bridge deployment (memos, burns).
+    /// The bridge (`[foreign] kind`): its vault tag (`[bridge] tag`, the only vaults and intents
+    /// this Hawkeye follows), lock destination and memo magic, as `hawkeye-core` defines them.
+    pub bridge_kind: BridgeKind,
+    /// The bridge deployment (memos, burns): Ethereum `(chainId, bridge)`, NEAR the hashed
+    /// `(network_id, contract_id)` (NEAR plan §2.2).
     pub deployment: CoreDeployment,
-    /// The first Ethereum block to scan.
+    /// The first foreign block to scan (Ethereum: the deployment block; NEAR: `[near]
+    /// start_block`).
     pub eth_start_block: u64,
     /// The vaults' delay.
     pub delay: u16,
@@ -334,6 +407,35 @@ impl Params {
     pub fn set_hash(&self) -> Hash256 {
         Hash256::from_internal(self.set_id)
     }
+
+    /// The bridge's vault tag (`WYEC`, `NYEC`).
+    pub fn tag(&self) -> [u8; 4] {
+        self.bridge_kind.tag()
+    }
+
+    /// The vault tag as text (`vault_list`'s filter, messages): it is printable ASCII.
+    pub fn tag_text(&self) -> String {
+        tag_text(&self.tag())
+    }
+}
+
+/// A vault tag as text (lossy for a non-ASCII tag, which [`parse_tag`] refuses).
+pub fn tag_text(tag: &[u8; 4]) -> String {
+    String::from_utf8_lossy(tag).into_owned()
+}
+
+/// A configured vault tag: exactly four printable ASCII characters (`"WYEC"`, `"NYEC"`). A
+/// module tag with a NUL byte (`YED\0`) is not a bridge's.
+pub fn parse_tag(s: &str) -> Result<[u8; 4]> {
+    let b: [u8; 4] = s
+        .as_bytes()
+        .try_into()
+        .map_err(|_| anyhow!("{s:?} is {} bytes, not 4", s.len()))?;
+    ensure!(
+        b.iter().all(u8::is_ascii_graphic),
+        "{s:?} is not four printable ASCII characters"
+    );
+    Ok(b)
 }
 
 /// A regtest [`Params`] for unit tests.
@@ -343,6 +445,7 @@ pub(crate) fn sample_params(drills: bool, mainnet: bool) -> Params {
         network: Network::Regtest,
         mainnet,
         set_id: [7; 32],
+        bridge_kind: BridgeKind::Ethereum,
         deployment: CoreDeployment {
             chain_id: 31337,
             bridge: EthAddress([0x5f; 20]),
@@ -404,13 +507,95 @@ impl Config {
             (None, None, None) => Auth::None,
             _ => bail!("ycash: give rpc_user and rpc_password, or cookie_file"),
         };
-        let deployment = Deployment::read(resolve(&self.eth.deployment))
-            .map_err(|e| anyhow!("eth.deployment: {e}"))?;
-        let finality = match (self.eth.finality.as_deref(), self.eth.depth) {
-            (None, Some(depth)) => Finality::Depth { depth },
-            (None | Some("finalized"), fallback_depth) => Finality::Finalized { fallback_depth },
-            (Some(other), _) => bail!("eth.finality {other:?}: only \"finalized\" (or use depth)"),
+        let foreign = match self.foreign.kind.as_deref() {
+            None => BridgeKind::Ethereum,
+            Some(k) => k.parse().map_err(|e| anyhow!("foreign.kind {k:?}: {e}"))?,
         };
+        let (eth, near) =
+            match foreign {
+                BridgeKind::Ethereum => (
+                    Some(self.eth.as_ref().ok_or_else(|| {
+                        anyhow!("foreign.kind \"ethereum\" needs an [eth] section")
+                    })?),
+                    None,
+                ),
+                BridgeKind::Near => {
+                    ensure!(
+                        self.eth.is_none(),
+                        "foreign.kind \"near\": remove the [eth] section"
+                    );
+                    (
+                        None,
+                        Some(self.near.as_ref().ok_or_else(|| {
+                            anyhow!("foreign.kind \"near\" needs a [near] section")
+                        })?),
+                    )
+                }
+            };
+        if foreign == BridgeKind::Ethereum {
+            ensure!(
+                self.near.is_none(),
+                "foreign.kind \"ethereum\": remove the [near] section"
+            );
+        }
+        // hawkeye-core's lock policy and intent matcher judge the vaults of the bridge kind's
+        // tag (Ethereum WYEC, NEAR NYEC): another tag would refuse every lock
+        if let Some(t) = &self.bridge.tag {
+            let tag = parse_tag(t).map_err(|e| anyhow!("bridge.tag {e}"))?;
+            ensure!(
+                tag == foreign.tag(),
+                "bridge.tag {t:?}: the {foreign} bridge's vault tag is {:?}",
+                tag_text(&foreign.tag())
+            );
+        }
+        let deployment = eth
+            .map(|eth| {
+                Deployment::read(resolve(&eth.deployment))
+                    .map_err(|e| anyhow!("eth.deployment: {e}"))
+            })
+            .transpose()?;
+        let finality = match eth.map(|e| (e.finality.as_deref(), e.depth)) {
+            None => Finality::Finalized {
+                fallback_depth: None,
+            },
+            Some((None, Some(depth))) => Finality::Depth { depth },
+            Some((None | Some("finalized"), fallback_depth)) => {
+                Finality::Finalized { fallback_depth }
+            }
+            Some((Some(other), _)) => {
+                bail!("eth.finality {other:?}: only \"finalized\" (or use depth)")
+            }
+        };
+        let near = near
+            .map(|n| -> Result<NearSettings> {
+                let contract_id = AccountId::parse(&n.contract_id)
+                    .map_err(|e| anyhow!("near.contract_id {:?}: {e}", n.contract_id))?;
+                let relayer_account = AccountId::parse(&n.relayer_account)
+                    .map_err(|e| anyhow!("near.relayer_account {:?}: {e}", n.relayer_account))?;
+                let domain = hawkeye_core::near::Domain::new(&n.network_id, contract_id)
+                    .map_err(|e| anyhow!("near.network_id: {e}"))?;
+                ensure!(
+                    mainnet == (n.network_id == "mainnet"),
+                    "near.network_id {:?} with network.name {:?}: a mainnet bridge pairs Ycash \
+                     mainnet with NEAR mainnet, and only those",
+                    n.network_id,
+                    self.network.name
+                );
+                let tgas = n.gas_tgas.unwrap_or(DEFAULT_NEAR_GAS_TGAS);
+                ensure!(
+                    (1..=300).contains(&tgas),
+                    "near.gas_tgas {tgas}: between 1 and 300"
+                );
+                Ok(NearSettings {
+                    rpc_url: n.rpc_url.clone(),
+                    domain,
+                    relayer_account,
+                    relayer_key_file: resolve(&n.relayer_key_file),
+                    gas: tgas * hawkeye_near::tx::TGAS,
+                    start_block: n.start_block,
+                })
+            })
+            .transpose()?;
         let set_id = self
             .bridge
             .set_id
@@ -429,9 +614,28 @@ impl Config {
             self.bridge.confirmations >= 1,
             "bridge.confirmations must be at least 1"
         );
+        // the bridge deployment: the [eth] deployment file, or the NEAR domain's hashed ids
+        let (core_deployment, start_block) = match (&deployment, &near) {
+            (Some(d), _) => (
+                CoreDeployment {
+                    chain_id: d.chain_id,
+                    bridge: EthAddress(d.bridge.into()),
+                },
+                d.deploy_block,
+            ),
+            (None, Some(n)) => (n.domain.deployment(), n.start_block),
+            (None, None) => bail!("no foreign deployment"),
+        };
         let mint_mode = match self.bridge.mint_mode.as_str() {
             "threshold" => MintMode::Threshold {
-                k: self.bridge.mint_threshold.unwrap_or(deployment.threshold),
+                k: match (self.bridge.mint_threshold, &deployment) {
+                    (Some(k), _) => k,
+                    (None, Some(d)) => d.threshold,
+                    (None, None) => bail!(
+                        "bridge.mint_threshold is required for a NEAR bridge in threshold mode \
+                         (no deployment file to default it from)"
+                    ),
+                },
             },
             "optimistic" => MintMode::Optimistic,
             other => bail!("bridge.mint_mode {other:?}: threshold or optimistic"),
@@ -439,7 +643,7 @@ impl Config {
         let chain_id = if mainnet {
             hawkeye_eth::mode::MAINNET
         } else {
-            deployment.chain_id
+            core_deployment.chain_id
         };
         mint_mode
             .check_allowed(chain_id)
@@ -455,8 +659,10 @@ impl Config {
                     "mainnet refuses bridge.mint_threshold {k} < 2 in every mint mode (plan §3.3)"
                 );
             }
-            hawkeye_eth::mode::check_contract_threshold(chain_id, deployment.threshold)
-                .map_err(|e| anyhow!("eth.deployment: {e} (plan §3.3)"))?;
+            if let Some(d) = &deployment {
+                hawkeye_eth::mode::check_contract_threshold(chain_id, d.threshold)
+                    .map_err(|e| anyhow!("eth.deployment: {e} (plan §3.3)"))?;
+            }
         }
         let key = match (&self.keys.secret_hex, &self.keys.keystore) {
             (Some(h), None) => {
@@ -498,11 +704,9 @@ impl Config {
             network,
             mainnet,
             set_id,
-            deployment: CoreDeployment {
-                chain_id: deployment.chain_id,
-                bridge: EthAddress(deployment.bridge.into()),
-            },
-            eth_start_block: deployment.deploy_block,
+            bridge_kind: foreign,
+            deployment: core_deployment,
+            eth_start_block: start_block,
             delay: self.bridge.delay,
             confirmations: self.bridge.confirmations,
             min_owner_age: self.bridge.min_owner_age,
@@ -522,9 +726,11 @@ impl Config {
             ycash_url: self.ycash.rpc_url.clone(),
             ycash_auth,
             ycash_start_height: self.ycash.start_height,
-            eth_url: self.eth.rpc_url.clone(),
+            foreign,
+            eth_url: eth.map(|e| e.rpc_url.clone()).unwrap_or_default(),
             deployment,
             finality,
+            near,
             params,
             key,
             store_path: resolve(&self.store.path),
@@ -568,6 +774,7 @@ pub fn base_dir(config_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hawkeye_core::template::TAG_WYEC;
 
     const DEPLOYMENT: &str = r#"{"chainId":31337,"bridge":"0x5FbDB2315678afecb367f032d93F642f64180aa3",
       "token":"0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512","deployBlock":1,"guardians":[],"threshold":1}"#;
@@ -706,6 +913,201 @@ format = "text"
         .settings(d.path())
         .unwrap();
         assert_eq!(s.params.mint_mode, MintMode::Optimistic);
+    }
+
+    /// `[foreign]` absent is Ethereum (existing configs and the devnet unchanged); `"near"` needs
+    /// `[near]` and no `[eth]`; anything else, or Ethereum without `[eth]`, is refused.
+    #[test]
+    fn foreign_kind() {
+        let d = dir();
+        let s = Config::parse(&sample("regtest", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert_eq!(s.foreign, BridgeKind::Ethereum);
+        let s = Config::parse(&sample("regtest", "[foreign]\nkind = \"ethereum\""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert_eq!(s.foreign, BridgeKind::Ethereum);
+        let e = Config::parse(&sample("regtest", "[foreign]\nkind = \"near\""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("remove the [eth] section"), "{e}");
+        let e = Config::parse(&sample("regtest", "[foreign]\nkind = \"solana\""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("foreign.kind"), "{e}");
+        let no_eth = sample("regtest", "").replace(
+            "[eth]\nrpc_url = \"http://127.0.0.1:8545\"\ndeployment = \"31337.json\"\nfinality = \"finalized\"\n",
+            "",
+        );
+        let e = Config::parse(&no_eth)
+            .unwrap()
+            .settings(d.path())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("needs an [eth] section"), "{e}");
+    }
+
+    fn near_sample(network: &str, net_id: &str, extra_bridge: &str) -> String {
+        sample(network, "")
+            .replace(
+                "[eth]\nrpc_url = \"http://127.0.0.1:8545\"\ndeployment = \"31337.json\"\nfinality = \"finalized\"\n",
+                &format!(
+                    "[foreign]\nkind = \"near\"\n[near]\nrpc_url = \"http://127.0.0.1:3030\"\n\
+                     network_id = \"{net_id}\"\ncontract_id = \"wyec.test.near\"\n\
+                     relayer_account = \"hawkeye1.test.near\"\nrelayer_key_file = \"keys/hawkeye1.json\"\n\
+                     start_block = 42\n"
+                ),
+            )
+            .replace("[bridge]\n", &format!("[bridge]\n{extra_bridge}"))
+    }
+
+    /// `[near]` (NEAR plan §4 item 4): the deployment is the hashed domain, the relayer key file
+    /// resolves against the config's directory, gas defaults to 100 TGas, the tag must be NYEC,
+    /// and mainnet pairs with NEAR mainnet only.
+    #[test]
+    fn near_section() {
+        let d = dir();
+        let s = Config::parse(&near_sample("regtest", "sandbox", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert_eq!(s.foreign, BridgeKind::Near);
+        assert_eq!(s.params.bridge_kind, BridgeKind::Near);
+        assert_eq!(s.params.tag(), *b"NYEC");
+        assert!(s.deployment.is_none() && s.eth_url.is_empty());
+        let n = s.near.as_ref().unwrap();
+        assert_eq!(n.relayer_key_file, d.path().join("keys/hawkeye1.json"));
+        assert_eq!(n.gas, 100_000_000_000_000);
+        assert_eq!(n.relayer_account.as_str(), "hawkeye1.test.near");
+        assert_eq!(s.params.eth_start_block, 42);
+        assert_eq!(s.params.deployment, n.domain.deployment());
+        assert_eq!(
+            s.params.deployment.chain_id,
+            hawkeye_core::near::chain_id("sandbox")
+        );
+        assert_eq!(s.params.mint_mode, MintMode::Threshold { k: 1 });
+        // the tag: NYEC accepted, WYEC refused
+        let with_tag = |t: &str| {
+            Config::parse(&near_sample(
+                "regtest",
+                "sandbox",
+                &format!("tag = \"{t}\"\n"),
+            ))
+            .unwrap()
+            .settings(d.path())
+        };
+        assert!(with_tag("NYEC").is_ok());
+        let e = with_tag("WYEC").unwrap_err().to_string();
+        assert!(e.contains("vault tag is \"NYEC\""), "{e}");
+        // threshold mode needs an explicit k (no deployment file)
+        let e = Config::parse(
+            &near_sample("regtest", "sandbox", "").replace("mint_threshold = 1\n", ""),
+        )
+        .unwrap()
+        .settings(d.path())
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("mint_threshold is required"), "{e}");
+        // gas bounds, account ids, the network pairing
+        let e = Config::parse(
+            &near_sample("regtest", "sandbox", "")
+                .replace("start_block = 42\n", "start_block = 42\ngas_tgas = 301\n"),
+        )
+        .unwrap()
+        .settings(d.path())
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("gas_tgas"), "{e}");
+        let e =
+            Config::parse(&near_sample("regtest", "sandbox", "").replace("wyec.test.near", "Wyec"))
+                .unwrap()
+                .settings(d.path())
+                .unwrap_err()
+                .to_string();
+        assert!(e.contains("near.contract_id"), "{e}");
+        let e = Config::parse(&near_sample("regtest", "mainnet", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("mainnet bridge pairs"), "{e}");
+        // [near] without the kind, or the kind without [near]
+        let e = Config::parse(&format!(
+            "{}\n[near]\nrpc_url = \"x\"\nnetwork_id = \"sandbox\"\ncontract_id = \"w.near\"\n\
+             relayer_account = \"r.near\"\nrelayer_key_file = \"k.json\"\nstart_block = 1\n",
+            sample("regtest", "")
+        ))
+        .unwrap()
+        .settings(d.path())
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("remove the [near] section"), "{e}");
+        let e = Config::parse(&sample("regtest", "").replace(
+            "[eth]\nrpc_url = \"http://127.0.0.1:8545\"\ndeployment = \"31337.json\"\nfinality = \"finalized\"\n",
+            "[foreign]\nkind = \"near\"\n",
+        ))
+        .unwrap()
+        .settings(d.path())
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("needs a [near] section"), "{e}");
+    }
+
+    /// `[bridge] tag`: `WYEC` by default; four printable ASCII characters.
+    #[test]
+    fn bridge_tag() {
+        let d = dir();
+        let s = Config::parse(&sample("regtest", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert_eq!(s.params.tag(), *b"WYEC");
+        assert_eq!(s.params.tag_text(), "WYEC");
+        let with = |tag: &str| {
+            Config::parse(
+                &sample("regtest", "")
+                    .replace("[bridge]\n", &format!("[bridge]\ntag = \"{tag}\"\n")),
+            )
+            .unwrap()
+            .settings(d.path())
+        };
+        assert_eq!(with("WYEC").unwrap().params.tag(), TAG_WYEC);
+        // a well-formed tag of another bridge: not the Ethereum bridge's
+        let e = with("NYEC").unwrap_err().to_string();
+        assert!(e.contains("vault tag is \"WYEC\""), "{e}");
+        for bad in ["WYE", "WYECX", "WY C", "YED\\u0000", "WYÉ"] {
+            let e = with(bad).unwrap_err().to_string();
+            assert!(e.contains("bridge.tag"), "{bad}: {e}");
+        }
+        assert_eq!(parse_tag("WYEC").unwrap(), TAG_WYEC);
+    }
+
+    /// The samples in `config/` stay valid: the NEAR one resolves completely (nothing to read
+    /// from disk); the Ethereum one parses (its deployment file is written by a deploy).
+    #[test]
+    fn example_configs() {
+        let d = dir();
+        let near = Config::parse(include_str!("../../../config/near-sandbox.example.toml"))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert_eq!(near.foreign, BridgeKind::Near);
+        assert_eq!(near.params.mint_mode, MintMode::Optimistic);
+        assert_eq!(
+            near.near.unwrap().relayer_key_file,
+            d.path().join("keys/hawkeye1.test.near.json")
+        );
+        let eth =
+            Config::parse(include_str!("../../../config/ethereum-anvil.example.toml")).unwrap();
+        assert_eq!(eth.foreign.kind.as_deref(), Some("ethereum"));
+        assert!(eth.near.is_none() && eth.eth.is_some());
     }
 
     #[test]

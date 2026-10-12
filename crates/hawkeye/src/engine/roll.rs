@@ -19,7 +19,7 @@
 use anyhow::{Result, anyhow, ensure};
 use hawkeye_core::leader::mint_leader_for;
 use hawkeye_core::lock::lock_id;
-use hawkeye_core::memo::{HawkeyeMemo, MemoKind, parse_memo_script};
+use hawkeye_core::memo::{HawkeyeMemo, MemoKind, parse_memo_script_for};
 use hawkeye_core::template::{OWNER_HEIGHT_MAX, VaultParams, parse_vault};
 use hawkeye_store::{IntentState, LockState, SignDomain, VaultRecord, VaultState, YcashSignKey};
 use hawkeye_ycash::tx::{Transaction, insert_op_return};
@@ -224,7 +224,8 @@ impl Engine {
             "the vault has an APP branch: not a bridge vault"
         );
         let new_spk = new.script().map_err(|e| anyhow!("new vault: {e}"))?;
-        let memo = HawkeyeMemo::roll(p.deployment, &new).map_err(|e| anyhow!("memo: {e}"))?;
+        let memo = HawkeyeMemo::roll_for(p.bridge_kind, p.deployment, &new)
+            .map_err(|e| anyhow!("memo: {e}"))?;
         let built = self
             .ctx
             .ycash
@@ -266,8 +267,8 @@ impl Engine {
         let p = self.ctx.params.clone();
         let tx = Transaction::decode_hex(signed).map_err(|e| anyhow!("{e}"))?;
         let is_roll = tx.outputs.iter().any(|o| {
-            matches!(parse_memo_script(&o.script_pubkey), Ok(Some(m))
-                if m.kind == MemoKind::Roll && m.deployment == p.deployment)
+            matches!(parse_memo_script_for(p.bridge_kind, &o.script_pubkey), Ok(Some(m))
+                if m.kind == MemoKind::Roll && m.is_for(p.bridge_kind, &p.deployment))
         });
         if !is_roll {
             return Ok(()); // the vault's stored unlock pays a burn: burns() owns it

@@ -1,8 +1,9 @@
 # Hawkeye
 
-The attestor sidecar for the **wYEC bridge** between Ycash and Ethereum. Each bridge attestor runs
-Hawkeye next to its own `ycashd` (the vault upgrade, `UPGRADE_VAULT` / branch ID `0x6d5b7a31`) and
-an Ethereum endpoint. The name is the job: an attestor watches Ethereum like a hawk for wYEC
+The attestor sidecar for the **wYEC bridge** between Ycash and Ethereum — and, on this branch, NEAR
+(`docs/hawkeye-near-plan.md`: tag `NYEC`, the `wyec-near` NEP-141 contract, `[foreign] kind = "near"`).
+Each bridge attestor runs Hawkeye next to its own `ycashd` (the vault upgrade, `UPGRADE_VAULT` /
+branch ID `0x6d5b7a31`) and an Ethereum (or NEAR) endpoint. The name is the job: an attestor watches Ethereum like a hawk for wYEC
 burns, and watches Ycash just as closely for cross-chain mints (implied by a user locking YEC
 collateral in a vault). Hawkeye:
 
@@ -18,17 +19,34 @@ collateral in a vault). Hawkeye:
 The Foundation's model is **one attestation, a challenge window, and slashing**: see
 [`docs/hawkeye-bridge-plan.md`](docs/hawkeye-bridge-plan.md), the plan of record.
 
+## Node requirement: the post-quantum line
+
+This branch runs against **`upgrade/quantum-vaults`** nodes only, on both node lines
+(`boyfromcave/ycash-dd`, `boyfromcave/ycash6`), never `upgrade/vault`: every vault's owner is a
+post-quantum key (the owner slot `<ownerHash:32> OP_1|OP_2 OP_CHECKPQSIG`; scheme 1
+SLH-DSA-SHA2-128s, scheme 2 FN-DSA-512) and this Hawkeye parses only that shape. Hawkeye holds no
+owner key and no post-quantum code: `hawkeye lock` takes the owner from `vault_getnewowner` (or
+`--owner <PQ address | pqkeyid>`), the depositor's node signs `hawkeye recover`'s spends
+(`vault_ownerspend`), the lock policy mints for scheme-1 owners only, and the member, bond and
+guardian keys stay secp256k1 (quantum plan D-Q-5), so the Ethereum EIP-712 and the NEAR
+`ecrecover` attestations are unchanged. Mainnet PQ Yellowback addresses are `yb…` on this line
+(testnet `yt…`, regtest `yr…`; D-Q-21). `devnet-e2e` builds both lines from that branch
+(`node_ref` overrides).
+
 ## Layout
 
 | Path | What |
 |---|---|
-| `crates/hawkeye-core` | pure encodings and rules: templates, memo, recipient, lockId, EIP-712, policy, matching |
+| `crates/hawkeye-core` | pure encodings and rules: templates, memo, recipient (§4.2: transparent or `TX_PQPKH`), lockId, EIP-712, policy, matching |
 | `crates/hawkeye-ycash` | ycashd JSON-RPC client (`set_*`, `vault_*`, stock), v4 tx codec, mock node |
 | `crates/hawkeye-eth` | Ethereum adapter (alloy): bindings, finalized scanner, signer, mint submitter |
-| `crates/hawkeye-store` | SQLite ledger, sign-once records, evidence |
-| `crates/hawkeye` | the daemon and CLI |
+| `crates/hawkeye-near` | NEAR adapter (NEAR plan NH4/NH5): JSON-RPC client, hand-rolled Borsh transaction codec (golden-vectored against `near-primitives`), relayer key, `wyec-near` client and block scanner, mock NEAR node, a test against a real sandbox (`tests/sandbox.rs`) and the devnet's set-up helper (`examples/near-admin.rs`) |
+| `crates/hawkeye-store` | SQLite ledger, sign-once records, evidence (v4: chain-neutral accounts; v5: 22/35-byte burn recipients) |
+| `crates/hawkeye` | the daemon and CLI (`[foreign] kind = "ethereum"` or `"near"`) |
 | `eth/` | Foundry project: wyec at a pinned commit, deploy scripts (anvil, Sepolia), vectors |
-| `devnet/` | regtest `ycashd` + anvil + several Hawkeyes, scenario drills |
+| `near/` | the `wyec-near` contract (NEP-141 wYEC + bridge policy), its own cargo project; `tools/fetch-sandbox.sh` pins the NEAR sandbox node |
+| `config/` | sample configs: `ethereum-anvil.example.toml`, `near-sandbox.example.toml` |
+| `devnet/` | regtest `ycashd` + anvil (or, `--foreign near`, a NEAR sandbox) + several Hawkeyes, scenario drills |
 
 ## Build
 

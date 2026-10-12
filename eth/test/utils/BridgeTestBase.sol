@@ -112,6 +112,28 @@ abstract contract BridgeTestBase is Test {
     }
 
     /// Mint through the threshold path with two guardian signatures.
+    // ------------------------------------------------------------------ recipients (plan §4.2 rev. 2)
+
+    /// A kind-0 (P2PKH) recipient: `02 00 <hash160>`, 22 bytes.
+    function p2pkh(bytes20 hash160) internal pure returns (bytes memory) {
+        return abi.encodePacked(bytes1(0x02), bytes1(0x00), hash160);
+    }
+
+    /// A kind-1 (P2SH) recipient: `02 01 <hash160>`, 22 bytes.
+    function p2sh(bytes20 hash160) internal pure returns (bytes memory) {
+        return abi.encodePacked(bytes1(0x02), bytes1(0x01), hash160);
+    }
+
+    /// A kind-2 (PQPKH) recipient: `02 02 <scheme> <keyHash>`, 35 bytes.
+    function pqpkh(uint8 scheme, bytes32 keyHash) internal pure returns (bytes memory) {
+        return abi.encodePacked(bytes1(0x02), bytes1(0x02), bytes1(scheme), keyHash);
+    }
+
+    /// The recipient the tests burn to when the recipient is not the point.
+    function someRecipient() internal pure returns (bytes memory) {
+        return p2pkh(bytes20(uint160(0xAbCd)));
+    }
+
     function mintTo(address to, uint256 amount, bytes32 lockId) internal {
         bridge.mint(
             lockId, amount, to, signSorted(guardianPair(), mintDigest(address(bridge), lockId, amount, to))

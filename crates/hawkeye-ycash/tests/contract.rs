@@ -103,6 +103,7 @@ fn through(method: &str, text: &str) -> Result<Value, String> {
         "set_create" => rt::<SetCreateResult>(text),
         "set_join" => rt::<SetJoinResult>(text),
         "set_heartbeat" => rt::<HeartbeatResult>(text),
+        "set_leave" => rt::<LeaveResult>(text),
         "set_buildact" | "set_signact" => rt::<ActResult>(text),
         "set_sendact" | "set_equivocation" | "vault_send" | "vault_release" => rt::<Hash256>(text),
         "vault_lock" => rt::<VaultLockResult>(text),
@@ -123,9 +124,9 @@ fn contract_is_the_node_copy() {
     assert_eq!(c["branchid"], "6d5b7a31");
     assert_eq!(
         c["source"]["sha256"],
-        "b3e9c414b92c55c38ed4da0cdb04412eba4e56c77c344075cd8f2beb7a612a1a"
+        "d7783c8e22061759d07686d2ef8569568160ce0d0ae2d79b323d851460b2a033"
     );
-    assert_eq!(c["methods"].as_object().unwrap().len(), 22);
+    assert_eq!(c["methods"].as_object().unwrap().len(), 23);
     assert_eq!(c["types"]["pqkeyid"]["json"], "string");
 }
 

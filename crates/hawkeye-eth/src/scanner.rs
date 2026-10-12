@@ -14,7 +14,7 @@
 //! `safe` is one epoch back, `finalized` two); start it with `--slots-in-an-epoch 1` for tests.
 
 use alloy::eips::BlockNumberOrTag;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
@@ -55,12 +55,14 @@ pub struct LogMeta {
 /// A decoded bridge event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BridgeEvent {
-    /// `BurnToYcash(nonce, from, amount, ycashRecipient)`: a burn to release on Ycash.
+    /// `BurnToYcash(nonce, from, amount, ycashRecipient)`: a burn to release on Ycash. The
+    /// recipient is the raw `bytes` the burner passed (Hawkeye plan §4.2: 22 or 35 bytes; the
+    /// contract validated its shape, `hawkeye-core` decodes it).
     Burn {
         nonce: U256,
         from: Address,
         amount: U256,
-        ycash_recipient: B256,
+        ycash_recipient: Bytes,
     },
     /// `Minted(lockId, to, amount)` (threshold mint or optimistic execute).
     Minted {

@@ -17,8 +17,10 @@ use crate::keys::PubKey33;
 use crate::pq::{PqKeyId, is_known_scheme};
 use crate::script::*;
 
-/// The bridge's vault tag, `"WYEC"`.
+/// The Ethereum bridge's vault tag, `"WYEC"`.
 pub const TAG_WYEC: [u8; 4] = *b"WYEC";
+/// The NEAR bridge's vault tag, `"NYEC"` (0x4E 0x59 0x45 0x43, NEAR plan N-1).
+pub const TAG_NYEC: [u8; 4] = *b"NYEC";
 
 /// `delay` range (V and I).
 pub const DELAY_MIN: u16 = 1;
@@ -372,6 +374,38 @@ pub fn parse_bond(redeem: &[u8]) -> Result<(PubKey33, u32)> {
         return Err(Error::Template("not the canonical bond bytes"));
     }
     Ok((key, locktime))
+}
+
+/// The scriptSig of a bond withdrawal: `<DER sig ‖ SIGHASH_ALL> <redeem>`, signed by `key`
+/// (the member key) over the ZIP-243 sighash of input `input_index` of `tx`, with the bond's
+/// redeem script as the scriptCode, the bond's `amount_zat` and `branch_id` (the next block's).
+///
+/// The transaction must satisfy the redeem script's CLTV (`nLockTime ≥ locktime`, a non-final
+/// sequence on that input) and the node's bond exit delay (owner 2026-10-11): an ACTIVE member's
+/// bond is `bad-vault-bond-locked`; it is spendable only from `exitHeight + maturity` after the
+/// member left (`set_leave`), and never once frozen.
+pub fn bond_withdrawal_script_sig(
+    tx: &crate::tx::Transaction,
+    input_index: usize,
+    key: &crate::keys::SecretKey,
+    locktime: u32,
+    amount_zat: u64,
+    branch_id: u32,
+) -> Result<Vec<u8>> {
+    let redeem = bond_redeem(&key.public_key(), locktime);
+    let digest = crate::sighash::zip243(
+        tx,
+        input_index,
+        &redeem,
+        amount_zat,
+        crate::sighash::SIGHASH_ALL,
+        branch_id,
+    )?;
+    let mut sig = crate::setsig::sign_der(key, &digest)?;
+    sig.push(crate::sighash::SIGHASH_ALL as u8);
+    let mut out = push(&sig);
+    push_to(&mut out, &redeem);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------

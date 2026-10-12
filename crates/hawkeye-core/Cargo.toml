@@ -18,6 +18,10 @@ sha3 = "=0.10.9"
 thiserror = "=2.0.21"
 
 [dev-dependencies]
+# Cross-checks only (tests/near_vectors.rs): the borsh crate near-sdk serialises with, and NEAR's
+# own account-id validation. Never runtime dependencies.
+borsh = { version = "=1.8.1", features = ["derive"] }
+near-account-id = { version = "=3.0.0", default-features = false }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 

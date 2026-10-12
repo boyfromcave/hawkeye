@@ -48,6 +48,10 @@ async fn metrics(State(ctx): State<Ctx>) -> Response {
 }
 
 async fn lock(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    let signer = match ctx.guardian() {
+        Ok(g) => g.to_string(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
     let Ok(bytes) = hex::decode(id.trim_start_matches("0x")) else {
         return err(StatusCode::BAD_REQUEST, "lockId is not hex");
     };
@@ -61,11 +65,11 @@ async fn lock(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
             outpoint: l.outpoint.to_string(),
             state: l.state.to_string(),
             amount: l.value_zat,
-            to: l.destination.map(|d| d.to_checksum()),
+            to: l.destination.map(|d| d.to_string()),
             block_height: l.block_height,
             rejection_reason: l.rejection_reason,
             signature: sig.map(|s| format!("0x{}", hex::encode(s.signature))),
-            signer: ctx.key.eth_address().to_checksum(),
+            signer,
         })
         .into_response(),
         Ok((None, _)) => err(StatusCode::NOT_FOUND, "unknown lock"),
@@ -80,8 +84,8 @@ async fn burn(State(ctx): State<Ctx>, Path(nonce): Path<u64>) -> Response {
             nonce,
             tx_hash: format!("0x{}", hex::encode(b.tx_hash)),
             amount: b.amount,
-            recipient: format!("0x{}", hex::encode(b.recipient)),
-            recipient_address: YcashRecipient::from_bytes32(&b.recipient)
+            recipient: format!("0x{}", hex::encode(&b.recipient)),
+            recipient_address: YcashRecipient::from_bytes(&b.recipient)
                 .ok()
                 .map(|r| encode_address(&r, ctx.params.network)),
             state: b.state.to_string(),

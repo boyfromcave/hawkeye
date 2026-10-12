@@ -13,9 +13,12 @@
 # files under crates/hawkeye-eth/abi/, and say so in the commit message.
 set -eu
 
-# wyec main at the merge of PR #1 (CR-W1 optimistic mint + rate limit, CR-W2 Foundry project,
-# CR-W3 recipient NatSpec). Was d2e382b (threshold mint only).
-WYEC_COMMIT=cad126a415bdb5e0ae9cf7d05f6bd1b512267efb
+# wyec `main` @ be177c5 (the merge of wyec#2, contracts = c23849a): CR-W4, ycashRecipient revision 2
+# (`burn(uint256, bytes)`, `BurnToYcash(…, bytes)`, `InvalidRecipient()`; Hawkeye plan §4.2, phase
+# R2). Move this pin to the merge commit once that PR merges into wyec main. Was cad126a (main at
+# the merge of PR #1: CR-W1 optimistic mint + rate limit, CR-W2 Foundry project, CR-W3 recipient
+# NatSpec), and d2e382b before that (threshold mint only).
+WYEC_COMMIT=be177c5762019c2521ea43c81e90d59f972973b7
 WYEC_URL=${WYEC_URL:-https://github.com/boyfromcave/wyec.git}
 
 here=$(cd "$(dirname "$0")/.." && pwd)

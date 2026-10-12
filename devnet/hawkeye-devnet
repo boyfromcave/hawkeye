@@ -15,16 +15,28 @@ starts `hawkeye run` beside each attestor's own node. Each Hawkeye talks only to
 The commands mirror bridge-sim's (ycash-dd contrib/yellowback/devnet/bridge-sim) so the two can be
 compared: up | lock | burn | rogue | rogue-mint | silence | unsilence | mine | pause | resume | status |
 logs | cli | down | clean | scenario demo | roll | dormancy | takeover | double | restart | reorg |
-rogue-mint.  Python 3 standard library only; Foundry (anvil, forge, cast) on PATH.
+rogue-mint | pq-recipient.  Python 3 standard library only; Foundry (anvil, forge, cast) on PATH.
 
 The bridge (wyec @ the pin in eth/tools/fetch-wyec.sh) is deployed with threshold 2 and a 12 s
 challenge window, and the attestors run mint_mode = optimistic (the Foundation's model: one attestor
 proposes, any attestor challenges within the window, anyone executes); `--mint-mode threshold`
 runs the k-of-n mint instead (k = 2), `--challenge-window N` changes the window.
 
+`--foreign near` (NEAR plan NH5, docs/hawkeye-near-plan.md) puts the bridge on NEAR instead: a real
+NEAR sandbox node replaces anvil, the wyec-near wasm (near/) is deployed to wyec.test.near with the
+members' 64-byte NEAR guardian keys, threshold 2 and the same window, every attestor gets its own
+relayer account (hawkeye<i>.test.near) and the holder is alice.test.near; the vaults carry the tag
+NYEC, locks the NR1 destination, burn releases the HKN1 memo. `scenario demo`, `scenario
+rogue-mint` and `scenario pq-recipient` run on either bridge; the other drills are Ethereum-only.
+
+`scenario pq-recipient` (plan §9.1 R5, NEAR plan NH-R5) burns to a plain-YEC post-quantum address
+(`getnewaddress "" "pq"`, rq… on regtest): the 35-byte §4.2 revision-2 recipient, the intent's
+recipienthash = SHA256 of the TX_PQPKH script, a release the node wallet lists and spends with its
+SLH-DSA key; the PQ owner form (yr…) is refused as a recipient.
+
 Environment:
-  YCASHD, YCASH_CLI   the node binaries, built from ycash-dd `upgrade/vault` (devnet/README.md);
-                      default: `ycashd` / `ycash-cli` on PATH
+  YCASHD, YCASH_CLI   the node binaries, built from `upgrade/quantum-vaults` of ycash-dd or ycash6
+                      (post-quantum vault owners; devnet/README.md); default: `ycashd` / `ycash-cli` on PATH
   DEVNET_NODE_LINE    ycash-dd | ycash6: the node line (its start-up args, the transcript name);
                       default: read from `ycashd -version` (major version >= 6 is ycash6)
   HAWKEYE             the daemon binary (default: <repo>/target/debug/hawkeye)
@@ -34,6 +46,13 @@ Environment:
   FOUNDRY_SOLC, FOUNDRY_OFFLINE
                       passed to `forge script`; unset, the solc-js shim (eth/tools/solc) is used
                       when it is present - set DEVNET_NATIVE_SOLC=1 to let forge use native solc
+  HAWKEYE_DEVNET_FOREIGN
+                      ethereum | near: the default of --foreign (default ethereum)
+  NEAR_SANDBOX_BIN    the NEAR sandbox node (default: near/vendor/sandbox/<pin>/near-sandbox, which
+                      near/tools/fetch-sandbox.sh fetches, else `near-sandbox` on PATH)
+  NEAR_ADMIN          the set-up helper (default <repo>/target/debug/examples/near-admin:
+                      `cargo build --locked -p hawkeye-near --example near-admin`)
+  WYEC_NEAR_WASM      the contract (default near/target/wasm32-unknown-unknown/release/wyec_near.wasm)
 """
 import argparse
 import datetime
@@ -50,6 +69,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import base64
 from base64 import b64encode
 from decimal import Decimal
 
@@ -62,6 +82,13 @@ TRANSCRIPTS = os.path.join(HERE, "transcripts")
 COIN = 100_000_000
 FEE = 10_000
 TAG = b"WYEC"
+FOREIGNS = ("ethereum", "near")
+TAGS = {"ethereum": "WYEC", "near": "NYEC"}                 # NEAR plan N-1
+NEAR = 10 ** 24                                             # yoctoNEAR
+NEAR_NETWORK_ID = "sandbox"                                 # bound into every NEAR attestation (N-6)
+NEAR_ROOT = "test.near"                                     # the sandbox's genesis account (validator_key.json)
+NEAR_SANDBOX_PIN = "2.13.4"                                 # near/tools/fetch-sandbox.sh
+NEAR_EPOCH_LENGTH = 100_000                                 # no epoch change (and no GC) during a devnet run
 VAULT_BRANCH = "6d5b7a31"
 # The four Ycash upgrades and the two Zcash ones they sit on, all at 1 (the qa tests' YCASH_UPGRADE_ARGS);
 # plain regtest's getblocktemplate aborts at height >= 150 without them (devnet/README.md).
@@ -94,6 +121,7 @@ def set_params(n):
     """The plan §2 regtest row for n attestors. SET_REMOVE needs slashThreshold distinct current members
     other than the target, so slashthreshold = n - 1 (at least 1)."""
     return {"seats": n, "unlockthreshold": 1, "cancelthreshold": 1, "slashthreshold": max(1, n - 1),
+            # maturity 2 = regtest's D-Q-31 floor (mainnet/testnet: >= 16,128, the 14-day exit window)
             "ratelimitbps": 5000, "ratewindow": 20, "livenesswindow": 60, "maturity": 2, "bondmin": 1,
             "bondlockmin": 50}
 
@@ -163,7 +191,7 @@ def _ec_add(a, b):
     return x, (lam * (a[0] - x) - a[1]) % _P
 
 
-def compressed_pubkey(secret32):
+def _pubkey_point(secret32):
     k = int.from_bytes(secret32, "big")
     if not 0 < k < _N:
         die("secret out of range")
@@ -173,7 +201,18 @@ def compressed_pubkey(secret32):
             acc = _ec_add(acc, add)
         add = _ec_add(add, add)
         k >>= 1
+    return acc
+
+
+def compressed_pubkey(secret32):
+    acc = _pubkey_point(secret32)
     return bytes([2 + (acc[1] & 1)]) + acc[0].to_bytes(32, "big")
+
+
+def near_guardian_key(secret32):
+    """NEAR plan §2.3: the 64-byte uncompressed key x ‖ y (what env::ecrecover returns), hex."""
+    acc = _pubkey_point(secret32)
+    return (acc[0].to_bytes(32, "big") + acc[1].to_bytes(32, "big")).hex()
 
 
 def new_secret():
@@ -188,19 +227,46 @@ def wif_regtest(secret32):
     return b58check_encode(b"\xef" + secret32 + b"\x01")
 
 
-REGTEST_P2PKH, REGTEST_P2SH = b"\x1c\x95", b"\x1c\x2a"   # plan §4.2
+# Address versions (Base58Check, 2 bytes), plan §4.2: transparent P2PKH / P2SH (ycash-dd src/chainparams.cpp), the
+# plain-YEC post-quantum address sq…/tq…/rq… (D-Q-20, src/key_io.cpp PlainPQAddressVersion) and the PQ *owner*
+# address yb…/yt…/yr… (quantum spec §4; doc/yellowback-rpc.md `pqAddressVersion`), which is not a recipient.
+P2PKH_VERSIONS = {b"\x1c\x28": "mainnet", b"\x1c\x95": "testnet/regtest"}
+P2SH_VERSIONS = {b"\x1c\x2c": "mainnet", b"\x1c\x2a": "testnet/regtest"}
+PQ_PLAIN_VERSIONS = {b"\x4d\xd9": "mainnet", b"\x4f\x61": "testnet", b"\x4c\x51": "regtest"}
+PQ_OWNER_VERSIONS = {b"\x56\xab": "mainnet", b"\x57\x1e": "testnet", b"\x57\x10": "regtest"}
+REGTEST_P2PKH, REGTEST_P2SH, REGTEST_PQ_PLAIN = b"\x1c\x95", b"\x1c\x2a", b"\x4c\x51"
+PQ_SCHEMES = {1: "SLH-DSA-SHA2-128s", 2: "FN-DSA-512"}
+RECIPIENT_VERSION = 2
+RECIPIENT_P2PKH, RECIPIENT_P2SH, RECIPIENT_PQPKH = 0, 1, 2
 
 
-def ycash_recipient32(address):
-    """Plan §4.2: version 0x01, kind (0 P2PKH | 1 P2SH), 10 zero bytes, hash160."""
+def ycash_recipient(address):
+    """Plan §4.2 revision 2, the Python mirror of hawkeye-core::recipient + address: `02 ‖ kind ‖ hash160`
+    (22 bytes) for a transparent s1…/t… address (kind 0 P2PKH, 1 P2SH), `02 ‖ 02 ‖ scheme ‖ keyHash` (35 bytes)
+    for a plain-YEC post-quantum address sq…/tq…/rq… (kind 2 PQPKH, scheme 1 or 2). The PQ owner address
+    yb…/yt…/yr… is refused: owner keys are vault owners, not holder addresses."""
     payload = b58check_decode(address)
-    if len(payload) != 22:
-        die("%s is not a transparent address" % address)
-    prefix, h160 = payload[:2], payload[2:]
-    kind = {REGTEST_P2PKH: 0, REGTEST_P2SH: 1}.get(prefix)
-    if kind is None:
-        die("%s is not a regtest t-address" % address)
-    return bytes([1, kind]) + bytes(10) + h160
+    version, body = payload[:2], payload[2:]
+    if len(payload) == 22 and version in P2PKH_VERSIONS:
+        return bytes([RECIPIENT_VERSION, RECIPIENT_P2PKH]) + body
+    if len(payload) == 22 and version in P2SH_VERSIONS:
+        return bytes([RECIPIENT_VERSION, RECIPIENT_P2SH]) + body
+    if len(payload) == 35 and version in PQ_PLAIN_VERSIONS:
+        if body[0] not in PQ_SCHEMES:
+            die("%s names an unknown post-quantum scheme %d" % (address, body[0]))
+        return bytes([RECIPIENT_VERSION, RECIPIENT_PQPKH]) + body
+    if len(payload) == 35 and version in PQ_OWNER_VERSIONS:
+        die("%s is a post-quantum owner address (yb…/yt…/yr…), not a burn recipient: pass the key's plain-YEC "
+            "sq…/tq…/rq… form" % address)
+    die("%s is not a transparent or plain-YEC post-quantum address" % address)
+
+
+def decode_pq_plain_address(address):
+    """(scheme, keyHash) of a plain-YEC post-quantum address sq…/tq…/rq… (53 characters)."""
+    payload = b58check_decode(address)
+    if len(payload) != 35 or payload[:2] not in PQ_PLAIN_VERSIONS:
+        die("%s is not a plain-YEC post-quantum address" % address)
+    return payload[2], payload[3:]
 
 
 # script
@@ -255,6 +321,28 @@ def owner_slot(owner):
     return push(owner[1:]) + push_int(owner[0]) + bytes([OP_CHECKPQSIG])
 
 
+def pqpkh_script(scheme, key_hash32):
+    """The node's TX_PQPKH (35 bytes): `20 <keyHash:32> OP_1|OP_2 OP_CHECKPQSIG` — the scheme as a script
+    number, never the data push `01 01` (quantum spec F-1; ycash-dd src/script/standard.cpp GetScriptForPQKey).
+    The same bytes as a vault's PQ owner slot."""
+    return owner_slot(bytes([scheme]) + key_hash32)
+
+
+def recipient_script(field):
+    """The scriptPubKey a §4.2 revision-2 recipient field names (hawkeye-core::recipient script()):
+    P2PKH, P2SH or TX_PQPKH; recipientHash = SHA256 of it."""
+    if len(field) not in (22, 35) or field[0] != RECIPIENT_VERSION:
+        die("not a revision-2 recipient: %s" % field.hex())
+    kind, body = field[1], field[2:]
+    if kind == RECIPIENT_P2PKH and len(body) == 20:
+        return bytes([OP_DUP, 0xa9]) + push(body) + bytes([OP_EQUALVERIFY, OP_CHECKSIG])
+    if kind == RECIPIENT_P2SH and len(body) == 20:
+        return bytes([0xa9]) + push(body) + bytes([OP_EQUAL])
+    if kind == RECIPIENT_PQPKH and len(body) == 33 and body[0] in PQ_SCHEMES:
+        return pqpkh_script(body[0], body[1:])
+    die("not a revision-2 recipient: %s" % field.hex())
+
+
 def vault_script(tag, set_id, cancel_set_id, delay, owner_height, app_height, owner):
     """The V scriptPubKey (upgrade plan §15.3 with the PQ owner of quantum spec §1; ycash-dd
     qa/rpc-tests/test_framework/vault.py vault_script)."""
@@ -297,16 +385,28 @@ def serialize_tx_v4(vin, vout, lock_time, expiry_height, sequence=0xFFFFFFFF):
 
 
 HKB1 = b"HKB1"
+HKN1 = b"HKN1"                                           # NEAR plan N-5: same layout, the magic names the bridge
 MEMO_SPK_PREFIX = bytes([OP_RETURN, 0x49]) + HKB1        # 6a 49 "HKB1": the 75-byte memo script (plan §4.3)
 
 
 def decode_memo(spk_hex):
+    """An HKB1 (Ethereum) or HKN1 (NEAR) memo output, or None."""
     spk = bytes.fromhex(spk_hex)
-    if len(spk) != 75 or not spk.startswith(MEMO_SPK_PREFIX):
+    if len(spk) != 75 or spk[:2] != bytes([OP_RETURN, 0x49]) or spk[2:6] not in (HKB1, HKN1):
         return None
     d = spk[2:]
-    return {"kind": d[4], "chainid": int.from_bytes(d[5:13], "little"), "bridge": "0x" + d[13:33].hex(),
-            "ref": int.from_bytes(d[33:41], "little"), "data": d[41:73].hex()}
+    return {"magic": d[:4].decode(), "kind": d[4], "chainid": int.from_bytes(d[5:13], "little"),
+            "bridge": "0x" + d[13:33].hex(), "ref": int.from_bytes(d[33:41], "little"), "data": d[41:73].hex()}
+
+
+def near_chain_id(network_id):
+    """NEAR plan §2.2: the memo's chainId, the first 8 bytes of SHA256("near:" ‖ network_id), u64 LE."""
+    return int.from_bytes(sha256(b"near:" + network_id.encode())[:8], "little")
+
+
+def near_bridge_id(contract_id):
+    """NEAR plan §2.2: the memo's bridge, the first 20 bytes of SHA256(contract account id)."""
+    return "0x" + sha256(contract_id.encode())[:20].hex()
 
 
 def zat(amount):
@@ -443,6 +543,72 @@ class Node:
         return lambda *p: self.call(name, *p)
 
 
+class NearRPC:
+    """NEAR JSON-RPC (stdlib): views, blocks, a contract's per-block state changes and receipts."""
+
+    def __init__(self, port, timeout=60):
+        self.url = "http://127.0.0.1:%d" % port
+        self.timeout = timeout
+
+    def call(self, method, params):
+        body = json.dumps({"jsonrpc": "2.0", "id": "devnet", "method": method, "params": params}).encode()
+        req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            out = json.loads(r.read())
+        if out.get("error"):
+            raise RPCError(out["error"])
+        return out["result"]
+
+    def view(self, account, method, args=None, block=None):
+        p = {"request_type": "call_function", "account_id": account, "method_name": method,
+             "args_base64": b64encode(json.dumps(args or {}).encode()).decode()}
+        p.update({"block_id": block} if block is not None else {"finality": "final"})
+        r = self.call("query", p)
+        if r.get("error"):          # nearcore answers a failed view in the result
+            raise RPCError({"code": "view", "message": r["error"]})
+        return json.loads(bytes(r["result"]).decode())
+
+    def block(self, block=None):
+        return self.call("block", {"block_id": block} if block is not None else {"finality": "final"})["header"]
+
+    def status(self):
+        req = urllib.request.Request(self.url + "/status")
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return json.loads(r.read())
+
+    def contract_calls(self, account, from_h, to_h):
+        """Every function call that changed `account`'s state in blocks [from_h, to_h]:
+        [{height, timestamp, receipt, predecessor, method, args}] (NEAR plan N-8's scan, in Python)."""
+        out = []
+        for h in range(from_h, to_h + 1):
+            try:
+                ch = self.call("EXPERIMENTAL_changes", {"changes_type": "data_changes", "account_ids": [account],
+                                                        "key_prefix_base64": "", "block_id": h})
+            except RPCError:
+                continue                # a height NEAR skipped
+            seen = []
+            for c in ch["changes"]:
+                rid = c.get("cause", {}).get("receipt_hash")
+                if rid and rid not in seen:
+                    seen.append(rid)
+            ts = None
+            for rid in seen:
+                r = self.call("EXPERIMENTAL_receipt", {"receipt_id": rid})
+                for a in r.get("receipt", {}).get("Action", {}).get("actions", []):
+                    f = a.get("FunctionCall") if isinstance(a, dict) else None
+                    if not f:
+                        continue
+                    if ts is None:
+                        ts = int(self.block(h)["timestamp_nanosec"]) // 10 ** 9
+                    try:
+                        args = json.loads(base64.b64decode(f["args"]))
+                    except ValueError:
+                        args = None
+                    out.append({"height": h, "timestamp": ts, "receipt": rid, "predecessor": r["predecessor_id"],
+                                "method": f["method_name"], "args": args})
+        return out
+
+
 def jdump(x):
     return json.dumps(x, default=str, sort_keys=True)
 
@@ -482,6 +648,8 @@ class Devnet:
         self.lines = []        # the transcript (scenario)
         self._help_cache = {}
         self.bridge_overrides = {}  # from the command line (--mint-mode, --challenge-window), applied by `up`
+        self.foreign_choice = None  # --foreign (else $HAWKEYE_DEVNET_FOREIGN, else ethereum), applied by `up`
+        self.near_port = 18630      # --near-port: the NEAR sandbox's RPC (its p2p port is the next one)
         self.api_base = 7800        # --api-base: node0's hawkeye API port; attestor i listens on api_base + i
 
     # ---------------------------------------------------------------- output
@@ -531,6 +699,8 @@ class Devnet:
             out.append(("hawkeye0", s["depositor"]["pid"], "hawkeye"))
         if s.get("anvil"):
             out.append(("anvil", s["anvil"].get("pid"), "anvil"))
+        if s.get("near"):
+            out.append(("near-sandbox", s["near"].get("pid"), "near-sandbox"))
         for n in s.get("nodes", []):
             out.append(("ycashd%d" % n["index"], n.get("pid"), "ycashd"))
         return out
@@ -545,6 +715,17 @@ class Devnet:
         cli = os.environ.get("YCASH_CLI") or shutil.which("ycash-cli")
         hawkeye = os.environ.get("HAWKEYE") or os.path.join(REPO, "target", "debug", "hawkeye")
         return ycashd, cli, hawkeye
+
+    @staticmethod
+    def near_binaries():
+        """(sandbox node, near-admin helper, wyec-near wasm) for `--foreign near`."""
+        vendored = os.path.join(REPO, "near", "vendor", "sandbox", NEAR_SANDBOX_PIN, "near-sandbox")
+        sandbox = os.environ.get("NEAR_SANDBOX_BIN") or (vendored if os.access(vendored, os.X_OK) else None) \
+            or shutil.which("near-sandbox")
+        admin = os.environ.get("NEAR_ADMIN") or os.path.join(REPO, "target", "debug", "examples", "near-admin")
+        wasm = os.environ.get("WYEC_NEAR_WASM") or os.path.join(REPO, "near", "target", "wasm32-unknown-unknown",
+                                                                "release", "wyec_near.wasm")
+        return sandbox, admin, wasm
 
     def hawkeye_help(self, *path):
         key = path
@@ -628,6 +809,39 @@ class Devnet:
         """The [bridge] parameters of this devnet (BRIDGE, with the overrides `up` recorded)."""
         return (self.s or {}).get("bridge") or BRIDGE
 
+    # ---------------------------------------------------------------- the foreign chain
+    def foreign(self):
+        """ethereum | near: where this devnet's bridge is (a devnet.json from before the field: ethereum)."""
+        return (self.s or {}).get("foreign") or "ethereum"
+
+    def is_near(self):
+        return self.foreign() == "near"
+
+    def tag(self):
+        """The bridge's vault tag: WYEC (Ethereum) or NYEC (NEAR, plan N-1)."""
+        return TAGS[self.foreign()]
+
+    def holder_account(self):
+        h = self.s["holder"]
+        return h["near_account"] if self.is_near() else h["eth_address"]
+
+    def near_rpc(self, timeout=60):
+        return NearRPC(self.s["near"]["port"], timeout)
+
+    def near_view(self, method, args=None, block=None):
+        return self.near_rpc().view(self.s["near"]["contract"], method, args, block)
+
+    def near_final(self):
+        """The final NEAR block: (height, unix seconds)."""
+        h = self.near_rpc().block()
+        return h["height"], int(h["timestamp_nanosec"]) // 10 ** 9
+
+    def memo_deployment(self):
+        """(chainId, bridge) a release memo of this devnet's bridge names."""
+        if self.is_near():
+            return near_chain_id(NEAR_NETWORK_ID), near_bridge_id(self.s["near"]["contract"])
+        return 31337, self.s["eth"]["bridge"].lower()
+
     # ================================================================ up
     def up(self, attestors, activation, base_port, anvil_port, interval, block_time, bridge=None, slots=1):
         old = self.load(required=False)
@@ -639,36 +853,58 @@ class Devnet:
             return self.resume()
         ycashd, cli, hawkeye = self.binaries()
         if not ycashd or not os.access(ycashd, os.X_OK):
-            die("ycashd not found: set YCASHD (devnet/README.md: build ycash-dd upgrade/vault)")
-        for tool in ("anvil", "forge", "cast"):
-            if not shutil.which(tool):
-                die("%s not on PATH (Foundry; devnet/README.md)" % tool)
-        if not os.path.isdir(os.path.join(ETH, "vendor", "wyec", "contracts")):
-            die("eth/vendor/wyec missing: run `cd eth && ./tools/fetch-wyec.sh && npm ci --ignore-scripts`")
-        if not os.path.isdir(os.path.join(ETH, "node_modules", "forge-std")):
-            die("eth/node_modules missing: run `cd eth && npm ci --ignore-scripts`")
+            die("ycashd not found: set YCASHD (devnet/README.md: build ycash-dd or ycash6 upgrade/quantum-vaults)")
+        foreign = self.foreign_choice or os.environ.get("HAWKEYE_DEVNET_FOREIGN") or "ethereum"
+        if foreign not in FOREIGNS:
+            die("--foreign must be one of %s, not %r" % (", ".join(FOREIGNS), foreign))
+        if foreign == "ethereum":
+            for tool in ("anvil", "forge", "cast"):
+                if not shutil.which(tool):
+                    die("%s not on PATH (Foundry; devnet/README.md)" % tool)
+            if not os.path.isdir(os.path.join(ETH, "vendor", "wyec", "contracts")):
+                die("eth/vendor/wyec missing: run `cd eth && ./tools/fetch-wyec.sh && npm ci --ignore-scripts`")
+            if not os.path.isdir(os.path.join(ETH, "node_modules", "forge-std")):
+                die("eth/node_modules missing: run `cd eth && npm ci --ignore-scripts`")
+            foreign_ports = [anvil_port]
+        else:
+            sandbox, admin, wasm = self.near_binaries()
+            if not sandbox or not os.access(sandbox, os.X_OK):
+                die("no NEAR sandbox node: run near/tools/fetch-sandbox.sh or set NEAR_SANDBOX_BIN")
+            if not os.access(admin, os.X_OK):
+                die("%s missing: `cargo build --locked -p hawkeye-near --example near-admin` (or set NEAR_ADMIN)" % admin)
+            if not os.path.isfile(wasm):
+                die("%s missing: `cd near && cargo build --locked --target wasm32-unknown-unknown --release` "
+                    "(or set WYEC_NEAR_WASM)" % wasm)
+            foreign_ports = [self.near_port, self.near_port + 1]
         if attestors < 1 or attestors > 15:
             die("--attestors must be 1..15")
         ports = []
         for i in range(attestors + 1):
             ports += [base_port + 2 * i, base_port + 2 * i + 1]
         api_ports = [self.api_base + i for i in range(0, attestors + 1)]
-        busy = [p for p in ports + api_ports + [anvil_port] if not free_port(p)]
+        busy = [p for p in ports + api_ports + foreign_ports if not free_port(p)]
         if busy:
-            die("ports in use: %s (choose --base-port / --anvil-port / --api-base)" % busy)
+            die("ports in use: %s (choose --base-port / --anvil-port / --near-port / --api-base)" % busy)
 
         line, version, banner = node_line(ycashd)
         os.makedirs(self.dir, exist_ok=True)
         self.s = {"version": 1, "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "activation": activation,
-                  "node_line": line, "node_version": version, "node_banner": banner,
+                  "foreign": foreign, "node_line": line, "node_version": version, "node_banner": banner,
                   "attestor_count": attestors, "base_port": base_port, "interval": interval,
                   "nodes": [], "attestors": [], "binaries": {"ycashd": ycashd, "ycash_cli": cli, "hawkeye": hawkeye},
                   "bridge": dict(BRIDGE, **dict(self.bridge_overrides, **(bridge or {})))}
         for i in range(attestors + 1):
             self.s["nodes"].append({"index": i, "port": base_port + 2 * i, "rpcport": base_port + 2 * i + 1,
                                     "datadir": self.path("ycash%d" % i), "pid": None})
-        self.s["anvil"] = {"port": anvil_port, "block_time": block_time, "pid": None, "slots": slots,
-                           "state": self.path("anvil-state.json"), "log": self.path("anvil.log")}
+        if foreign == "ethereum":
+            self.s["anvil"] = {"port": anvil_port, "block_time": block_time, "pid": None, "slots": slots,
+                               "state": self.path("anvil-state.json"), "log": self.path("anvil.log")}
+        else:
+            sandbox, admin, wasm = self.near_binaries()
+            self.s["near"] = {"port": self.near_port, "net_port": self.near_port + 1, "pid": None,
+                              "home": self.path("near"), "log": self.path("near-sandbox.log"),
+                              "keys": self.path("near-keys"), "contract": "wyec." + NEAR_ROOT,
+                              "sandbox": sandbox, "admin": admin, "wasm": wasm}
         self.save()
         try:
             self._up(attestors, activation)
@@ -683,7 +919,8 @@ class Devnet:
     def _up(self, attestors, activation):
         n = attestors + 1
         self.say("hawkeye-devnet up: %d regtest ycashd nodes (node0 user/miner, node1..%d attestors), vault upgrade "
-                 "%s at height %d, dir %s" % (n, attestors, VAULT_BRANCH, activation, self.dir))
+                 "%s at height %d, bridge on %s (tag %s), dir %s"
+                 % (n, attestors, VAULT_BRANCH, activation, self.foreign(), self.tag(), self.dir))
         self.say("  node line %s %s (%s); extra start-up args: %s"
                  % (self.s["node_line"], self.s["node_version"], self.s["node_banner"],
                     " ".join(LINE_ARGS[self.s["node_line"]]) or "none"))
@@ -709,20 +946,32 @@ class Devnet:
             die("vault upgrade not active at %d: %s" % (self.tip(), jdump(info)))
         self.say("  height %d: vault upgrade active (branch %s, activation %s), node0 balance %s YEC"
                  % (self.tip(), info["branchid"], info["activationheight"], self.node(0).getbalance()))
-        # ---- 3. keys: one secret per attestor, member key and Ethereum address
+        # ---- 3. keys: one secret per attestor, member key and its Ethereum / NEAR guardian form
         self.s["attestors"] = []
         for i in range(1, attestors + 1):
             secret = new_secret()
-            member, eth = self.derive_keys(secret)
-            self.s["attestors"].append({"index": i, "node": i, "secret_hex": secret.hex(), "memberkey": member,
-                                        "eth_address": eth, "api": "127.0.0.1:%d" % (self.api_base + i),
-                                        "config": self.path("attestor%d.toml" % i), "home": self.path("attestor%d" % i),
-                                        "log": self.path("attestor%d" % i, "hawkeye.log"), "pid": None})
-            self.say("  attestor%d: member key %s, eth address %s" % (i, member, eth))
-        holder = new_secret()
-        holder_addr = self.cast("wallet", "address", "--private-key", "0x" + holder.hex())
-        self.s["holder"] = {"secret_hex": holder.hex(), "eth_address": holder_addr}
-        self.say("  holder (node0's Ethereum persona): %s" % holder_addr)
+            k = self.derive_keys(secret)
+            a = {"index": i, "node": i, "secret_hex": secret.hex(), "memberkey": k["member"],
+                 "eth_address": k["eth"], "near_guardian": k["near"], "api": "127.0.0.1:%d" % (self.api_base + i),
+                 "config": self.path("attestor%d.toml" % i), "home": self.path("attestor%d" % i),
+                 "log": self.path("attestor%d" % i, "hawkeye.log"), "pid": None}
+            if self.is_near():
+                a["relayer"] = "hawkeye%d.%s" % (i, NEAR_ROOT)
+                a["relayer_key"] = os.path.join(self.s["near"]["keys"], a["relayer"] + ".json")
+                self.say("  attestor%d: member key %s, NEAR guardian %s.., relayer %s" % (i, k["member"], k["near"][:24],
+                                                                                    a["relayer"]))
+            else:
+                self.say("  attestor%d: member key %s, eth address %s" % (i, k["member"], k["eth"]))
+            self.s["attestors"].append(a)
+        if self.is_near():
+            alice = "alice." + NEAR_ROOT
+            self.s["holder"] = {"near_account": alice, "key_file": os.path.join(self.s["near"]["keys"], alice + ".json")}
+            self.say("  holder (node0's NEAR persona): %s" % alice)
+        else:
+            holder = new_secret()
+            holder_addr = self.cast("wallet", "address", "--private-key", "0x" + holder.hex())
+            self.s["holder"] = {"secret_hex": holder.hex(), "eth_address": holder_addr}
+            self.say("  holder (node0's Ethereum persona): %s" % holder_addr)
         self.save()
         # ---- 4. fund the attestor wallets with several coins each (finding (76): keep >= 8 coins)
         outs = {}
@@ -752,21 +1001,31 @@ class Devnet:
                                                             params["ratelimitbps"], params["ratewindow"],
                                                             params["livenesswindow"], params["maturity"],
                                                             params["bondmin"]))
-        # ---- 6. Ethereum: anvil + wYEC with the members' addresses as guardians
-        self.start_anvil()
-        self.deploy_wyec()
-        for addr in [a["eth_address"] for a in self.s["attestors"]] + [self.s["holder"]["eth_address"]]:
-            self.eth_rpc("anvil_setBalance", addr, ETH_FUNDING)
-        self.say("  funded %d Ethereum accounts with 1000 ETH each (anvil_setBalance)" % (attestors + 1))
+        if self.is_near():
+            # ---- 6. NEAR: a sandbox node + wyec-near with the members' 64-byte keys as guardians
+            self.start_near(fresh=True)
+            self.deploy_wyec_near()
+        else:
+            # ---- 6. Ethereum: anvil + wYEC with the members' addresses as guardians
+            self.start_anvil()
+            self.deploy_wyec()
+            for addr in [a["eth_address"] for a in self.s["attestors"]] + [self.s["holder"]["eth_address"]]:
+                self.eth_rpc("anvil_setBalance", addr, ETH_FUNDING)
+            self.say("  funded %d Ethereum accounts with 1000 ETH each (anvil_setBalance)" % (attestors + 1))
         # ---- 7. configs, enrolment, joins
         for a in self.s["attestors"]:
             os.makedirs(a["home"], exist_ok=True)
             self.write_config(a["config"], a["node"], a["secret_hex"], a["home"], a["api"],
-                              [b["api"] for b in self.s["attestors"] if b is not a])
+                              [b["api"] for b in self.s["attestors"] if b is not a],
+                              relayer=(a.get("relayer"), a.get("relayer_key")))
         self.s["depositor"] = {"config": self.path("node0.toml"), "home": self.path("node0"), "pid": None}
         os.makedirs(self.s["depositor"]["home"], exist_ok=True)
-        self.write_config(self.s["depositor"]["config"], 0, self.s["holder"]["secret_hex"],
-                          self.s["depositor"]["home"], "127.0.0.1:%d" % self.api_base, [b["api"] for b in self.s["attestors"]])
+        # node0's own Hawkeye config (lock, burn, recover): on NEAR its "relayer" is the holder, so `burn`
+        # sends from alice; its [keys] secret is a throwaway (node0 is no member)
+        h = self.s["holder"]
+        self.write_config(self.s["depositor"]["config"], 0, h.get("secret_hex") or new_secret().hex(),
+                          self.s["depositor"]["home"], "127.0.0.1:%d" % self.api_base, [b["api"] for b in self.s["attestors"]],
+                          relayer=(h.get("near_account"), h.get("key_file")))
         self.save()
         for a in self.s["attestors"]:
             self.enroll(a)
@@ -787,7 +1046,8 @@ class Devnet:
         the Hawkeyes and the miner."""
         self.say("hawkeye-devnet up: resuming the devnet in %s" % self.dir)
         busy = [p for nd in self.s["nodes"] for p in (nd["port"], nd["rpcport"]) if not free_port(p)]
-        busy += [self.s["anvil"]["port"]] if not free_port(self.s["anvil"]["port"]) else []
+        fp = [self.s["near"]["port"], self.s["near"]["net_port"]] if self.is_near() else [self.s["anvil"]["port"]]
+        busy += [p for p in fp if not free_port(p)]
         if busy:
             die("ports in use: %s" % busy)
         try:
@@ -799,7 +1059,10 @@ class Devnet:
             for nd in self.s["nodes"][1:]:
                 self.node(nd["index"]).addnode("127.0.0.1:%d" % self.s["nodes"][0]["port"], "onetry")
             self.wait_peers()
-            self.start_anvil()
+            if self.is_near():
+                self.start_near(fresh=False)
+            else:
+                self.start_anvil()
             if self.s.get("attestors"):
                 self.start_hawkeyes()
             self.start_miner()
@@ -858,37 +1121,48 @@ class Devnet:
 
     # ---------------------------------------------------------------- keys and the set
     def derive_keys(self, secret):
-        """(member key, eth address). `hawkeye keys derive --secret` when available, cross-checked against
-        this script's own derivation (compressed secp256k1 pubkey; cast for keccak256)."""
+        """{member, eth, near}: the compressed member key, its Ethereum address and its NEAR guardian key.
+        `hawkeye keys derive --secret` when available, cross-checked against this script's own derivation
+        (secp256k1 in Python; cast for keccak256, which an Ethereum devnet has on PATH)."""
         member = compressed_pubkey(secret).hex()
-        eth = self.cast("wallet", "address", "--private-key", "0x" + secret.hex())
+        near = near_guardian_key(secret)
+        eth = None
+        if shutil.which("cast"):
+            eth = self.cast("wallet", "address", "--private-key", "0x" + secret.hex())
         if self.use_binary("keys", "derive"):
             out = run_cmd([self.binaries()[2], "keys", "derive", "--secret", secret.hex()]).stdout
             got = self.parse_derive(out)
             if got[0] and got[0].lower() != member:
                 die("hawkeye keys derive: member key %s, expected %s" % (got[0], member))
-            if got[1] and got[1].lower() != eth.lower():
+            if got[1] and eth and got[1].lower() != eth.lower():
                 die("hawkeye keys derive: eth address %s, expected %s" % (got[1], eth))
+            if got[2] and got[2].lower() != near:
+                die("hawkeye keys derive: near guardian %s, expected %s" % (got[2], near))
             if not all(got):
                 self.say("  note: could not parse `hawkeye keys derive` output, using the script's derivation: %r" % out[:200])
             eth = got[1] or eth
-        return member, eth
+        if eth is None:
+            die("no Ethereum address for the member key: neither `hawkeye keys derive` nor cast")
+        return {"member": member, "eth": eth, "near": near}
 
     @staticmethod
     def parse_derive(out):
-        member = eth = None
+        member = eth = near = None
         try:
             j = json.loads(out)
             for k in ("memberkey", "member_key", "pubkey", "compressed_pubkey"):
                 member = member or j.get(k)
             for k in ("eth_address", "ethaddress", "address", "eth"):
                 eth = eth or j.get(k)
+            near = j.get("near_guardian")
         except ValueError:
             m = re.search(r"\b(0[23][0-9a-fA-F]{64})\b", out)
             member = m.group(1) if m else None
             m = re.search(r"\b(0x[0-9a-fA-F]{40})\b", out)
             eth = m.group(1) if m else None
-        return member, eth
+            m = re.search(r"\b([0-9a-fA-F]{128})\b", out)
+            near = m.group(1) if m else None
+        return member, eth, near
 
     def enroll(self, a):
         """The member key into that attestor's own node wallet (plan §3.5: importprivkey once, no rescan)."""
@@ -994,11 +1268,118 @@ class Devnet:
         self.say("  wYEC deployed: bridge %s, token %s (deploy block %s, threshold %s, challengeWindow %ss, mintMode %s) -> %s"
                  % (d["bridge"], d["token"], d["deployBlock"], d["threshold"], window, d.get("mintMode"), dest))
 
+    # ---------------------------------------------------------------- NEAR
+    def near_admin(self, *args, signer=None, timeout=180):
+        """One set-up transaction through the near-admin helper (hawkeye-near's codec): its JSON."""
+        n = self.s["near"]
+        signer = signer or os.path.join(n["home"], "validator_key.json")
+        out = run_cmd([n["admin"], args[0], "--rpc", "http://127.0.0.1:%d" % n["port"], "--signer", signer]
+                      + list(args[1:]), timeout=timeout).stdout
+        return json.loads(out)
+
+    def start_near(self, fresh):
+        """The NEAR sandbox node: `init --fast` on a fresh devnet (epoch length raised so no epoch change or
+        garbage collection happens during a run), then `run` on 127.0.0.1:<near port>."""
+        n = self.s["near"]
+        if fresh:
+            if os.path.exists(n["home"]):
+                shutil.rmtree(n["home"])
+            p = run_cmd([n["sandbox"], "--home", n["home"], "init", "--fast"], timeout=120, check=False)
+            if p.returncode != 0 or not os.path.exists(os.path.join(n["home"], "genesis.json")):
+                die("near-sandbox init failed:\n%s" % (p.stdout + p.stderr)[-1500:])
+            gpath = os.path.join(n["home"], "genesis.json")
+            with open(gpath) as f:
+                g = json.load(f)
+            g["epoch_length"] = NEAR_EPOCH_LENGTH
+            with open(gpath, "w") as f:
+                json.dump(g, f)
+            n["protocol_version"] = g.get("protocol_version")
+        argv = [n["sandbox"], "--home", n["home"], "run", "--rpc-addr", "127.0.0.1:%d" % n["port"],
+                "--network-addr", "127.0.0.1:%d" % n["net_port"]]
+        n["pid"] = spawn(argv, n["log"])
+        n["argv"] = argv
+        self.save()
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                st = self.near_rpc(5).status()
+                if st["sync_info"]["latest_block_height"] >= 2:
+                    self.say("  near-sandbox up on %s (%s, protocol %s, chain %s, height %d)"
+                             % (self.near_rpc().url, st["version"]["version"], st.get("protocol_version"),
+                                st.get("chain_id"), st["sync_info"]["latest_block_height"]))
+                    return
+            except (OSError, ValueError, KeyError):
+                pass
+            if not proc_alive(n["pid"], "near-sandbox"):
+                die("near-sandbox exited: %s" % open(n["log"], errors="replace").read()[-1500:])
+            time.sleep(0.3)
+        die("near-sandbox did not answer on %s" % self.near_rpc().url)
+
+    def deploy_wyec_near(self):
+        """Accounts (CreateAccount + Transfer + AddKey, signed by test.near), then wyec-near deployed and
+        initialised in one transaction: guardians = the members' NEAR keys, threshold, challenge window,
+        no mint cap (as the Ethereum deployment's MINT_CAP default)."""
+        n = self.s["near"]
+        os.makedirs(n["keys"], exist_ok=True)
+        contract = n["contract"]
+        ckey = os.path.join(n["keys"], contract + ".json")
+        r = self.near_admin("create-account", "--account", contract, "--amount", "50", "--out", ckey)
+        self.say("  NEAR account %s (50 NEAR: contract storage, holder registrations), tx %s" % (contract, r["tx"]))
+        for a in self.s["attestors"]:
+            r = self.near_admin("create-account", "--account", a["relayer"], "--amount", "20", "--out", a["relayer_key"])
+            self.say("  NEAR account %s (attestor%d's relayer, 20 NEAR), key %s" % (a["relayer"], a["index"], r["public_key"]))
+        h = self.s["holder"]
+        self.near_admin("create-account", "--account", h["near_account"], "--amount", "20", "--out", h["key_file"])
+        self.say("  NEAR account %s (the holder, 20 NEAR)" % h["near_account"])
+        b = self.bridge()
+        init = {"network_id": NEAR_NETWORK_ID, "guardians": [a["near_guardian"] for a in self.s["attestors"]],
+                "threshold": b["mint_threshold"], "challenge_window_sec": b["challenge_window"],
+                "mint_cap": "0", "cap_window_sec": 0}
+        r = self.near_admin("deploy", "--wasm", n["wasm"], "--init", "new", "--args", json.dumps(init), signer=ckey)
+        block = self.near_rpc().block(r["receipt_block"])
+        n["deploy_block"] = block["height"]
+        n["deploy_gas"] = r["gas_burnt"]
+        self.save()
+        cfg = self.near_view("config")
+        if cfg["guardians"] != init["guardians"] or cfg["threshold"] != init["threshold"] \
+                or cfg["challenge_window_sec"] != init["challenge_window_sec"] or cfg["network_id"] != NEAR_NETWORK_ID \
+                or cfg["contract_id"] != contract:
+            die("wyec-near config() does not match the deployment: %s" % jdump(cfg))
+        meta = self.near_view("ft_metadata")
+        self.say("  wyec-near deployed to %s (%d-byte wasm, %s) in block %d: guardians %d, threshold %d, challenge "
+                 "window %ds, mint cap none, network_id %s; gas %.2f TGas; token %s (%s, %d decimals)"
+                 % (contract, r["wasm_bytes"], os.path.relpath(n["wasm"], REPO), n["deploy_block"], len(cfg["guardians"]),
+                    cfg["threshold"], cfg["challenge_window_sec"], cfg["network_id"], r["gas_burnt"] / 1e12,
+                    meta["name"], meta["symbol"], meta["decimals"]))
+
     # ---------------------------------------------------------------- Hawkeye
-    def write_config(self, path, node_index, secret_hex, home, api, peers):
+    def write_config(self, path, node_index, secret_hex, home, api, peers, relayer=(None, None)):
+        """One hawkeye.toml. `relayer` (NEAR only): the account that sends and pays this Hawkeye's NEAR
+        transactions and its credentials file."""
         nd = self.s["nodes"][node_index]
         q = json.dumps      # TOML basic strings are JSON strings for this alphabet
         b = self.bridge()
+        if self.is_near():
+            n = self.s["near"]
+            foreign = """[foreign]
+kind = "near"
+
+[near]
+rpc_url = %s
+network_id = %s
+contract_id = %s
+relayer_account = %s
+relayer_key_file = %s
+start_block = %d
+gas_tgas = 100
+""" % (q("http://127.0.0.1:%d" % n["port"]), q(NEAR_NETWORK_ID), q(n["contract"]), q(relayer[0]), q(relayer[1]),
+                n["deploy_block"])
+        else:
+            foreign = """[eth]
+rpc_url = %s
+deployment = %s
+finality = "finalized"
+""" % (q(self.anvil_url()), q(self.path("deployments", "31337.json")))
         text = """# hawkeye-devnet: generated by `hawkeye-devnet up`; node%(node)d's sidecar. Do not edit while it runs.
 [network]
 name = "regtest"
@@ -1008,13 +1389,9 @@ rpc_url = %(ycash)s
 rpc_user = %(user)s
 rpc_password = %(password)s
 
-[eth]
-rpc_url = %(eth)s
-deployment = %(deployment)s
-finality = "finalized"
-
+%(foreign)s
 [bridge]
-set_id = %(setid)s
+%(tag)sset_id = %(setid)s
 delay = %(delay)d
 confirmations = %(confirmations)d
 min_owner_age = %(min_owner_age)d
@@ -1048,7 +1425,8 @@ drills = true
 level = "info"
 format = "text"
 """ % {"node": node_index, "ycash": q("http://127.0.0.1:%d" % nd["rpcport"]), "user": q(RPC_USER),
-       "password": q(RPC_PASSWORD), "eth": q(self.anvil_url()), "deployment": q(self.path("deployments", "31337.json")),
+       "password": q(RPC_PASSWORD), "foreign": foreign,
+       "tag": "tag = %s\n" % q(self.tag()) if self.is_near() else "",
        "setid": q(self.s["set"]["setid"]), "delay": b["delay"], "confirmations": b["confirmations"],
        "min_owner_age": b["min_owner_age"], "roll_margin": b["roll_margin"], "takeover_blocks": b["takeover_blocks"],
        "heartbeat_blocks": b["heartbeat_blocks"], "min_lock": q(b["min_lock"]), "max_lock": q(b["max_lock"]),
@@ -1122,16 +1500,22 @@ format = "text"
             self.say("background miner resumed")
 
     # ================================================================ commands
-    def lock(self, amount, dest=None, owner_age=None):
+    def lock(self, amount, dest=None, owner_age=None, owner=None):
         """node0 locks YEC under the set: a WYEC V + the destination as an ABI bytes32 OP_RETURN (plan §1.2).
-        `owner_age`: ownerHeight - tip (default: the binary's MIN_OWNER_AGE + ROLL_MARGIN + 10)."""
+        `owner_age`: ownerHeight - tip (default: the binary's MIN_OWNER_AGE + ROLL_MARGIN + 10).
+        `owner`: the vault's post-quantum owner, a PQ address (regtest `yr…`) or a 66-hex pqkeyid of
+        scheme 1; default a new SLH-DSA owner of node0's wallet (vault_getnewowner)."""
         self.load()
-        dest = dest or self.s["holder"]["eth_address"]
+        dest = dest or self.holder_account()
         dep = self.s["depositor"]["config"]
-        if self.use_binary("lock"):
+        if self.is_near() and not self.hawkeye_has("lock"):
+            die("the hawkeye binary has no `lock`: a NEAR lock (NR1 destination) needs it")
+        if self.use_binary("lock") or self.is_near():
             extra = ["--owner-age", str(owner_age)] if owner_age is not None else []
+            if owner:
+                extra += ["--owner", owner]
             out = self.hawkeye(dep, "lock", str(amount), "--dest", dest, *extra).stdout.strip()
-            self.say("hawkeye lock %s --dest %s%s: %s" % (amount, dest, " --owner-age %d" % owner_age if owner_age is not None else "",
+            self.say("hawkeye lock %s --dest %s%s: %s" % (amount, dest, "".join(" " + e for e in extra),
                                                          out.replace("\n", " | ")))
             try:                     # the JSON document: since the PQ owner its 66-hex `owner` precedes `txid`
                 j = json.loads(out.splitlines()[-1])
@@ -1142,16 +1526,21 @@ format = "text"
             m = re.search(r"\b([0-9a-f]{64})(?::(\d+))?", out)
             return {"txid": m.group(1) if m else None, "outpoint": "%s:%s" % (m.group(1), m.group(2) or 0) if m else None,
                     "via": "hawkeye", "output": out}
-        return self.lock_fallback(amount, dest, owner_age)
+        return self.lock_fallback(amount, dest, owner_age, owner=owner)
 
-    def lock_fallback(self, amount, dest, owner_age=None, lock_time=0, sequence=0xFFFFFFFF):
+    def lock_fallback(self, amount, dest, owner_age=None, lock_time=0, sequence=0xFFFFFFFF, owner=None):
         n = self.node(0)
         dest_bytes = bytes.fromhex(dest[2:] if dest.startswith("0x") else dest)
         if len(dest_bytes) == 20:
             dest_bytes = bytes(12) + dest_bytes
         if len(dest_bytes) != 32 or dest_bytes[:12] != bytes(12) or dest_bytes == bytes(32):
             die("destination must be a non-zero 20-byte Ethereum address")
-        owner = bytes.fromhex(n.vault_getnewowner(1)["owner"])  # an SLH-DSA owner of node0's wallet
+        if owner is None:
+            owner = bytes.fromhex(n.vault_getnewowner(1)["owner"])  # an SLH-DSA owner of node0's wallet
+        else:                        # the fallback has no address codec: a pqkeyid only
+            if not re.fullmatch(r"[0-9a-fA-F]{66}", owner):
+                die("the fallback builder takes --owner as a 66-hex pqkeyid (scheme || keyHash)")
+            owner = bytes.fromhex(owner)
         tip = self.tip()
         b = self.bridge()
         owner_height = tip + 1 + (owner_age if owner_age is not None else b["min_owner_age"] + OWNER_AGE_SLACK)
@@ -1192,23 +1581,29 @@ format = "text"
         return {"txid": txid, "outpoint": "%s:0" % txid, "via": "fallback", "ownerheight": owner_height, "hex": signed["hex"]}
 
     def burn(self, amount, recipient=None):
-        """The holder burns wYEC to a Ycash t-address (plan §4.2 recipient encoding)."""
+        """The holder burns wYEC to a Ycash address: a transparent t-address or a plain-YEC post-quantum
+        rq… address (plan §4.2 revision 2: a 22- or 35-byte ycashRecipient)."""
         self.load()
         recipient = recipient or self.node(0).getnewaddress()
         dep = self.s["depositor"]["config"]
-        if self.use_binary("burn"):
+        if self.is_near() and not self.hawkeye_has("burn"):
+            die("the hawkeye binary has no `burn`: a NEAR burn needs it")
+        if self.use_binary("burn") or self.is_near():
             out = self.hawkeye(dep, "burn", str(amount), "--recipient", recipient).stdout.strip()
             self.say("hawkeye burn %s --recipient %s: %s" % (amount, recipient, out.replace("\n", " | ")))
             return {"recipient": recipient, "via": "hawkeye", "output": out}
-        r32 = "0x" + ycash_recipient32(recipient).hex()
+        field = ycash_recipient(recipient)
+        rhex = "0x" + field.hex()
         out = self.cast("send", "--rpc-url", self.anvil_url(), "--private-key", "0x" + self.s["holder"]["secret_hex"],
-                        "--json", self.s["eth"]["bridge"], "burn(uint256,bytes32)", str(zat(amount)), r32, timeout=120)
+                        "--json", self.s["eth"]["bridge"], "burn(uint256,bytes)", str(zat(amount)), rhex, timeout=120)
         receipt = json.loads(out)
         if receipt.get("status") not in ("0x1", 1, "1"):
             die("burn reverted: %s" % out[:500])
-        self.say("burned %s wYEC (fallback: cast send burn) to %s (ycashRecipient %s): tx %s, block %s"
-                 % (amount, recipient, r32, receipt.get("transactionHash"), int(receipt.get("blockNumber"), 16)))
-        return {"recipient": recipient, "via": "fallback", "tx": receipt.get("transactionHash")}
+        self.say("burned %s wYEC (fallback: cast send burn) to %s (ycashRecipient %s, %d bytes): tx %s, block %s"
+                 % (amount, recipient, rhex, len(field), receipt.get("transactionHash"), int(receipt.get("blockNumber"), 16)))
+        return {"recipient": recipient, "via": "fallback", "tx": receipt.get("transactionHash"),
+                "output": json.dumps({"txhash": receipt.get("transactionHash"), "recipient": rhex,
+                                      "recipienthash": sha256(recipient_script(field)).hex()})}
 
     def rogue(self, amount, attestor=1):
         """A member signs an unlock with no burn behind it (drill D-2)."""
@@ -1221,11 +1616,11 @@ format = "text"
             return {"intent": m.group(0) if m else None, "via": "hawkeye", "output": out}
         n = self.node(a["node"])
         value = zat(amount)
-        vaults = sorted(n.vault_list({"tag": "WYEC", "setid": self.s["set"]["setid"], "kind": "vault"}),
+        vaults = sorted(n.vault_list({"tag": self.tag(), "setid": self.s["set"]["setid"], "kind": "vault"}),
                         key=lambda r: -r["valuezat"])
         vault = next((r for r in vaults if r["valuezat"] >= value), None)
         if vault is None:
-            die("no WYEC vault under the set holds %s YEC" % amount)
+            die("no %s vault under the set holds %s YEC" % (self.tag(), amount))
         thief = n.getnewaddress()
         built = n.vault_buildunlock(vault["outpoint"], [{"address": thief, "amount": Decimal(str(amount))}])
         signed = n.set_signunlock(built["hex"])
@@ -1325,7 +1720,7 @@ format = "text"
                 st["members"] = [{"attestor": keys.get(m["key"]), "key": m["key"], "status": m["status"],
                                   "current": m["current"], "live": m["live"], "lastact": m["lastact"],
                                   "bondfrozen": m["bondfrozen"]} for m in info["memberlist"]]
-                rows = n0.vault_list({"tag": "WYEC", "setid": self.s["set"]["setid"]})
+                rows = n0.vault_list({"tag": self.tag(), "setid": self.s["set"]["setid"]})
                 st["vaults"] = [{"outpoint": r["outpoint"], "value": r["value"], "height": r["height"]}
                                 for r in rows if r["kind"] == "vault"]
                 st["intents"] = [{"outpoint": r["outpoint"], "value": r["value"], "mature": r["mature"],
@@ -1334,6 +1729,16 @@ format = "text"
                 st["locked_zat"] = sum(r["valuezat"] for r in rows)
         except Exception as error:
             st["ycash_error"] = str(error)
+        try:
+            if self.is_near() and self.s["near"].get("deploy_block"):
+                h, t = self.near_final()
+                st["near"] = {"final": h, "time": t, "contract": self.s["near"]["contract"],
+                              "totalSupply": self.wyec_supply(), "holder": self.holder_account(),
+                              "holderBalance": self.wyec_balance()}
+                if "locked_zat" in st:
+                    st["supply_invariant"] = st["near"]["totalSupply"] <= st["locked_zat"]
+        except Exception as error:
+            st["near_error"] = str(error)
         try:
             if self.s.get("eth"):
                 st["eth"] = {"block": int(self.cast("block-number", "--rpc-url", self.anvil_url())),
@@ -1383,7 +1788,12 @@ format = "text"
             print("  eth: block %d (finalized %d), wYEC totalSupply %s, holder %s balance %s; supply invariant %s"
                   % (e["block"], e["finalized"], yec(e["totalSupply"]), e["holder"], yec(e["holderBalance"]),
                      "holds" if st.get("supply_invariant") else "BROKEN" if "supply_invariant" in st else "n/a"))
-        for k in ("ycash_error", "eth_error"):
+        if "near" in st:
+            e = st["near"]
+            print("  near: final block %d, %s wYEC ft_total_supply %s, holder %s balance %s; supply invariant %s"
+                  % (e["final"], e["contract"], yec(e["totalSupply"]), e["holder"], yec(e["holderBalance"]),
+                     "holds" if st.get("supply_invariant") else "BROKEN" if "supply_invariant" in st else "n/a"))
+        for k in ("ycash_error", "eth_error", "near_error"):
             if k in st:
                 print("  %s: %s" % (k, st[k]))
         for k, v in st["hawkeye"].items():
@@ -1393,7 +1803,7 @@ format = "text"
 
     def logs(self, lines, follow):
         self.load()
-        files = [self.path("miner.log"), self.s["anvil"]["log"], self.path("forge-deploy.log")]
+        files = [self.path("miner.log"), (self.s.get("anvil") or self.s.get("near"))["log"], self.path("forge-deploy.log")]
         files += [os.path.join(n["datadir"], "regtest", "debug.log") for n in self.s["nodes"]]
         files += [a["log"] for a in self.s.get("attestors", [])]
         files = [f for f in files if os.path.exists(f)]
@@ -1427,6 +1837,8 @@ format = "text"
             self.s["miner"]["pid"] = None
         if self.s.get("anvil"):
             self.s["anvil"]["pid"] = None
+        if self.s.get("near"):
+            self.s["near"]["pid"] = None
         for n in self.s.get("nodes", []):
             n["pid"] = None
         self.save()
@@ -1466,7 +1878,7 @@ format = "text"
         die("timed out after %ds waiting for: %s%s" % (timeout, what, " (last error: %s)" % last_error if last_error else ""))
 
     def intents(self):
-        return self.node(0).vault_list({"tag": "WYEC", "setid": self.s["set"]["setid"], "kind": "intent"})
+        return self.node(0).vault_list({"tag": self.tag(), "setid": self.s["set"]["setid"], "kind": "intent"})
 
     def memo_of(self, txid):
         tx = self.node(0).getrawtransaction(txid, 1)
@@ -1514,11 +1926,13 @@ format = "text"
                 line, version = node_line(self.binaries()[0])[:2]
             except DevnetError:
                 line, version = "unknown", "unknown"
-        return "%s-%s-%s-%s.txt" % (kind, started.strftime("%Y-%m-%d"), line, version)
+        return "%s-%s-%s-%s%s.txt" % (kind, started.strftime("%Y-%m-%d"), line, version, "-near" if self.is_near() else "")
 
     def scenario_demo(self, attestors, activation, base_port, anvil_port, interval, block_time, keep, timeout):
         started = datetime.datetime.now(datetime.timezone.utc)
         self.say("=== hawkeye-devnet scenario demo (plan §8 D-1 + D-2), %s" % started.strftime("%Y-%m-%d %H:%M:%S UTC"))
+        if (self.foreign_choice or os.environ.get("HAWKEYE_DEVNET_FOREIGN") or "ethereum") == "near":
+            self.say("bridge on NEAR (NEAR plan NH5): wyec-near on a NEAR sandbox, tag NYEC, NR1 destination, HKN1 memo")
         ycashd = self.binaries()[0]
         if ycashd:
             line, version, banner = node_line(ycashd)
@@ -1531,23 +1945,24 @@ format = "text"
             self.up(attestors, activation, base_port, anvil_port, interval, block_time)
             if not self.hawkeye_has("run"):
                 die("the hawkeye binary has no `run` subcommand: the demo needs the sidecars (devnet/README.md)")
-            dep = self.deployment()
-            token, holder = dep["token"], self.s["holder"]["eth_address"]
+            holder = self.holder_account()
             set_id = self.s["set"]["setid"]
+            chain_id, bridge_id = self.memo_deployment()
 
-            self.say("--- step 2: lock 10 YEC on node0 to the holder %s" % holder)
+            self.say("--- step 2: lock 10 YEC on node0 to the holder %s (a %s vault)" % (holder, self.tag()))
             lk = self.lock("10", holder)
             if lk.get("txid"):
                 self.wait_for("lock %s confirmed" % lk["txid"][:16],
                               lambda: self.node(0).getrawtransaction(lk["txid"], 1).get("confirmations", 0) >= 1, timeout)
 
             b = self.bridge()
-            self.say("--- step 3: wait for the mint (wYEC.balanceOf(holder) == 10e8; mint mode %s%s)"
-                     % (b["mint_mode"], ": proposeMint -> %ds challenge window -> executeMint" % b["challenge_window"]
-                        if b["mint_mode"] == "optimistic" else ", k = %d" % b["mint_threshold"]))
-            self.wait_for("holder holds 10 wYEC",
-                          lambda: int(self.eth_call(token, "balanceOf(address)(uint256)", holder)) == 10 * COIN, timeout)
-            self.say("  wYEC totalSupply %s" % yec(int(self.eth_call(token, "totalSupply()(uint256)"))))
+            calls = ("propose_mint", "execute_mint", "mint") if self.is_near() else ("proposeMint", "executeMint", "mint")
+            self.say("--- step 3: wait for the mint (wYEC %s(holder) == 10e8; mint mode %s%s)"
+                     % ("ft_balance_of" if self.is_near() else "balanceOf", b["mint_mode"],
+                        ": %s -> %ds challenge window -> %s" % (calls[0], b["challenge_window"], calls[1])
+                        if b["mint_mode"] == "optimistic" else ", k = %d (%s)" % (b["mint_threshold"], calls[2])))
+            self.wait_for("holder holds 10 wYEC", lambda: self.wyec_balance() == 10 * COIN, timeout)
+            self.say("  wYEC totalSupply %s" % yec(self.wyec_supply()))
             self.report_mint_path()
 
             recipient = self.node(0).getnewaddress()
@@ -1557,7 +1972,8 @@ format = "text"
             before = {r["outpoint"] for r in self.intents()}
             self.burn("4", recipient)
 
-            self.say("--- step 5: wait for the intent carrying the HKB1 memo")
+            magic = "HKN1" if self.is_near() else "HKB1"
+            self.say("--- step 5: wait for the intent carrying the %s memo" % magic)
 
             def burn_intent():
                 for r in self.intents():
@@ -1567,11 +1983,19 @@ format = "text"
                     if memo and memo["kind"] == 1:
                         return r, memo
                 return None
-            row, memo = self.wait_for("intent paying 4 YEC to the burn recipient, with an HKB1 kind-1 memo", burn_intent, timeout)
-            self.say("  intent %s: memo chainId %d bridge %s nonce %d burn tx 0x%s; matures at %s"
-                     % (row["outpoint"], memo["chainid"], memo["bridge"], memo["ref"], memo["data"], row["matureheight"]))
-            if memo["chainid"] != 31337 or memo["bridge"].lower() != dep["bridge"].lower():
-                die("memo names another deployment: %s" % memo)
+            row, memo = self.wait_for("intent paying 4 YEC to the burn recipient, with an %s kind-1 memo" % magic,
+                                      burn_intent, timeout)
+            self.say("  intent %s: memo %s chainId %d bridge %s nonce %d %s 0x%s; matures at %s"
+                     % (row["outpoint"], memo["magic"], memo["chainid"], memo["bridge"], memo["ref"],
+                        "burn record SHA256(borsh)" if self.is_near() else "burn tx", memo["data"], row["matureheight"]))
+            if memo["magic"] != magic or memo["chainid"] != chain_id or memo["bridge"].lower() != bridge_id.lower():
+                die("memo names another deployment: %s (expected %s chainId %d bridge %s)" % (memo, magic, chain_id, bridge_id))
+            if self.is_near():
+                rec = self.near_view("get_burns", {"from_nonce": memo["ref"], "limit": 1})[0]
+                if rec["record_hash"] != memo["data"]:
+                    die("the memo's data %s is not burn %d's record hash %s" % (memo["data"], memo["ref"], rec["record_hash"]))
+                self.say("  burn record %d on NEAR: from %s, %s zat, block %s; record_hash = memo data"
+                         % (rec["nonce"], rec["from"], rec["amount"], rec["block_height"]))
 
             self.say("--- step 6: wait for the release (node0 receives 4 YEC at %s)" % recipient)
             self.wait_for("4 YEC received at %s" % recipient,
@@ -1627,11 +2051,12 @@ format = "text"
             self.say("  member %s..: %s" % (key1[:16], jdump(m)))
 
             self.say("--- step 10: the supply invariant")
-            supply = int(self.eth_call(token, "totalSupply()(uint256)"))
-            rows = self.node(0).vault_list({"tag": "WYEC", "setid": set_id})
+            supply = self.wyec_supply()
+            rows = self.node(0).vault_list({"tag": self.tag(), "setid": set_id})
             locked = sum(r["valuezat"] for r in rows)
-            self.say("  wYEC totalSupply %s <= WYEC value under the set %s (%d vaults, %d intents)"
-                     % (yec(supply), yec(locked), sum(r["kind"] == "vault" for r in rows), sum(r["kind"] == "intent" for r in rows)))
+            self.say("  wYEC %s %s <= %s value under the set %s (%d vaults, %d intents)"
+                     % ("ft_total_supply" if self.is_near() else "totalSupply", yec(supply), self.tag(), yec(locked),
+                        sum(r["kind"] == "vault" for r in rows), sum(r["kind"] == "intent" for r in rows)))
             if supply > locked:
                 die("supply invariant broken")
             if supply != 6 * COIN:
@@ -1640,7 +2065,8 @@ format = "text"
             for k, v in st["hawkeye"].items():
                 self.say("  %s status: %s" % (k, json.dumps(v, default=str)[:300]))
             ok = True
-            self.say("=== PASS: lock -> mint, burn -> intent (HKB1) -> release, rogue -> cancel -> slash, invariant holds")
+            self.say("=== PASS: lock -> mint, burn -> intent (%s) -> release, rogue -> cancel -> slash, invariant holds%s"
+                     % (magic, " (bridge on NEAR)" if self.is_near() else ""))
         except DevnetError as error:
             self.say("=== FAIL: %s" % error)
         finally:
@@ -1822,16 +2248,23 @@ format = "text"
         return self.index_of_key(live[int(lock_id_hex, 16) % len(live)])
 
     def burn_nonce(self):
+        if self.is_near():
+            return int(self.near_view("get_burn_count"))
         return int(self.eth_call(self.s["eth"]["bridge"], "burnNonce()(uint256)"))
 
     def wyec_balance(self, who=None):
+        """wYEC of `who` (default the holder): ERC-20 balanceOf, or NEP-141 ft_balance_of."""
+        if self.is_near():
+            return int(self.near_view("ft_balance_of", {"account_id": who or self.holder_account()}))
         return int(self.eth_call(self.s["eth"]["token"], "balanceOf(address)(uint256)", who or self.s["holder"]["eth_address"]))
 
     def wyec_supply(self):
+        if self.is_near():
+            return int(self.near_view("ft_total_supply"))
         return int(self.eth_call(self.s["eth"]["token"], "totalSupply()(uint256)"))
 
     def locked_zat(self):
-        return sum(r["valuezat"] for r in self.node(0).vault_list({"tag": "WYEC", "setid": self.s["set"]["setid"]}))
+        return sum(r["valuezat"] for r in self.node(0).vault_list({"tag": self.tag(), "setid": self.s["set"]["setid"]}))
 
     def received(self, address):
         return Decimal(self.node(0).getreceivedbyaddress(address, 1))
@@ -1949,7 +2382,7 @@ format = "text"
 
     def lock_mint(self, amount, total, timeout, owner_age=None):
         """Lock `amount` with the binary and wait until the holder holds `total` wYEC."""
-        lk = self.lock(amount, self.s["holder"]["eth_address"], owner_age)
+        lk = self.lock(amount, self.holder_account(), owner_age)
         if not lk.get("txid"):
             die("the lock printed no txid: %s" % lk)
         self.wait_for("lock %s confirmed" % lk["txid"][:16], lambda: self.confirmations(lk["txid"]) >= 1, timeout)
@@ -1976,7 +2409,7 @@ format = "text"
         return {"nonce": nonce, "recipient": recipient, "rhash": rhash, "out": out}
 
     def wait_burn_intent(self, nonce, from_h, timeout):
-        return self.wait_for("an intent carrying the HKB1 kind-1 memo of burn %d" % nonce,
+        return self.wait_for("an intent carrying the %s kind-1 memo of burn %d" % ("HKN1" if self.is_near() else "HKB1", nonce),
                              lambda: (self.burn_intents(nonce, from_h) or [None])[0], timeout)
 
     def assert_members(self, statuses=("active",), frozen=False):
@@ -2317,13 +2750,18 @@ format = "text"
     # ================================================================ drill D-5: rogue mint (optimistic proposal)
     def report_mint_path(self):
         """The transcript lines of how the mint went: proposals (by whom), challenges, executes."""
-        bridge = self.s["eth"]["bridge"]
-        try:
-            count = int(self.eth_call(bridge, "proposalCount()(uint96)"))
-        except Exception:
-            return
-        self.say("  bridge: proposalCount %d, threshold %s, challengeWindow %ss"
-                 % (count, self.eth_call(bridge, "threshold()(uint8)"), self.eth_call(bridge, "challengeWindow()(uint64)")))
+        if self.is_near():
+            c = self.near_view("config")
+            self.say("  wyec-near: proposal_count %d, threshold %d, challenge_window_sec %d, burn_count %d"
+                     % (c["proposal_count"], c["threshold"], c["challenge_window_sec"], c["burn_count"]))
+        else:
+            bridge = self.s["eth"]["bridge"]
+            try:
+                count = int(self.eth_call(bridge, "proposalCount()(uint96)"))
+            except Exception:
+                return
+            self.say("  bridge: proposalCount %d, threshold %s, challengeWindow %ss"
+                     % (count, self.eth_call(bridge, "threshold()(uint8)"), self.eth_call(bridge, "challengeWindow()(uint64)")))
         for a in self.s["attestors"]:
             for name in ("mint_proposed", "mint_executed", "mint_challenged", "mint_submitted"):
                 for ln in self.log_events(a, name):
@@ -2333,6 +2771,8 @@ format = "text"
         return int(self.cast("block", str(block), "--field", "timestamp", "--rpc-url", self.anvil_url()))
 
     def drill_rogue_mint(self, timeout):
+        if self.is_near():
+            return self.drill_rogue_mint_near(timeout)
         set_id = self.s["set"]["setid"]
         bridge, token = self.s["eth"]["bridge"], self.s["eth"]["token"]
         b = self.bridge()
@@ -2433,6 +2873,125 @@ format = "text"
         return ("honest lock -> proposal -> execute (unchallenged); rogue proposal %d for a lockId with no lock -> "
                 "challenged by attestor%s %ds before eta -> no wYEC, proposer vetoed -> attestor%d removed, bond frozen"
                 % (pid, ",".join(map(str, by)), eta - cts, rogue))
+
+    def near_attestor_of(self, account):
+        """The attestor whose relayer account is `account`, or None."""
+        return next((a["index"] for a in self.s["attestors"] if a.get("relayer") == account), None)
+
+    def drill_rogue_mint_near(self, timeout):
+        """D-5 on the NEAR bridge: `propose_mint` for a lockId with no lock behind it, from the rogue's own
+        relayer account; another attestor's `challenge_mint` within the window; no wYEC; the rogue vetoed for
+        that lock and slashed on Ycash. The challenge is found the way Hawkeye finds it (N-8): the contract's
+        state changes per block, their receipts' calls."""
+        set_id = self.s["set"]["setid"]
+        contract = self.s["near"]["contract"]
+        rpc = self.near_rpc()
+        b = self.bridge()
+        if b["mint_mode"] != "optimistic":
+            self.say("  (mint mode %s: the honest mint is k-of-n; the watchers challenge proposals in every mode)" % b["mint_mode"])
+        cfg = self.near_view("config")
+        window = cfg["challenge_window_sec"]
+        self.step("lock 10 YEC (NYEC vault, NR1 destination %s); the honest mint (%s; threshold %d, challenge window %ds): "
+                  "nobody challenges it" % (self.holder_account(), b["mint_mode"], cfg["threshold"], window))
+        self.lock_mint("10", 10 * COIN, timeout)
+        self.report_mint_path()
+        if self.scan_logs(["event=mint_challenged"]):
+            die("an honest proposal was challenged: %s" % self.scan_logs(["event=mint_challenged"]))
+        honest = rpc.contract_calls(contract, self.s["near"]["deploy_block"], self.near_final()[0])
+        for c in honest:
+            who = self.near_attestor_of(c["predecessor"])
+            self.say("  near block %d: %s from %s%s" % (c["height"], c["method"], c["predecessor"],
+                                                        " (attestor%d's relayer)" % who if who else ""))
+
+        rogue = 1
+        ra = self.attestor(rogue)
+        self.step("attestor%d proposes 5 wYEC for a lockId with no lock behind it: `hawkeye rogue-mint 5 --to %s` (one "
+                  "Mint signature, drill sign-once record; propose_mint from its own relayer account)" % (rogue, ra["relayer"]))
+        before = self.wyec_supply()
+        rm = self.rogue_mint("5", rogue, to=ra["relayer"])
+        lock_id, pid, eta = rm["lockid"], int(rm["proposal_id"]), int(rm["eta"])
+        lock_hex = lock_id[2:] if lock_id.startswith("0x") else lock_id
+        if rm["proposer"].lower() != "0x" + ra["near_guardian"]:
+            die("the proposal's proposer %s is not attestor%d (0x%s)" % (rm["proposer"], rogue, ra["near_guardian"]))
+        prop_ts = int(rpc.block(rm["block"])["timestamp_nanosec"]) // 10 ** 9
+        st = self.near_view("proposal_status", {"lock_id": lock_hex})
+        self.say("  proposal %d of lockId %s.. in NEAR block %d (t=%d), eta %d (= t + %ds); proposal_status %s"
+                 % (pid, lock_id[:18], rm["block"], prop_ts, eta, eta - prop_ts, st))
+
+        self.step("another attestor challenges it inside the window (a Challenge(lockId, %d) signature, challenge_mint)" % pid)
+
+        def challenged():
+            if self.near_view("get_proposal", {"lock_id": lock_hex}) is not None:
+                return None
+            for c in rpc.contract_calls(contract, rm["block"], self.near_final()[0]):
+                if c["method"] == "challenge_mint" and (c["args"] or {}).get("lock_id") == lock_hex \
+                        and (c["args"] or {}).get("proposal_id") == pid:
+                    return c
+            return None
+        ch = self.wait_for("challenge_mint(%s.., %d) in a final NEAR block" % (lock_id[:18], pid), challenged,
+                           window + 30, poll=0.5)
+        by = self.near_attestor_of(ch["predecessor"])
+        self.say("  challenge_mint in NEAR block %d (t=%d, %ds before eta) sent by %s (attestor%s); receipt %s"
+                 % (ch["height"], ch["timestamp"], eta - ch["timestamp"], ch["predecessor"], by or "?", ch["receipt"]))
+        if by is None:
+            die("the challenge was sent by %s, no attestor's relayer" % ch["predecessor"])
+        if by == rogue:
+            die("the rogue challenged its own proposal; the drill needs another attestor")
+        if ch["timestamp"] >= eta:
+            die("challenged at t=%d, not before eta %d" % (ch["timestamp"], eta))
+        for a in self.s["attestors"]:
+            for ln in self.log_events(a, "mint_challenged"):
+                self.say("  attestor%d: %s" % (a["index"], ln.strip()[:230]))
+            for ln in self.log_events(a, "own_fraudulent_proposal"):
+                self.say("  attestor%d: %s" % (a["index"], ln.strip()[:230]))
+
+        self.step("the window passes: no wYEC for the rogue lockId; the proposer is vetoed for it")
+        self.wait_for("NEAR final time past eta %d" % eta, lambda: self.near_final()[1] > eta + 1, window + 30, poll=0.5)
+        status = self.near_view("proposal_status", {"lock_id": lock_hex})
+        consumed = self.near_view("is_consumed", {"lock_id": lock_hex})
+        vetoed = self.near_view("is_vetoed", {"lock_id": lock_hex, "guardian": ra["near_guardian"]})
+        ex = run_cmd([self.s["near"]["admin"], "call", "--rpc", rpc.url, "--signer", self.s["holder"]["key_file"],
+                      "--contract", contract, "--method", "execute_mint", "--args", json.dumps({"lock_id": lock_hex})],
+                     timeout=120, check=False)
+        exec_err = (ex.stdout + ex.stderr).strip().splitlines()[-1:] if ex.returncode != 0 else ["SUCCEEDED"]
+        self.say("  proposal_status %s, is_consumed %s, is_vetoed[lockId][attestor%d] %s; execute_mint (from %s): %s"
+                 % (status, consumed, rogue, vetoed, self.holder_account(), exec_err[0][:200] if exec_err else "?"))
+        if status != "None" or consumed is not False or vetoed is not True or ex.returncode == 0 \
+                or "wyec: no such proposal" not in (ex.stdout + ex.stderr):
+            die("the rogue proposal is not dead: status %s consumed %s vetoed %s" % (status, consumed, vetoed))
+        supply, bal = self.wyec_supply(), self.wyec_balance(rm["to"])
+        self.say("  wYEC ft_total_supply %s (before the rogue proposal %s); balance of the rogue recipient %s: %s; "
+                 "proposal_count %d" % (yec(supply), yec(before), rm["to"], yec(bal), self.near_view("config")["proposal_count"]))
+        if supply != before or bal != 0:
+            die("wYEC was minted for the rogue lockId")
+
+        self.step("the proposer is slashed on Ycash: attestor%d removed, bond frozen" % rogue)
+
+        def slashed():
+            for m in self.node(0).set_getinfo(set_id)["memberlist"]:
+                if m["key"] == ra["memberkey"] and m["status"] == "removed" and m["bondfrozen"]:
+                    return m
+            return None
+        m = self.wait_for("attestor%d status removed, bondfrozen true" % rogue, slashed, timeout + 120)
+        self.say("  member %s..: %s" % (ra["memberkey"][:16], jdump(m)))
+        opened = [ln for a in self.s["attestors"] if a["index"] != rogue
+                  for ln in self.log_events(a, "slash_case_opened", needle="FRAUDULENT_MINT")]
+        for ln in opened[:2]:
+            self.say("  %s" % ln.strip()[:230])
+        if not opened:
+            die("no FRAUDULENT_MINT slash case opened by another attestor")
+        for a in self.s["attestors"]:
+            for ln in self.log_events(a, "slash_submitted"):
+                self.say("  attestor%d: %s" % (a["index"], ln.strip()[:230]))
+
+        self.step("the supply invariant holds")
+        supply, locked = self.wyec_supply(), self.locked_zat()
+        self.say("  wYEC ft_total_supply %s <= NYEC value under the set %s" % (yec(supply), yec(locked)))
+        if supply != 10 * COIN or supply > locked:
+            die("supply invariant broken (supply %s, locked %s)" % (yec(supply), yec(locked)))
+        return ("honest lock -> propose_mint -> execute_mint (unchallenged); rogue proposal %d for a lockId with no lock -> "
+                "challenge_mint by attestor%d %ds before eta -> no wYEC, proposer vetoed -> attestor%d removed, bond frozen "
+                "(bridge on NEAR)" % (pid, by, eta - ch["timestamp"], rogue))
 
     # ================================================================ drill D-16: restart / crash mid-flow
     def drill_restart(self, timeout):
@@ -2689,6 +3248,237 @@ format = "text"
         return ("Ycash reorg before C_Y: ledger rewound, no mint, single mint after re-confirmation; Ethereum reorg "
                 "below finality: no ledger row, no intent; the reused nonce released once")
 
+    # ================================================================ plan §9.1 R5: a post-quantum burn recipient
+    SLH_DSA_SCRIPTSIG = 7938      # bytes: the TX_PQPKH scriptSig of an SLH-DSA-SHA2-128s spend (quantum spec §2.1)
+
+    def burn_log_recipient(self, nonce, from_block):
+        """The recipient the bridge recorded for burn `nonce`, read from the chain itself: Ethereum, the
+        `BurnToYcash(nonce, from, amount, ycashRecipient)` log's ABI-encoded `bytes`; NEAR, `get_burns`.
+        Returns (amount_zat, recipient bytes, where, the HKN1 memo's data on NEAR = record_hash, else None)."""
+        if self.is_near():
+            rec = self.near_view("get_burns", {"from_nonce": nonce, "limit": 1})[0]
+            if rec["nonce"] != nonce:
+                die("get_burns(%d) returned burn %s" % (nonce, rec["nonce"]))
+            return int(rec["amount"]), bytes.fromhex(rec["ycash_recipient"]), "NEAR burn record %d from %s, block %s (record_hash %s)" % (
+                nonce, rec["from"], rec["block_height"], rec["record_hash"]), rec["record_hash"]
+        out = self.cast("logs", "--rpc-url", self.anvil_url(), "--from-block", str(from_block), "--address",
+                        self.s["eth"]["bridge"], "--json", "BurnToYcash(uint256,address,uint256,bytes)", str(nonce))
+        logs = [l for l in json.loads(out or "[]") if int(l["topics"][1], 16) == nonce]
+        if len(logs) != 1:
+            die("%d BurnToYcash logs for nonce %d" % (len(logs), nonce))
+        data = bytes.fromhex(logs[0]["data"][2:])
+        amount = int.from_bytes(data[:32], "big")
+        off = int.from_bytes(data[32:64], "big")
+        length = int.from_bytes(data[off:off + 32], "big")
+        return amount, data[off + 32:off + 32 + length], "BurnToYcash log in block %d (from %s, %d data bytes)" % (
+            int(logs[0]["blockNumber"], 16), "0x" + logs[0]["topics"][2][-40:], len(data)), None
+
+    def drill_pq_recipient(self, timeout):
+        """Plan §9.1 R5 (NEAR plan NH-R5): a burn to a plain-YEC post-quantum address. node0 draws
+        `getnewaddress "" "pq"` (an rq… address, D-Q-20), `hawkeye burn` encodes it as the 35-byte revision-2
+        recipient `02 02 ‖ scheme ‖ keyHash`, the bridge records those bytes, the intent commits
+        SHA256(`20 <keyHash> 51 c2`), the release pays that TX_PQPKH output, node0's wallet sees it and spends
+        it with its post-quantum key (the ~8 KB SLH-DSA scriptSig, priced at max(DEFAULT_FEE, -pqfeerate x size));
+        the PQ owner form (yr…) is refused as a recipient. Hawkeye holds no post-quantum key or code throughout."""
+        n0 = self.node(0)
+        set_id = self.s["set"]["setid"]
+        dep = self.s["depositor"]["config"]
+        chain_id, bridge_id = self.memo_deployment()
+        magic = "HKN1" if self.is_near() else "HKB1"
+        if not self.hawkeye_has("burn"):
+            die("the hawkeye binary has no `burn`: the drill burns to an rq… address through it")
+
+        self.step("lock 10 YEC on node0 to the holder %s (a %s vault with a post-quantum owner); wait for the mint"
+                  % (self.holder_account(), self.tag()))
+        lk = self.lock_mint("10", 10 * COIN, timeout)
+        self.report_mint_path()
+        owner_address = None
+        try:
+            owner_address = json.loads(lk["output"].splitlines()[-1]).get("owner_address")
+        except (KeyError, ValueError, TypeError, IndexError):
+            pass
+        if not owner_address:
+            owner_address = n0.vault_getnewowner(1)["address"]
+
+        self.step('node0 draws a plain-YEC post-quantum address: getnewaddress "" "pq" (rq…, D-Q-20) and validateaddress')
+        rq = n0.getnewaddress("", "pq")
+        v = n0.validateaddress(rq)
+        scheme, key_hash = decode_pq_plain_address(rq)
+        spk = bytes.fromhex(v["scriptPubKey"])
+        self.say("  %s (%d characters, version %s, scheme %d %s, keyHash %s)" % (rq, len(rq), b58check_decode(rq)[:2].hex(),
+                                                                               scheme, PQ_SCHEMES.get(scheme), key_hash.hex()))
+        self.say("  validateaddress: isvalid %s, ismine %s, pqscheme %s, pqkeyhash %s.., scriptPubKey %s (%d bytes)"
+                 % (v.get("isvalid"), v.get("ismine"), v.get("pqscheme"), str(v.get("pqkeyhash"))[:16], spk.hex(), len(spk)))
+        if not rq.startswith("rq") or len(rq) != 53 or b58check_decode(rq)[:2] != REGTEST_PQ_PLAIN:
+            die("%s is not a regtest plain-YEC PQ address" % rq)
+        if scheme != 1:
+            die("getnewaddress \"\" \"pq\" drew a scheme-%d key; Falcon is not active on this regtest, so scheme 1 was expected" % scheme)
+        if spk != pqpkh_script(1, key_hash) or len(spk) != 35 or spk[0] != 0x20 or spk[33:] != bytes([OP_1, OP_CHECKPQSIG]):
+            die("the scriptPubKey of %s is %s, not TX_PQPKH `20 <keyHash> 51 c2`" % (rq, spk.hex()))
+        if not v.get("ismine") or v.get("pqscheme") != 1 or v.get("pqkeyhash") != key_hash.hex():
+            die("validateaddress does not report node0's PQ key: %s" % jdump(v))
+        field = ycash_recipient(rq)
+        rhash = sha256(spk).hex()
+        if recipient_script(field) != spk or len(field) != 35 or field[:3] != bytes([2, 2, 1]):
+            die("the Python recipient codec disagrees with the node: field %s, script %s" % (field.hex(), spk.hex()))
+        self.say("  ycashRecipient (plan §4.2 revision 2, kind 2 PQPKH): 0x%s (%d bytes); recipientHash SHA256(script) %s"
+                 % (field.hex(), len(field), rhash))
+
+        self.step("hawkeye burn 4 --recipient %s (node0.toml, the holder); the bridge records the 35-byte recipient" % rq)
+        nonce = self.burn_nonce()
+        from_h = self.tip()
+        from_block = None if self.is_near() else int(self.cast("block-number", "--rpc-url", self.anvil_url()))
+        balance_before = Decimal(n0.getbalance())
+        b = self.burn("4", rq)
+        try:
+            out = json.loads(b["output"].splitlines()[-1])
+        except (ValueError, IndexError, KeyError):
+            die("hawkeye burn printed no JSON: %s" % b.get("output"))
+        if out.get("nonce") not in (None, nonce):
+            die("the burn got nonce %s, expected %d" % (out.get("nonce"), nonce))
+        if out.get("recipient", "").lower() != "0x" + field.hex() or out.get("recipienthash") != rhash \
+                or (out.get("recipient_kind") not in (None, "pqpkh")):
+            die("hawkeye burn's recipient %s / %s / %s is not the 35-byte PQPKH form 0x%s / %s"
+                % (out.get("recipient"), out.get("recipient_kind"), out.get("recipienthash"), field.hex(), rhash))
+        amount, recorded, where, record_hash = self.burn_log_recipient(nonce, from_block or 0)
+        self.say("  %s: amount %d zat, ycashRecipient 0x%s (%d bytes)" % (where, amount, recorded.hex(), len(recorded)))
+        if amount != 4 * COIN or recorded != field:
+            die("the bridge recorded %s for burn %d, not 0x%s" % (recorded.hex(), nonce, field.hex()))
+
+        self.step("negative: the PQ owner address %s.. (yr…, the vault owner form) is refused as a recipient" % owner_address[:12])
+        p = self.hawkeye(dep, "burn", "1", "--recipient", owner_address, check=False)
+        err = (p.stderr.strip() or p.stdout.strip()).splitlines()
+        self.say("  hawkeye burn 1 --recipient %s: exit %d: %s" % (owner_address, p.returncode, (err or ["?"])[-1][:200]))
+        if p.returncode == 0 or "not a recipient" not in (p.stdout + p.stderr):
+            die("a PQ owner address was accepted as a burn recipient (exit %d)" % p.returncode)
+        if self.burn_nonce() != nonce + 1:
+            die("the refused burn consumed a nonce (%d, expected %d)" % (self.burn_nonce(), nonce + 1))
+        self.say("  no nonce consumed (burn count %d)" % (nonce + 1))
+
+        self.step("wait for the intent carrying the %s memo of burn %d; its recipienthash = SHA256(the TX_PQPKH script)" % (magic, nonce))
+        it = self.wait_burn_intent(nonce, from_h, timeout)
+        memo = it["memo"]
+        if memo["magic"] != magic or memo["chainid"] != chain_id or memo["bridge"].lower() != bridge_id.lower():
+            die("memo names another deployment: %s (expected %s chainId %d bridge %s)" % (memo, magic, chain_id, bridge_id))
+        expected_data = record_hash if self.is_near() else out["txhash"][2:].lower()
+        if memo["data"] != expected_data:
+            die("the memo's data %s is not the burn's %s %s" % (memo["data"], "record_hash" if self.is_near() else "tx", expected_data))
+        row = self.wait_for("intent %s confirmed (vault_list)" % it["outpoint"],
+                            lambda: next((r for r in self.intents() if r["outpoint"] == it["outpoint"]), None), timeout)
+        dec = n0.vault_decodescript(row["script"])
+        self.say("  intent %s: %s YEC, recipienthash %s (vault_list) / %s (vault_decodescript), matures at %s; memo %s chainId %d bridge %s nonce %d"
+                 % (row["outpoint"], row["value"], row["recipienthash"], dec.get("recipienthash"), row["matureheight"],
+                    memo["magic"], memo["chainid"], memo["bridge"], memo["ref"]))
+        if row["recipienthash"] != rhash or dec.get("recipienthash") != rhash or row["valuezat"] != 4 * COIN:
+            die("the intent commits %s / %s YEC, not SHA256(%s) = %s / 4" % (row["recipienthash"], row["value"], spk.hex(), rhash))
+        for a in self.s["attestors"]:
+            code, bv = self.api(a, "burns/%d" % nonce)
+            if code == 200:
+                self.say("  attestor%d GET /burns/%d: state %s, recipient %s (%d bytes), recipient_address %s"
+                         % (a["index"], nonce, bv["state"], bv["recipient"], (len(bv["recipient"]) - 2) // 2, bv.get("recipient_address")))
+                if bv["recipient"].lower() != "0x" + field.hex() or bv.get("recipient_address") != rq:
+                    die("attestor%d's ledger holds recipient %s / %s" % (a["index"], bv["recipient"], bv.get("recipient_address")))
+
+        self.step("wait for the release: a TX_PQPKH output of 4 YEC paying %s.., seen by node0's wallet" % spk.hex()[:20])
+
+        def released():
+            sp = self.spender_of(it["outpoint"], it["height"] or from_h)
+            if not sp:
+                return None
+            t, tx = sp
+            types = [n0.vault_decodescript(o["scriptPubKey"]["hex"]).get("type") for o in tx["vout"]]
+            if "vault" in types or "intent" in types:
+                die("the intent %s was spent by %s, which is not a release (outputs %s)" % (it["outpoint"], t, types))
+            outs = [o for o in tx["vout"] if o["scriptPubKey"]["hex"] == spk.hex()]
+            if len(outs) != 1 or zat(outs[0]["value"]) != 4 * COIN:
+                die("the release %s pays %s to the PQ script, not one output of 4 YEC" % (t, [str(o["value"]) for o in outs]))
+            return t, tx, outs[0]
+        rtxid, rtx, ro = self.wait_for("intent %s released" % it["outpoint"][:16], released, timeout + 60)
+        self.wait_for("release %s confirmed" % rtxid[:16], lambda: self.confirmations(rtxid) >= 1, 120)
+        rtx = n0.getrawtransaction(rtxid, 1)
+        self.say("  release %s (%d bytes, %d in / %d out): vout %d pays %s YEC to %s, type %s, addresses %s"
+                 % (rtxid, len(rtx["hex"]) // 2, len(rtx["vin"]), len(rtx["vout"]), ro["n"], ro["value"], ro["scriptPubKey"]["hex"],
+                    ro["scriptPubKey"].get("type"), ro["scriptPubKey"].get("addresses")))
+        self.wait_for("node0 received 4 YEC at %s (getreceivedbyaddress, 1 confirmation)" % rq,
+                      lambda: Decimal(n0.getreceivedbyaddress(rq, 1)) == 4, 60)
+        coins = [u for u in n0.listunspent(1, 9999999, [rq]) if u["txid"] == rtxid and u["vout"] == ro["n"]]
+        if len(coins) != 1 or zat(coins[0]["amount"]) != 4 * COIN or coins[0]["scriptPubKey"] != spk.hex() \
+                or not coins[0].get("spendable", True):
+            die("listunspent does not list the released PQ coin: %s" % jdump(n0.listunspent(1, 9999999, [rq])))
+        balance_after = Decimal(n0.getbalance())
+        self.say("  listunspent [%s]: %s:%d, %s YEC, spendable %s, address %s; getbalance %s -> %s (+%s, coinbase maturity included)"
+                 % (rq, rtxid[:16], ro["n"], coins[0]["amount"], coins[0].get("spendable", True), coins[0].get("address"),
+                    balance_before, balance_after, balance_after - balance_before))
+        if balance_after - balance_before < 4:
+            die("node0's balance grew by %s, less than the 4 YEC released" % (balance_after - balance_before))
+        for a in self.s["attestors"]:
+            def burn_released(a=a):
+                code, bv = self.api(a, "burns/%d" % nonce)
+                return bv if code == 200 and bv.get("state") == "RELEASED" else None
+            bv = self.wait_for("attestor%d GET /burns/%d RELEASED" % (a["index"], nonce), burn_released, 60)
+            if bv["intent"] != it["outpoint"] or bv.get("recipient_address") != rq:
+                die("attestor%d's ledger: %s" % (a["index"], jdump(bv)))
+
+        self.step("node0 spends the PQ coin with its SLH-DSA key: sendtoaddress 1.5 YEC to a fresh node1 t-address "
+                  "(the other coins locked, the miner paused for the build)")
+        dest = self.node(1).getnewaddress()
+        self.pause(True)
+        others = []
+        try:
+            time.sleep(0.5)                  # a block the miner was generating lands before the coins are listed
+            others = [{"txid": u["txid"], "vout": u["vout"]} for u in n0.listunspent(0)
+                      if (u["txid"], u["vout"]) != (rtxid, ro["n"])]
+            if others and not n0.lockunspent(False, others):
+                die("lockunspent refused")
+            spend = n0.sendtoaddress(dest, Decimal("1.5"))
+        finally:
+            if others:
+                try:
+                    n0.lockunspent(True, others)
+                except RPCError as error:
+                    self.say("  lockunspent(true): %s" % error)
+            self.pause(False)
+        stx = n0.getrawtransaction(spend, 1)
+        fee = -Decimal(n0.gettransaction(spend)["fee"])
+        size = len(stx["hex"]) // 2
+        sigs = [(i["txid"], i["vout"], len(i["scriptSig"]["hex"]) // 2) for i in stx["vin"]]
+        self.say("  spend %s: %d bytes, inputs %s, fee %s YEC (%d zat; max(DEFAULT_FEE 1000, -pqfeerate x size) = %d at the "
+                 "default 100 zat/kB); outputs %s"
+                 % (spend, size, ["%s:%d scriptSig %d B" % (t[:16], n, l) for t, n, l in sigs], fee, zat(fee),
+                    max(1000, 100 * size // 1000), ["%s %s" % (o["value"], (o["scriptPubKey"].get("addresses") or [o["scriptPubKey"]["type"]])[0]) for o in stx["vout"]]))
+        if [(t, n) for t, n, _ in sigs] != [(rtxid, ro["n"])]:
+            die("the spend's inputs are %s, not the released PQ coin alone" % sigs)
+        if sigs[0][2] < 7000:
+            die("the PQ input's scriptSig is %d bytes, no SLH-DSA signature (expected about %d)" % (sigs[0][2], self.SLH_DSA_SCRIPTSIG))
+        if zat(fee) < max(1000, 100 * size // 1000):
+            die("the spend's fee %d zat is below max(DEFAULT_FEE, -pqfeerate x size)" % zat(fee))
+        self.wait_for("spend %s confirmed" % spend[:16], lambda: self.confirmations(spend) >= 1, 120)
+        self.wait_for("node1 received 1.5 YEC at %s" % dest, lambda: Decimal(self.node(1).getreceivedbyaddress(dest, 1)) == Decimal("1.5"), 60)
+        left = n0.listunspent(0, 9999999, [rq])
+        if left:
+            die("the PQ coin is still unspent: %s" % jdump(left))
+        self.say("  the PQ coin is spent (listunspent [%s] empty); scriptSig %d bytes = %s"
+                 % (rq, sigs[0][2], "the SLH-DSA-SHA2-128s TX_PQPKH scriptSig of quantum spec §2.1" if sigs[0][2] == self.SLH_DSA_SCRIPTSIG
+                    else "unexpected (spec §2.1 says %d)" % self.SLH_DSA_SCRIPTSIG))
+
+        self.step("the supply invariant holds; nobody slashed")
+        supply, locked = self.wyec_supply(), self.locked_zat()
+        rows = n0.vault_list({"tag": self.tag(), "setid": set_id})
+        self.say("  wYEC %s %s <= %s value under the set %s (%d vaults, %d intents)"
+                 % ("ft_total_supply" if self.is_near() else "totalSupply", yec(supply), self.tag(), yec(locked),
+                    sum(r["kind"] == "vault" for r in rows), sum(r["kind"] == "intent" for r in rows)))
+        if supply != 6 * COIN or supply > locked:
+            die("supply invariant broken (supply %s, locked %s)" % (yec(supply), yec(locked)))
+        self.assert_members()
+        for a in self.s["attestors"]:
+            st = self.hk_status(a)
+            if st.get("alarms"):
+                die("attestor%d alarms: %s" % (a["index"], jdump(st["alarms"])))
+        return ("burn 4 wYEC to node0's %s (35-byte PQPKH recipient, recorded by the bridge) -> %s intent with recipienthash "
+                "SHA256(20 <keyHash> 51 c2) -> release pays the TX_PQPKH output (%d-byte tx) -> node0's wallet lists it and spends "
+                "it (%d-byte SLH-DSA scriptSig, %d-byte tx, fee %d zat); the yr… owner form refused; supply %s = locked - released%s"
+                % (rq, magic, len(rtx["hex"]) // 2, sigs[0][2], size, zat(fee), yec(supply), " (bridge on NEAR)" if self.is_near() else ""))
+
 
 # ====================================================================== CLI
 
@@ -2701,7 +3491,12 @@ DRILLS = {
     # finalized = latest - 16 on anvil, so a burn can be reorged out below finality (D-10)
     "reorg": ("plan §8 D-9 + D-10: Ycash and Ethereum reorgs", "drill_reorg", {"slots": 8}),
     "rogue-mint": ("plan §8 D-5: rogue mint, an optimistic proposal with no lock", "drill_rogue_mint", {}),
+    "pq-recipient": ("plan §9.1 R5: a burn to a plain-YEC post-quantum address, released and spent", "drill_pq_recipient", {}),
 }
+
+# The scenarios that run with --foreign near (NEAR plan NH5; pq-recipient: NH-R5).
+NEAR_SCENARIOS = ("demo", "rogue-mint", "pq-recipient")
+
 
 def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)        # `hawkeye-devnet logs | head`
@@ -2727,15 +3522,23 @@ def main():
                        help="the attestors' mint mode (default optimistic; threshold = k-of-n mint with k = 2)")
         p.add_argument("--challenge-window", type=int, default=BRIDGE["challenge_window"],
                        help="the bridge's optimistic challenge window in seconds (default %d)" % BRIDGE["challenge_window"])
+        p.add_argument("--foreign", choices=FOREIGNS, default=os.environ.get("HAWKEYE_DEVNET_FOREIGN") or "ethereum",
+                       help="where the bridge is: ethereum (anvil + wYEC, default; $HAWKEYE_DEVNET_FOREIGN) or near "
+                            "(a NEAR sandbox + wyec-near, tag NYEC)")
+        p.add_argument("--near-port", type=int, default=18630,
+                       help="NEAR sandbox RPC port with --foreign near (p2p: the next port)")
 
     up_args(sub.add_parser("up", help="start the devnet (or resume a stopped one)"))
     p = sub.add_parser("lock", help="node0 locks YEC under the set (to the holder by default)")
     p.add_argument("amount")
     p.add_argument("--dest")
     p.add_argument("--owner-age", type=int, help="ownerHeight - tip (default MIN_OWNER_AGE + ROLL_MARGIN + 10)")
-    p = sub.add_parser("burn", help="the holder burns wYEC to a Ycash t-address (node0's by default)")
+    p.add_argument("--owner", help="the vault's post-quantum owner: a PQ address (yr… on regtest) or a 66-hex pqkeyid, "
+                                   "scheme 1 (default: a new SLH-DSA owner of node0's wallet, vault_getnewowner)")
+    p = sub.add_parser("burn", help="the holder burns wYEC to a Ycash address (a fresh node0 t-address by default)")
     p.add_argument("amount")
-    p.add_argument("--recipient")
+    p.add_argument("--recipient", help="a transparent t-address or a plain-YEC post-quantum rq… address "
+                                       "(getnewaddress \"\" \"pq\"); the PQ owner form yr… is refused")
     p = sub.add_parser("rogue", help="attestor1 signs an unlock with no burn (drill D-2)")
     p.add_argument("amount")
     p.add_argument("--attestor", type=int, default=1)
@@ -2771,11 +3574,17 @@ def main():
     if hasattr(args, "mint_mode"):
         dv.bridge_overrides = {"mint_mode": args.mint_mode, "challenge_window": args.challenge_window}
         dv.api_base = args.api_base
+    if hasattr(args, "foreign"):
+        if args.foreign not in FOREIGNS:
+            print("hawkeye-devnet: HAWKEYE_DEVNET_FOREIGN must be one of %s" % ", ".join(FOREIGNS), file=sys.stderr)
+            return 2
+        dv.foreign_choice = args.foreign
+        dv.near_port = args.near_port
     try:
         if args.command == "up":
             dv.up(args.attestors, args.activation, args.base_port, args.anvil_port, args.interval, args.block_time)
         elif args.command == "lock":
-            dv.lock(args.amount, args.dest, args.owner_age)
+            dv.lock(args.amount, args.dest, args.owner_age, args.owner)
         elif args.command == "burn":
             dv.burn(args.amount, args.recipient)
         elif args.command == "rogue":
@@ -2817,6 +3626,8 @@ def main():
                     die("%s holds a stopped devnet; the demo starts from a fresh one: `clean` first or pass --fresh" % dv.dir)
                 dv.clean()
                 dv.s = None
+            if args.foreign == "near" and args.name not in NEAR_SCENARIOS:
+                die("scenario %s is Ethereum-only; on NEAR: %s" % (args.name, ", ".join(NEAR_SCENARIOS)))
             drill_args = (args.attestors, args.activation, args.base_port, args.anvil_port, args.interval,
                           args.block_time, args.keep, args.timeout)
             if args.name in DRILLS:

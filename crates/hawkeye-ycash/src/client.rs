@@ -14,7 +14,7 @@ use crate::error::{Error, RpcError};
 use crate::primitives::{BlockHash, HexBytes, OutPoint, PubKey, SetId, Txid};
 use crate::stock::{
     BlockSummary, BlockWithTxs, BlockchainInfo, PrevTx, SignRawResult, TxInfo, Unspent,
-    ValidateAddress,
+    UnspentOutInfo, ValidateAddress,
 };
 use crate::types::*;
 
@@ -268,6 +268,24 @@ impl YcashRpc {
         .await
     }
 
+    /// `set_leave`: this wallet's member key leaves the set by its own `SET_REMOVE` (burn 0, no
+    /// cosigners). The bond stays locked, and slashable, until `bondspendableat`.
+    pub async fn set_leave(
+        &self,
+        setid: &SetId,
+        memberkey: Option<&PubKey>,
+    ) -> Result<LeaveResult, Error> {
+        let m = "set_leave";
+        self.call(
+            m,
+            params(vec![
+                Some(val(m, setid)?),
+                memberkey.map(|k| val(m, k)).transpose()?,
+            ]),
+        )
+        .await
+    }
+
     pub async fn set_buildact(&self, act: &BuildAct) -> Result<ActResult, Error> {
         let m = "set_buildact";
         let p = act.params().map_err(|source| Error::Request {
@@ -492,6 +510,26 @@ impl YcashRpc {
             branchid.map(Value::from),
         ];
         self.call(m, params(ps)).await
+    }
+
+    /// `gettxout`: `None` when the output is spent (by a block, or by the mempool when
+    /// `include_mempool`) or unknown.
+    pub async fn gettxout(
+        &self,
+        txid: &Txid,
+        vout: u32,
+        include_mempool: bool,
+    ) -> Result<Option<UnspentOutInfo>, Error> {
+        let m = "gettxout";
+        self.call(
+            m,
+            vec![
+                val(m, txid)?,
+                Value::from(vout),
+                Value::from(include_mempool),
+            ],
+        )
+        .await
     }
 
     pub async fn validateaddress(&self, address: &str) -> Result<ValidateAddress, Error> {
