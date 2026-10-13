@@ -48,6 +48,7 @@ hawkeye-near = { path = "../hawkeye-near", features = ["mock"] }
 hawkeye-ycash = { path = "../hawkeye-ycash", features = ["mock"] }
 alloy = { version = "=2.5.0", default-features = false, features = ["node-bindings"] }
 tempfile = "=3.27.0"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "fallible_uint"] }
 
 [lints]
 workspace = true

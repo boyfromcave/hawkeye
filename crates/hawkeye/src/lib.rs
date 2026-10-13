@@ -18,6 +18,7 @@
 
 pub mod api;
 pub mod attribution;
+pub mod audit;
 pub mod cli;
 pub mod config;
 pub mod convert;

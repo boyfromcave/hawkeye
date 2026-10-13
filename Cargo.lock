@@ -2322,6 +2322,7 @@ dependencies = [
  "hawkeye-ycash",
  "hex",
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
