@@ -2758,7 +2758,7 @@ impl MockYcashd {
         let auth = match &self.state().auth {
             Some((u, p)) => Auth::UserPass {
                 user: u.clone(),
-                password: p.clone(),
+                password: p.clone().into(),
             },
             None => Auth::None,
         };

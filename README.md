@@ -82,11 +82,15 @@ contract: rotate the member's guardian key out of the contract in the same gover
 
 ## Node requirement
 
-Hawkeye needs nodes from the **post-quantum line, `upgrade/quantum-vaults`**, on either node line
+Hawkeye needs `upgrade/vault` nodes, on either node line
 ([ycash-dd](https://github.com/boyfromcave/ycash-dd) or
-[ycash6](https://github.com/boyfromcave/ycash6)): the vault upgrade (branch ID `0x6d5b7a31`), and
-`rpcversion` 8 for the current fee rules. It parses only the post-quantum owner shape, so an
-`upgrade/vault` node has no vault this Hawkeye recognises.
+[ycash6](https://github.com/boyfromcave/ycash6)), which carry the post-quantum layer (built on
+`upgrade/quantum-vaults`, merged into `upgrade/vault`): the vault upgrade (branch ID `0x6d5b7a31`)
+and `rpcversion` 8 (`yed_getinfo`; 5 was the vault upgrade, 7 post-quantum owners, 8 the fee
+rules). It parses only the post-quantum owner shape, so a node from before the post-quantum layer
+(`rpcversion` below 7) has no vault this Hawkeye recognises. The workspace's agent rules
+(`AGENTS.md` rule 2, in [yellowback](https://github.com/boyfromcave/yellowback)) state the same
+`rpcversion` for every client; keep the two in step.
 
 Hawkeye reaches `ycashd` only through stock RPCs and the vault primitive's `set_*` / `vault_*`
 RPCs (never `yed_*`), and Ethereum and NEAR only through their standard JSON-RPC. It never needs a

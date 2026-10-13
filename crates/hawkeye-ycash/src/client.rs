@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::amount::Amount;
 use crate::error::{Error, RpcError};
 use crate::primitives::{BlockHash, HexBytes, OutPoint, PubKey, SetId, Txid};
+use crate::redacted::Redacted;
 use crate::stock::{
     BlockSummary, BlockWithTxs, BlockchainInfo, PrevTx, SignRawResult, TxInfo, Unspent,
     UnspentOutInfo, ValidateAddress,
@@ -24,7 +25,8 @@ pub enum Auth {
     None,
     UserPass {
         user: String,
-        password: String,
+        /// Never printed by `Debug` (audit 05/I-1).
+        password: Redacted<String>,
     },
     /// `<datadir>/.cookie` (mainnet) or `<datadir>/<network dir>/.cookie`; read on every call,
     /// so a restarted node's new cookie is picked up.
@@ -47,7 +49,7 @@ impl Auth {
     async fn header(&self) -> Result<Option<String>, Error> {
         let creds = match self {
             Auth::None => return Ok(None),
-            Auth::UserPass { user, password } => format!("{user}:{password}"),
+            Auth::UserPass { user, password } => format!("{user}:{}", password.expose()),
             Auth::CookieFile(p) => tokio::fs::read_to_string(p)
                 .await
                 .map_err(|source| Error::Cookie {
