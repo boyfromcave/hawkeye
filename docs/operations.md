@@ -242,8 +242,10 @@ within a working day.
 | `slash-case-<id>` | page | a slash case waits for this operator (`auto_slash = false`, the mainnet default) | verify the evidence (section 10a) and vote |
 | `burn-over-cap` | ticket | a burn larger than the set's whole per-window unlock cap is parked out of the FIFO; later burns are served | governance: a `SET_PARAMS` raising `ratelimitbps`, or a decision to leave it parked |
 | `node-sign-restored` | page | `"wallet"` mode: the node wallet refuses every set signature (`set-sign-restored`, 07/F-5): it imported the member key (enrolment) or was restored from a seed, and its restore marker is set; no unlock or cancel is signed | if no other copy of the key can have signed: `hawkeye acknowledge-restore` (section 4 step 7, section 5 step 5); otherwise do not acknowledge, leave with the key |
-| `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet: its vault is spent in the mempool, or by another transaction not yet `C_Y` deep, or it is a drill's (takeover moves the burn on) | check the node's mempool |
-| `unlock-dead` | ticket | a signed unlock can no longer confirm: its **vault** was spent by another transaction at least `C_Y` deep (a fee-input spend never makes it dead: it can be re-funded, 01/V-2); one more vault may now be signed for the burn | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
+| `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet: its vault is spent in the mempool, or in a block the follower has not recorded at the tip yet, or by another transaction not yet `C_Y` deep | check the node's mempool and the follower's lag |
+| `unlock-prior-unknown` | page | this attestor leads a burn others led before, and not every previous leader (every member, while `ledger-restored`) has answered `POST /burns/unlock`, signed, that it holds no signed unlock for it: no fresh vault is signed (an unreachable previous leader holds the burn, 01/V-2, review M-1) | bring the previous leader's Hawkeye and API back; it then re-sends or serves its bytes, or answers none |
+| `ledger-restored` | page | the ledger holds fewer sign-once records than its high-water mark (`hawkeye.db.hwm`), or the node wallet (`"wallet"` mode) signed an unlock or cancel the ledger has no record of: it was restored from a backup (review L-2); fresh unlocks wait for every member's signed "none" | `hawkeye audit-ledger`; ask the other attestors; then `hawkeye acknowledge-ledger-restore` |
+| `unlock-dead` | ticket | a signed unlock can no longer confirm: its **vault** was spent by another transaction at least `C_Y` deep (from the ledger's own spend record, the follower at the tip), or by this unlock whose intent was then cancelled `C_Y` deep; a fee-input spend never makes it dead (it can be re-funded, 01/V-2); one more vault may now be signed for the burn | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
 | `roll-overdue` | ticket | vaults past half their `ROLL_MARGIN` without a roll (HK-6) | check the roll leader and the rate limit |
 | `roll-waiting-cap` | ticket | rolls wait for rate-limit room | expected under load; governance if it persists |
 | `fee-coins-low` | ticket | fewer than 8 confirmed fee coins in the node wallet: a flood of intents can outrun the cancels | fund the wallet; `hawkeye split-coins --count 16` |
@@ -288,24 +290,39 @@ calls `vault_refee`, checks that only the fee inputs changed (log `refee`; a ref
 unlock whose fee input is gone is therefore re-sent, never declared dead: anyone holding its bytes
 could re-fund it, so signing another vault for the burn could pay it twice.
 
-**One revivable unlock per burn (01/V-2 on 05/N-1).** The rule every attestor follows: it never
-signs a second unlock for a burn while an unlock it signed for that burn could still confirm, and
-an unlock stops being revivable only when its **vault** is spent by another transaction at least
-`C_Y` deep (log `unlock_dead`) or the burn is paid. In practice:
+**One revivable unlock per burn (01/V-2 on 05/N-1; review of fix/unlock-revival).** The rule
+every attestor follows: it never signs a second unlock for a burn while an unlock it signed for
+that burn could still confirm. An unlock stops being revivable only when its **vault** is spent by
+another transaction at least `C_Y` deep — read from the ledger's own spend record with the
+follower at the tip, so a reorg cannot fast-forward it — or when this unlock spent the vault and
+its intent was then cancelled `C_Y` deep (log `unlock_dead`). In practice:
 
-- an unlock this attestor co-signed (`unlockThreshold > 1`) and now leads after a takeover is
-  re-sent re-funded (`vault_refee` replaces every fee input: they are the old leader's), with no
-  new signature — log `unlock_resend` with `refund=true`;
-- a takeover leader that holds nothing for the burn first asks every peer's `GET /burns/<nonce>`
-  (field `unlock`: the signed unlock that peer holds for it) and adopts a valid one — log
-  `unlock_prior_found` / `unlock_adopted`, then `refee` — instead of building a new unlock; only
-  when no peer has one does it sign a fresh vault (the silent old leader's bytes, should they ever
-  be revived, are a second intent for a consumed burn: the watchers cancel it as a benign race);
-- a co-signer asked again for the same unlock re-funded adds the signature it already made (log
-  `unlock_cosign_merged`), and still refuses any other unlock of the vault.
+- **No change outputs (H-1).** Every unlock, roll and cancel Hawkeye builds moves exactly the
+  template coin's value: the change output the node's build adds is dropped and the spend is
+  funded exactly with `vault_refee` (log `refee`), so whoever ever funds or re-funds those bytes
+  pays the fee and nothing else. Co-signers and takeover leaders refuse an unlock whose outputs
+  move more than the vault's value; a re-fund is sent only if it costs this wallet at most
+  0.001 YEC (`MAX_REFUND_ZAT`), else `refee_refused`.
+- An unlock this attestor co-signed (`unlockThreshold > 1`) and now leads after a takeover is
+  re-sent re-funded, with no new signature — log `unlock_resend` with `refund=true`.
+- A takeover leader that holds nothing for the burn asks every peer `POST /burns/unlock`
+  (authenticated; the answer is signed). A peer serves the signed unlock it holds only while the
+  burn is unpaid in its own ledger, and only to a current member — never on the public `GET
+  /burns/<nonce>`. A valid one is adopted (logs `unlock_prior_found`, `unlock_adopted`, `refee`).
+  A fresh vault is signed only when every previous leader of the burn in this ledger (every
+  member, while `ledger-restored`) has answered, signed, that it holds none; an unreachable or
+  unsigned answer counts for nothing (alarm `unlock-prior-unknown`, log `unlock_prior_unknown`).
+- A co-signer asked again for the same unlock re-funded adds the signature it already made (log
+  `unlock_cosign_merged`) and still refuses any other unlock of the vault.
+- **Orphans (H-2).** A member holding a signed unlock of a vault for a burn that was paid by
+  another vault `C_Y` deep marks that vault `ROLL_DUE` and reports it to the others (`POST
+  /vaults/orphaned`, logs `unlock_orphaned`, `orphan_reported`, `orphan_marked`): the vault's roll
+  leader — never a member that signed it — rolls it, which spends it, so the orphaned bytes die.
+- **Evicted unlocks (M-3).** A burn whose unlock left the mempool unmined goes back to its leader
+  after `max(TAKEOVER, C_Y)` blocks (log `burn_intent_evicted`), which re-sends it.
 
-Keep the peer API reachable to the other attestors: a takeover depends on reading the old
-leader's `/burns/<nonce>`. By hand: `ycash-cli
+Keep the peer API reachable to the other attestors: a takeover, and any fresh unlock of a burn
+someone else led, depends on their signed answers. By hand: `ycash-cli
 vault_refee <signed hex>`, then `vault_send` of the result. Re-funding needs a coin of exactly the
 missing value (within 1,000 zatoshi) or makes one with a self-send the spend chains on; keep fee
 coins confirmed (`fee-coins-low`). The node also remembers one build per vault and intent

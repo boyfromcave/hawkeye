@@ -64,6 +64,7 @@ fn burn_forward() -> Vec<(BurnState, BurnState)> {
         (IntentPending, Cancelled),
         (IntentConfirmed, Cancelled),
         (Cancelled, Finalized),
+        (IntentPending, Finalized),
     ]
 }
 
