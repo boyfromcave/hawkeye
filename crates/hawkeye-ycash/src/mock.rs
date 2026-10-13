@@ -200,6 +200,9 @@ pub struct MockState {
     pub unspent: Vec<Unspent>,
     /// The `(setid, prevout)` → `(role, sighash)` sign-once record.
     pub sign_once: HashMap<(SetId, OutPoint), (u8, Bytes32)>,
+    /// The sign-once records of each wallet view ([`MockState::wallet_views`]): separate
+    /// attestor nodes each keep their own (the shared map serves the view-less client).
+    pub view_sign_once: HashMap<(String, SetId, OutPoint), (u8, Bytes32)>,
     /// The wallet's restore marker (07/F-5): while set, `set_signunlock` / `set_signcancel`
     /// refuse a `(setid, prevout)` with no record (`set-sign-restored`) unless the call passes
     /// `{"acknowledgerestore": true}`; `set_acknowledgerestore` clears it.
@@ -469,6 +472,7 @@ impl MockState {
             addresses: BTreeMap::new(),
             unspent: vec![],
             sign_once: HashMap::new(),
+            view_sign_once: HashMap::new(),
             restored: false,
             recipients: HashMap::new(),
             auth: None,
@@ -1799,6 +1803,15 @@ impl MockState {
                 .find(|u| u.txid == txid && u.vout == vout)
                 .map(|u| (u.amount_zat, u.script_pub_key.0.clone()))
         };
+        // an output of a mempool transaction (includemempool): what the node shows too
+        let found = found.or_else(|| {
+            (mempool && self.mempool.contains(&txid))
+                .then(|| self.txs.get(&txid))
+                .flatten()
+                .and_then(|(raw, _)| Transaction::decode(raw).ok())
+                .and_then(|t| t.outputs.get(vout as usize).cloned())
+                .map(|o| (o.value, o.script_pubkey))
+        });
         let Some((value, spk)) = found else {
             return Ok(Value::Null);
         };
@@ -1815,7 +1828,7 @@ impl MockState {
             .map_or(self.tip_height(), |b| b.height);
         Ok(json!({
             "bestblock": self.tip_hash(),
-            "confirmations": self.tip_height() - height + 1,
+            "confirmations": if self.mempool.contains(&txid) { 0 } else { self.tip_height() - height + 1 },
             "value": Amount(value).to_string(),
             "scriptPubKey": match &wallet_address {
                 Some(a) => json!({"asm": "", "hex": hex::encode(&spk), "type": "pubkeyhash",
@@ -2373,7 +2386,18 @@ impl MockState {
             );
         }
         let mut recorded = false;
-        if let Some((r, sh)) = self.sign_once.get(&(setid, prevout)) {
+        let view = self
+            .current_wallet
+            .clone()
+            .filter(|w| self.wallet_views.contains_key(w));
+        let prior = match &view {
+            Some(w) => self
+                .view_sign_once
+                .get(&(w.clone(), setid, prevout))
+                .copied(),
+            None => self.sign_once.get(&(setid, prevout)).copied(),
+        };
+        if let Some((r, sh)) = prior.as_ref() {
             if *r != role || *sh != sighash {
                 return err(
                     -4,
@@ -2395,7 +2419,15 @@ impl MockState {
                 continue;
             }
             if !recorded {
-                self.sign_once.insert((setid, prevout), (role, sighash));
+                match &view {
+                    Some(w) => {
+                        self.view_sign_once
+                            .insert((w.clone(), setid, prevout), (role, sighash));
+                    }
+                    None => {
+                        self.sign_once.insert((setid, prevout), (role, sighash));
+                    }
+                }
                 recorded = true;
             }
             sigs.push(mock_set_sig(&key, &sighash));

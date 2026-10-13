@@ -330,7 +330,8 @@ impl Machine for BurnState {
             | (IntentConfirmed, Released)
             | (IntentPending, Cancelled)
             | (IntentConfirmed, Cancelled)
-            | (Cancelled, Finalized) => Some(Edge::Forward),
+            | (Cancelled, Finalized)
+            | (IntentPending, Finalized) => Some(Edge::Forward),
             (IntentConfirmed, IntentPending) | (Released, IntentConfirmed) => Some(Edge::Rewind),
             _ => None,
         }

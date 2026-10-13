@@ -915,7 +915,9 @@ impl Tx<'_> {
         )
     }
 
-    /// The live unlock that pays `burn` here, if any: its vault and origin.
+    /// The live unlock that pays `burn` here, if any: its vault and origin. A drill row (D-3's
+    /// deliberate double) is never it: it is not re-sent, served or judged as the burn's unlock
+    /// (review L-3); the per-burn guard of [`Tx::sign_once_unlock`] still counts it.
     pub fn live_unlock_for_burn(
         &self,
         set_id: &Hash32,
@@ -924,7 +926,29 @@ impl Tx<'_> {
         Ok(self
             .unlock_burn_rows(set_id, burn)?
             .into_iter()
-            .find(UnlockBurnRecord::is_live))
+            .find(|r| r.is_live() && r.origin != UnlockOrigin::Drill))
+    }
+
+    /// Every live non-drill per-burn row (the orphan check: a row whose burn was paid by another
+    /// vault).
+    pub fn live_unlock_rows(&self, set_id: &Hash32) -> Result<Vec<UnlockBurnRecord>> {
+        self.all(
+            &format!(
+                "SELECT {UNLOCK_BURN_COLS} FROM sign_once_unlock_burn
+                     WHERE set_id = ?1 AND dead_reason IS NULL AND origin != 'drill'
+                     ORDER BY signed_at"
+            ),
+            params![set_id],
+            unlock_burn_row,
+        )
+    }
+
+    /// How many Ycash sign-once records the ledger holds (the restore high-water mark, review
+    /// L-2: a ledger restored from a backup holds fewer than it once did).
+    pub fn ycash_signature_count(&self) -> Result<u64> {
+        Ok(self
+            .one("SELECT count(*) FROM sign_once_ycash", [], |r| r.get(0))?
+            .unwrap_or(0))
     }
 
     /// Mark the live row `(burn, prevout)` dead: its transaction can no longer confirm. Only a
