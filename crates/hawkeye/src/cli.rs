@@ -97,7 +97,7 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
         st.foreign.lag
     );
     println!("live members {}", st.live_members);
-    if let (Some(who), Some(bal)) = (&st.sender, st.sender_balance) {
+    if let (Some(who), Some(bal)) = (&st.sender, &st.sender_balance) {
         println!("{} sender {who} balance {bal}", st.foreign_kind);
     }
     if let Some(n) = st.fee_coins {

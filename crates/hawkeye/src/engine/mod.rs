@@ -568,7 +568,7 @@ impl Engine {
             },
             fee_coins: self.mem.fee_coins,
             sender: self.mem.sender.as_ref().map(|s| s.0.clone()),
-            sender_balance: self.mem.sender.as_ref().map(|s| s.1),
+            sender_balance: self.mem.sender.as_ref().map(|s| s.1.to_string()),
             alarms: self.alarms(),
             ticks: self.mem.ticks,
             last_errors: report.errors.clone(),

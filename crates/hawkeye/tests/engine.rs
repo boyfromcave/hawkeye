@@ -2680,7 +2680,8 @@ async fn o_gas_account_sends_the_guardian_attests() {
         st.sender.as_deref(),
         Some(senders[0].eth_address().to_checksum().as_str())
     );
-    assert!(st.sender_balance.unwrap() > 0);
+    assert!(st.sender_balance.as_ref().unwrap().parse::<u128>().unwrap() > 0);
+    serde_json::to_value(&st).expect("a wei balance above u64 serialises");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

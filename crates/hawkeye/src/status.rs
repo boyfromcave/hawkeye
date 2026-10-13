@@ -88,8 +88,9 @@ pub struct Status {
     /// The foreign-chain account that sends and pays gas (Ethereum: the `[eth] sender_*` gas
     /// account, else the member key's), and its balance (wei).
     pub sender: Option<String>,
-    /// The sender's balance, base units (wei on Ethereum).
-    pub sender_balance: Option<u128>,
+    /// The sender's balance, base units (wei on Ethereum), as a decimal string (wei exceed the
+    /// JSON number range serde_json prints).
+    pub sender_balance: Option<String>,
     /// Raised alarms.
     pub alarms: Vec<Alarm>,
     /// Ticks run by this process.
@@ -203,11 +204,15 @@ pub fn render_metrics(s: &Status) -> String {
             &[(String::new(), n as f64)],
         );
     }
-    if let Some(b) = s.sender_balance {
+    if let Some(b) = s
+        .sender_balance
+        .as_deref()
+        .and_then(|b| b.parse::<f64>().ok())
+    {
         gauge(
             "hawkeye_sender_balance",
             "Balance of the foreign-chain sender (gas) account, base units",
-            &[(String::new(), b as f64)],
+            &[(String::new(), b)],
         );
     }
     let alarms: Vec<(String, f64)> = s
