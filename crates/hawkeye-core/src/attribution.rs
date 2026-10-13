@@ -3,15 +3,16 @@
 //! An UNLOCK of a vault V (selector 1) and a CANCEL of an intent I (selector 2) carry `k`
 //! 65-byte recoverable set signatures in the scriptSig, each over
 //! `SetSigMsg(setId, role, prevout, sighash)` with
-//! `sighash = SignatureHash(scriptCode = prev scriptPubKey, tx, nIn, SIGHASH_ALL, amount,
-//! consensusBranchId)` (upgrade plan §15.2 steps 3–4). Recovering each signature over that
+//! `sighash = SignatureHash(scriptCode = prev scriptPubKey, tx, nIn,
+//! SIGHASH_ALL|SIGHASH_ANYONECANPAY, amount, consensusBranchId)` (upgrade plan §15.2 steps 3–4;
+//! [`SET_SIG_HASH_TYPE`], audit 01/V-2). Recovering each signature over that
 //! message names the signer: the evidence for a slash case.
 
 use crate::bytes::{Hash32, OutPoint};
 use crate::error::{Error, Result, array};
 use crate::keys::PubKey33;
 use crate::setsig::{Role, SIG_LEN, recover_compact, set_sig_msg};
-use crate::sighash::{SIGHASH_ALL, zip243};
+use crate::sighash::{SET_SIG_HASH_TYPE, zip243};
 use crate::template::{
     SEL_CANCEL, SEL_UNLOCK, TemplateKind, TemplateShape, parse_selector, template_shape,
 };
@@ -40,7 +41,7 @@ pub struct Attribution {
     pub role: Role,
     /// The coin the input spends.
     pub prevout: OutPoint,
-    /// The input's `SIGHASH_ALL` signature hash (internal byte order).
+    /// The input's set-signature hash ([`SET_SIG_HASH_TYPE`], `0x81`; internal byte order).
     pub sighash: Hash32,
     /// The set signatures in scriptSig order, each with its recovered key.
     pub signers: Vec<SetSigner>,
@@ -111,7 +112,7 @@ pub fn attribute_template_input(
         input_index,
         prev_spk,
         prev_value_zat,
-        SIGHASH_ALL,
+        SET_SIG_HASH_TYPE,
         branch_id,
     )?;
     let prevout = input.prevout;

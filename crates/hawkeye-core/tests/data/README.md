@@ -4,20 +4,15 @@
 
 The vault primitive's golden vector, copied verbatim from the node:
 
-- source: `boyfromcave/ycash-dd` `src/test/data/vault_vectors.json` at commit **`d41026209`**
-  (the head of the post-quantum line `upgrade/quantum-vaults`), byte-identical to
-  `boyfromcave/ycash6` `upgrade/quantum-vaults` **`0c6c5fdf2`** (checked by sha256 when copied:
-  the vector is the same on both node lines). Every V and I owner is a post-quantum key id
-  (quantum spec §1). New since the previous copy (ycash-dd `a8572900f`, sha256 `29633de7…7b131`):
-  the Falcon owner `falconOwner` (scheme 2: seed, the 897-byte `pk`, `owner`) now owns the
-  `owner-falcon-scheme-2` V, and an I of that name is new; `intentsInvalid` gains the owner-slot
-  cases `owner-scheme-as-data-push`, `owner-scheme-0`, `owner-hash-31-bytes`,
-  `owner-hash-33-bytes`; `ownerSpends` grows from one to four (`kind` and `verify` fields;
-  OWNER-RELEASED selector-3 spends of a V and of an I, and the Falcon owner spend with its
-  `falconEntropy`); the former secp256k1 owner key is relabelled `ec-legacy` in `keys` and
-  `signatures`, so the `owner-ec-key-checksig` scripts changed. The `upgrade/vault` copy was
-  ycash-dd `dbc1ab0`, sha256 `b9681ac0…6f97`.
-- sha256 `4ba212836eed05b9021ccca7d9ae151848ac79f40064fbe33d06f66438780d03`
+- source: `boyfromcave/ycash-dd` `src/test/data/vault_vectors.json` at commit **`8af82551b`**
+  (`upgrade/vault`, after the remedial-action merges), byte-identical to `boyfromcave/ycash6`
+  `upgrade/vault` **`047b561ac`** (checked by sha256 when copied: the vector is the same on both
+  node lines). New since the previous copy (ycash-dd `d41026209`, sha256 `4ba21283…80d03`): set
+  signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY` (`0x81`, audit 01/V-2), so `spends[0]`
+  (`unlock`) and `spends[1]` (`cancel`) have new `sighash`, `setSigMsg`, `sigs`, `scriptSig` and
+  `tx`; nothing else changed (`ownerSpends` is untouched: the post-quantum owner signs with the
+  hash type its signature carries).
+- sha256 `2f7a3ab2fc909bca4772957f15696e8ed5f6feec6914f957e016adf5d0fd7dc8`
 - schema and conventions: ycash-dd `qa/rpc-tests/test_framework/VAULT_VECTORS.md`; generator
   `qa/rpc-tests/test_framework/gen_vault_vectors.py` (both at the same commit)
 
@@ -34,8 +29,8 @@ post-quantum signature code (the node signs owner spends), and `verify` (`script
 `signature`) needs the node's interpreter and set state.
 
 `tests/attribution.rs` runs every `spends` case through `attribution::attribute_template_input`
-(it must name exactly the recorded signers, with the recorded sighash and `setSigMsg`) and the
-negative cases built from them.
+(it must name exactly the recorded signers, with the recorded sighash — `0x81`, and not the plain
+`SIGHASH_ALL` one — and `setSigMsg`) and the negative cases built from them.
 
 ## `sighash.json`
 

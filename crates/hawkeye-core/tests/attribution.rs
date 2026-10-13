@@ -1,13 +1,13 @@
 //! `attribute_template_input` against the node's template spends (`vault_vectors.json`
-//! `spends`, ycash-dd `d41026209`, the quantum line; the two cases are unchanged since the PQ
-//! owner landed): each attributes to exactly its recorded signers with the recorded sighash;
-//! every way the input can be wrong is refused or names other keys.
+//! `spends`, ycash-dd `8af82551b`: set signatures over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, audit
+//! 01/V-2): each attributes to exactly its recorded signers with the recorded sighash; every way
+//! the input can be wrong is refused or names other keys.
 
 use hawkeye_core::attribution::{VAULT_BRANCH_ID, attribute_template_input};
 use hawkeye_core::bytes::{OutPoint, from_hex, from_hex_array};
 use hawkeye_core::script::{OP_1, OP_2, OP_3, p2pkh_script};
 use hawkeye_core::setsig::Role;
-use hawkeye_core::sighash::{SIGHASH_ALL, zip243};
+use hawkeye_core::sighash::{SET_SIG_HASH_TYPE, SIGHASH_ALL, zip243};
 use hawkeye_core::tx::Transaction;
 use hawkeye_core::{Error, PubKey33};
 use serde_json::Value;
@@ -105,9 +105,17 @@ fn spends_attribute_to_recorded_signers() {
         let tx = Transaction::parse(&s.tx).unwrap();
         assert_eq!(tx.to_bytes().unwrap(), s.tx, "{} round trip", s.name);
         assert_eq!(
-            zip243(&tx, s.n_in, &s.spk, s.amount, SIGHASH_ALL, s.branch).unwrap(),
+            zip243(&tx, s.n_in, &s.spk, s.amount, SET_SIG_HASH_TYPE, s.branch).unwrap(),
             s.sighash,
             "{} sighash",
+            s.name
+        );
+        // 01/V-2: the set signatures are over ALL|ANYONECANPAY, not plain ALL
+        assert_eq!(SET_SIG_HASH_TYPE, 0x81);
+        assert_ne!(
+            zip243(&tx, s.n_in, &s.spk, s.amount, SIGHASH_ALL, s.branch).unwrap(),
+            s.sighash,
+            "{} plain SIGHASH_ALL",
             s.name
         );
 

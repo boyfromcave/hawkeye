@@ -3,8 +3,8 @@
 //! overwintered branch) and its `Get*Hash` helpers.
 //!
 //! The set signatures of the vault primitive sign `SetSigMsg(…, sighash)` with
-//! `sighash = SignatureHash(scriptCode, tx, nIn, SIGHASH_ALL, amount, consensusBranchId)`
-//! (upgrade plan §15.2 step 4); for a bare V or I output the `scriptCode` is the whole prev
+//! `sighash = SignatureHash(scriptCode, tx, nIn, SIGHASH_ALL|SIGHASH_ANYONECANPAY, amount,
+//! consensusBranchId)` ([`SET_SIG_HASH_TYPE`]; upgrade plan §15.2 step 4, audit 01/V-2); for a bare V or I output the `scriptCode` is the whole prev
 //! scriptPubKey (the templates have no `OP_CODESEPARATOR`).
 //!
 //! The result is the 32 BLAKE2b output bytes, which are the node's `uint256` in internal byte
@@ -24,6 +24,13 @@ pub const SIGHASH_NONE: u32 = 2;
 pub const SIGHASH_SINGLE: u32 = 3;
 /// `SIGHASH_ANYONECANPAY` (a flag on the others).
 pub const SIGHASH_ANYONECANPAY: u32 = 0x80;
+/// The hash type of every set signature (`OP_CHECKSETSIG`, upgrade plan §15.2 step 4):
+/// `SIGHASH_ALL | SIGHASH_ANYONECANPAY` = `0x81` since audit 01/V-2 (ycash-dd `8af82551b`
+/// `src/vault/checker.cpp`). It binds the template input (prevout, amount, scriptCode) and every
+/// output but no other input, so a build can be re-funded (`vault_refee`) without invalidating
+/// the set signatures already made. A set signature carries no hashtype byte: the node always
+/// hashes with this value.
+pub const SET_SIG_HASH_TYPE: u32 = SIGHASH_ALL | SIGHASH_ANYONECANPAY;
 
 const PREVOUTS: &[u8; 16] = b"ZcashPrevoutHash";
 const SEQUENCE: &[u8; 16] = b"ZcashSequencHash";
