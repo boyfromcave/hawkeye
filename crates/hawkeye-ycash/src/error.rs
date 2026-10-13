@@ -135,6 +135,14 @@ pub enum ErrorReason {
     TemplateNotVault,
     /// -4 `set-sign-once`: this wallet already signed a different spend of the outpoint
     SetSignOnce,
+    /// -4 `set-sign-restored`: the wallet carries the restore marker (restored from a seed, or it
+    /// imported a member key) and has no sign-once record for the outpoint (07/F-5)
+    SetSignRestored,
+    /// -8 `already built a different unlock`: the wallet remembers another build of the vault
+    /// (07/N-2); `rebuild` discards it, only before anyone signed it
+    AlreadyBuiltDifferent,
+    /// -8 `appheight on a tag no module governs`
+    AppHeightUngoverned,
     /// -8 `not an unspent intent output`
     NotUnspentIntent,
     /// -1 `can no longer be cancelled` (the intent matured at `height`)
@@ -224,6 +232,12 @@ impl RpcError {
             R::TemplateNotVault
         } else if self.has(-4, "set-sign-once") {
             R::SetSignOnce
+        } else if self.has(-4, "set-sign-restored") {
+            R::SetSignRestored
+        } else if self.has(-8, "already built a different unlock") {
+            R::AlreadyBuiltDifferent
+        } else if self.has(-8, "appheight on a tag no module governs") {
+            R::AppHeightUngoverned
         } else if self.has(-8, "not an unspent intent output") {
             R::NotUnspentIntent
         } else if self.has(-1, "can no longer be cancelled") {
@@ -375,6 +389,24 @@ mod tests {
                     "set-sign-once: this wallet already signed a different unlock (role 1, sighash ab) of x:0 for set y; ...",
                 ),
                 ErrorReason::SetSignOnce,
+            ),
+            (
+                e(
+                    -4,
+                    "set-sign-restored: this wallet was restored or imported a member key and has no sign-once history; ...",
+                ),
+                ErrorReason::SetSignRestored,
+            ),
+            (
+                e(
+                    -8,
+                    "this wallet already built a different unlock of x:0 (sighash ab): members sign once",
+                ),
+                ErrorReason::AlreadyBuiltDifferent,
+            ),
+            (
+                e(-8, "appheight on a tag no module governs"),
+                ErrorReason::AppHeightUngoverned,
             ),
             (
                 e(-8, "not an unspent intent output"),

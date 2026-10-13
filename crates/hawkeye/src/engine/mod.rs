@@ -310,6 +310,7 @@ impl Engine {
         step!("exposure", self.refresh_exposures());
         step!("guardians", self.check_guardians());
         step!("fees", self.check_fee_coins());
+        step!("restored", self.check_sign_restored());
         step!("watch", self.watch());
         step!("locks", self.evaluate_locks());
         step!("mint", self.mint());
@@ -368,6 +369,32 @@ impl Engine {
                 since,
             },
         );
+    }
+
+    /// A set signature the node wallet refused with `set-sign-restored` (07/F-5, `"wallet"` mode):
+    /// the wallet carries the restore marker, so it signs no unlock or cancel until the operator
+    /// imports the history and acknowledges (`hawkeye acknowledge-restore`). Paged: the bridge's
+    /// cancels depend on it.
+    pub(crate) fn note_sign_error(&mut self, e: &anyhow::Error) {
+        if format!("{e:#}").contains("set-sign-restored") {
+            self.alarm(
+                "node-sign-restored",
+                "the node wallet refuses to sign (set-sign-restored: restored from a seed or the \
+                 member key imported); after checking no other copy of the key signed, run \
+                 `hawkeye acknowledge-restore`"
+                    .to_owned(),
+            );
+        }
+    }
+
+    /// Clear `node-sign-restored` once the wallet's restore marker is gone.
+    async fn check_sign_restored(&mut self) -> Result<()> {
+        if self.mem.alarms.contains_key("node-sign-restored")
+            && !self.ctx.ycash.set_listsigned().await?.restored
+        {
+            self.clear_alarm("node-sign-restored");
+        }
+        Ok(())
     }
 
     /// Clear an alarm.

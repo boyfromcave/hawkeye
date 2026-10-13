@@ -310,7 +310,8 @@ conditional in a later upgrade).
 An intent commits `SHA256(recipient script)` and its value. Two burns of the same amount to the
 same address are indistinguishable, and a dishonest attestor could post a second intent for a burn
 already paid. Hawkeye puts a **burn-reference memo** `OP_RETURN` in every unlock (S-2 permits
-OP_RETURN outputs; the set signature, SIGHASH_ALL, covers it), so matching is exact and one burn
+OP_RETURN outputs; the set signature, `SIGHASH_ALL|SIGHASH_ANYONECANPAY` since audit 01/V-2,
+covers every output and so the memo), so matching is exact and one burn
 pays once:
 
 - a burn is **consumed** by the first intent carrying its memo that is mined and not cancelled;
@@ -385,7 +386,8 @@ at rest only. Hawkeye:
   protects the Ycash side as well as Hawkeye's ledger;
 - in **`"self"` mode** (HK-14; recommended on mainnet once the ledger backup discipline is in
   place) makes every set and act signature itself: the ZIP-243 sighash of the template input
-  under the next block's branch id, `SetSigMsg` / `ActMsg`, `sign_compact`, the signature placed
+  (hash type `SIGHASH_ALL|SIGHASH_ANYONECANPAY` = `0x81`, audit 01/V-2) under the next block's
+  branch id, `SetSigMsg` / `ActMsg`, `sign_compact`, the signature placed
   where `SignSetInPlace` / `SignActInPlace` put it (the template scriptSig; the act `OP_RETURN`
   after the payload); the node wallet funds and signs fee inputs only (`vault_send`,
   `set_sendact`) and never holds the member key. Proven on regtest on both node lines
@@ -506,7 +508,9 @@ digest is also pinned from `cast`. Sign-once covers every one of them: `Mint` pe
 
 For an intent spend, Hawkeye recomputes `msg = SHA256d("YcashSetSig" ‖ setId ‖ role ‖ prevout ‖
 sighash)` (§15.2 step 4), taking `sighash` from the node (`set_signunlock`/`set_signcancel` results,
-or ZIP-243 recomputed in H8), and recovers the signer from the 65-byte signature in the scriptSig.
+or ZIP-243 recomputed in H8 with hash type `SIGHASH_ALL|SIGHASH_ANYONECANPAY` = `0x81`, the node's
+`OP_CHECKSETSIG` digest since audit 01/V-2: it binds the template input and every output but no
+other input, so a re-funded build, `vault_refee`, keeps its signatures), and recovers the signer from the 65-byte signature in the scriptSig.
 Vectors: the node's `src/test/data/vault_vectors.json` (`setSigMsgs`, `signatures`), byte-identical on
 both lines.
 

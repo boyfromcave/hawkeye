@@ -118,6 +118,7 @@ impl Engine {
         for i in unmatched {
             if let Err(e) = self.handle_unmatched(&i).await {
                 warn!(event = "cancel_failed", intent = %i.outpoint, error = %format!("{e:#}"));
+                self.note_sign_error(&e);
             }
         }
         // e. our cancels not yet mined: re-broadcast the stored bytes (never rebuilt)
@@ -309,7 +310,8 @@ impl Engine {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    warn!(event = "cancel_failed", intent = %i.outpoint, error = %format!("{e:#}"))
+                    warn!(event = "cancel_failed", intent = %i.outpoint, error = %format!("{e:#}"));
+                    self.note_sign_error(&e);
                 }
             }
         }
@@ -435,7 +437,8 @@ impl Engine {
             return Ok(CancelOutcome::Incomplete);
         };
         let hex: HexBytes = complete.parse().map_err(|e| anyhow!("{e}"))?;
-        match self.ctx.ycash.vault_send(&hex).await {
+        // a lost fee input is re-funded (01/V-2): the cancel must confirm before the delay ends
+        match super::sign::send_set_signed(&self.ctx.ycash, &hex, op).await {
             Ok(t) => Ok(CancelOutcome::Sent(t.0)),
             Err(e) if e.rpc().is_some_and(|r| r.is_already_known()) => {
                 Ok(CancelOutcome::AlreadyKnown)

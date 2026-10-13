@@ -62,6 +62,12 @@ enum Cmd {
     },
     /// Import the member key into the node wallet (no rescan).
     Enroll,
+    /// `"wallet"` mode (07/F-5): give the node wallet this attestor's sign-once history and clear
+    /// its restore marker (`set_importsigned` of the ledger's unlock and cancel records, then
+    /// `set_acknowledgerestore`), after `audit-ledger` passes. The operator's statement that no
+    /// other copy of the member key has signed: run it once after enrolment and the `SET_JOIN`, or
+    /// after a restore (docs/operations.md §4, §5).
+    AcknowledgeRestore,
     /// Key helpers.
     Keys {
         #[command(subcommand)]
@@ -302,6 +308,7 @@ async fn main() -> Result<()> {
         Cmd::Status { json, params: true } => cli::status_params(&s, *json).await,
         Cmd::Status { json, .. } => cli::status(&s, *json).await,
         Cmd::Enroll => cli::enroll(&s).await,
+        Cmd::AcknowledgeRestore => cli::acknowledge_restore(&s).await,
         Cmd::Lock {
             amount,
             amount_pos,

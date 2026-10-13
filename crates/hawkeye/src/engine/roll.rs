@@ -188,6 +188,7 @@ impl Engine {
             }
             if let Err(e) = self.post_roll(&v).await {
                 warn!(event = "roll_failed", vault = %v.outpoint, error = %format!("{e:#}"));
+                self.note_sign_error(&e);
             }
         }
         if blocked.is_empty() {
@@ -228,20 +229,20 @@ impl Engine {
         let new_spk = new.script().map_err(|e| anyhow!("new vault: {e}"))?;
         let memo = HawkeyeMemo::roll_for(p.bridge_kind, p.deployment, &new)
             .map_err(|e| anyhow!("memo: {e}"))?;
-        let built = self
-            .ctx
-            .ycash
-            .vault_buildunlock(
-                &op_rpc(&v.outpoint),
-                &[Recipient::script(
-                    new_spk,
-                    Amount::from_zat(i64::try_from(value)?),
-                )],
-            )
-            .await?;
+        let key = self.unlock_key(&v.outpoint);
+        let unsigned_here = self.ctx.db(|t| t.ycash_signature(&key))?.is_none();
+        let built = super::sign::build_unlock(
+            &self.ctx.ycash,
+            &op_rpc(&v.outpoint),
+            &[Recipient::script(
+                new_spk,
+                Amount::from_zat(i64::try_from(value)?),
+            )],
+            unsigned_here,
+        )
+        .await?;
         let with_memo = insert_op_return(&built.hex.to_string(), &memo.encode())
             .map_err(|e| anyhow!("memo: {e}"))?;
-        let key = self.unlock_key(&v.outpoint);
         let signer = SetSigning::prepare(&self.ctx, &with_memo, Role::Unlock, v.outpoint).await?;
         let rec = self.ctx.db(|t| {
             // a roll pays no burn: per vault only
@@ -276,7 +277,7 @@ impl Engine {
             return Ok(()); // the vault's stored unlock pays a burn: burns() owns it
         }
         let hex: HexBytes = signed.parse().map_err(|e| anyhow!("{e}"))?;
-        let txid = match self.ctx.ycash.vault_send(&hex).await {
+        let txid = match super::sign::send_set_signed(&self.ctx.ycash, &hex, &v.outpoint).await {
             Ok(t) => t,
             Err(e) if e.rpc().is_some_and(|r| r.is_already_known()) => return Ok(()),
             Err(e) if matches!(e.reason(), Some(ErrorReason::Rejected { ref reason, .. }) if reason.contains("vault-rate")) =>

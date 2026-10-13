@@ -1,7 +1,7 @@
 //! A mock `ycashd` (feature `mock`): an in-process HTTP JSON-RPC server with a scriptable
 //! in-memory chain, for this crate's tests and for other crates' engine tests.
 //!
-//! It answers the 23 `set_*` / `vault_*` RPCs with the contract's shapes and the stock RPCs
+//! It answers the 27 `set_*` / `vault_*` RPCs with the contract's shapes and the stock RPCs
 //! Hawkeye uses, keeps blocks, a mempool, sets and a template-output index, and applies a
 //! simplified version of the node's rules: thresholds, the sign-once record (`set-sign-once`), the
 //! cancel window, maturity, the owner branch, the rate limit, double spends. It is not consensus:
@@ -9,8 +9,13 @@
 //! - vault and intent scripts are placeholders (`MOCKV…`/`MOCKI…` plus a hash of the fields), not
 //!   the §15.3 templates; register real scripts with [`MockState::register_script`];
 //! - set signatures are fake 65-byte strings `0x1f ‖ key ‖ sighash[..31]` over a mock sighash
-//!   (SHA256d of the transaction with every scriptSig cleared), act transactions carry a mock
-//!   payload, fee inputs come from an unlimited mock wallet;
+//!   (SHA256d of the transaction reduced to its template input, scriptSig cleared, and every
+//!   output: like the node's `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, audit 01/V-2, so `vault_refee`
+//!   keeps the signatures valid), act transactions carry a mock payload, fee inputs come from an
+//!   unlimited mock wallet;
+//! - builds are remembered per wallet and vault (`vault_buildunlock`: `reused`, `already built a
+//!   different unlock`, `rebuild`; 07/N-2); the sign-once listing RPCs answer from
+//!   [`MockState::sign_once`] and [`MockState::restored`] (the restore marker, off by default);
 //! - a join is current as soon as it is mined (no maturity).
 //!
 //! The bond rules are modelled (owner 2026-10-11, quantum plan D-Q-29..D-Q-31): bonds are real
@@ -195,6 +200,10 @@ pub struct MockState {
     pub unspent: Vec<Unspent>,
     /// The `(setid, prevout)` → `(role, sighash)` sign-once record.
     pub sign_once: HashMap<(SetId, OutPoint), (u8, Bytes32)>,
+    /// The wallet's restore marker (07/F-5): while set, `set_signunlock` / `set_signcancel`
+    /// refuse a `(setid, prevout)` with no record (`set-sign-restored`) unless the call passes
+    /// `{"acknowledgerestore": true}`; `set_acknowledgerestore` clears it.
+    pub restored: bool,
     /// Recipient scripts by `recipienthash` (for `vault_release` without a recipient).
     pub recipients: HashMap<Bytes32, Vec<u8>>,
     /// `-rpcuser`/`-rpcpassword`, checked when set.
@@ -210,6 +219,9 @@ pub struct MockState {
     http_failures: VecDeque<u16>,
     pending: HashMap<Txid, PendingAct>,
     cancels: HashMap<OutPoint, Vec<u8>>,
+    /// `vault_buildunlock`'s remembered builds: `(wallet, vault)` → (the requested outputs, the
+    /// build).
+    builds: HashMap<BuildKey, (Vec<TxOut>, Vec<u8>)>,
     counter: u64,
 }
 
@@ -426,6 +438,9 @@ fn tag_text(tag: &[u8]) -> String {
         .to_owned()
 }
 
+/// A remembered build's key: the wallet (`/wallet/<name>`, if any) and the vault.
+type BuildKey = (Option<String>, OutPoint);
+
 impl Default for MockState {
     fn default() -> Self {
         Self::new()
@@ -454,6 +469,7 @@ impl MockState {
             addresses: BTreeMap::new(),
             unspent: vec![],
             sign_once: HashMap::new(),
+            restored: false,
             recipients: HashMap::new(),
             auth: None,
             wallet_views: HashMap::new(),
@@ -463,6 +479,7 @@ impl MockState {
             http_failures: VecDeque::new(),
             pending: HashMap::new(),
             cancels: HashMap::new(),
+            builds: HashMap::new(),
             counter: 0,
         };
         s.mine_block();
@@ -1000,6 +1017,8 @@ impl MockState {
             bondvalue: bond,
             bondlocktime: locktime,
             bondfrozen: false,
+            exitheight: None,
+            unlockheight: None,
             wallet: false,
         });
     }
@@ -1080,6 +1099,10 @@ impl MockState {
             if self.spent_on_chain(&i.prevout) {
                 return err(-25, "Missing inputs");
             }
+            if self.spent_in_block(&i.prevout) {
+                // what both node lines answer for a spent output of a known transaction
+                return err(-26, "18: bad-txns-inputs-spent");
+            }
         }
         if let Some(e) = self.bond_refusal(&tx) {
             return Err(e);
@@ -1087,6 +1110,14 @@ impl MockState {
         self.txs.insert(txid, (raw, None));
         self.mempool.push(txid);
         Ok(txid)
+    }
+
+    /// Any outpoint (a fee coin too) spent by a mined transaction.
+    fn spent_in_block(&self, op: &OutPoint) -> bool {
+        self.txs.values().any(|(r, b)| {
+            b.is_some()
+                && Transaction::decode(r).is_ok_and(|t| t.inputs.iter().any(|i| i.prevout == *op))
+        })
     }
 
     fn spent_on_chain(&self, op: &OutPoint) -> bool {
@@ -1181,9 +1212,15 @@ impl MockState {
             .map(|k| (k.clone(), o.value, None))
     }
 
-    fn mock_sighash(tx: &Transaction) -> Bytes32 {
+    /// The mock set-signature sighash of template input `idx`: the transaction reduced to that
+    /// input (scriptSig cleared) and every output — what `SIGHASH_ALL|SIGHASH_ANYONECANPAY`
+    /// commits to (01/V-2), so replacing the fee inputs keeps it.
+    pub fn mock_sighash(tx: &Transaction, idx: usize) -> Bytes32 {
         let mut t = tx.clone();
-        t.inputs.iter_mut().for_each(|i| i.script_sig.clear());
+        t.inputs = vec![TxIn {
+            script_sig: vec![],
+            ..tx.inputs[idx].clone()
+        }];
         Bytes32(sha256d(&t.encode()))
     }
 
@@ -1310,6 +1347,16 @@ impl MockState {
             "set_signcancel" => self.set_sign(p, 2),
             "vault_buildcancel" => self.vault_buildcancel(p),
             "vault_send" => self.vault_send(p),
+            "vault_refee" => self.vault_refee(p),
+            "set_listsigned" => self.set_listsigned(),
+            "set_importsigned" => self.set_importsigned(p),
+            "set_acknowledgerestore" => {
+                self.restored = false;
+                to_json(&AckRestoreResult {
+                    restored: false,
+                    pendingkeys: 0,
+                })
+            }
             "vault_release" => self.vault_release(p),
             "vault_ownerspend" => self.vault_ownerspend(p),
             // ---- stock
@@ -1429,6 +1476,8 @@ impl MockState {
             activationheight: self.activation_height,
             active: self.active_next(),
             height: i64::from(tip),
+            attestorsetid: None,
+            moduleactive: false,
             dbtip: active_tip.then(|| DbTip {
                 hash: self.tip_hash(),
                 height: tip,
@@ -2195,6 +2244,38 @@ impl MockState {
                 script_pubkey: v.script.0.clone(),
             });
         }
+        let rebuild = !app && opt_arg::<bool>(p, 2, "rebuild")?.unwrap_or(false);
+        let memo_key = (self.current_wallet.clone(), op);
+        if !app {
+            if rebuild {
+                self.builds.remove(&memo_key);
+            } else if let Some((want, raw)) = self.builds.get(&memo_key).cloned() {
+                if want != outputs {
+                    let old = Transaction::decode(&raw).expect("remembered build");
+                    return err(
+                        -8,
+                        format!(
+                            "this wallet already built a different unlock of {op} (sighash {}): members sign once, so \
+                             collect signatures on that build (call again with its recipients), or pass rebuild=true \
+                             if no member has signed it",
+                            Self::mock_sighash(&old, 0)
+                        ),
+                    );
+                }
+                let tx = Transaction::decode(&raw).expect("remembered build");
+                let required = self
+                    .set(&v.fields.setid)
+                    .map_or(0, |s| s.set.params.unlockthreshold);
+                return to_json(&BuildUnlockResult {
+                    hex: HexBytes(raw),
+                    intents,
+                    required,
+                    sighash: Self::mock_sighash(&tx, 0),
+                    build: BuildKind::Reused,
+                });
+            }
+        }
+        let requested = outputs.clone();
         let script_sig = if app { vec![OP_1 + 3] } else { vec![] };
         let lock_time = if app { v.fields.appheight } else { 0 };
         let mut tx = Transaction::new_v4(
@@ -2215,10 +2296,13 @@ impl MockState {
             let required = self
                 .set(&v.fields.setid)
                 .map_or(0, |s| s.set.params.unlockthreshold);
+            self.builds.insert(memo_key, (requested, hex.0.clone()));
             to_json(&BuildUnlockResult {
                 hex,
                 intents,
                 required,
+                sighash: Self::mock_sighash(&tx, 0),
+                build: BuildKind::New,
             })
         }
     }
@@ -2252,7 +2336,7 @@ impl MockState {
         } else {
             set.set.params.cancelthreshold
         } as usize;
-        let sighash = Self::mock_sighash(&tx);
+        let sighash = Self::mock_sighash(&tx, idx);
         let prevout = tx.inputs[idx].prevout;
         let mut sigs = vec![];
         if !tx.inputs[idx].script_sig.is_empty() {
@@ -2272,6 +2356,21 @@ impl MockState {
                     );
                 }
             }
+        }
+        let ack = p
+            .get(1)
+            .and_then(|o| o.get("acknowledgerestore"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if self.restored && !ack && !self.sign_once.contains_key(&(setid, prevout)) {
+            return err(
+                -4,
+                format!(
+                    "set-sign-restored: this wallet was restored or imported a member key and has no sign-once history; \
+                     import it with set_importsigned (or a wallet dump) and then set_acknowledgerestore, or pass \
+                     {{\"acknowledgerestore\": true}} if this key has never signed a set spend of {prevout}"
+                ),
+            );
         }
         let mut recorded = false;
         if let Some((r, sh)) = self.sign_once.get(&(setid, prevout)) {
@@ -2344,9 +2443,15 @@ impl MockState {
                 ),
             );
         }
+        let rebuild = opt_arg::<bool>(p, 1, "rebuild")?.unwrap_or(false);
+        if rebuild {
+            self.cancels.remove(&op);
+        }
+        let mut build = BuildKind::Reused;
         let hex = match self.cancels.get(&op) {
             Some(h) => h.clone(),
             None => {
+                build = BuildKind::New;
                 let mut tx = Transaction::new_v4(
                     vec![TxIn {
                         prevout: op,
@@ -2369,13 +2474,126 @@ impl MockState {
         let required = self
             .set(&fields.cancelsetid)
             .map_or(0, |s| s.set.params.cancelthreshold);
+        let sighash = Self::mock_sighash(&Transaction::decode(&hex).expect("cancel build"), 0);
         to_json(&BuildCancelResult {
             hex: HexBytes(hex),
             required,
             cancelsetid: fields.cancelsetid,
             deadline: coin_height + fields.delay - 1,
             intentconfirmed: height.is_some(),
+            sighash,
+            build,
         })
+    }
+
+    /// `vault_refee` (01/V-2): every input but the template input replaced by one fresh mock
+    /// wallet coin worth exactly what the outputs need beyond the template coin plus [`FEE`];
+    /// the template input (with its scriptSig) moves to index 0, every output stays.
+    fn vault_refee(&mut self, p: &[Value]) -> RpcResult {
+        self.ensure_active()?;
+        let h: HexBytes = arg(p, 0, "hex")?;
+        let mut tx = Transaction::decode(&h.0).map_err(|_| (-22, "TX decode failed".to_owned()))?;
+        let mut found = None;
+        for (i, input) in tx.inputs.iter().enumerate() {
+            if let Some((_, value, _)) = self.template(&input.prevout) {
+                if found.is_some() {
+                    return err(-8, "more than one template input (S-1)");
+                }
+                found = Some((i, value));
+            }
+        }
+        let Some((idx, value)) = found else {
+            return err(-8, "no unspent vault or intent input");
+        };
+        let template = tx.inputs[idx].clone();
+        let replaced: Vec<OutPoint> = tx
+            .inputs
+            .iter()
+            .filter(|i| i.prevout != template.prevout)
+            .map(|i| i.prevout)
+            .collect();
+        let out: i64 = tx.outputs.iter().map(|o| o.value).sum();
+        let needed = out + FEE - value;
+        tx.inputs = vec![template];
+        if needed > 0 {
+            let prev = Hash256(self.fresh("refee"));
+            let a = format!("tmMock{}", hex::encode(&prev.0[..10]));
+            let spk = p2pkh(&sha256(&prev.0));
+            self.addresses.insert(a.clone(), spk.clone());
+            self.unspent.push(Unspent {
+                txid: prev,
+                vout: 0,
+                generated: false,
+                address: Some(a),
+                account: None,
+                redeem_script: None,
+                script_pub_key: HexBytes(spk),
+                amount: Amount(needed),
+                amount_zat: needed,
+                confirmations: 6,
+                spendable: true,
+            });
+            tx.inputs.push(TxIn {
+                prevout: OutPoint::new(prev, 0),
+                script_sig: vec![],
+                sequence: u32::MAX,
+            });
+        }
+        to_json(&RefeeResult {
+            hex: HexBytes(tx.encode()),
+            sighash: Self::mock_sighash(&tx, 0),
+            fee: Amount(FEE),
+            replaced,
+        })
+    }
+
+    fn set_listsigned(&self) -> RpcResult {
+        let mut records: Vec<SignedRecord> = self
+            .sign_once
+            .iter()
+            .map(|((setid, prevout), (role, sighash))| SignedRecord {
+                setid: *setid,
+                prevout: *prevout,
+                role: *role,
+                sighash: *sighash,
+            })
+            .collect();
+        records.sort_by_key(|r| (r.setid.0, r.prevout.txid.0, r.prevout.vout));
+        to_json(&SignedRecords {
+            restored: self.restored,
+            records,
+        })
+    }
+
+    fn set_importsigned(&mut self, p: &[Value]) -> RpcResult {
+        let records: Vec<SignedRecord> = arg(p, 0, "records")?;
+        let mut present = 0;
+        for r in &records {
+            match self.sign_once.get(&(r.setid, r.prevout)) {
+                Some(x) if *x == (r.role, r.sighash) => present += 1,
+                Some(_) => {
+                    return err(
+                        -4,
+                        format!(
+                            "set-sign-once: a different record of {} for set {} is already held; nothing imported",
+                            r.prevout, r.setid
+                        ),
+                    );
+                }
+                None => {}
+            }
+        }
+        let mut imported = 0;
+        for r in &records {
+            if self
+                .sign_once
+                .insert((r.setid, r.prevout), (r.role, r.sighash))
+                .is_none()
+            {
+                imported += 1;
+            }
+        }
+        to_json(&ImportSignedResult { imported, present })
     }
 
     fn vault_send(&mut self, p: &[Value]) -> RpcResult {

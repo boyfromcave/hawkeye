@@ -27,7 +27,8 @@ use crate::engine::Engine;
 use crate::foreign::{self, Account};
 use crate::keys::{key_info, parse_secret, wif};
 
-/// The flat fee of a hand-built lock transaction (the node's vault RPCs use the same).
+/// The flat fee of a hand-built lock transaction (the node's vault RPCs use the same); raised to
+/// the transaction's ZIP-317 conventional fee when that is higher (audit 04/N-1).
 pub const LOCK_FEE: i64 = 10_000;
 
 /// The flat fee of the bond withdrawal (one P2SH input, one output: about 250 bytes).
@@ -67,6 +68,93 @@ pub async fn enroll(s: &Settings) -> Result<()> {
         .context("importprivkey")?;
     info!(event = "enrolled", address = %address, member = %hex::encode(key.public_key()));
     print(&serde_json::to_value(key_info(&key))?)
+}
+
+/// `hawkeye acknowledge-restore` (07/F-5, `"wallet"` mode): the node wallet carries a restore
+/// marker once the member key was imported and joined (or the wallet was restored from a seed),
+/// and refuses every set signature (`set-sign-restored`) until its sign-once history is imported
+/// and acknowledged. This ledger is that history for the bridge: the audit must pass (no unlock by
+/// this member on the chain or in the mempool without a record here), then its unlock and cancel
+/// records go to `set_importsigned` (a conflicting node record refuses the whole import:
+/// `set-sign-once`) and `set_acknowledgerestore` clears the marker. Never run by the daemon.
+pub async fn acknowledge_restore(s: &Settings) -> Result<()> {
+    if s.params.ycash_signing == crate::config::YcashSigning::SelfSigned {
+        return print(&json!({"restored": false, "note":
+            "ycash_signing = \"self\": the node wallet holds no member key; nothing to acknowledge"}));
+    }
+    let node = ycash(s)?;
+    let before = node.set_listsigned().await.context("set_listsigned")?;
+    if !before.restored {
+        return print(&json!({"restored": false, "records": before.records.len()}));
+    }
+    let key = s.load_key()?;
+    if !s.store_path.exists() {
+        // before the first `hawkeye run`: an empty ledger, as `run` would create it (the audit
+        // still checks the chain for unlocks signed by this member)
+        drop(
+            Store::open(&s.store_path)
+                .with_context(|| format!("ledger {}", s.store_path.display()))?,
+        );
+    }
+    let mut store = Store::open_readonly(&s.store_path)
+        .with_context(|| format!("ledger {}", s.store_path.display()))?;
+    let audit = crate::audit::audit_ledger(
+        &mut store,
+        &node,
+        &CoreAttributor,
+        &s.params,
+        &key.public_key(),
+    )
+    .await?;
+    if !audit.ok {
+        return Err(crate::audit::refuse(&audit));
+    }
+    let recs = store.read(|t| t.ycash_signatures(&s.params.set_id))?;
+    let records: Vec<hawkeye_ycash::types::SignedRecord> = recs
+        .iter()
+        .filter_map(|r| {
+            let role = match r.key.domain {
+                SignDomain::YcashUnlock => 1,
+                SignDomain::YcashCancel => 2,
+                _ => return None,
+            };
+            Some(hawkeye_ycash::types::SignedRecord {
+                setid: hawkeye_ycash::Hash256::from_internal(r.key.set_id),
+                prevout: hawkeye_ycash::OutPoint::new(
+                    hawkeye_ycash::Hash256::from_internal(r.key.prevout.txid),
+                    r.key.prevout.vout,
+                ),
+                role,
+                sighash: hawkeye_ycash::Bytes32(r.sighash),
+            })
+        })
+        .collect();
+    let imported = if records.is_empty() {
+        None
+    } else {
+        Some(
+            node.set_importsigned(&records)
+                .await
+                .context("set_importsigned")?,
+        )
+    };
+    let after = node
+        .set_acknowledgerestore()
+        .await
+        .context("set_acknowledgerestore")?;
+    info!(
+        event = "restore_acknowledged",
+        records = records.len(),
+        pending_keys = after.pendingkeys,
+        restored = after.restored
+    );
+    print(&json!({
+        "restored": after.restored,
+        "pendingkeys": after.pendingkeys,
+        "ledger_records": records.len(),
+        "imported": imported.as_ref().map(|i| i.imported),
+        "present": imported.as_ref().map(|i| i.present),
+    }))
 }
 
 /// `hawkeye audit-ledger [--json]` (docs/operations.md §5): the ledger, opened read-only and
@@ -456,56 +544,68 @@ pub async fn lock(
         .filter(|u| u.spendable && !busy.contains(&hawkeye_ycash::OutPoint::new(u.txid, u.vout)))
         .collect();
     coins.sort_by_key(|u| std::cmp::Reverse(u.amount_zat));
-    let mut inputs = vec![];
-    let mut total = 0i64;
-    for u in coins {
-        inputs.push(TxIn {
-            prevout: hawkeye_ycash::OutPoint::new(u.txid, u.vout),
-            script_sig: vec![],
-            sequence: u32::MAX,
-        });
-        total += u.amount_zat;
-        if total >= value + LOCK_FEE {
-            break;
-        }
-    }
-    if total < value + LOCK_FEE {
-        bail!(
-            "the wallet holds {total} zat in usable coins; the lock needs {}",
-            value + LOCK_FEE
-        );
-    }
     let change_address = node.getnewaddress().await?;
     let change = node
         .validateaddress(&change_address)
         .await?
         .script_pub_key
         .ok_or_else(|| anyhow!("validateaddress gave no scriptPubKey"))?;
-    let mut outputs = vec![
-        TxOut {
-            value,
-            script_pubkey: script,
-        },
-        TxOut {
-            value: 0,
-            script_pubkey: to.script(),
-        },
-    ];
-    if total - value - LOCK_FEE > 0 {
-        outputs.push(TxOut {
-            value: total - value - LOCK_FEE,
-            script_pubkey: change.0,
-        });
+    // the fee: LOCK_FEE, raised to the signed transaction's ZIP-317 conventional fee when that is
+    // higher (a post-quantum coin's scriptSig is ~8 KB: 26,500 zat; audit 04/N-1), re-selecting
+    // and re-signing until it covers it
+    let mut fee = LOCK_FEE;
+    let mut signed = None;
+    for _ in 0..4 {
+        let mut inputs = vec![];
+        let mut total = 0i64;
+        for u in &coins {
+            inputs.push(TxIn {
+                prevout: hawkeye_ycash::OutPoint::new(u.txid, u.vout),
+                script_sig: vec![],
+                sequence: u32::MAX,
+            });
+            total += u.amount_zat;
+            if total >= value + fee {
+                break;
+            }
+        }
+        if total < value + fee {
+            bail!(
+                "the wallet holds {total} zat in usable coins; the lock needs {}",
+                value + fee
+            );
+        }
+        let mut outputs = vec![
+            TxOut {
+                value,
+                script_pubkey: script.clone(),
+            },
+            TxOut {
+                value: 0,
+                script_pubkey: to.script(),
+            },
+        ];
+        if total - value - fee > 0 {
+            outputs.push(TxOut {
+                value: total - value - fee,
+                script_pubkey: change.0.clone(),
+            });
+        }
+        let tx = Transaction::new_v4(inputs, outputs, 0, tip + 40);
+        let s = node
+            .signrawtransaction(&HexBytes(tx.encode()), None, None, None, None)
+            .await?;
+        ensure!(s.complete, "signrawtransaction incomplete: {:?}", s.errors);
+        let conventional = Transaction::decode(&s.hex.0)
+            .map_err(|e| anyhow!("signed lock: {e}"))?
+            .zip317_conventional_fee();
+        if conventional <= fee {
+            signed = Some(s);
+            break;
+        }
+        fee = conventional;
     }
-    let tx = Transaction::new_v4(inputs, outputs, 0, tip + 40);
-    let signed = node
-        .signrawtransaction(&HexBytes(tx.encode()), None, None, None, None)
-        .await?;
-    ensure!(
-        signed.complete,
-        "signrawtransaction incomplete: {:?}",
-        signed.errors
-    );
+    let signed = signed.ok_or_else(|| anyhow!("the lock's ZIP-317 fee did not settle"))?;
     let txid = node.sendrawtransaction(&signed.hex, false).await?;
     let id = lock_id(&CoreOutPoint::new(txid.0, 0));
     info!(event = "lock_sent", txid = %txid, value, to = %to,
@@ -734,9 +834,10 @@ pub async fn rogue_unlock(
             s.params.tag_text()
         )
     })?;
-    let built = node
-        .vault_buildunlock(&vault, std::slice::from_ref(&recipient))
-        .await?;
+    // no record of this vault in the ledger (checked above): a stale node build may go
+    let built =
+        crate::engine::sign::build_unlock(&node, &vault, std::slice::from_ref(&recipient), true)
+            .await?;
     let vout = built.intents.first().map_or(0, |i| i.vout);
     let unsigned = match &replay {
         Some(r) => hawkeye_ycash::tx::insert_op_return(&built.hex.to_string(), &r.memo)
@@ -1107,6 +1208,11 @@ pub fn build_bond_withdrawal(
     tx.inputs[0].script_sig =
         bond_withdrawal_script_sig(&core, 0, key, locktime, value_zat as u64, branch_id)
             .map_err(|e| anyhow!("bond withdrawal: {e}"))?;
+    // one P2SH input and one output: two ZIP-317 actions, 1,000 zat (04/N-1)
+    ensure!(
+        tx.zip317_conventional_fee() <= BOND_WITHDRAW_FEE,
+        "the bond withdrawal's ZIP-317 conventional fee exceeds its flat fee"
+    );
     Ok(tx)
 }
 

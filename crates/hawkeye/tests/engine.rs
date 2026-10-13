@@ -1872,15 +1872,18 @@ async fn unlock_hex(
     amount: i64,
     memo: Option<&hawkeye_core::memo::HawkeyeMemo>,
 ) -> String {
+    // a fresh build every call (`rebuild`): the node remembers one build per vault (07/N-2),
+    // these tests want distinct spends of one vault
     let built = env
         .mock
         .client()
-        .vault_buildunlock(
+        .vault_buildunlock_with(
             vault,
             &[hawkeye_ycash::types::Recipient::script(
                 r.script(),
                 Amount(amount),
             )],
+            true,
         )
         .await
         .unwrap()
@@ -2329,9 +2332,11 @@ async fn k3_attacker_prefilled_record_is_not_reused() {
 }
 
 /// (k3b) A leader's own unlock that never left (vault_send failed) and whose fee input was then
-/// spent `C_Y` deep is marked dead, and another vault is signed for the burn.
+/// spent is **re-funded** (`vault_refee`, audit 01/V-2) and re-sent on the same vault with the
+/// same set signatures; it never dies and no other vault is signed for the burn (anyone holding
+/// the signed bytes could re-fund the old one: a second vault would pay the burn twice).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn k3b_unsendable_leader_unlock_dies_after_c_y() {
+async fn k3b_unsendable_leader_unlock_is_refunded() {
     let Some(env) = setup().await else { return };
     let mut engines = three(&env).await;
     lock_and_mint(&env, &mut engines).await;
@@ -2390,23 +2395,51 @@ async fn k3b_unsendable_leader_unlock_dies_after_c_y() {
     );
     env.mock.state().submit(spend.encode()).unwrap();
     env.mine(1);
-    engines[leader].tick().await; // 1 deep: held, never re-sent (its fee input is gone)
-    assert!(unlocks_for(&env, nonce).is_empty());
-    env.mine(1);
-    engines[leader].tick().await; // dead
-    engines[leader].tick().await; // another vault
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    engines[leader].tick().await; // re-sent: Missing inputs → vault_refee → sent
+    assert_eq!(env.mock.state().calls_to("vault_refee").len(), 1);
+    let posted = unlocks_for(&env, nonce);
+    assert_eq!(posted.len(), 1, "the re-funded unlock is in the mempool");
+    assert_eq!(
+        CoreOutPoint::new(posted[0].1.txid.0, posted[0].1.vout),
+        first,
+        "on the same vault"
+    );
+    assert_eq!(
+        env.mock.state().calls_to("set_signunlock").len(),
+        signs,
+        "no new set signature"
+    );
+    // the broadcast spend carries the recorded template input (the same signatures)
+    let raws: Vec<Vec<u8>> = {
+        let st = env.mock.state();
+        st.mempool
+            .iter()
+            .filter_map(|t| st.txs.get(t).map(|(r, _)| r.clone()))
+            .collect()
+    };
+    let sent = raws
+        .iter()
+        .filter_map(|r| Transaction::decode(r).ok())
+        .find(|t| {
+            t.inputs
+                .iter()
+                .any(|i| CoreOutPoint::new(i.prevout.txid.0, i.prevout.vout) == first)
+        })
+        .expect("the re-funded unlock");
+    let i = hawkeye::engine::sign::input_index(&sent, &first).unwrap();
+    let j = hawkeye::engine::sign::input_index(&tx, &first).unwrap();
+    assert_eq!(sent.inputs[i].script_sig, tx.inputs[j].script_sig);
+    assert_eq!(sent.outputs, tx.outputs);
+    assert!(sent.inputs.iter().all(|x| x.prevout != fee));
+    env.mine(C_Y);
+    engines[leader].tick().await;
     let rows = engines[leader]
         .ctx()
         .db(|t| t.unlock_burn_rows(&env.set.0, &k))
         .unwrap();
-    assert_eq!(rows.len(), 2);
-    assert!(rows.iter().any(|r| r.prevout == first && !r.is_live()));
-    let posted = unlocks_for(&env, nonce);
-    assert_eq!(posted.len(), 1);
-    assert_ne!(
-        CoreOutPoint::new(posted[0].1.txid.0, posted[0].1.vout),
-        first
-    );
+    assert_eq!(rows.len(), 1, "no other vault signed for the burn");
+    assert!(rows[0].dead_reason.is_none(), "{:?}", rows[0]);
 }
 
 /// A peer that answers `/unlock/sign` with a forged transaction, signed by a member key.
@@ -2608,6 +2641,48 @@ async fn k6_fee_coins_alarm() {
     );
     let st = e.ctx().status.read().unwrap().clone();
     assert!(st.fee_coins.unwrap() >= 16);
+}
+
+/// (k7) 07/F-5, `"wallet"` mode: a node wallet carrying the restore marker refuses every set
+/// signature (`set-sign-restored`); the daemon pages `node-sign-restored` and signs nothing, and
+/// once the operator acknowledges (`set_acknowledgerestore`, what `hawkeye acknowledge-restore`
+/// ends with) the burn is unlocked and the alarm clears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k7_restore_marker_pages_until_acknowledged() {
+    let Some(env) = setup().await else { return };
+    let mut engines = vec![
+        env.engine(0).await,
+        env.engine(1).await,
+        env.engine(2).await,
+    ];
+    lock_and_mint(&env, &mut engines).await;
+    env.mock.state().restored = true;
+    let nonce = burn_and_release(&env, &mut engines, &[0, 1, 2]).await;
+    tick_all(&mut engines).await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "nothing signed");
+    assert!(
+        engines
+            .iter()
+            .any(|e| e.alarms().iter().any(|a| a.name == "node-sign-restored")),
+        "{:?}",
+        engines.iter().map(|e| e.alarms()).collect::<Vec<_>>()
+    );
+    let ack = env.mock.client().set_acknowledgerestore().await.unwrap();
+    assert!(!ack.restored);
+    tick_all(&mut engines).await;
+    tick_all(&mut engines).await;
+    assert_eq!(
+        unlocks_for(&env, nonce).len(),
+        1,
+        "unlocked once acknowledged"
+    );
+    for e in &engines {
+        assert!(
+            !e.alarms().iter().any(|a| a.name == "node-sign-restored"),
+            "{:?}",
+            e.alarms()
+        );
+    }
 }
 
 // ------------------------------------------------------------------------------------------

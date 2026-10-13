@@ -85,6 +85,12 @@ pub struct Member {
     pub bondvalue: Amount,
     pub bondlocktime: u32,
     pub bondfrozen: bool,
+    /// The member's exit height, only while it has left and its bond is unspent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exitheight: Option<u32>,
+    /// `exitheight + maturity`: the first block the bond may be spent in (with `exitheight`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlockheight: Option<u32>,
     /// This node's wallet holds the key.
     pub wallet: bool,
 }
@@ -408,6 +414,10 @@ pub struct VaultInfo {
     pub active: bool,
     /// The tip.
     pub height: i64,
+    /// The set the registered module (YED) governs on this node; null when it governs none.
+    pub attestorsetid: Option<SetId>,
+    /// Whether the module governs a set on this node.
+    pub moduleactive: bool,
     /// The block the set state is at (null before the first active block).
     pub dbtip: Option<DbTip>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -827,6 +837,23 @@ pub struct BuildUnlockResult {
     pub intents: Vec<IntentOut>,
     /// The set's `unlockthreshold`.
     pub required: u32,
+    /// The set-signature sighash the members sign (raw order; `SIGHASH_ALL|SIGHASH_ANYONECANPAY`,
+    /// audit 01/V-2): what `set_signunlock` reports for this transaction.
+    pub sighash: Bytes32,
+    /// Whether the node built the spend now, returned its remembered build, or re-funded it.
+    pub build: BuildKind,
+}
+
+/// `vault_buildunlock` / `vault_buildcancel` `build` (07/N-2: one build per template outpoint).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildKind {
+    /// A new build (none was remembered, or `rebuild` discarded it).
+    New,
+    /// The remembered build, byte-identical.
+    Reused,
+    /// The remembered build with a lost fee input replaced (same sighash, new txid).
+    Refunded,
 }
 
 /// `vault_buildcancel`'s result.
@@ -839,6 +866,54 @@ pub struct BuildCancelResult {
     pub deadline: u32,
     /// false: the intent is still in the mempool.
     pub intentconfirmed: bool,
+    /// The set-signature sighash (raw order), as for [`BuildUnlockResult::sighash`].
+    pub sighash: Bytes32,
+    pub build: BuildKind,
+}
+
+/// `vault_refee`'s result (01/V-2): the spend with every input but the template input replaced
+/// by this wallet's coins; the template input (with its signatures) and every output unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefeeResult {
+    pub hex: HexBytes,
+    /// Unchanged: the set signatures already on the template input stay valid.
+    pub sighash: Bytes32,
+    pub fee: Amount,
+    /// The inputs that were replaced.
+    pub replaced: Vec<OutPoint>,
+}
+
+/// One sign-once record (`set_listsigned`, `set_importsigned`, 07/F-5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedRecord {
+    pub setid: SetId,
+    pub prevout: OutPoint,
+    /// 1 unlock, 2 cancel.
+    pub role: u8,
+    /// Raw order.
+    pub sighash: Bytes32,
+}
+
+/// `set_listsigned`'s result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedRecords {
+    /// The restore marker: while true the sign RPCs refuse `set-sign-restored`.
+    pub restored: bool,
+    pub records: Vec<SignedRecord>,
+}
+
+/// `set_importsigned`'s result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportSignedResult {
+    pub imported: u32,
+    pub present: u32,
+}
+
+/// `set_acknowledgerestore`'s result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckRestoreResult {
+    pub restored: bool,
+    pub pendingkeys: u32,
 }
 
 /// `vault_ownerspend`'s result.

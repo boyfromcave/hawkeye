@@ -1043,6 +1043,9 @@ class Devnet:
         if info["current"] != attestors:
             die("only %d of %d members current: %s" % (info["current"], attestors, jdump(info)))
         self.say("  %d members current at height %d; lockedvalue %s" % (info["current"], self.tip(), info["lockedvalue"]))
+        self.sync()
+        for a in self.s["attestors"]:
+            self.acknowledge_restore(a)
         # ---- 8. the sidecars and the miner
         self.start_hawkeyes()
         self.start_miner()
@@ -1190,6 +1193,35 @@ class Devnet:
             if not v.get("ismine"):
                 die("attestor%d: node%d's wallet does not hold the member key after enrolment" % (a["index"], a["node"]))
         self.say("  attestor%d enrolled in node%d's wallet (%s)" % (a["index"], a["node"], how))
+
+    def acknowledge_restore(self, a):
+        """07/F-5: the attestor's node wallet imported the member key, so once its SET_JOIN connected the
+        wallet carries the restore marker and refuses every set signature (set-sign-restored) until the
+        operator acknowledges. The key is fresh (generated here), so `hawkeye acknowledge-restore` (the
+        ledger's audit, its records imported, the marker cleared) is the operator's true statement."""
+        n = self.node(a["node"])
+        # the wallet learns of blocks on its own thread: wait until it has the SET_JOIN confirmed, which
+        # is when the marker is set (an imported key that joins), before reading it
+        deadline = time.time() + 60
+        while True:
+            try:
+                if n.gettransaction(a["join_txid"]).get("confirmations", 0) >= 1:
+                    break
+            except Exception:  # noqa: BLE001 (not in the wallet yet)
+                pass
+            if time.time() > deadline:
+                die("attestor%d: node%d's wallet never saw its SET_JOIN %s confirmed" % (a["index"], a["node"], a["join_txid"]))
+            time.sleep(0.2)
+        if not n.set_listsigned().get("restored"):
+            return
+        if self.use_binary("acknowledge-restore"):
+            out = self.hawkeye(a["config"], "acknowledge-restore").stdout.strip()
+            how = "hawkeye acknowledge-restore: %s" % (out.splitlines()[-1] if out else "ok")
+        else:
+            how = "set_acknowledgerestore (fallback): %s" % jdump(n.set_acknowledgerestore())
+        if n.set_listsigned().get("restored"):
+            die("attestor%d: node%d's wallet still carries the restore marker" % (a["index"], a["node"]))
+        self.say("  attestor%d: node%d's restore marker cleared (%s)" % (a["index"], a["node"], how))
 
     def join_all(self):
         """bridge-sim's join_all: one SET_JOIN per attestor with its member key, built and member-signed on the

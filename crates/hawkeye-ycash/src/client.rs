@@ -343,9 +343,28 @@ impl YcashRpc {
         vault: &OutPoint,
         recipients: &[Recipient],
     ) -> Result<BuildUnlockResult, Error> {
+        self.vault_buildunlock_with(vault, recipients, false).await
+    }
+
+    /// [`YcashRpc::vault_buildunlock`] with `rebuild`: `true` discards the wallet's remembered
+    /// build of the vault (07/N-2; refused recipients otherwise: `already built a different
+    /// unlock`). Only before any member signed the remembered build.
+    pub async fn vault_buildunlock_with(
+        &self,
+        vault: &OutPoint,
+        recipients: &[Recipient],
+        rebuild: bool,
+    ) -> Result<BuildUnlockResult, Error> {
         let m = "vault_buildunlock";
-        self.call(m, vec![val(m, vault)?, val(m, recipients)?])
-            .await
+        self.call(
+            m,
+            params(vec![
+                Some(val(m, vault)?),
+                Some(val(m, recipients)?),
+                rebuild.then_some(Value::Bool(true)),
+            ]),
+        )
+        .await
     }
 
     /// Adds this wallet's unlock signatures. **Sign once**: a different spend of the same vault
@@ -363,6 +382,34 @@ impl YcashRpc {
     pub async fn set_signcancel(&self, hex: &HexBytes) -> Result<SetSigResult, Error> {
         let m = "set_signcancel";
         self.call(m, vec![val(m, hex)?]).await
+    }
+
+    /// Re-funds a set-signed UNLOCK or CANCEL spend (01/V-2): every input but the template input
+    /// replaced by this wallet's coins; the template input and every output unchanged, so the
+    /// set signatures (over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`) stay valid. Anyone may.
+    pub async fn vault_refee(&self, hex: &HexBytes) -> Result<RefeeResult, Error> {
+        let m = "vault_refee";
+        self.call(m, vec![val(m, hex)?]).await
+    }
+
+    /// The wallet's set sign-once records and its restore marker (07/F-5).
+    pub async fn set_listsigned(&self) -> Result<SignedRecords, Error> {
+        self.call("set_listsigned", vec![]).await
+    }
+
+    /// Imports sign-once records as `set_listsigned` printed them on the wallet that signed.
+    pub async fn set_importsigned(
+        &self,
+        records: &[SignedRecord],
+    ) -> Result<ImportSignedResult, Error> {
+        let m = "set_importsigned";
+        self.call(m, vec![val(m, records)?]).await
+    }
+
+    /// Clears the restore marker (the operator's statement that the imported history is
+    /// complete). Never called by the daemon.
+    pub async fn set_acknowledgerestore(&self) -> Result<AckRestoreResult, Error> {
+        self.call("set_acknowledgerestore", vec![]).await
     }
 
     pub async fn vault_send(&self, hex: &HexBytes) -> Result<Txid, Error> {

@@ -21,9 +21,10 @@ gathered from the peers' APIs); `--challenge-window N` changes the window. Both 
 options.
 
 Each Hawkeye talks only to its own node's RPC and to anvil (AGENTS.md rule 1). The nodes are
-regtest `ycashd` built from the **post-quantum line `upgrade/quantum-vaults`** of `ycash-dd` or
-`ycash6` (every vault owner is a post-quantum key: this Hawkeye parses only the PQ owner slot, so an
-`upgrade/vault` node has no vault it recognises), the vault upgrade activated with
+regtest `ycashd` built from **`upgrade/vault`** of `ycash-dd` or `ycash6` (the post-quantum line is
+merged into it: every vault owner is a post-quantum key, and this Hawkeye parses only the PQ owner
+slot; set signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, audit 01/V-2, so a node from
+`upgrade/quantum-vaults`, which predates that, no longer works with it), the vault upgrade activated with
 `-nuparams=6d5b7a31:<h>`. The commands mirror `bridge-sim`'s (ycash-dd
 `contrib/yellowback/devnet/bridge-sim`), whose set-up logic this follows: set creation, closed-set
 joins co-signed by the admit key, several funding coins per wallet, the lock transaction.
@@ -33,14 +34,14 @@ The script is Python 3 standard library only. It also needs Foundry (`anvil`, `f
 
 ## Prerequisites
 
-### 1. `ycashd` from `upgrade/quantum-vaults` (either line; built outside this repository)
+### 1. `ycashd` from `upgrade/vault` (either line; built outside this repository)
 
 Hawkeye never patches the node. Build it the way CI does
 (`ycash-dd/.github/workflows/yellowback-tests.yml`, job `build`; `.github/workflows/devnet-e2e.yml`
-here builds both lines from `upgrade/quantum-vaults`, `node_ref` overrides):
+here builds both lines from `upgrade/vault`, `node_ref` overrides):
 
 ```sh
-git clone https://github.com/boyfromcave/ycash-dd -b upgrade/quantum-vaults ycash-build && cd ycash-build
+git clone https://github.com/boyfromcave/ycash-dd -b upgrade/vault ycash-build && cd ycash-build
 BUILD_STAGE=depends ./zcutil/build.sh -j3          # depends (about 25 min)
 host=$(./depends/config.guess)
 ./autogen.sh
@@ -129,7 +130,7 @@ devnet/hawkeye-devnet scenario pq-recipient [--fresh] [--foreign ethereum|near]
 
 ### Both node lines
 
-The same script drives `ycash-dd` (v4.5.0) and `ycash6` (6.2x) `upgrade/quantum-vaults` nodes. It reads the
+The same script drives `ycash-dd` (v4.5.0) and `ycash6` (6.2x) `upgrade/vault` nodes. It reads the
 line from `ycashd -version` (major version 6 or above is `ycash6`), or from `DEVNET_NODE_LINE`,
 records it in `devnet.json`, and passes that line's extra start-up arguments the way its qa harness
 does: none on `ycash-dd`, and `-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025` on
@@ -172,6 +173,11 @@ as a current member, so it is not affected.
    closed, each join is co-signed with the admit key (`set_signact` on node0) and then sent with
    `set_sendact` on the attestor node. All joins land before any of them matures, so the admit key
    covers all of them. Mines `1 + maturity` blocks and checks that every member is current.
+   Then, once each attestor's wallet has its `SET_JOIN` confirmed, clears the wallet's restore
+   marker (an imported member key that joined, 07/F-5: the wallet refuses every set signature,
+   `set-sign-restored`, until acknowledged): `hawkeye --config attestor<i>.toml
+   acknowledge-restore`, or `set_acknowledgerestore` as the fallback. The keys are fresh, so the
+   acknowledgement is true.
 9. Starts `hawkeye --config <run>/attestor<i>.toml run` beside each attestor node, each in its
    own process group, with its log in `<run>/attestor<i>/hawkeye.log`. Then starts the
    background miner: node0 mines 1 block every `--interval` seconds; `pause` / `resume`.
@@ -218,6 +224,7 @@ NEAR side never sees them (NEAR plan, "Post-quantum owners").
 | `rogue A` | `hawkeye --config attestor1.toml rogue-unlock A` (drill D-3: `rogue-unlock --replay-burn <nonce>`, below) | On node1: `vault_buildunlock` to a fresh node1 address, then `set_signunlock` (attestor1's member key alone meets `unlockthreshold 1`), then `vault_send`. No memo. |
 | `rogue-mint A` | `hawkeye --config attestor1.toml rogue-mint A [--to] [--lock-id]`: signs `Mint(lockId, A, to)` for an invented lockId (sign-once drill record), `proposeMint` from its own account | none (needs the binary) |
 | enrolment | `hawkeye --config … enroll` | `importprivkey` of the WIF. |
+| restore marker | `hawkeye --config … acknowledge-restore` | `set_acknowledgerestore`. |
 | key derivation | `hawkeye keys derive --secret <hex>` (cross-checked) | Python secp256k1, plus `cast wallet address`. |
 
 The script detects a subcommand by checking whether `hawkeye [<parent>] --help` lists it.

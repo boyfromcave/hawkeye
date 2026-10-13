@@ -1,6 +1,6 @@
-//! Replays the node's golden vector (`tests/data/vault_vectors.json`, ycash-dd
-//! `upgrade/quantum-vaults` `d41026209` = ycash6 `0c6c5fdf2`: the post-quantum owner of quantum
-//! spec §1, both registered schemes). Hawkeye holds no post-quantum signature code, so the
+//! Replays the node's golden vector (`tests/data/vault_vectors.json`, ycash-dd `upgrade/vault`
+//! `8af82551b` = ycash6 `047b561ac`: the post-quantum owner of quantum spec §1, both registered
+//! schemes; set signatures over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, audit 01/V-2). Hawkeye holds no post-quantum signature code, so the
 //! SLH-DSA and Falcon signature bytes of `ownerSpends` are never verified here: what is checked
 //! is everything around them (the chunked scriptSig shape, the public key's hash against the
 //! template's owner, the ZIP-243 sighash the signature is over).

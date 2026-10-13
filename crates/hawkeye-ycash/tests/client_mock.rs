@@ -337,15 +337,81 @@ async fn sign_once_is_enforced_and_reported() {
     // the identical transaction again: idempotent
     let again = c.set_signunlock(&u1.hex).await.unwrap();
     assert_eq!(again.sighash, s1.sighash);
-    // a different spend of the same vault: set-sign-once
+    // the build is remembered (07/N-2): other recipients are refused without `rebuild`
+    let e = c
+        .vault_buildunlock(&vault, &[Recipient::address(a.clone(), Amount(200))])
+        .await
+        .unwrap_err();
+    assert_eq!(rpc_reason(&e), ErrorReason::AlreadyBuiltDifferent);
+    // a different spend of the same vault (rebuilt): set-sign-once
     let u2 = c
-        .vault_buildunlock(&vault, &[Recipient::address(a, Amount(200))])
+        .vault_buildunlock_with(&vault, &[Recipient::address(a, Amount(200))], true)
         .await
         .unwrap();
+    assert_eq!(u2.build, BuildKind::New);
     let e = c.set_signunlock(&u2.hex).await.unwrap_err();
     assert_eq!(rpc_reason(&e), ErrorReason::SetSignOnce);
     assert!(e.rpc().unwrap().is_set_sign_once());
     assert_eq!(e.rpc().unwrap().code, -4);
+    // the record is listed and re-imports as present
+    let l = c.set_listsigned().await.unwrap();
+    assert!(!l.restored);
+    assert_eq!(l.records.len(), 1);
+    assert_eq!(l.records[0].sighash, s1.sighash);
+    assert_eq!(l.records[0].role, 1);
+    let i = c.set_importsigned(&l.records).await.unwrap();
+    assert_eq!((i.imported, i.present), (0, 1));
+    let mut other = l.records[0].clone();
+    other.sighash.0[0] ^= 1;
+    let e = c.set_importsigned(&[other]).await.unwrap_err();
+    assert_eq!(rpc_reason(&e), ErrorReason::SetSignOnce);
+}
+
+/// 07/N-2 and 01/V-2: one remembered build per vault (`reused`, same sighash), and a signed
+/// spend whose fee input is gone re-funded by `vault_refee` with the signatures still on it.
+#[tokio::test]
+async fn remembered_builds_and_refee() {
+    let (m, _set, vault) = bridge(0).await;
+    let c = m.client();
+    let a = c.getnewaddress().await.unwrap();
+    let to = [Recipient::address(a, Amount(100_000_000))];
+    let u1 = c.vault_buildunlock(&vault, &to).await.unwrap();
+    assert_eq!(u1.build, BuildKind::New);
+    let u2 = c.vault_buildunlock(&vault, &to).await.unwrap();
+    assert_eq!(u2.build, BuildKind::Reused);
+    assert_eq!((u2.hex.clone(), u2.sighash), (u1.hex.clone(), u1.sighash));
+    let signed = c.set_signunlock(&u1.hex).await.unwrap();
+    assert_eq!(
+        signed.sighash, u1.sighash,
+        "the build reports the signed sighash"
+    );
+    let old = Transaction::decode(&signed.hex.0).unwrap();
+    let r = c.vault_refee(&signed.hex).await.unwrap();
+    assert_eq!(r.sighash, signed.sighash);
+    assert_eq!(r.replaced.len(), old.inputs.len() - 1);
+    let new = Transaction::decode(&r.hex.0).unwrap();
+    assert_eq!(new.outputs, old.outputs);
+    assert_eq!(
+        new.inputs[0], old.inputs[0],
+        "the template input keeps its signatures"
+    );
+    assert!(
+        new.inputs[1..]
+            .iter()
+            .all(|i| !r.replaced.contains(&i.prevout))
+    );
+    // signing the re-funded spend again is idempotent: the same sighash, no equivocation
+    let again = c.set_signunlock(&r.hex).await.unwrap();
+    assert_eq!(again.sighash, signed.sighash);
+    let sent = c.vault_send(&r.hex).await.unwrap();
+    // the cancel build is remembered too
+    m.state().mine(1);
+    let intent = hawkeye_ycash::OutPoint::new(sent, u1.intents[0].vout);
+    let b1 = c.vault_buildcancel(&intent).await.unwrap();
+    let b2 = c.vault_buildcancel(&intent).await.unwrap();
+    assert_eq!(b1.build, BuildKind::New);
+    assert_eq!(b2.build, BuildKind::Reused);
+    assert_eq!((b2.hex, b2.sighash), (b1.hex, b1.sighash));
 }
 
 #[tokio::test]
@@ -890,7 +956,7 @@ async fn errors_injection_http_and_auth() {
     // canned result in node format (amounts as decimal numbers)
     m.state().queue_result_text(
         "vault_getinfo",
-        r#"{"branchid":"6d5b7a31","activationheight":-1,"active":false,"height":7,"dbtip":null}"#,
+        r#"{"branchid":"6d5b7a31","activationheight":-1,"active":false,"height":7,"attestorsetid":null,"moduleactive":false,"dbtip":null}"#,
     );
     let info = c.vault_getinfo().await.unwrap();
     assert_eq!(
