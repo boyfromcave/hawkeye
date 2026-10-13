@@ -5,28 +5,18 @@ import {Vm} from "forge-std/Vm.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {WrappedYcash} from "wyec/WrappedYcash.sol";
 import {WyecBridge} from "wyec/WyecBridge.sol";
-import {BridgeTestBase} from "./utils/BridgeTestBase.sol";
-import {WyecEip712} from "./utils/WyecEip712.sol";
+import {BridgeTestBase} from "wyec-test/utils/BridgeTestBase.sol";
+import {WyecEip712} from "wyec-test/utils/WyecEip712.sol";
 
 /// Hawkeye's assumptions about wyec's optimistic mint (wyec-contract-design.md §4.5; plan §3.3,
 /// §5.3), the path its `mint_mode = optimistic` drives: the leader proposes with its own Mint
 /// signature, watchers challenge with a Challenge signature, anyone executes after the window. Each
 /// test names one assumption the engine (crates/hawkeye/src/engine/mint.rs) or the adapter
-/// (crates/hawkeye-eth) relies on.
-contract OptimisticMintTest is BridgeTestBase {
+/// (crates/hawkeye-eth) relies on. wyec's own suites run beside these at the pin
+/// (test/Upstream.t.sol); the fixture and the encoding are wyec's test/utils, not a copy.
+contract HawkeyeOptimisticMintTest is BridgeTestBase {
     bytes32 constant LOCK = keccak256("opt-lock");
     uint256 constant AMOUNT = 7e8;
-
-    event MintProposed(
-        bytes32 indexed lockId,
-        uint256 indexed proposalId,
-        address indexed proposer,
-        address to,
-        uint256 amount,
-        uint64 eta
-    );
-    event MintChallenged(bytes32 indexed lockId, uint256 indexed proposalId, address indexed challenger);
-    event Minted(bytes32 indexed lockId, address indexed to, uint256 amount);
 
     function g(uint256 i) internal view returns (uint256) {
         return guardianKeys[i];

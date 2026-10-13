@@ -10,7 +10,9 @@
 #                                         # (offline machines, or where GitHub is unreachable)
 #
 # Re-pinning is deliberate: change WYEC_COMMIT here, regenerate vectors/eip712.json and the ABI
-# files under crates/hawkeye-eth/abi/, and say so in the commit message.
+# files under crates/hawkeye-eth/abi/, and say so in the commit message. The vectors' `wyecCommit`
+# stamp is read from vendor/wyec/.wyec-commit by test/Vectors.t.sol, and CI checks it against the
+# WYEC_COMMIT= line below: a re-pin without regenerating fails `forge test` (audit 05/T-1).
 set -eu
 
 # wyec `main` @ be177c5 (the merge of wyec#2, contracts = c23849a): CR-W4, ycashRecipient revision 2
@@ -62,12 +64,15 @@ if [ "$got" != "$WYEC_COMMIT" ]; then
     exit 1
 fi
 git -C "$src" cat-file -e "$WYEC_COMMIT:contracts/WyecBridge.sol" &&
-    git -C "$src" cat-file -e "$WYEC_COMMIT:contracts/WrappedYcash.sol" || {
+    git -C "$src" cat-file -e "$WYEC_COMMIT:contracts/WrappedYcash.sol" &&
+    git -C "$src" cat-file -e "$WYEC_COMMIT:test/utils/BridgeTestBase.sol" || {
     echo "commit $WYEC_COMMIT lacks the contracts" >&2
     exit 1
 }
 
-git -C "$src" archive --format=tar "$WYEC_COMMIT" contracts docs | tar -x -C "$dest"
-(cd "$dest" && find contracts docs -type f | LC_ALL=C sort | xargs sha256sum >.wyec-sha256)
+# script/ and test/ too: Hawkeye runs wyec's own Foundry suites at the pin (test/Upstream.t.sol)
+# instead of keeping a copy of them (audit 05/T-4); wyec's Deploy.t.sol imports its script.
+git -C "$src" archive --format=tar "$WYEC_COMMIT" contracts docs script test | tar -x -C "$dest"
+(cd "$dest" && find contracts docs script test -type f | LC_ALL=C sort | xargs sha256sum >.wyec-sha256)
 echo "$WYEC_COMMIT" >"$stamp"
 echo "wyec @ $WYEC_COMMIT -> $dest"

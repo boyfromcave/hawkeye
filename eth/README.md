@@ -5,14 +5,16 @@ at a **pinned commit**, which are fetched and never copied in (AGENTS.md rule 2)
 
 | Path | What |
 |---|---|
-| `tools/fetch-wyec.sh` | fetches `boyfromcave/wyec` @ `be177c5762019c2521ea43c81e90d59f972973b7` (branch `claude/hawkeye-bridge-plan-uedxax`: CR-W4, `burn(uint256, bytes)` with the §4.2 revision-2 recipient validated, `InvalidRecipient()`; move the pin to the merge commit once that PR merges — was `cad126a`, main at the merge of PR #1: CR-W1 optimistic mint and rate limit, CR-W2, CR-W3) into `vendor/wyec` (gitignored), verifies the commit and records file checksums; `WYEC_SRC=<clone>` to export from a local clone instead |
+| `tools/fetch-wyec.sh` | fetches `boyfromcave/wyec` at the commit on its `WYEC_COMMIT=` line (the pin is stated there only, with its history in the comment above it; this file does not repeat the hash) into `vendor/wyec` (gitignored): `contracts/`, `docs/`, `script/` and `test/`; verifies the commit and records file checksums; `WYEC_SRC=<clone>` to export from a local clone instead |
 | `package.json` | pinned dependencies: `@openzeppelin/contracts` 5.6.1 (wyec's compile check), `forge-std` v1.17.0 (git commit `f3dae6e`), `solc` 0.8.37 (solc-js, only for the shim) |
-| `foundry.toml` | `src` = `vendor/wyec/contracts`, solc 0.8.37, optimizer 200 runs (as wyec's `compile.js`), remappings `@openzeppelin/contracts/`, `forge-std/`, `wyec/` |
+| `foundry.toml` | `src` = `vendor/wyec/contracts`, solc 0.8.37, optimizer 200 runs (as wyec's `compile.js`), remappings `@openzeppelin/contracts/`, `forge-std/`, `wyec/`, `wyec-test/` (= `vendor/wyec/test/`) |
 | `tools/solc`, `tools/solc-shim.js` | a native-`solc` stand-in over solc-js, for machines where Foundry cannot download the compiler |
-| `test/WyecBridge.t.sol` | Hawkeye's assumptions about the contract: deployment, threshold mint, burn, pause, rotation, hand-off (below) |
-| `test/OptimisticMint.t.sol` | Hawkeye's assumptions about the optimistic mint it drives (below) |
-| `test/Vectors.t.sol` → `vectors/eip712.json` | EIP-712 golden vectors; format in `vectors/README.md` |
-| `test/Deploy.t.sol`, `script/Deploy.s.sol` | the predicted-address deployment and its output file |
+| `test/Upstream.t.sol` | **wyec's own suites at the pin** (`vendor/wyec/test/`: threshold path, optimistic mint, rate limit, deployment), compiled in and run under Hawkeye's toolchain: one copy of the contract tests, never a diverging local one (audit 05/T-4) |
+| `test/HawkeyeOptimisticMint.t.sol` | Hawkeye's assumptions about the optimistic mint it drives (below), on wyec's test fixture (`wyec-test/utils/`) |
+| `test/HawkeyeBurnRecipient.t.sol` | the recipients `hawkeye-core`'s `recipient_vectors.json` builds are accepted; malformed ones revert `InvalidRecipient()` |
+| `test/Vectors.t.sol` → `vectors/eip712.json` | EIP-712 golden vectors, accepted and refused cases, stamped with the fetched pin; format in `vectors/README.md` |
+| `test/Deploy.t.sol`, `script/Deploy.s.sol` | Hawkeye's predicted-address deployment (with `mintMode`) and its output file |
+| `tools/check-test-counts.sh` | CI: every test function declared upstream and in `test/` is one `forge test --list` runs |
 | `tools/deploy-anvil-smoke.sh` | CI smoke test: anvil on a free port, `Deploy.s.sol --broadcast` (3 guardians, threshold 2, 12 s window, 1000 wYEC/day cap), checks the file and `cast call`s guardianCount / threshold / challengeWindow / mintCap / capWindow / decimals / token↔bridge; output in a removed temp dir |
 | `tools/export-abi.sh` | writes `../crates/hawkeye-eth/abi/*.json` (ABI + bytecode) from the build; `--check` in CI |
 | `deployments/<chainid>.json` | written by `Deploy.s.sol`; anvil's (31337) is gitignored, public networks' are committed |
@@ -28,7 +30,8 @@ npm ci --ignore-scripts        # OpenZeppelin 5.6.1, forge-std v1.17.0, solc-js 
 ./tools/fetch-wyec.sh          # wyec @ pin -> vendor/wyec; idempotent, verifies the commit and checksums
 forge fmt --check              # Hawkeye's own script/ and test/ only ([fmt] ignore: vendor, node_modules)
 forge build --sizes
-forge test -vvv                # also fails if vectors/eip712.json is stale
+forge test -vvv                # wyec's suites too; fails if vectors/eip712.json is stale or mis-stamped
+./tools/check-test-counts.sh   # every declared test (upstream and Hawkeye's) is run
 ./tools/export-abi.sh --check  # crates/hawkeye-eth/abi/ matches this build
 ./tools/deploy-anvil-smoke.sh  # Deploy.s.sol on a throwaway anvil, read back with cast
 ```
@@ -47,11 +50,15 @@ Foundry itself can come from npm too (`@foundry-rs/forge`, `@foundry-rs/anvil`,
 
 After a re-pin or a compiler change: `WRITE_VECTORS=true forge test --mc Eip712VectorsTest` and
 `./tools/export-abi.sh`, then commit `vectors/eip712.json` and `crates/hawkeye-eth/abi/`. CI runs
-`forge test` (which fails on stale vectors) and `./tools/export-abi.sh --check`.
+`forge test` (which fails on stale vectors, and first on a `wyecCommit` stamp that is not the
+fetched pin), checks the stamp against the `WYEC_COMMIT=` line a second time with `jq`, and runs
+`./tools/export-abi.sh --check`. Negative tests assert their selector: CI refuses a bare
+`vm.expectRevert()` under `test/`.
 
 ## What the tests pin down
 
-`test/WyecBridge.t.sol` (one test per assumption Hawkeye's engine makes):
+wyec's own suites (run at the pin through `test/Upstream.t.sol`; their sources are
+`vendor/wyec/test/*.t.sol`, the list below is what Hawkeye relies on from them):
 
 - deployment order: bridge first with the predicted token address; the EIP-712 domain is
   `WyecBridge` / `1` / chain id / bridge;
@@ -76,10 +83,11 @@ After a re-pin or a compiler change: `WRITE_VECTORS=true forge test --mc Eip712V
 - `setBridge`: the old bridge can no longer mint or burn; balances are untouched; zero rejected;
 - the token: `decimals() = 8`, `CAP = 21,000,000 × 10^8`, only the bridge mints and burns;
 - the constructor: a zero challenge window and a cap without a window are refused; `setMintLimit`
-  shares the `adminNonce`.
+  shares the `adminNonce`;
+- the rate limit (`RateLimit.t.sol`): fixed windows, shared by both mint paths, threshold-settable.
 
-`test/OptimisticMint.t.sol` (the optimistic path, wyec-contract-design.md §4.5, as the engine drives
-it):
+`test/HawkeyeOptimisticMint.t.sol` (the optimistic path, wyec-contract-design.md §4.5, as the
+engine drives it):
 
 - both digests (`Mint`, `Challenge(bytes32 lockId,uint256 proposalId)`) are Hawkeye's encoding;
 - `proposeMint`: one guardian's signature over the threshold path's `Mint` digest, **any submitter**

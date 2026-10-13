@@ -8,7 +8,7 @@ import {WyecBridge} from "wyec/WyecBridge.sol";
 import {Deploy} from "../script/Deploy.s.sol";
 
 /// script/Deploy.s.sol in-process: predicted-address deployment and the deployment file.
-contract DeployScriptTest is Test {
+contract HawkeyeDeployScriptTest is Test {
     using stdJson for string;
 
     // Configs are passed in, not through the environment: forge runs tests in parallel and
@@ -23,7 +23,9 @@ contract DeployScriptTest is Test {
         c.mintCap = 1000e8;
         c.capWindow = 1 days;
         c.mintMode = "optimistic";
-        c.file = string.concat(vm.projectRoot(), "/deployments/.test-", name, ".json");
+        // `.test-hawkeye-`: wyec's own Deploy.t.sol (run through Upstream.t.sol, in parallel) writes
+        // `.test-<name>.json` into the same directory.
+        c.file = string.concat(vm.projectRoot(), "/deployments/.test-hawkeye-", name, ".json");
     }
 
     function test_Deploy_PairAndFile() public {
