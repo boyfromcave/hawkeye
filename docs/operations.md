@@ -244,6 +244,7 @@ within a working day.
 | `node-sign-restored` | page | `"wallet"` mode: the node wallet refuses every set signature (`set-sign-restored`, 07/F-5): it imported the member key (enrolment) or was restored from a seed, and its restore marker is set; no unlock or cancel is signed | if no other copy of the key can have signed: `hawkeye acknowledge-restore` (section 4 step 7, section 5 step 5); otherwise do not acknowledge, leave with the key |
 | `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet: its vault is spent in the mempool, or in a block the follower has not recorded at the tip yet, or by another transaction not yet `C_Y` deep | check the node's mempool and the follower's lag |
 | `unlock-prior-unknown` | page | this attestor leads a burn others led before, and not every previous leader (every member, while `ledger-restored`) has answered `POST /burns/unlock`, signed, that it holds no signed unlock for it: no fresh vault is signed (an unreachable previous leader holds the burn, 01/V-2, review M-1) | bring the previous leader's Hawkeye and API back; it then re-sends or serves its bytes, or answers none |
+| `gone-member-answered` | page | a member declared gone (`declare-leader-gone`) answered that it holds a signed unlock for a burn: the declaration was wrong, the member's hold stands | find out why the member was declared gone; adopt or wait for its unlock |
 | `ledger-restored` | page | the ledger holds fewer sign-once records than its high-water mark (`hawkeye.db.hwm`), or the node wallet (`"wallet"` mode) signed an unlock or cancel the ledger has no record of: it was restored from a backup (review L-2); fresh unlocks wait for every member's signed "none" | `hawkeye audit-ledger`; ask the other attestors; then `hawkeye acknowledge-ledger-restore` |
 | `unlock-dead` | ticket | a signed unlock can no longer confirm: its **vault** was spent by another transaction at least `C_Y` deep (from the ledger's own spend record, the follower at the tip), or by this unlock whose intent was then cancelled `C_Y` deep; a fee-input spend never makes it dead (it can be re-funded, 01/V-2); one more vault may now be signed for the burn | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
 | `roll-overdue` | ticket | vaults past half their `ROLL_MARGIN` without a roll (HK-6) | check the roll leader and the rate limit |
@@ -344,9 +345,14 @@ out:
    (`sha256d("HawkeyeMemberGone" ‖ setId ‖ member)` with its member key), records it in its
    ledger and sends it to every peer (`POST /members/gone`, authenticated); each ledger records it
    after checking the signature and that the declarer is a current member other than the gone one
-   (logs `member_declared_gone`, `declare_leader_gone`, then `unlock_prior_excluded`). **Quorum: at
-   least `unlockThreshold` (k) distinct current members other than the gone one** — as many as can
-   release an unlock — after which no ledger waits for that member's answer. Only declare a member
+   (logs `member_declared_gone`, `declare_leader_gone`, then `unlock_prior_excluded`). **Quorum: a
+   strict majority of the current members other than the gone one, and never less than
+   `unlockThreshold` (k): `max(k, floor((n − 1) / 2) + 1)`, n counting the gone member** (a
+   single member at `k = 1` could otherwise release an honest but slow leader's hold and double a
+   burn). Declarations from members that later leave the set stop counting. The override applies
+   only while the declared member stays silent: if it answers that it holds a signed unlock, the
+   adoption path wins and the alarm `gone-member-answered` is raised (log `gone_member_answered`;
+   the override itself logs `unlock_prior_overridden`). Only declare a member
    gone when you are sure its signed unlocks are lost with it; if it comes back with them, the
    watchers' benign-race cancel and the orphan roll are the remaining net.
 

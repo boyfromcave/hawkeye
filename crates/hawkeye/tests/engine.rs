@@ -136,6 +136,8 @@ struct Opts {
     window: u64,
     /// The bridge's `mintCap` per day (0: no limit; mainnet semantics then pause own mints).
     mint_cap: u128,
+    /// The set's members (and seats).
+    members: u8,
 }
 
 impl Default for Opts {
@@ -151,6 +153,7 @@ impl Default for Opts {
             slots: 1,
             window: WINDOW,
             mint_cap: 0,
+            members: 3,
         }
     }
 }
@@ -212,7 +215,7 @@ async fn setup_with(opts: Opts) -> Option<Env> {
         .expect("spawn anvil");
     let deployer =
         PrivateKeySigner::from_bytes(&B256::from_slice(&anvil.keys()[0].to_bytes())).unwrap();
-    let keys: Vec<SecretKey> = (1..=3).map(secret).collect();
+    let keys: Vec<SecretKey> = (1..=opts.members).map(secret).collect();
     let holder = secret(9);
     let guardians: Vec<Address> = keys
         .iter()
@@ -240,7 +243,7 @@ async fn setup_with(opts: Opts) -> Option<Env> {
     let mut st = MockState::new();
     let admit = st.new_wallet_key();
     let set = st.add_set(SetParams {
-        seats: 3,
+        seats: u32::from(opts.members),
         unlockthreshold: opts.unlock_threshold,
         cancelthreshold: opts.cancel_threshold,
         slashthreshold: 2,
@@ -5469,8 +5472,8 @@ async fn s1_a_member_no_longer_current_is_not_required() {
     assert_eq!(unlocks_for(&env, nonce).len(), 1, "no longer held");
 }
 
-/// (s2) The owner's override: a quorum (`unlockThreshold` = 1 here) of other current members
-/// declares the unreachable leader gone; the hold is released. A self-declaration, a forged
+/// (s2) The owner's override: a quorum — a strict majority of the other current members, never
+/// less than `unlockThreshold` — declares the unreachable leader gone; the hold is released. A self-declaration, a forged
 /// signature and a non-member's declaration are refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2_declared_gone_by_a_quorum_releases_the_hold() {
@@ -5517,16 +5520,35 @@ async fn s2_declared_gone_by_a_quorum_releases_the_hold() {
             "not a member"
         );
     }
-    // one other member declares it gone to everyone (as `hawkeye declare-leader-gone` does)
-    let declarer = (leader + 2) % 3;
+    // n = 3, k = 1: the quorum is a strict majority of the two others, 2; one is not enough
+    let first = (leader + 2) % 3;
     for (i, e) in engines.iter().enumerate() {
         if i == leader {
             continue;
         }
-        let a = hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.keys[declarer], mk))
+        let a = hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.keys[first], mk))
             .await
             .unwrap();
-        assert_eq!((a.declarations, a.quorum), (1, 1));
+        assert_eq!((a.declarations, a.quorum), (1, 2));
+    }
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "one declaration is not a quorum"
+    );
+    let second = (leader + 1) % 3;
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let a = hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.keys[second], mk))
+            .await
+            .unwrap();
+        assert_eq!((a.declarations, a.quorum), (2, 2));
     }
     for _ in 0..2 {
         for (i, e) in engines.iter_mut().enumerate() {
@@ -5617,4 +5639,140 @@ async fn s4_a_divergent_leaders_evicted_unlock_is_adopted_not_rebuilt() {
         env.mock.state().calls_to("set_signunlock").len() <= signs + 1,
         "no fresh signature beyond the adopter's no-op pass"
     );
+}
+
+/// (s2b) The override quorum at `k = 1`, `n = 4`: a strict majority of the three others (2).
+/// One declaration (a single, possibly malicious, member) releases nothing; a declaration from a
+/// member that then leaves the set stops counting; after three declarations (two from members
+/// still current: the majority of the three current members) the hold is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2b_one_declaration_is_not_a_quorum_at_k1_n4() {
+    use hawkeye::peers::GoneDeclaration;
+    let Some(env) = setup_with(Opts {
+        members: 4,
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    assert_eq!(hawkeye::engine::burn::gone_quorum(1, 4), 2);
+    assert_eq!(hawkeye::engine::burn::gone_quorum(1, 3), 2);
+    assert_eq!(hawkeye::engine::burn::gone_quorum(3, 4), 3);
+    assert_eq!(hawkeye::engine::burn::gone_quorum(1, 7), 4);
+    let mut engines = vec![];
+    for i in 0..4 {
+        engines.push(env.engine(i).await);
+    }
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x73; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let mut live: Vec<[u8; 33]> = (0..4).map(|i| env.key_of_index(i)).collect();
+    hawkeye_core::keys::sort_members(&mut live);
+    let leader = (0..4)
+        .find(|i| env.key_of_index(*i) == live[(nonce % 4) as usize])
+        .unwrap();
+    drop(engines);
+    // four APIs, the leader's down
+    let mut listeners = vec![];
+    let mut urls = vec![];
+    for _ in 0..4 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", l.local_addr().unwrap()));
+        listeners.push(Some(l));
+    }
+    listeners[leader] = None;
+    let mut engines = vec![];
+    for i in 0..4 {
+        let peers = (0..4)
+            .filter(|j| *j != i)
+            .map(|j| urls[j].clone())
+            .collect();
+        engines.push(env.engine_with_peers(i, peers).await);
+    }
+    for (i, l) in listeners.into_iter().enumerate() {
+        if let Some(l) = l {
+            let ctx = engines[i].ctx().clone();
+            tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+        }
+    }
+    for _ in 0..2 * TAKEOVER + 2 {
+        tick_except(&mut engines, leader).await;
+        env.mine(1);
+    }
+    assert!(unlocks_for(&env, nonce).is_empty(), "held");
+    let mk = env.key_of_index(leader);
+    let decl = |by: &SecretKey| GoneDeclaration {
+        member: hex::encode(mk),
+        declarer: hex::encode(by.public_key()),
+        sig: hex::encode(
+            hawkeye_core::peerauth::sign(by, &hawkeye_core::peerauth::gone_msg(&env.set.0, &mk))
+                .unwrap(),
+        ),
+        reason: "test".into(),
+    };
+    let others: Vec<usize> = (0..4).filter(|i| *i != leader).collect();
+    let declare = |by: usize, engines: &Vec<Engine>| {
+        let d = decl(&env.keys[by]);
+        let ctxs: Vec<_> = others.iter().map(|i| engines[*i].ctx().clone()).collect();
+        async move {
+            let mut last = None;
+            for c in ctxs {
+                last = Some(
+                    hawkeye::engine::burn::record_gone(&c, None, &d)
+                        .await
+                        .unwrap(),
+                );
+            }
+            last.unwrap()
+        }
+    };
+    // one member alone (the attack): no release
+    let a = declare(others[0], &engines).await;
+    assert_eq!((a.declarations, a.quorum), (1, 2));
+    tick_except(&mut engines, leader).await;
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "one declaration releases nothing"
+    );
+    // its declarer leaves the set: its declaration stops counting
+    {
+        let mut st = env.mock.state();
+        let h = st.tip_height();
+        st.leave_member(&env.set, &PubKey(env.key_of_index(others[0])), h);
+    }
+    env.mine(1);
+    tick_except(&mut engines, leader).await;
+    // three: released
+    let a = declare(others[1], &engines).await;
+    assert_eq!(
+        (a.declarations, a.quorum),
+        (1, 2),
+        "the leaver's declaration no longer counts (n = 3 current now)"
+    );
+    tick_except(&mut engines, leader).await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "still no quorum");
+    let a = declare(others[2], &engines).await;
+    assert_eq!((a.declarations, a.quorum), (2, 2), "{a:?}");
+    // the burn may sit with the member that left until the takeover moves it on
+    let mut released = false;
+    for _ in 0..3 * TAKEOVER + 3 {
+        tick_except(&mut engines, leader).await;
+        if !unlocks_for(&env, nonce).is_empty() {
+            released = true;
+            break;
+        }
+        env.mine(1);
+    }
+    assert!(released, "released by a majority");
+}
+
+/// Tick every engine but `skip`.
+async fn tick_except(engines: &mut [Engine], skip: usize) {
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != skip {
+            e.tick().await;
+        }
+    }
 }
