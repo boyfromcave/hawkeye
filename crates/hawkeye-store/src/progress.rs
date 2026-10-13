@@ -30,6 +30,9 @@ pub struct PendingMintRecord {
     pub since_height: u32,
     /// A `MintProposed` (CR-W1), not a `Minted`.
     pub proposal: bool,
+    /// Seen at `latest`, not yet finalized (schema v7, audit 05/H-2): challenged like a final
+    /// one, never the ground of a slash case; dropped if its block finalizes without it.
+    pub provisional: bool,
 }
 
 /// The case owner's act with the signatures gathered so far.
@@ -99,8 +102,8 @@ impl Tx<'_> {
     pub fn add_pending_mint(&self, r: &PendingMintRecord) -> Result<bool> {
         let n = self.conn().execute(
             "INSERT OR IGNORE INTO pending_mints (lock_id, tx_hash, recipient, amount, block,
-                                                  since_height, proposal, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                                  since_height, proposal, created_at, provisional)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 r.lock_id,
                 r.tx_hash,
@@ -109,16 +112,43 @@ impl Tx<'_> {
                 r.block,
                 r.since_height,
                 b(r.proposal),
-                self.now()
+                self.now(),
+                b(r.provisional)
             ],
         )?;
         Ok(n == 1)
     }
 
+    /// The finalized scan ingested `(lockId, txHash)` in `block`: a provisional record of it (seen
+    /// at `latest` first) becomes final, at the block it finalized in (audit 05/H-2). `true` if
+    /// there was a record.
+    pub fn finalize_pending_mint(
+        &self,
+        lock_id: &Hash32,
+        tx_hash: &Hash32,
+        block: u64,
+    ) -> Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE pending_mints SET provisional = 0, block = ?3 WHERE lock_id = ?1 AND tx_hash = ?2",
+            params![lock_id, tx_hash, block],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Provisional records whose block the finalized scan has passed without ingesting them
+    /// (their proposal was reorged out): deleted. Run after the finalized ingestion of `..=to`
+    /// in the same transaction. Returns how many were dropped.
+    pub fn drop_unfinalized_pending_mints(&self, to: u64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM pending_mints WHERE provisional = 1 AND block <= ?1",
+            params![to],
+        )?)
+    }
+
     /// Every deferred mint check, oldest first.
     pub fn pending_mints(&self) -> Result<Vec<PendingMintRecord>> {
         self.all(
-            "SELECT lock_id, tx_hash, recipient, amount, block, since_height, proposal
+            "SELECT lock_id, tx_hash, recipient, amount, block, since_height, proposal, provisional
              FROM pending_mints ORDER BY created_at, block, lock_id",
             [],
             |r| {
@@ -130,6 +160,7 @@ impl Tx<'_> {
                     block: r.get(4)?,
                     since_height: r.get(5)?,
                     proposal: r.get::<_, i64>(6)? != 0,
+                    provisional: r.get::<_, i64>(7)? != 0,
                 })
             },
         )

@@ -6,7 +6,12 @@
 //! rebuild procedure, which v4 uses).
 
 /// Every migration, in order. Entry `i` takes `user_version` from `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+///
+/// **Merge note (remedial lanes, 2026-10-12):** `V6` is lane `bridge-peer`'s (audit 05/H-1:
+/// `sign_once_unlock_burn`, `meta`), `V7` this lane's (audit 05/H-2: `pending_mints.provisional`).
+/// On this branch alone V7 is the sixth entry; merged after H-1 the list is
+/// `[V1, V2, V3, V4, V5, V6, V7]`. V7 touches only `pending_mints`, so it applies on top of either.
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V7];
 
 /// Version 1: the H4 ledger.
 const V1: &str = r#"
@@ -499,6 +504,17 @@ CREATE TRIGGER sign_once_drill_mint_immutable_update BEFORE UPDATE ON sign_once_
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
 CREATE TRIGGER sign_once_drill_mint_immutable_delete BEFORE DELETE ON sign_once_drill_mint
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+"#;
+
+/// Version 7 (audit 05/H-2): `pending_mints.provisional`. The watcher reads `MintProposed` at
+/// `latest`, ahead of finality; a deferred check of such a proposal is recorded with
+/// `provisional = 1`. A provisional row is judged and challenged like a final one, but never
+/// opens a slash case or a `fraudulent-mint` alarm; the finalized scan clears the flag when it
+/// ingests the same `(lockId, txHash)`, and deletes the row when its block finalizes without it
+/// (the proposal was reorged out). Existing rows came from the finalized scan: 0.
+const V7: &str = r#"
+ALTER TABLE pending_mints ADD COLUMN provisional INTEGER NOT NULL DEFAULT 0
+    CHECK (provisional IN (0, 1));
 "#;
 
 /// Version 5 (main plan §4.2 revision 2, phase R4): `burns.recipient` is the variable-length

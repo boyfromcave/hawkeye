@@ -268,6 +268,12 @@ impl ForeignChain for EthereumChain {
                     "bridge challengeWindow (is it the wyec CR-W1 bridge?): {e}"
                 ))
             })?;
+            let (mint_cap, cap_window) = self
+                .client
+                .mint_limit()
+                .await
+                .map_err(|e| ForeignError::new(format!("bridge mint limit: {e}")))?;
+            let (mint_cap, cap_window) = (sat(mint_cap), sat(cap_window));
             let chain = if mainnet {
                 hawkeye_eth::mode::MAINNET
             } else {
@@ -275,15 +281,46 @@ impl ForeignChain for EthereumChain {
             };
             hawkeye_eth::mode::check_contract_threshold(chain, threshold)
                 .map_err(|e| ForeignError::new(format!("{e} (plan §3.3)")))?;
+            hawkeye_eth::mode::check_challenge_window(chain, challenge_window)
+                .map_err(|e| ForeignError::new(format!("{e} (audit 05/H-2)")))?;
+            hawkeye_eth::mode::check_mint_cap(chain, mint_cap)
+                .map_err(|e| ForeignError::new(format!("{e} (audit 05/H-2)")))?;
             Ok(BridgeInfo {
                 threshold,
                 challenge_window,
+                mint_cap,
+                cap_window,
             })
         })
     }
 
     fn finalized_height(&self) -> BoxFut<'_, u64> {
         Box::pin(async move { self.client.finalized_block_number().await.map_err(fe) })
+    }
+
+    fn latest_height(&self) -> BoxFut<'_, u64> {
+        Box::pin(async move { self.client.latest_block_number().await.map_err(fe) })
+    }
+
+    fn scan_proposals(&self, from: u64, to: u64) -> BoxFut<'_, ScanBatch> {
+        Box::pin(async move {
+            let events = self.client.scan_proposals(from, to).await.map_err(fe)?;
+            Ok(ScanBatch {
+                events: events
+                    .iter()
+                    .map(|ev| Scanned {
+                        meta: EventMeta {
+                            height: ev.meta.block_number,
+                            block_hash: ev.meta.block_hash.0,
+                            tx: TxId(ev.meta.tx_hash.0),
+                            index: ev.meta.log_index,
+                        },
+                        event: event(&ev.event),
+                    })
+                    .collect(),
+                to_hash: [0; 32],
+            })
+        })
     }
 
     fn scan(&self, from: u64, to: u64) -> BoxFut<'_, ScanBatch> {

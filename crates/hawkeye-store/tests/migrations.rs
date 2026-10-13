@@ -421,7 +421,7 @@ fn a_v4_ledger_migrates_to_v5_converting_v1_recipients() {
         .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 5);
+    assert_eq!(s.schema_version().unwrap() as usize, MIGRATIONS.len());
     assert_eq!(tables(&path), TABLES);
     s.tx(|t| {
         let b = t.burn(&BurnKey::new(dep, 3))?.unwrap();
@@ -492,6 +492,7 @@ fn near_accounts_round_trip() {
             block: 7,
             since_height: 9,
             proposal: true,
+            provisional: false,
         };
         t.add_pending_mint(&pm)?;
         assert_eq!(t.pending_mints()?, vec![pm]);
@@ -543,6 +544,7 @@ fn restart_records_round_trip() {
             block: 7,
             since_height: 9,
             proposal: true,
+            provisional: false,
         };
         assert!(t.add_pending_mint(&pm)?);
         assert!(!t.add_pending_mint(&PendingMintRecord {
@@ -649,6 +651,117 @@ fn constraints_are_enforced() {
         let (b, created_b) = t.open_slash_case(&new)?;
         assert!(created_a && !created_b);
         assert_eq!(a, b);
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+}
+
+/// Schema v7 (audit 05/H-2): `pending_mints.provisional`, 0 for every row a v5 ledger already had
+/// (they came from the finalized scan). V7 touches only `pending_mints`; merged after lane
+/// `bridge-peer`'s V6 it is the seventh migration, here the last one whatever its index.
+#[test]
+fn the_last_migration_adds_pending_mints_provisional() {
+    use hawkeye_core::EthAddress;
+    use hawkeye_store::PendingMintRecord;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let before = MIGRATIONS.len() - 1;
+    {
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        for m in &MIGRATIONS[..before] {
+            raw.execute_batch(m).unwrap();
+        }
+        raw.pragma_update(None, "user_version", before as i64)
+            .unwrap();
+        raw.execute(
+            "INSERT INTO pending_mints (lock_id, tx_hash, recipient, amount, block, since_height,
+                                        proposal, created_at)
+             VALUES (?1, ?2, 'ethereum:0x' || ?3, 5, 7, 9, 1, 0)",
+            (vec![1u8; 32], vec![2u8; 32], "03".repeat(20)),
+        )
+        .unwrap();
+    }
+    let mut s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap() as usize, MIGRATIONS.len());
+    s.tx(|t| {
+        let rows = t.pending_mints()?;
+        assert_eq!(
+            rows,
+            vec![PendingMintRecord {
+                lock_id: [1; 32],
+                tx_hash: [2; 32],
+                to: hawkeye_core::Destination::Ethereum(EthAddress([3; 20])),
+                amount: 5,
+                block: 7,
+                since_height: 9,
+                proposal: true,
+                provisional: false,
+            }]
+        );
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+    // the column refuses anything but 0 / 1
+    drop(s);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        raw.execute("UPDATE pending_mints SET provisional = 2", [])
+            .is_err()
+    );
+}
+
+/// Provisional rows (audit 05/H-2): the finalized scan confirms one it ingests (at the block it
+/// finalized in) and drops one whose block it passed without it (reorged out).
+#[test]
+fn provisional_pending_mints_finalize_or_drop() {
+    use hawkeye_core::EthAddress;
+    use hawkeye_store::PendingMintRecord;
+    let mut s = common::store();
+    s.tx(|t| {
+        let seen = PendingMintRecord {
+            lock_id: [1; 32],
+            tx_hash: [2; 32],
+            to: hawkeye_core::Destination::Ethereum(EthAddress([3; 20])),
+            amount: 5,
+            block: 70,
+            since_height: 9,
+            proposal: true,
+            provisional: true,
+        };
+        let reorged = PendingMintRecord {
+            lock_id: [4; 32],
+            tx_hash: [5; 32],
+            block: 71,
+            ..seen.clone()
+        };
+        let later = PendingMintRecord {
+            lock_id: [6; 32],
+            tx_hash: [7; 32],
+            block: 90,
+            ..seen.clone()
+        };
+        for r in [&seen, &reorged, &later] {
+            assert!(t.add_pending_mint(r)?);
+        }
+        // the finalized scan of ..=80 ingests `seen` (re-mined in block 72), not `reorged`
+        assert!(t.finalize_pending_mint(&seen.lock_id, &seen.tx_hash, 72)?);
+        assert!(!t.finalize_pending_mint(&[9; 32], &[9; 32], 72)?);
+        assert_eq!(t.drop_unfinalized_pending_mints(80)?, 1);
+        let rows = t.pending_mints()?;
+        assert_eq!(
+            rows,
+            vec![
+                PendingMintRecord {
+                    block: 72,
+                    provisional: false,
+                    ..seen.clone()
+                },
+                later.clone()
+            ]
+        );
+        // a final row is never dropped by the provisional sweep
+        assert_eq!(t.drop_unfinalized_pending_mints(1_000)?, 1);
+        assert_eq!(t.pending_mints()?.len(), 1);
         Ok::<_, StoreError>(())
     })
     .unwrap();

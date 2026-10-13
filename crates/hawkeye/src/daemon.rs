@@ -57,8 +57,10 @@ pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributo
 /// The start-up checks: the node's network, the set exists with at least the network's minimum
 /// `maturity` (D-Q-31: 16,128 on mainnet/testnet, 2 on regtest), this key is a current member, the
 /// guardian set matches the members (refused on mainnet, warned elsewhere), and the live bridge's
-/// threshold is ≥ 2 on mainnet in every mint mode (plan §3.3; warned elsewhere when it is 1) —
-/// the bridge's own rules through [`ForeignChain::check_bridge`](foreign::ForeignChain::check_bridge).
+/// threshold is ≥ 2 on mainnet in every mint mode (plan §3.3; warned elsewhere when it is 1), and
+/// on mainnet its `challengeWindow` is at least two hours and its `mintCap` non-zero (audit
+/// 05/H-2; an unbounded cap is warned elsewhere) — the bridge's own rules through
+/// [`ForeignChain::check_bridge`](foreign::ForeignChain::check_bridge).
 pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
     let info = ctx.ycash.getblockchaininfo().await.context("ycashd")?;
     let want = match ctx.network_name.as_str() {
@@ -110,6 +112,13 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
         .await
         .map_err(|e| anyhow!("{e}"))?;
     let (threshold, window) = (bridge.threshold, bridge.challenge_window);
+    if bridge.mint_cap == 0 {
+        // refused on mainnet by check_bridge (audit 05/H-2)
+        warn!(
+            event = "startup_bridge_mint_cap_unbounded",
+            "the bridge has no mint rate limit: a proposal nobody challenges mints without bound (development only)"
+        );
+    }
     if threshold < MAINNET_MIN_THRESHOLD {
         warn!(
             event = "startup_bridge_threshold_one",
@@ -121,7 +130,8 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
           foreign = %ctx.foreign.kind(), tag = %ctx.params.tag_text(),
           eth = %ctx.guardian()?, chain = %info.chain, tip = info.blocks,
           mint_mode = %ctx.params.mint_mode, bridge_threshold = threshold,
-          challenge_window = window);
+          challenge_window = window, mint_cap = %bridge.mint_cap,
+          cap_window = %bridge.cap_window);
     Ok(())
 }
 

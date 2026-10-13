@@ -121,6 +121,13 @@ struct Opts {
     roll_margin: u32,
     /// The set's `ratelimitbps` (0: no rate limit).
     ratelimitbps: u32,
+    /// anvil's `--slots-in-an-epoch`: finalized = latest − 2 × slots (audit 05/T-3: 32 pins
+    /// finality 64 blocks behind the head, as on mainnet).
+    slots: u64,
+    /// The bridge's challenge window, seconds.
+    window: u64,
+    /// The bridge's `mintCap` per day (0: no limit; mainnet semantics then pause own mints).
+    mint_cap: u128,
 }
 
 impl Default for Opts {
@@ -130,6 +137,9 @@ impl Default for Opts {
             min_owner_age: 400,
             roll_margin: 50,
             ratelimitbps: 0,
+            slots: 1,
+            window: WINDOW,
+            mint_cap: 0,
         }
     }
 }
@@ -180,11 +190,13 @@ async fn setup_with(opts: Opts) -> Option<Env> {
             std::env::var("HAWKEYE_REQUIRE_ANVIL").as_deref() != Ok("1"),
             "HAWKEYE_REQUIRE_ANVIL=1 but `anvil` is not on PATH"
         );
-        eprintln!("skipping: `anvil` is not on PATH");
+        eprintln!(
+            "SKIPPED (anvil not on PATH): this test passed vacuously; `make test` or HAWKEYE_REQUIRE_ANVIL=1 turns a missing anvil into a failure"
+        );
         return None;
     }
     let anvil = Anvil::new()
-        .args(["--slots-in-an-epoch", "1"])
+        .args(["--slots-in-an-epoch", &opts.slots.to_string()])
         .try_spawn()
         .expect("spawn anvil");
     let deployer =
@@ -201,11 +213,14 @@ async fn setup_with(opts: Opts) -> Option<Env> {
         MintMode::Threshold { k } => k,
         MintMode::Optimistic => 2,
     };
-    let dep = deploy(
-        &provider,
-        deployer.address(),
-        &DeployParams::new(&guardians, threshold, WINDOW, opts.mode),
-    )
+    let dep = deploy(&provider, deployer.address(), &{
+        let mut p = DeployParams::new(&guardians, threshold, opts.window, opts.mode);
+        if opts.mint_cap > 0 {
+            p.mint_cap = opts.mint_cap;
+            p.cap_window = 86_400;
+        }
+        p
+    })
     .await
     .unwrap();
     for k in keys.iter().chain([&holder]) {
@@ -294,6 +309,20 @@ impl Env {
         peers: Vec<String>,
         adjust: impl FnOnce(&mut Params),
     ) -> Engine {
+        let foreign = Arc::new(hawkeye::foreign::EthereumChain::new(
+            self.eth(&self.keys[i]).await,
+        ));
+        self.engine_on(i, peers, foreign, adjust)
+    }
+
+    /// Attestor `i`'s engine over a given foreign-chain adapter (a test wrapper).
+    fn engine_on(
+        &self,
+        i: usize,
+        peers: Vec<String>,
+        foreign: Arc<dyn hawkeye::foreign::ForeignChain>,
+        adjust: impl FnOnce(&mut Params),
+    ) -> Engine {
         let key = self.keys[i].clone();
         let store = Store::open(self.dir.path().join(format!("attestor{i}.db"))).unwrap();
         let mut params = self.params();
@@ -301,7 +330,7 @@ impl Env {
         Engine::new(Ctx {
             params: Arc::new(params),
             me: key.public_key(),
-            foreign: Arc::new(hawkeye::foreign::EthereumChain::new(self.eth(&key).await)),
+            foreign,
             key,
             ycash: Arc::new(self.mock.client()),
             store: Arc::new(Mutex::new(store)),
@@ -2370,4 +2399,567 @@ async fn t3_threshold_fallback_respects_signing_pause() {
         c.balance_of(holder).await.unwrap(),
         U256::from(1_000_000_000u64)
     );
+}
+
+// ------------------------------------------------------------------------------------------
+// audit 05/H-2, 05/T-3: proposals watched at `latest`, the finality stall, pinned finality
+
+/// An Ethereum adapter whose `finalized` can be pinned (a finality stall), which can inject
+/// `MintProposed` events into the head-of-chain scan (a proposal later reorged out), and which
+/// counts this attestor's own `proposeMint` submissions.
+struct TestChain {
+    inner: hawkeye::foreign::EthereumChain,
+    pinned: Mutex<Option<u64>>,
+    inject: Mutex<Vec<hawkeye::foreign::Scanned>>,
+    proposes: std::sync::atomic::AtomicUsize,
+}
+
+mod test_chain {
+    use super::TestChain;
+    use hawkeye::foreign::*;
+    use hawkeye_core::bytes::Hash32;
+    use hawkeye_core::{Deployment, PubKey33, SecretKey};
+    use std::sync::atomic::Ordering;
+
+    impl AttestationScheme for TestChain {
+        fn guardian_of(&self, m: &PubKey33) -> ForeignResult<Guardian> {
+            self.inner.guardian_of(m)
+        }
+        fn mint_digest(&self, l: &Hash32, a: u64, to: &Account) -> ForeignResult<Hash32> {
+            self.inner.mint_digest(l, a, to)
+        }
+        fn challenge_digest(&self, l: &Hash32, id: u128) -> Hash32 {
+            self.inner.challenge_digest(l, id)
+        }
+        fn sign(&self, k: &SecretKey, d: &Hash32) -> ForeignResult<[u8; 65]> {
+            self.inner.sign(k, d)
+        }
+        fn recover(&self, d: &Hash32, s: &[u8]) -> ForeignResult<Guardian> {
+            self.inner.recover(d, s)
+        }
+        fn parse_account(&self, t: &str) -> ForeignResult<Account> {
+            self.inner.parse_account(t)
+        }
+    }
+
+    impl ForeignChain for TestChain {
+        fn kind(&self) -> BridgeKind {
+            self.inner.kind()
+        }
+        fn deployment(&self) -> Deployment {
+            self.inner.deployment()
+        }
+        fn check_bridge(&self, mainnet: bool) -> BoxFut<'_, BridgeInfo> {
+            self.inner.check_bridge(mainnet)
+        }
+        fn finalized_height(&self) -> BoxFut<'_, u64> {
+            Box::pin(async move {
+                let pinned = *self.pinned.lock().unwrap();
+                match pinned {
+                    Some(h) => Ok(h),
+                    None => self.inner.finalized_height().await,
+                }
+            })
+        }
+        fn latest_height(&self) -> BoxFut<'_, u64> {
+            self.inner.latest_height()
+        }
+        fn scan(&self, from: u64, to: u64) -> BoxFut<'_, ScanBatch> {
+            self.inner.scan(from, to)
+        }
+        fn scan_proposals(&self, from: u64, to: u64) -> BoxFut<'_, ScanBatch> {
+            Box::pin(async move {
+                let mut b = self.inner.scan_proposals(from, to).await?;
+                for e in self.inject.lock().unwrap().iter() {
+                    if (from..=to).contains(&e.meta.height) {
+                        b.events.push(e.clone());
+                    }
+                }
+                Ok(b)
+            })
+        }
+        fn now(&self) -> BoxFut<'_, u64> {
+            self.inner.now()
+        }
+        fn guardians(&self) -> BoxFut<'_, Vec<Guardian>> {
+            self.inner.guardians()
+        }
+        fn threshold(&self) -> BoxFut<'_, u8> {
+            self.inner.threshold()
+        }
+        fn challenge_window(&self) -> BoxFut<'_, u64> {
+            self.inner.challenge_window()
+        }
+        fn consumed(&self, l: Hash32) -> BoxFut<'_, bool> {
+            self.inner.consumed(l)
+        }
+        fn proposal(&self, l: Hash32) -> BoxFut<'_, Option<Proposal>> {
+            self.inner.proposal(l)
+        }
+        fn proposal_status(&self, l: Hash32) -> BoxFut<'_, ProposalStatus> {
+            self.inner.proposal_status(l)
+        }
+        fn vetoed(&self, l: Hash32, who: Guardian) -> BoxFut<'_, bool> {
+            self.inner.vetoed(l, who)
+        }
+        fn mint_available(&self) -> BoxFut<'_, u128> {
+            self.inner.mint_available()
+        }
+        fn total_supply(&self) -> BoxFut<'_, u128> {
+            self.inner.total_supply()
+        }
+        fn paused(&self) -> BoxFut<'_, bool> {
+            self.inner.paused()
+        }
+        fn mint_signatures(&self, tx: TxId) -> BoxFut<'_, Vec<Vec<u8>>> {
+            self.inner.mint_signatures(tx)
+        }
+        fn threshold_mint(
+            &self,
+            k: u8,
+            l: Hash32,
+            a: u64,
+            to: Account,
+            sigs: Vec<[u8; 65]>,
+        ) -> BoxFut<'_, Mined> {
+            self.inner.threshold_mint(k, l, a, to, sigs)
+        }
+        fn propose_mint(
+            &self,
+            l: Hash32,
+            a: u64,
+            to: Account,
+            sig: [u8; 65],
+        ) -> BoxFut<'_, Proposed> {
+            self.proposes.fetch_add(1, Ordering::SeqCst);
+            self.inner.propose_mint(l, a, to, sig)
+        }
+        fn challenge_mint(&self, l: Hash32, id: u128, sig: [u8; 65]) -> BoxFut<'_, Mined> {
+            self.inner.challenge_mint(l, id, sig)
+        }
+        fn execute_mint(&self, l: Hash32) -> BoxFut<'_, Mined> {
+            self.inner.execute_mint(l)
+        }
+        fn burn(&self, amount: u64, r: Vec<u8>) -> BoxFut<'_, Burned> {
+            self.inner.burn(amount, r)
+        }
+    }
+}
+
+impl Env {
+    async fn test_chain(&self, i: usize) -> Arc<TestChain> {
+        Arc::new(TestChain {
+            inner: hawkeye::foreign::EthereumChain::new(self.eth(&self.keys[i]).await),
+            pinned: Mutex::new(None),
+            inject: Mutex::new(vec![]),
+            proposes: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    async fn finalized(&self) -> u64 {
+        self.eth(&self.holder)
+            .await
+            .finalized_block_number()
+            .await
+            .unwrap()
+    }
+
+    async fn latest(&self) -> u64 {
+        self.provider.get_block_number().await.unwrap()
+    }
+}
+
+fn pending_provisional(e: &Engine, lock_id: &[u8; 32]) -> Vec<bool> {
+    e.ctx()
+        .db(|t| t.pending_mints())
+        .unwrap()
+        .into_iter()
+        .filter(|p| &p.lock_id == lock_id)
+        .map(|p| p.provisional)
+        .collect()
+}
+
+fn fraud_cases(e: &Engine, target: [u8; 33]) -> usize {
+    open_cases(e)
+        .iter()
+        .filter(|c| c.fault == hawkeye_store::FaultKind::FraudulentMint && c.target_key == target)
+        .count()
+}
+
+/// A rogue proposal by guardian `r` over an invented lockId; returns (lockId, its block).
+async fn rogue_proposal(env: &Env, r: usize, fake: [u8; 32]) -> u64 {
+    let to = env.holder.eth_address();
+    let digest = hawkeye_core::eip712::Domain::new(31337, EthAddress(env.dep.bridge.0.0))
+        .mint_digest(&fake, 700_000_000, &to);
+    let sig = hawkeye_core::eth::sign_digest(&env.keys[r], &digest).unwrap();
+    let p = env
+        .eth(&env.keys[r])
+        .await
+        .propose_mint(
+            B256::from(fake),
+            U256::from(700_000_000u64),
+            hawkeye::convert::addr(&to),
+            &sig,
+        )
+        .await
+        .unwrap();
+    match p {
+        hawkeye_eth::MintSubmitted::Proposed { mined, .. } => mined.block_number,
+        other => panic!("not a proposal: {other:?}"),
+    }
+}
+
+/// Acceptance 1 (both fixtures): a proposal mined at `latest` is a provisional deferred check
+/// within one tick of its block, before that block is final.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o1_proposal_recorded_within_a_tick_before_finality() {
+    for slots in [1u64, 32] {
+        let Some(env) = setup_with(Opts { slots, ..opt() }).await else {
+            return;
+        };
+        let mut engines = three(&env).await;
+        tick_all(&mut engines).await;
+        let fake = [0xa1; 32];
+        let block = rogue_proposal(&env, 1, fake).await;
+        assert!(
+            env.finalized().await < block,
+            "slots {slots}: not final yet"
+        );
+        tick_all(&mut engines).await;
+        for (i, e) in engines.iter().enumerate() {
+            assert_eq!(
+                pending_provisional(e, &fake),
+                vec![true],
+                "slots {slots}: attestor {i} records it provisionally"
+            );
+        }
+    }
+}
+
+/// The H-2 test (05/T-3): finality pinned 64 blocks behind the head (`--slots-in-an-epoch 32`,
+/// 12 s blocks) and a 60 s window — a finalized-only watcher could never see the proposal in
+/// time. Watchers challenge it while its block is unfinalized, `executeMint` after `eta` finds
+/// nothing, and the FRAUDULENT_MINT case opens only once the proposal's block is final.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o_proposal_seen_at_latest_challenged_before_eta() {
+    let Some(env) = setup_with(Opts {
+        slots: 32,
+        window: 60,
+        ..opt()
+    })
+    .await
+    else {
+        return;
+    };
+    let _: serde_json::Value = env
+        .provider
+        .raw_request(Cow::Borrowed("anvil_setBlockTimestampInterval"), (12u64,))
+        .await
+        .unwrap();
+    let mut engines = three(&env).await;
+    tick_all(&mut engines).await;
+    let (r, fake) = (1, [0xcd; 32]);
+    let block = rogue_proposal(&env, r, fake).await;
+    let rogue = env.eth(&env.keys[r]).await;
+    let mut rounds = 0;
+    while rogue.proposal(B256::from(fake)).await.unwrap().is_some() {
+        rounds += 1;
+        assert!(rounds <= 4, "not challenged after {rounds} rounds");
+        env.mine(1); // Ycash: the lock-absent rule counts C_Y blocks
+        tick_all(&mut engines).await;
+        env.eth_mine(1).await;
+    }
+    let fin = env.finalized().await;
+    assert!(
+        fin < block,
+        "challenged while the proposal's block {block} is unfinalized (finalized {fin})"
+    );
+    // after eta nothing executes: the proposal is gone
+    env.warp(120).await;
+    let e = rogue.execute_mint(B256::from(fake)).await.unwrap_err();
+    assert!(e.is_revert("NoProposal"), "{e}");
+    for (i, e) in engines.iter().enumerate() {
+        assert_eq!(
+            fraud_cases(e, env.key_of_index(r)),
+            0,
+            "attestor {i}: no slash case from an unfinalized proposal"
+        );
+        assert!(
+            !e.alarms().iter().any(|a| a.name == "fraudulent-mint"),
+            "attestor {i}: {:?}",
+            e.alarms()
+        );
+    }
+    // the proposal's block finalizes: the finalized scan opens the case
+    env.eth_mine(70).await;
+    assert!(env.finalized().await >= block);
+    for _ in 0..25 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    for (i, e) in engines.iter().enumerate() {
+        if i == r {
+            continue;
+        }
+        assert_eq!(fraud_cases(e, env.key_of_index(r)), 1, "attestor {i}");
+    }
+    assert_eq!(rogue.total_supply().await.unwrap(), U256::ZERO);
+}
+
+/// A pinned `finalized` (finality stall) on mainnet semantics: `eth-finality-stall` within the
+/// stall threshold, no own `Mint` signature or proposal, challenges continue; unpinned, the
+/// alarm clears and the proposal goes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o2_stalled_finality_pauses_own_mints() {
+    let Some(env) = setup_with(Opts {
+        mint_cap: 100_000_000_000,
+        ..opt()
+    })
+    .await
+    else {
+        return;
+    };
+    let chains: Vec<Arc<TestChain>> = vec![
+        env.test_chain(0).await,
+        env.test_chain(1).await,
+        env.test_chain(2).await,
+    ];
+    let mut engines: Vec<Engine> = (0..3)
+        .map(|i| {
+            env.engine_on(i, vec![], chains[i].clone(), |p| {
+                p.mainnet = true;
+                p.drills = false;
+            })
+        })
+        .collect();
+    tick_all(&mut engines).await;
+    let fin = env.finalized().await;
+    for c in &chains {
+        *c.pinned.lock().unwrap() = Some(fin);
+    }
+    tick_all(&mut engines).await;
+    env.eth_mine(3).await;
+    for e in engines.iter_mut() {
+        e.advance_clock(std::time::Duration::from_secs(
+            hawkeye_eth::mode::ETH_FINALITY_STALL_SECS,
+        ));
+    }
+    tick_all(&mut engines).await;
+    for e in &engines {
+        assert!(e.finality_stalled());
+        assert!(
+            e.alarms().iter().any(|a| a.name == "eth-finality-stall"),
+            "{:?}",
+            e.alarms()
+        );
+    }
+    // a policy-OK lock: neither signed nor proposed while stalled
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let lock_id = hawkeye_core::lock::lock_id(&op);
+    env.mine(C_Y);
+    for _ in 0..4 {
+        tick_all(&mut engines).await;
+        env.eth_mine(3).await;
+    }
+    for (i, e) in engines.iter().enumerate() {
+        let l = e.ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap();
+        assert_eq!(
+            l.state,
+            LockState::PolicyOk,
+            "attestor {i}: no Mint signature"
+        );
+        assert_eq!(
+            chains[i].proposes.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+    // challenges continue: a rogue proposal seen at `latest` is challenged during the stall
+    let fake = [0xee; 32];
+    rogue_proposal(&env, 1, fake).await;
+    let rogue = env.eth(&env.keys[1]).await;
+    let mut rounds = 0;
+    while rogue.proposal(B256::from(fake)).await.unwrap().is_some() {
+        rounds += 1;
+        assert!(rounds <= 6, "not challenged during the stall");
+        env.mine(1);
+        tick_all(&mut engines).await;
+        env.eth_mine(1).await;
+    }
+    // finality resumes: the alarm clears and the lock is proposed
+    for c in &chains {
+        *c.pinned.lock().unwrap() = None;
+    }
+    for _ in 0..4 {
+        tick_all(&mut engines).await;
+        env.eth_mine(3).await;
+    }
+    for e in &engines {
+        assert!(!e.finality_stalled());
+        assert!(!e.alarms().iter().any(|a| a.name == "eth-finality-stall"));
+    }
+    let c = env.eth(&env.holder).await;
+    let states: Vec<_> = engines
+        .iter()
+        .map(|e| e.ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap().state)
+        .collect();
+    assert!(
+        c.proposal(B256::from(lock_id)).await.unwrap().is_some(),
+        "proposed once finality resumed: {states:?} {:?}",
+        chains
+            .iter()
+            .map(|c| c.proposes.load(std::sync::atomic::Ordering::SeqCst))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        chains
+            .iter()
+            .map(|c| c.proposes.load(std::sync::atomic::Ordering::SeqCst))
+            .sum::<usize>(),
+        1
+    );
+}
+
+/// A proposal seen at `latest` that is gone by the time it is due (reorged out) is never
+/// challenged with a stale id; when its block finalizes without it, the provisional record is
+/// dropped and no case opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o3_reorged_proposal_never_challenged_with_stale_id() {
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    let chain = env.test_chain(0).await;
+    let mut e = vec![env.engine_on(0, vec![], chain.clone(), |_| {})];
+    tick_all(&mut e).await;
+    let fake = [0x77; 32];
+    let block = env.latest().await + 1;
+    env.eth_mine(1).await;
+    chain
+        .inject
+        .lock()
+        .unwrap()
+        .push(hawkeye::foreign::Scanned {
+            meta: hawkeye::foreign::EventMeta {
+                height: block,
+                block_hash: [0x55; 32],
+                tx: hawkeye::foreign::TxId([0x66; 32]),
+                index: 0,
+            },
+            event: hawkeye::foreign::ForeignEvent::MintProposed {
+                lock_id: fake,
+                proposal_id: 7,
+                proposer: hawkeye::foreign::Guardian::Ethereum(env.keys[1].eth_address()),
+                to: hawkeye::foreign::Account::Ethereum(env.holder.eth_address()),
+                amount: 700_000_000,
+                eta: u64::MAX,
+            },
+        });
+    tick_all(&mut e).await;
+    assert_eq!(pending_provisional(&e[0], &fake), vec![true]);
+    // due by the lock-absent rule; the live proposal is absent: nothing is signed
+    for _ in 0..4 {
+        env.mine(1);
+        tick_all(&mut e).await;
+    }
+    assert!(challenges(&e[0]).is_empty());
+    // its block finalizes without it (the finalized scan never saw it): dropped, no case
+    chain.inject.lock().unwrap().clear();
+    env.eth_mine(5).await;
+    for _ in 0..25 {
+        env.mine(1);
+        tick_all(&mut e).await;
+    }
+    assert!(pending_provisional(&e[0], &fake).is_empty());
+    assert!(challenges(&e[0]).is_empty());
+    assert_eq!(fraud_cases(&e[0], env.key_of_index(1)), 0);
+}
+
+/// The mainnet floors through the adapter (`startup_checks` bails on its error): a 3,600 s
+/// window, then an unbounded cap, then both satisfied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o4_mint_cap_zero_refused_on_mainnet() {
+    use hawkeye::foreign::ForeignChain;
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    let deployer =
+        PrivateKeySigner::from_bytes(&B256::from_slice(&env._anvil.keys()[0].to_bytes())).unwrap();
+    let guardians: Vec<Address> = env
+        .keys
+        .iter()
+        .map(|k| hawkeye::convert::addr(&k.eth_address()))
+        .collect();
+    let check = |window: u64, cap: u128| {
+        let env = &env;
+        let deployer = deployer.clone();
+        let guardians = guardians.clone();
+        async move {
+            let mut p = DeployParams::new(&guardians, 2, window, MintMode::Optimistic);
+            p.mint_cap = cap;
+            p.cap_window = if cap == 0 { 0 } else { 86_400 };
+            let dep = deploy(&env.provider, deployer.address(), &p).await.unwrap();
+            let mut c = EthConfig::new(env.url.clone(), 31337, dep.bridge);
+            c.token = Some(dep.token);
+            let chain =
+                hawkeye::foreign::EthereumChain::new(EthClient::connect(&c, None).await.unwrap());
+            (
+                chain.check_bridge(true).await.map_err(|e| e.to_string()),
+                chain.check_bridge(false).await.map_err(|e| e.to_string()),
+            )
+        }
+    };
+    let (main, dev) = check(3_600, 1_000_000_000).await;
+    assert!(main.unwrap_err().contains("challengeWindow is 3600 s"));
+    assert!(dev.is_ok());
+    let (main, dev) = check(7_200, 0).await;
+    assert!(main.unwrap_err().contains("mintCap is 0"));
+    assert_eq!(dev.unwrap().mint_cap, 0);
+    let (main, _) = check(7_200, 1_000_000_000).await;
+    let info = main.unwrap();
+    assert_eq!(
+        (info.challenge_window, info.mint_cap, info.cap_window),
+        (7_200, 1_000_000_000, 86_400)
+    );
+}
+
+/// Mainnet semantics with the constructor's `MintLimitChanged(0, 0)` finalized: alarm
+/// `mint-cap-unbounded`, own `Mint` signatures paused (audit 05/H-2); off mainnet, only a log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o5_unbounded_mint_cap_pauses_own_mints_on_mainnet() {
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    let mut main = vec![
+        env.engine_with(0, vec![], |p| {
+            p.mainnet = true;
+            p.drills = false;
+        })
+        .await,
+    ];
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let lock_id = hawkeye_core::lock::lock_id(&op);
+    env.mine(C_Y);
+    eth_rounds(&env, &mut main, 4).await;
+    assert!(
+        main[0]
+            .alarms()
+            .iter()
+            .any(|a| a.name == "mint-cap-unbounded"),
+        "{:?}",
+        main[0].alarms()
+    );
+    let l = main[0].ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap();
+    assert_eq!(l.state, LockState::PolicyOk, "no Mint signature");
+    drop(main);
+    let mut dev = vec![env.engine(1).await];
+    eth_rounds(&env, &mut dev, 4).await;
+    assert!(
+        !dev[0]
+            .alarms()
+            .iter()
+            .any(|a| a.name == "mint-cap-unbounded")
+    );
+    let l = dev[0].ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap();
+    assert_ne!(l.state, LockState::PolicyOk, "signed off mainnet");
 }
