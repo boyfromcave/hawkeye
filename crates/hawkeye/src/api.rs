@@ -110,6 +110,7 @@ async fn burn(State(ctx): State<Ctx>, Path(nonce): Path<u64>) -> Response {
                 .ok()
                 .map(|r| encode_address(&r, ctx.params.network)),
             state: b.state.to_string(),
+            reason: b.waiting_reason().map(str::to_owned),
             leader: b.leader.map(hex::encode),
             intent: b.intent.map(|i| i.to_string()),
         })

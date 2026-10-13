@@ -20,8 +20,8 @@ use hawkeye_core::matcher::Classification;
 use hawkeye_core::template::{parse_intent, parse_vault};
 use hawkeye_core::{IntentParams, OutPoint as CoreOutPoint, PubKey33};
 use hawkeye_store::{
-    Chain, FaultKind, LockState, SignDomain, SlashCaseRecord, SlashProgress, SlashState, VoteGiven,
-    YcashSignKey, classification_code,
+    Chain, FaultKind, LockState, ObjectKind, SignDomain, SlashCaseRecord, SlashProgress,
+    SlashState, VoteGiven, YcashSignKey, classification_code,
 };
 use hawkeye_ycash::tx::Transaction;
 use hawkeye_ycash::types::{ActBody, BuildAct, DecodedAct, DecodedScript};
@@ -193,6 +193,7 @@ pub async fn verify_evidence(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdic
     match fault {
         FaultKind::FraudulentIntent => verify_intent(ctx, ev).await,
         FaultKind::FraudulentMint => verify_mint(ctx, ev).await,
+        FaultKind::Griefing => verify_griefing(ctx, ev).await,
         FaultKind::Equivocation => {
             bail!("an equivocation needs no vote: set_equivocation ejects the member by itself")
         }
@@ -434,6 +435,92 @@ async fn verify_mint(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
         target: claimed,
         subject: lock_id.to_vec(),
         reason,
+    })
+}
+
+/// Griefing (audit 05/L-4, plan §2.3): a member challenged a proposal that matched a policy-OK
+/// lock. Established here only if **this** attestor's ledger has the lock policy-OK (or later)
+/// with the evidence's `(amount, to)`, and this attestor itself observed — on its own final
+/// foreign-chain view — that very proposal challenged by that very guardian while the lock was
+/// `PROPOSED` by a matching proposal. A proposal this attestor challenged itself is never
+/// griefing here: it refuses the vote. The act is `SET_REMOVE burn=0`.
+async fn verify_griefing(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
+    let lock_id: Hash32 = hex::decode(ev_str(ev, "lock_id")?.trim_start_matches("0x"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("lock_id is not 32 bytes"))?;
+    let proposal_id: u128 = ev_str(ev, "proposal_id")?
+        .parse()
+        .map_err(|e| anyhow!("proposal_id: {e}"))?;
+    let challenger = ev_str(ev, "challenger")?;
+    let amount = ev["amount"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("evidence without amount"))?;
+    let to = ctx
+        .foreign
+        .parse_account(ev_str(ev, "to")?)
+        .map_err(|e| anyhow!("to: {e}"))?;
+    let claimed: PubKey33 = hex::decode(ev_str(ev, "target")?)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("evidence target is not a 33-byte key"))?;
+    let want = ctx
+        .foreign
+        .guardian_of(&claimed)
+        .map_err(|e| anyhow!("evidence target: {e}"))?;
+    ensure!(
+        want.to_string() == challenger,
+        "the challenger {challenger} is not the accused's guardian {want}"
+    );
+    ensure!(
+        slashable_members(ctx).await?.contains(&claimed),
+        "the accused is neither a current member nor in its bond exit delay here"
+    );
+    let not_here = "not griefing here: the proposal does not match a policy-OK lock";
+    let lock = ctx.db(|t| t.lock(&lock_id))?;
+    let Some(l) = lock else {
+        bail!("{not_here} (no such lock on this attestor's chain)");
+    };
+    use LockState::*;
+    ensure!(
+        matches!(
+            l.state,
+            PolicyOk | Signed | Proposed | Challenged | MintSubmitted | Executed | Minted
+        ),
+        "{not_here} (the lock is {} here)",
+        l.state
+    );
+    ensure!(
+        l.value_zat == amount && l.destination.as_ref() == Some(&to),
+        "{not_here} (the lock is {} zat to {:?} here, the evidence says {amount} to {to})",
+        l.value_zat,
+        l.destination.as_ref().map(|d| d.to_string())
+    );
+    let mine = ctx.db(|t| t.challenge_signatures())?;
+    ensure!(
+        !mine
+            .iter()
+            .any(|c| c.lock_id == lock_id && c.proposal_id == proposal_id),
+        "this attestor challenged proposal {proposal_id} itself: not griefing here"
+    );
+    let seen = format!("proposal {proposal_id} challenged by {challenger}");
+    let observed = ctx.db(|t| {
+        Ok(t.events_for(ObjectKind::Lock, &hex::encode(lock_id))?
+            .iter()
+            .any(|e| e.to == Challenged.as_str() && e.detail.as_deref() == Some(seen.as_str())))
+    })?;
+    ensure!(
+        observed,
+        "this attestor has not observed (final) a challenge of the lock's matching proposal \
+         {proposal_id} by {challenger}"
+    );
+    let mut subject = lock_id.to_vec();
+    subject.extend_from_slice(&proposal_id.to_be_bytes());
+    Ok(Verdict {
+        fault: FaultKind::Griefing,
+        target: claimed,
+        subject,
+        reason: format!("{seen}, matching policy-OK lock 0x{}", hex::encode(lock_id)),
     })
 }
 

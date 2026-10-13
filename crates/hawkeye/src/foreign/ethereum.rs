@@ -60,7 +60,7 @@ impl EthereumChain {
     /// Connect the configured deployment (`[eth]`) for the attestor whose member key is
     /// `member`: transactions are sent (and gas paid) by the `[eth] sender_*` gas account when
     /// one is configured (required on mainnet, remedial report 05/M-1), else by `member`'s
-    /// account. EIP-712 attestations are always the member key's ([`ForeignChain::sign`]).
+    /// account. EIP-712 attestations are always the member key's (`AttestationScheme::sign`).
     pub async fn connect(s: &Settings, member: &SecretKey) -> anyhow::Result<Self> {
         let sender = s.load_eth_sender(member)?;
         Self::connect_sending_as(s, sender.as_ref().unwrap_or(member)).await

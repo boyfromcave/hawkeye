@@ -10,8 +10,8 @@ use std::collections::{HashMap, VecDeque};
 use common::*;
 use hawkeye_core::OutPoint;
 use hawkeye_store::{
-    BurnState, Edge, FaultKind, IntentState, LockState, Machine, NewSlashCase, ObjectKind,
-    SlashState, Store, StoreError, Tx, VaultState,
+    BurnState, Edge, FaultKind, IntentState, LockState, Machine, NewSlashCase, OVER_CAP_EPOCH,
+    ObjectKind, SlashState, Store, StoreError, Tx, VaultState,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -591,6 +591,39 @@ fn burn_payloads_are_stored_and_cleared() {
             t.burn_intent_pending(&k, &op(0x77, 1), 131),
             Err(StoreError::NotFound { .. })
         ));
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+}
+
+/// Audit 05/M-2: an over-cap burn is parked with the `OVER_CAP_EPOCH` sentinel (no schema
+/// change), round-trips through the `INTEGER` column, reports reason `over-cap` and is logged so.
+#[test]
+fn an_over_cap_burn_round_trips_its_sentinel() {
+    let mut s = store();
+    s.tx(|t| {
+        let k = t.insert_burn(&new_burn(5, 10, true))?.key;
+        t.burn_wait_cap(&k, OVER_CAP_EPOCH, Some(100))?;
+        let b = t.burn(&k)?.unwrap();
+        assert_eq!(b.waiting_epoch, Some(OVER_CAP_EPOCH));
+        assert!(b.over_cap());
+        assert_eq!(b.waiting_reason(), Some("over-cap"));
+        let ev = t.events_for(ObjectKind::Burn, &k.to_string())?;
+        assert!(
+            ev.iter().any(|e| e
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("over-cap"))),
+            "{ev:?}"
+        );
+        // released when the cap rises, then an ordinary epoch wait
+        t.transition_burn(&k, BurnState::Finalized, Some(101), Some("cap raised"))?;
+        t.burn_wait_cap(&k, 7, Some(102))?;
+        let b = t.burn(&k)?.unwrap();
+        assert!(!b.over_cap());
+        assert_eq!(b.waiting_reason(), Some("epoch"));
+        t.assign_burn(&k, &LEADER, 103)?;
+        assert_eq!(t.burn(&k)?.unwrap().waiting_reason(), None);
         Ok::<_, StoreError>(())
     })
     .unwrap();

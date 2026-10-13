@@ -92,7 +92,7 @@ async fn start(bin: &str, dir: &std::path::Path, port: u16) -> Node {
         format!("http://127.0.0.1:{}/", port + 1),
         Auth::UserPass {
             user: "u".into(),
-            password: "p".into(),
+            password: "p".to_owned().into(),
         },
     )
     .unwrap();

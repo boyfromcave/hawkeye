@@ -127,6 +127,8 @@ struct Opts {
     /// Each attestor signs through its own wallet view of the shared mock (`a<i>`: its member
     /// key only), as separate nodes would; needed for thresholds above 1.
     wallet_views: bool,
+    /// The set's `ratelimitbps` (0: no rate limit).
+    ratelimitbps: u32,
 }
 
 impl Default for Opts {
@@ -138,6 +140,7 @@ impl Default for Opts {
             unlock_threshold: 1,
             cancel_threshold: 1,
             wallet_views: false,
+            ratelimitbps: 0,
         }
     }
 }
@@ -227,7 +230,7 @@ async fn setup_with(opts: Opts) -> Option<Env> {
         cancelthreshold: opts.cancel_threshold,
         slashthreshold: 2,
         open: false,
-        ratelimitbps: 0,
+        ratelimitbps: opts.ratelimitbps,
         ratewindow: 20,
         livenesswindow: 1000,
         bondmin: Amount(100_000_000),
@@ -283,6 +286,7 @@ impl Env {
             mint_mode: self.opts.mode,
             auto_slash: true,
             drills: true,
+            fallback_to_threshold: true,
             ycash_start_height: Some(1),
             ycash_signing: hawkeye::config::YcashSigning::Wallet,
             min_sender_balance_wei: 0,
@@ -300,6 +304,16 @@ impl Env {
     /// Attestor `i`'s engine over the ledger file `attestor<i>.db`.
     async fn engine(&self, i: usize) -> Engine {
         self.engine_with_peers(i, vec![]).await
+    }
+
+    /// Attestor `i`'s engine with peer API URLs and adjusted parameters.
+    async fn engine_with(
+        &self,
+        i: usize,
+        peers: Vec<String>,
+        adjust: impl FnOnce(&mut Params),
+    ) -> Engine {
+        self.engine_full(i, peers, None, adjust).await
     }
 
     /// Attestor `i`'s node client: its own wallet view when the set needs per-member signing.
@@ -323,17 +337,25 @@ impl Env {
 
     /// Attestor `i`'s engine, asking `peers` (signed with its member key).
     async fn engine_with_peers(&self, i: usize, peers: Vec<String>) -> Engine {
-        self.engine_full(i, peers, None).await
+        self.engine_full(i, peers, None, |_| {}).await
     }
 
     /// Attestor `i`'s engine whose Ethereum transactions are sent by `sender` (a gas account,
     /// 05/M-1) instead of its member key.
-    async fn engine_full(&self, i: usize, peers: Vec<String>, sender: Option<SecretKey>) -> Engine {
+    async fn engine_full(
+        &self,
+        i: usize,
+        peers: Vec<String>,
+        sender: Option<SecretKey>,
+        adjust: impl FnOnce(&mut Params),
+    ) -> Engine {
         let key = self.keys[i].clone();
         let eth_key = sender.unwrap_or_else(|| key.clone());
         let store = Store::open(self.dir.path().join(format!("attestor{i}.db"))).unwrap();
+        let mut params = self.params();
+        adjust(&mut params);
         Engine::new(Ctx {
-            params: Arc::new(self.params()),
+            params: Arc::new(params),
             me: key.public_key(),
             foreign: Arc::new(hawkeye::foreign::EthereumChain::new(
                 self.eth(&eth_key).await,
@@ -2616,7 +2638,7 @@ async fn o_gas_account_sends_the_guardian_attests() {
     }
     let mut engines = vec![];
     for (i, k) in senders.iter().enumerate() {
-        engines.push(env.engine_full(i, vec![], Some(k.clone())).await);
+        engines.push(env.engine_full(i, vec![], Some(k.clone()), |_| {}).await);
     }
     let to = env.holder.eth_address();
     let op = env.lock(1_000_000_000, &to);
@@ -2776,6 +2798,12 @@ async fn n_wrong_amount_proposal_on_a_real_lock_challenged() {
                 "attestor {i}"
             );
         }
+        assert!(
+            !open_cases(e)
+                .iter()
+                .any(|c| c.fault == hawkeye_store::FaultKind::Griefing),
+            "an honest challenge is never griefing (attestor {i})"
+        );
     }
     env.warp(WINDOW).await;
     eth_rounds(&env, &mut engines, 3).await;
@@ -2820,4 +2848,357 @@ async fn j2_threshold_mode_watchers_still_challenge_proposals() {
     env.warp(WINDOW).await;
     tick_all(&mut engines).await;
     assert_eq!(rogue.total_supply().await.unwrap(), U256::ZERO);
+}
+
+/// GET `/burns/<nonce>` from `e`'s API.
+async fn burn_view(e: &Engine, nonce: u64) -> hawkeye::peers::BurnView {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = hawkeye::api::router(e.ctx().clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    reqwest::get(format!("http://{addr}/burns/{nonce}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// (p) Audit 05/M-2: a burn above the set's whole per-window cap never stalls later nonces. With
+/// `ratelimitbps` 5000 over 10 YEC locked (cap 5 YEC), burns of 8, 1 and 1 YEC: the 8 is parked
+/// `WAITING_CAP` (reason `over-cap`, alarm `burn-over-cap`, `/status`, `/metrics`, `/burns`) on
+/// every attestor while the two 1-YEC burns are unlocked; raising the set's rate limit releases it
+/// without a restart and clears the alarm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p_over_cap_burn_does_not_block_later_burns() {
+    let Some(env) = setup_with(Opts {
+        ratelimitbps: 5_000,
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let mut engines = vec![
+        env.engine(0).await,
+        env.engine(1).await,
+        env.engine(2).await,
+    ];
+    lock_and_mint(&env, &mut engines).await;
+    // into the next rate-limit epoch: its basis is the 10 YEC locked
+    env.mine(20);
+    tick_all(&mut engines).await;
+    let r = YcashRecipient::p2pkh([0x77; 20]);
+    let big = env.burn(800_000_000, &r).await;
+    let small = [
+        env.burn(100_000_000, &r).await,
+        env.burn(100_000_000, &r).await,
+    ];
+    env.eth_mine(3).await;
+    tick_all(&mut engines).await;
+    let dep = dep_of(&engines[0]);
+    let kb = BurnKey::new(dep, big);
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&kb)).unwrap().unwrap();
+        assert!(b.over_cap(), "parked over cap on every ledger: {b:?}");
+        assert!(
+            e.alarms().iter().any(|a| a.name == "burn-over-cap"),
+            "{:?}",
+            e.alarms()
+        );
+    }
+    // the later burns go on
+    for _ in 0..6 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    for n in small {
+        let k = BurnKey::new(dep, n);
+        for e in &engines {
+            let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+            assert!(
+                matches!(b.state, BurnState::IntentConfirmed | BurnState::Released),
+                "burn {n} is served past the over-cap one: {:?}",
+                b.state
+            );
+        }
+    }
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&kb)).unwrap().unwrap();
+        assert!(b.over_cap(), "still parked: {b:?}");
+        let st = e.ctx().status.read().unwrap().clone();
+        assert_eq!(st.burns_over_cap, 1);
+        let m = hawkeye::status::render_metrics(&st);
+        assert!(m.contains("hawkeye_burn_over_cap 1"), "{m}");
+        assert!(m.contains("hawkeye_alarm{name=\"burn-over-cap\"} 1"), "{m}");
+    }
+    let view = burn_view(&engines[0], big).await;
+    assert_eq!(view.state, "WAITING_CAP");
+    assert_eq!(view.reason.as_deref(), Some("over-cap"));
+    // governance raises the rate limit: released at the next tick, no restart
+    env.mock
+        .state()
+        .sets
+        .get_mut(&env.set)
+        .unwrap()
+        .set
+        .params
+        .ratelimitbps = 10_000;
+    tick_all(&mut engines).await;
+    for e in &engines {
+        assert!(
+            !e.alarms().iter().any(|a| a.name == "burn-over-cap"),
+            "the alarm clears: {:?}",
+            e.alarms()
+        );
+    }
+    for _ in 0..3 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&kb)).unwrap().unwrap();
+        assert!(
+            matches!(
+                b.state,
+                BurnState::IntentPending | BurnState::IntentConfirmed | BurnState::Released
+            ),
+            "released after the cap raise: {:?}",
+            b.state
+        );
+        assert_eq!(e.ctx().status.read().unwrap().burns_over_cap, 0);
+    }
+    assert_eq!(burn_view(&engines[0], big).await.reason, None);
+}
+
+/// Attestors `idx` with their APIs served and wired to each other as peers (`GET /locks/<id>`
+/// for the threshold path), parameters adjusted by `adjust`.
+async fn wired(env: &Env, idx: &[usize], adjust: impl Fn(&mut Params)) -> Vec<Engine> {
+    let mut listeners = vec![];
+    let mut urls = vec![];
+    for _ in idx {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", l.local_addr().unwrap()));
+        listeners.push(l);
+    }
+    let mut engines = vec![];
+    for (n, (&i, l)) in idx.iter().zip(listeners).enumerate() {
+        let peers = urls
+            .iter()
+            .enumerate()
+            .filter(|(m, _)| *m != n)
+            .map(|(_, u)| u.clone())
+            .collect();
+        let e = env.engine_with(i, peers, &adjust).await;
+        let app = hawkeye::api::router(e.ctx().clone());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        engines.push(e);
+    }
+    engines
+}
+
+/// One griefing round: member `griefer` challenges whatever proposal is live for `lock_id`
+/// (every honest re-proposal, its own included), then one Ycash block and one foreign round.
+async fn grief_round(env: &Env, engines: &mut [Engine], lock_id: [u8; 32], griefer: usize) {
+    let c = env.eth(&env.holder).await;
+    if let Some(p) = c.proposal(B256::from(lock_id)).await.unwrap() {
+        let digest = hawkeye_core::eip712::Domain::new(31337, EthAddress(env.dep.bridge.0.0))
+            .challenge_digest(&lock_id, p.id);
+        let sig = hawkeye_core::eth::sign_digest(&env.keys[griefer], &digest).unwrap();
+        c.challenge_mint(B256::from(lock_id), p.id, &sig)
+            .await
+            .unwrap();
+    }
+    env.mine(1);
+    eth_rounds(env, engines, 1).await;
+}
+
+fn griefing_cases(e: &Engine, target: [u8; 33]) -> Vec<hawkeye_store::SlashCaseRecord> {
+    open_cases(e)
+        .into_iter()
+        .filter(|c| c.fault == hawkeye_store::FaultKind::Griefing && c.target_key == target)
+        .collect()
+}
+
+/// (t) Audit 05/L-4, HK-15: member 2 challenges every honest proposal of a policy-OK lock (each
+/// challenged proposer is `vetoed` for it). Once no live member may propose, the lock is minted
+/// by the threshold path (`mint`, the contract's threshold of `Mint` signatures gathered over
+/// `GET /locks/<id>`) without operator action and without the window ever passing; the honest
+/// attestors hold a verifiable `GRIEFING` case against member 2, which opens none against itself;
+/// (t2) a griefing vote for a proposal that matches no policy-OK lock here is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_all_proposers_vetoed_falls_back_to_threshold() {
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    let mut engines = wired(&env, &[0, 1, 2], |_| {}).await;
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let lock_id = drive_mint(&env, &mut engines, &op).await;
+    let c = env.eth(&env.holder).await;
+    assert!(c.proposal(B256::from(lock_id)).await.unwrap().is_some());
+    let holder = hawkeye::convert::addr(&to);
+    let mut rounds = 0;
+    while c.balance_of(holder).await.unwrap() == U256::ZERO {
+        rounds += 1;
+        assert!(rounds <= 40, "no threshold fallback after {rounds} rounds");
+        grief_round(&env, &mut engines, lock_id, 2).await;
+    }
+    assert_eq!(
+        c.balance_of(holder).await.unwrap(),
+        U256::from(1_000_000_000u64)
+    );
+    // every honest proposer was barred: the optimistic path could not have minted it
+    for i in [0, 1] {
+        assert!(
+            c.vetoed(
+                B256::from(lock_id),
+                hawkeye::convert::addr(&env.keys[i].eth_address())
+            )
+            .await
+            .unwrap(),
+            "attestor {i} vetoed"
+        );
+    }
+    eth_rounds(&env, &mut engines, 2).await;
+    let key2 = env.key_of_index(2);
+    for (i, e) in engines.iter().enumerate() {
+        assert_eq!(
+            e.ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap().state,
+            LockState::Minted,
+            "attestor {i}"
+        );
+        let cases = griefing_cases(e, key2);
+        if i == 2 {
+            assert!(cases.is_empty(), "no case against itself: {cases:?}");
+            continue;
+        }
+        assert!(!cases.is_empty(), "attestor {i} holds a GRIEFING case");
+        for case in &cases {
+            assert_eq!(&case.subject[..32], lock_id.as_slice());
+            let ev: serde_json::Value = serde_json::from_str(&case.evidence_json).unwrap();
+            assert_eq!(ev["fault"], "GRIEFING");
+            assert!(ev["challenge_tx"].as_str().unwrap().starts_with("0x"));
+            // verifiable by the other honest attestor, on its own ledger
+            let other = &engines[1 - i];
+            let v = hawkeye::engine::slash::verify_evidence(other.ctx(), &ev)
+                .await
+                .unwrap();
+            assert_eq!(v.fault, hawkeye_store::FaultKind::Griefing);
+            assert_eq!(v.target, key2);
+        }
+    }
+    // (t2) a challenge of a proposal with no policy-OK lock behind it is not griefing here
+    let ev = serde_json::json!({
+        "fault": "GRIEFING",
+        "target": hex::encode(key2),
+        "lock_id": format!("0x{}", hex::encode([0xab; 32])),
+        "proposal_id": "9",
+        "challenger": env.keys[2].eth_address().to_checksum(),
+        "amount": 1_000_000_000u64,
+        "to": to.to_checksum(),
+    });
+    let refused = hawkeye::engine::slash::verify_evidence(engines[0].ctx(), &ev)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("not griefing here: the proposal does not match a policy-OK lock"),
+        "{refused}"
+    );
+    // nor one of the real lock with another amount
+    let mut wrong = ev.clone();
+    wrong["lock_id"] = format!("0x{}", hex::encode(lock_id)).into();
+    wrong["amount"] = 9_000_000_000u64.into();
+    let refused = hawkeye::engine::slash::verify_evidence(engines[0].ctx(), &wrong)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("not griefing here"), "{refused}");
+}
+
+/// (t3) The threshold fallback is a submission like any other: guardian drift on mainnet
+/// semantics (`signing_paused`) holds it; once the drift is gone it mints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t3_threshold_fallback_respects_signing_pause() {
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    // the vetoes first, with the fallback off
+    let mut engines = wired(&env, &[0, 1, 2], |p| p.fallback_to_threshold = false).await;
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let lock_id = drive_mint(&env, &mut engines, &op).await;
+    let c = env.eth(&env.holder).await;
+    let vetoed = |i: usize| {
+        let c = &c;
+        let a = hawkeye::convert::addr(&env.keys[i].eth_address());
+        async move { c.vetoed(B256::from(lock_id), a).await.unwrap() }
+    };
+    let mut rounds = 0;
+    while !(vetoed(0).await && vetoed(1).await) {
+        rounds += 1;
+        assert!(
+            rounds <= 40,
+            "proposers not all vetoed after {rounds} rounds"
+        );
+        grief_round(&env, &mut engines, lock_id, 2).await;
+    }
+    for _ in 0..3 {
+        grief_round(&env, &mut engines, lock_id, 2).await;
+    }
+    let holder = hawkeye::convert::addr(&to);
+    assert_eq!(
+        c.balance_of(holder).await.unwrap(),
+        U256::ZERO,
+        "fallback off"
+    );
+    drop(engines);
+    // member 2 leaves the set (its griefing case's outcome): guardians {0,1,2} ≠ members {0,1}
+    {
+        let mut st = env.mock.state();
+        let info = st.sets.get_mut(&env.set).unwrap();
+        let m = info
+            .memberlist
+            .iter_mut()
+            .find(|m| m.key.0 == env.key_of_index(2))
+            .unwrap();
+        m.status = MemberStatus::Removed;
+    }
+    let mut paused = wired(&env, &[0, 1], |p| {
+        p.mainnet = true;
+        p.drills = false;
+        p.fallback_to_threshold = true;
+    })
+    .await;
+    for _ in 0..6 {
+        env.mine(1);
+        eth_rounds(&env, &mut paused, 1).await;
+    }
+    for e in &paused {
+        assert!(
+            e.alarms().iter().any(|a| a.name == "guardian-drift"),
+            "{:?}",
+            e.alarms()
+        );
+    }
+    assert_eq!(
+        c.balance_of(holder).await.unwrap(),
+        U256::ZERO,
+        "signing paused: no threshold fallback"
+    );
+    drop(paused);
+    // the drift resolved (here: off mainnet semantics, the alarm stays an alarm): it mints
+    let mut engines = wired(&env, &[0, 1], |p| p.fallback_to_threshold = true).await;
+    let mut rounds = 0;
+    while c.balance_of(holder).await.unwrap() == U256::ZERO {
+        rounds += 1;
+        assert!(rounds <= 20, "no fallback after {rounds} rounds");
+        env.mine(1);
+        eth_rounds(&env, &mut engines, 1).await;
+    }
+    assert_eq!(
+        c.balance_of(holder).await.unwrap(),
+        U256::from(1_000_000_000u64)
+    );
 }

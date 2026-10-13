@@ -208,6 +208,7 @@ impl Env {
             mint_mode: self.mode,
             auto_slash: true,
             drills: true,
+            fallback_to_threshold: true,
             ycash_start_height: Some(1),
             ycash_signing: hawkeye::config::YcashSigning::Wallet,
             min_sender_balance_wei: 0,

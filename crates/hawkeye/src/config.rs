@@ -17,7 +17,7 @@ use hawkeye_core::address::Network;
 use hawkeye_core::bytes::Hash32;
 use hawkeye_core::{AccountId, Deployment as CoreDeployment, EthAddress, SecretKey};
 use hawkeye_eth::{Deployment, Finality, MintMode};
-use hawkeye_ycash::{Amount, Auth, Hash256};
+use hawkeye_ycash::{Amount, Auth, Hash256, Redacted};
 use serde::Deserialize;
 
 use crate::foreign::BridgeKind;
@@ -78,8 +78,8 @@ pub struct YcashSection {
     pub rpc_url: String,
     /// `-rpcuser`.
     pub rpc_user: Option<String>,
-    /// `-rpcpassword`.
-    pub rpc_password: Option<String>,
+    /// `-rpcpassword` (never printed by `Debug`, audit 05/I-1).
+    pub rpc_password: Option<Redacted<String>>,
     /// The node's `.cookie` file (instead of user/password).
     pub cookie_file: Option<PathBuf>,
     /// Extension: the first Ycash height the follower reads (default: the upgrade's activation
@@ -159,8 +159,9 @@ pub struct EthSection {
     /// The environment variable holding the sender keystore's password (default
     /// `HAWKEYE_SENDER_PASSWORD`).
     pub sender_password_env: Option<String>,
-    /// The sender key as 64 hex digits (devnets only: refused on mainnet).
-    pub sender_secret_hex: Option<String>,
+    /// The sender key as 64 hex digits (devnets only: refused on mainnet; never printed by
+    /// `Debug`).
+    pub sender_secret_hex: Option<Redacted<String>>,
     /// Raise `gas-low` when the sender's balance is below this many wei (default 0.05 ETH on
     /// mainnet, 0 — no alarm — elsewhere).
     pub min_sender_balance_wei: Option<String>,
@@ -197,14 +198,19 @@ pub struct BridgeSection {
     /// `k` for `threshold` (default: the deployment's threshold). Also the floor the contract's
     /// threshold is held to: on mainnet it must be ≥ 2 in every mode (plan §3.3).
     pub mint_threshold: Option<u8>,
+    /// Optimistic mode: once every live member is barred from a lock (`vetoed`, or a recorded
+    /// griefer of it), gather the contract's threshold of `Mint` signatures and `mint` at once
+    /// (plan §5.3, HK-15; audit 05/L-4). Default true; always on on mainnet.
+    pub fallback_to_threshold: Option<bool>,
 }
 
 /// `[keys]`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysSection {
-    /// The member key as 64 hex digits (dev only: refused on mainnet).
-    pub secret_hex: Option<String>,
+    /// The member key as 64 hex digits (dev only: refused on mainnet; never printed by `Debug`,
+    /// audit 05/I-1).
+    pub secret_hex: Option<Redacted<String>>,
     /// An Ethereum keystore v3 file holding the member key.
     pub keystore: Option<PathBuf>,
     /// The environment variable holding the keystore password.
@@ -325,8 +331,8 @@ fn default_format() -> String {
 /// Where the member key comes from.
 #[derive(Debug, Clone)]
 pub enum KeySource {
-    /// `secret_hex`.
-    Hex(String),
+    /// `secret_hex` (never printed by `Debug`, audit 05/I-1).
+    Hex(Redacted<String>),
     /// A keystore and the variable holding its password.
     Keystore {
         /// The file.
@@ -427,6 +433,9 @@ pub struct Params {
     pub auto_slash: bool,
     /// Drills allowed.
     pub drills: bool,
+    /// Optimistic mode: fall back to the threshold path when every live member is barred from a
+    /// lock (`[bridge] fallback_to_threshold`, always true on mainnet; HK-15).
+    pub fallback_to_threshold: bool,
     /// The first Ycash height to follow (default: the upgrade's activation height).
     pub ycash_start_height: Option<u32>,
     /// Who makes the member key's Ycash signatures (`[keys] ycash_signing`).
@@ -520,6 +529,7 @@ pub(crate) fn sample_params(drills: bool, mainnet: bool) -> Params {
         mint_mode: MintMode::Threshold { k: 1 },
         auto_slash: true,
         drills,
+        fallback_to_threshold: true,
         ycash_start_height: None,
         ycash_signing: YcashSigning::Wallet,
         min_sender_balance_wei: 0,
@@ -863,6 +873,7 @@ impl Config {
             mint_mode,
             auto_slash: self.policy.auto_slash.unwrap_or(!mainnet),
             drills: self.devnet.drills,
+            fallback_to_threshold: mainnet || self.bridge.fallback_to_threshold.unwrap_or(true),
             ycash_start_height: self.ycash.start_height,
             ycash_signing,
             min_sender_balance_wei,
@@ -901,7 +912,7 @@ impl KeySource {
     /// Load the key (`what` names it in errors).
     pub fn load(&self, what: &str) -> Result<SecretKey> {
         match self {
-            KeySource::Hex(h) => SecretKey::from_hex(h.trim_start_matches("0x"))
+            KeySource::Hex(h) => SecretKey::from_hex(h.expose().trim_start_matches("0x"))
                 .map_err(|e| anyhow!("{what} secret_hex: {e}")),
             KeySource::Keystore { path, password_env } => {
                 let pw = std::env::var(password_env)
@@ -1126,6 +1137,54 @@ format = "text"
             }
         ));
         s.load_key().unwrap();
+    }
+
+    /// Audit 05/I-1: no `Debug` output of the config, the settings or the node auth contains the
+    /// member key's hex or the RPC password.
+    #[test]
+    fn debug_redacts_secrets() {
+        let d = dir();
+        let text = sample("regtest", "").replace(
+            "rpc_password = \"p\"",
+            "rpc_password = \"pw-NOT-IN-LOGS-77\"",
+        );
+        let c = Config::parse(&text).unwrap();
+        let s = c.settings(d.path()).unwrap();
+        let key = "01".repeat(32);
+        for out in [
+            format!("{c:?}"),
+            format!("{s:?}"),
+            format!("{:?}", s.ycash_auth),
+            format!("{:?}", s.key),
+            format!("{:#?}", c.keys),
+        ] {
+            assert!(!out.contains(&key), "member key in {out}");
+            assert!(!out.contains("pw-NOT-IN-LOGS-77"), "password in {out}");
+            assert!(out.contains("<redacted>"), "{out}");
+        }
+        // the values are still there for their users
+        assert_eq!(
+            c.ycash.rpc_password.as_ref().map(|p| p.expose().as_str()),
+            Some("pw-NOT-IN-LOGS-77")
+        );
+        s.load_key().unwrap();
+    }
+
+    /// HK-15: the threshold fallback is on by default; a devnet may turn it off.
+    #[test]
+    fn fallback_to_threshold_defaults_on() {
+        let d = dir();
+        let s = Config::parse(&sample("regtest", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert!(s.params.fallback_to_threshold);
+        let off = sample("regtest", "").replace(
+            "mint_threshold = 1\n",
+            "mint_threshold = 1\nfallback_to_threshold = false\n",
+        );
+        let s = Config::parse(&off).unwrap().settings(d.path()).unwrap();
+        assert!(!s.params.fallback_to_threshold);
     }
 
     #[test]

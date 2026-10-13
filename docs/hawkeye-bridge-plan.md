@@ -238,7 +238,7 @@ mainnet row (Q-1).
 | Two set signatures by one key over two different spends of one outpoint | the two signatures | `SET_EQUIVOCATION`: EJECTED, bond frozen | anyone; Hawkeye submits automatically |
 | A fraudulent intent (no finalized burn behind it, or the wrong value or recipient, or a burn already consumed) | the intent tx: its set signature recovers to the signer's key (§15.2 step 4); the memo or its absence | cancel (I-2) + `SET_REMOVE burn=1` | cancel: any one Hawkeye at once; slash: `slashThreshold` Hawkeyes co-sign a slash proposal after independent verification (§5.3) |
 | A fraudulent mint signature or proposal (no lock behind the `lockId`, or a different amount or recipient) | the EIP-712 signature over `Mint(lockId, amount, to)` recovers to the signer | challenge (CR-W1) + `SET_REMOVE burn=1` on Ycash | same |
-| Griefing (cancelling or challenging honest work) | the cancel's signer vs a matching burn | `SET_REMOVE burn=0` (O-6, bond returned) | `slashThreshold` |
+| Griefing (cancelling or challenging honest work) | the cancel's signer vs a matching burn; the `MintChallenged` challenger of a proposal that matched a policy-OK lock (HK-15) | `SET_REMOVE burn=0` (O-6, bond returned) | `slashThreshold` |
 | Equivocating EIP-712 Mint signatures (one `lockId`, two `(amount, to)`) | the two signatures | `SET_REMOVE burn=1` | `slashThreshold` |
 
 Ycash consensus records the slash, never the reason (upgrade plan §3.6); Hawkeye records the reason
@@ -351,7 +351,8 @@ mode (§5.3 step 2); `mint_mode` only decides how *honest* mints are made:
 A challenged *matching* proposal (griefing, or a watcher that could not decide in time) is not
 lost: the challenged proposer is barred from that lock, the next eligible attestor re-proposes the
 same signed `(amount, to)` with a fresh id, and the alarm `matching-proposal-challenged` names the
-challenger. If every live member were barred, a threshold `mint` is the override.
+challenger, who faces a `GRIEFING` case and is no longer waited for as that lock's proposer. Once
+every live member is barred, Hawkeye mints by threshold automatically (HK-15, §5.3 step 2).
 
 ### 3.4 F-4: recipient bytes are opaque in meaning on both chains (HK-5)
 
@@ -583,6 +584,18 @@ takeover overlap are a benign race: the later one is cancelled, nobody is slashe
    re-sent with the recorded bytes. A Hawkeye leaves a proposal it made deliberately (the
    `rogue-mint` drill) to the others, as it does its own deliberate intents. The window must exceed
    Ethereum finality plus `C_Y` Ycash blocks plus submission (wyec-contract-design.md §4.5.3).
+   A final `MintChallenged` of a proposal that **matched** a policy-OK lock is griefing (HK-15): the
+   lock is re-proposed by the next eligible member (live, not `vetoed`, not a recorded griefer of
+   the lock), the alarm `matching-proposal-challenged` is raised, and a `GRIEFING` case is opened
+   against the challenger (a member a slash reaches, not this attestor; subject `lockId ‖
+   proposalId`, evidence with the challenge transaction). A peer votes on it only if its own ledger
+   has the lock policy-OK with the same `(amount, to)`, it observed that very challenge on its own
+   final view, and it did not challenge that proposal itself. **Threshold fallback** (optimistic
+   mode, `[bridge] fallback_to_threshold`, default true, always on mainnet): once no eligible
+   proposer is left, the mint leader over the live members but the griefers gathers the contract's
+   `threshold()` of `Mint` signatures (its own and the peers' over `GET /locks/<id>`, each
+   recovered to a distinct current guardian) and calls `mint`, which overrides at once (event
+   `mint_threshold_fallback`); `signing_paused` gates it like every submission.
 3. Each fault opens a `SlashCase` with a self-contained evidence bundle (transactions, signatures,
    the recovered key, the reason). The case is gossiped to other Hawkeyes over the authenticated peer
    channel (H5, §6) or exchanged out of band; each Hawkeye **verifies independently**, then
@@ -606,7 +619,15 @@ takeover overlap are a benign race: the later one is cancelled, nobody is slashe
 
 Before building an unlock, the leader reads `set_getinfo.unlockavailable`; if the burn does not fit,
 it waits for the next epoch (as bridge-sim does), FIFO by burn nonce, never splitting a burn across
-epochs in v1 (HK-8). Ycash fees come from the leader's transparent coins (keep ≥ 8 coins, finding
+epochs in v1 (HK-8). **An over-cap burn** — one larger than the set's whole per-window cap
+`RateCap(basis, ratelimitbps)`, the basis the larger of `epochbasis` and `lockedvalue` (the next
+epoch's) — fits no epoch: every attestor parks it `WAITING_CAP` out of the FIFO (reason `over-cap`;
+`waiting_epoch` = `i64::MAX`, no schema change) with alarm `burn-over-cap`
+(`/status` `burns_over_cap`, gauge `hawkeye_burn_over_cap`, `GET /burns/<nonce>` `reason`), and
+later nonces are served. It is released when the set's cap rises to its amount (a `SET_PARAMS`
+raising `ratelimitbps`, or more value locked), re-checked every tick, no restart; the alarm clears
+when none is left. The node's `bad-txns-vault-rate` on such a burn routes to the same branch.
+`hawkeye burn` refuses an over-cap amount unless `--allow-over-cap` (audit 05/M-2). Ycash fees come from the leader's transparent coins (keep ≥ 8 coins, finding
 (76)); Ethereum gas from the attestor's gas account (§3.5). Protocol fees (O-2 "bps fee") are out of
 v1 (Q-4).
 
@@ -793,6 +814,7 @@ from the members' compressed keys.
 | CR-W2 | wyec | **Done** (wyec#1, `cad126a`). Foundry project (replacing `compile.js`), `Deploy.s.sol` with the predicted-address assertion and the mainnet threshold rule | Hawkeye binds the ABI; Sepolia deploy | done (Hawkeye keeps its own `eth/script/Deploy.s.sol`, the same checks plus `mintMode`, and exports the ABI from the pinned build) |
 | CR-W3 | wyec | **Done** (wyec#1, `cad126a`). §4.2's recipient encoding in `burn`'s NatSpec | one definition | done |
 | CR-W4 | wyec | §4.2 revision 2: `burn(uint256 amount, bytes ycashRecipient)` and `BurnToYcash(…, bytes ycashRecipient)`, the recipient validated in the contract (22 or 35 bytes, version 2, kinds 0–2, scheme 1–2), the design doc and NatSpec updated, Foundry tests, the deploy script unchanged in shape (R2) | post-quantum burn recipients (Q-7) | **Done** (wyec#2, `be177c5`) |
+| CR-W5 | wyec | `maxBurn` (uint256, 0 = none) set by the threshold through `SetBurnLimit(uint256 maxBurn,uint256 adminNonce)`; `burn` reverts `BurnTooLarge(amount, maxBurn)` above it; the guardians keep it ≤ the Ycash set's full-window cap (audit 05/M-2 option c) | makes an over-cap burn impossible rather than merely harmless (§5.5); needs a new EIP-712 struct, vectors, the binding and a re-pin | no (open) |
 | CR-N1 | ycash-dd, ycash6 | `vault_lock` `"data"` parameter (finding (73)) | wallets write the destination without hand-built transactions | no |
 | CR-N4 | ycash-dd, ycash6 | quantum line: a post-quantum owner through the `vault_*` surface (client survey C-4) | `hawkeye lock` builds the V itself (CR-N1) and may not call `yed_*` | **done** on ycash-dd `q/wallet` (`vault_getnewowner`, Q5); ycash6 to follow |
 | CR-N2 | ycash-dd, ycash6 | `vault_buildunlock` `"data"` parameter (an OP_RETURN output) | the memo without a tx codec in Hawkeye | no |
@@ -830,10 +852,11 @@ from the members' compressed keys.
 | HK-5 | `ycashRecipient` version 2 (§4.2): `0x02`, kind (P2PKH, P2SH, PQPKH), then a 20-byte hash160 or `scheme ‖ keyHash` (33 bytes); 22 or 35 bytes, validated by both contracts; transparent or `TX_PQPKH`, never shielded. (Revision 1 was the 32-byte transparent-only form; retired 2026-10-11, Q-7.) |
 | HK-6 | Minimum owner age, drain-nearest-expiry, rolls, and a supply alarm answer F-1 |
 | HK-7 | One key on both chains; Ycash signing via the node wallet (its sign-once guard) or, since HK-14, by Hawkeye itself; EIP-712 via Hawkeye with its own sign-once record |
-| HK-8 | No batching and no burn splitting in v1 (one burn ↔ one intent ↔ one vault input) |
+| HK-8 | No batching and no burn splitting in v1 (one burn ↔ one intent ↔ one vault input); a burn above the set's full-window cap is parked out of the FIFO until the cap rises (§5.5, audit 05/M-2) — splitting it stays the v2 design option |
 | HK-9 | Deterministic leader by `nonce mod |live|`, takeover after `TAKEOVER` blocks; every attestor verifies everything |
 | HK-11 | Contract facts Hawkeye relies on (Foundry-tested in `eth/test/`): mint signatures carry no nonce (the `lockId` is the only replay key, valid across rotations while the signers remain guardians); one shared `adminNonce` serialises admin rounds (run one at a time); `setPaused` to the current state reverts; high-S signatures are rejected |
 | HK-10 | Hawkeye reaches the node only through stock and `set_*`/`vault_*` RPCs, and Ethereum only through standard JSON-RPC |
 | HK-13 | (2026-10-12, remedial report 05/H-1) The peer channel is authenticated by member-key request signatures (§4.6) and answers are signed; `/unlock/sign` is inert at `unlockThreshold = 1` and above it co-signs only for the burn's (or roll's) leader; every unlock signature is recorded per burn as well as per vault (one live vault per burn); co-signatures are adopted only after checking; cancels are gathered at `cancelThreshold > 1` and cancel capacity is measured (§5.5) |
 | HK-14 | (2026-10-12, remedial report 05/M-1) The member key is hot in the node wallet in `"wallet"` mode, in clear; `[keys] ycash_signing = "self"` keeps it out of the wallet (Hawkeye signs set and act messages itself; the ledger is then the only Ycash equivocation guard); on mainnet the Ethereum gas account is separate from the member key |
 | HK-12 | (2026-10-11, D-Q-29..D-Q-31) An attestor leaves by `hawkeye leave` (`set_leave`) and recovers its bond by `hawkeye withdraw-bond` after the set's `maturity` (≥ 16,128 on mainnet: the mainnet row's 1,152 became 16,128); slashing reaches members in their exit delay (§2.4, §5.3 step 5) |
+| HK-15 | (audit 05/L-4) Optimistic mode falls back to the threshold path automatically once every live member is barred from a lock (`vetoed`, or a recorded griefer of it); the challenger of a proposal that matched a policy-OK lock gets a `GRIEFING` case (`SET_REMOVE burn=0`) and is not waited for as that lock's proposer (§5.3 step 2) |

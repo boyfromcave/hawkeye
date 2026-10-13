@@ -79,6 +79,10 @@ enum Cmd {
         /// default: the config's relayer key file).
         #[arg(long)]
         near_key: Option<PathBuf>,
+        /// Send a burn above the attestor set's per-window cap anyway (it is not released
+        /// until the set raises its rate limit; later burns are not held up by it).
+        #[arg(long)]
+        allow_over_cap: bool,
     },
     /// DRILL ONLY: sign an unlock with no burn behind it (or, with --replay-burn, a second
     /// unlock for an already-released burn, carrying its valid memo).
@@ -261,6 +265,7 @@ async fn main() -> Result<()> {
             recipient,
             eth_key,
             near_key,
+            allow_over_cap,
         } => {
             cli::burn(
                 &s,
@@ -268,6 +273,7 @@ async fn main() -> Result<()> {
                 recipient,
                 eth_key.as_deref(),
                 near_key.as_deref(),
+                *allow_over_cap,
             )
             .await
         }

@@ -61,6 +61,10 @@ pub struct BurnView {
     pub recipient_address: Option<String>,
     /// Burn state.
     pub state: String,
+    /// Why a `WAITING_CAP` burn waits: `over-cap` (it exceeds the set's full-window cap and
+    /// waits for a cap raise, audit 05/M-2) or `epoch` (the next rate-limit epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Assigned leader key.
     pub leader: Option<String>,
     /// The intent paying it.
