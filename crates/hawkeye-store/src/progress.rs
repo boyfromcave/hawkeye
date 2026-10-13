@@ -286,6 +286,23 @@ impl Tx<'_> {
     /// Record a set signature seen on Ycash. Returns the signatures by the same key over the
     /// same `(set, prevout)` with a **different** `(role, sighash)` already recorded: each one is
     /// an equivocation with `s`.
+    /// Whether this ledger saw `member` set-sign a spend of `prevout` (any role) under `set_id`.
+    pub fn seen_set_sig_by(
+        &self,
+        set_id: &hawkeye_core::bytes::Hash32,
+        prevout: &hawkeye_core::OutPoint,
+        member: &hawkeye_core::PubKey33,
+    ) -> Result<bool> {
+        Ok(self
+            .one(
+                "SELECT 1 FROM set_sigs_seen WHERE set_id = ?1 AND prevout_txid = ?2
+                   AND prevout_vout = ?3 AND member_key = ?4 LIMIT 1",
+                rusqlite::params![set_id, prevout.txid, prevout.vout, member],
+                |r| r.get::<_, i64>(0),
+            )?
+            .is_some())
+    }
+
     pub fn note_set_sig(&self, s: &SeenSetSig) -> Result<Vec<SeenSetSig>> {
         let conflicts = self.all(
             "SELECT role, sighash, signature, txid FROM set_sigs_seen

@@ -107,6 +107,7 @@ impl Engine {
         }
         // c. re-classify (consumption changes as intents are mined) and link burns
         self.reclassify()?;
+        self.evict_pending_intents()?;
         // d. act on unmatched intents
         let mut unmatched = self
             .ctx
@@ -167,6 +168,7 @@ impl Engine {
     /// scans the burn on Ethereum. If it now matches, the release is adopted (intent and burn
     /// `RELEASED`), so the burn is never assigned and posted a second time (drill D-7).
     fn reclassify(&mut self) -> Result<()> {
+        let in_mempool = self.mem.mempool_seen.clone();
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
         self.ctx.db(|t| {
@@ -239,7 +241,12 @@ impl Engine {
                     info!(event = "intent_classified", intent = %i.outpoint, classification = %code,
                           previous = ?i.classification);
                 }
-                if let Classification::MatchedBurn { nonce } = c {
+                // an unmined intent that left the mempool is not re-linked (review M-3): its
+                // burn goes back to its leader, who re-sends the signed unlock
+                let live = i.confirmed_height.is_some() || in_mempool.contains(&i.outpoint.txid);
+                if let Classification::MatchedBurn { nonce } = c
+                    && live
+                {
                     link_burn(t, &p, nonce, &i.outpoint, i.confirmed_height.is_some(), tip)?;
                 }
             }
@@ -376,6 +383,41 @@ impl Engine {
         Ok(self.ctx.db(|t| t.ycash_signature(&key))?.is_some())
     }
 
+    /// Review M-3: a burn whose intent is neither mined nor in the mempool for
+    /// `max(TAKEOVER, C_Y)` blocks (the unlock was evicted, or never relayed) goes back to
+    /// `FINALIZED`, so it is assigned again and its leader re-sends — or a takeover leader
+    /// adopts — the signed unlock. Without it the burn would wait in `INTENT_PENDING` forever.
+    fn evict_pending_intents(&mut self) -> Result<()> {
+        let p = self.ctx.params.clone();
+        let tip = self.mem.tip;
+        let after = p.takeover.max(p.confirmations).max(1);
+        let pending = self
+            .ctx
+            .db(|t| t.burns_in_state(&p.deployment, BurnState::IntentPending))?;
+        let mut still = HashSet::new();
+        for b in pending {
+            let Some(op) = b.intent else { continue };
+            let Some(i) = self.ctx.db(|t| t.intent(&op))? else {
+                continue;
+            };
+            if i.confirmed_height.is_some() || self.mem.mempool_seen.contains(&op.txid) {
+                self.mem.evicted_since.remove(&op.txid);
+                continue;
+            }
+            still.insert(op.txid);
+            let since = *self.mem.evicted_since.entry(op.txid).or_insert(tip);
+            if tip.saturating_sub(since) >= after {
+                self.ctx.db(|t| t.burn_intent_evicted(&b.key, tip))?;
+                self.mem.evicted_since.remove(&op.txid);
+                warn!(event = "burn_intent_evicted", nonce = b.key.nonce, intent = %op,
+                      blocks = tip - since,
+                      "the unlock left the mempool unmined: the burn is assigned again");
+            }
+        }
+        self.mem.evicted_since.retain(|t, _| still.contains(t));
+        Ok(())
+    }
+
     /// The member that builds an intent's cancel when `cancelThreshold > 1` (the others
     /// co-sign over `POST /cancel/sign`): the mint schedule over the intent outpoint's id, live
     /// members other than the intent's signer. Two members building two cancels of one intent would each refuse the
@@ -422,7 +464,18 @@ impl Engine {
                     }
                     Err(e) => return Err(e.into()),
                 };
-                let built_hex = built.hex.to_string();
+                // no change output: whoever ever re-funds these bytes pays the fee only (H-1)
+                let (_, intent_value) = self
+                    .intent_coin_of(op)
+                    .await?
+                    .ok_or_else(|| anyhow!("intent {op} unknown"))?;
+                let built_hex = super::sign::fund_exactly(
+                    &self.ctx.ycash,
+                    &built.hex.to_string(),
+                    op,
+                    intent_value,
+                )
+                .await?;
                 let signer = SetSigning::prepare(&self.ctx, &built_hex, Role::Cancel, *op).await?;
                 let rec = self.ctx.db(|t| {
                     t.sign_once_ycash(&key, &built_hex, |h| {
@@ -635,6 +688,14 @@ pub async fn verify_and_sign_cancel(
     let tx = Transaction::decode_hex(&req.hex).map_err(|e| anyhow!("cancel: {e}"))?;
     let idx = input_index(&tx, &op).ok_or_else(|| anyhow!("the transaction spends no {op}"))?;
     role_args(&tx, idx, Role::Cancel)?;
+    // H-1: the cancel moves the intent's value and nothing else
+    let iop = op_rpc(&op);
+    let coin = ctx
+        .ycash
+        .gettxout(&iop.txid, iop.vout, true)
+        .await?
+        .ok_or_else(|| anyhow!("intent {op} is spent"))?;
+    super::sign::unlock_value_bounded(&tx, u64::try_from(coin.value.zat()).unwrap_or(0))?;
     let i = ctx
         .db(|t| t.intent(&op))?
         .ok_or_else(|| anyhow!("intent {op} is not in this ledger: not judged here"))?;

@@ -136,6 +136,8 @@ struct Opts {
     window: u64,
     /// The bridge's `mintCap` per day (0: no limit; mainnet semantics then pause own mints).
     mint_cap: u128,
+    /// The set's members (and seats).
+    members: u8,
 }
 
 impl Default for Opts {
@@ -151,6 +153,7 @@ impl Default for Opts {
             slots: 1,
             window: WINDOW,
             mint_cap: 0,
+            members: 3,
         }
     }
 }
@@ -212,7 +215,7 @@ async fn setup_with(opts: Opts) -> Option<Env> {
         .expect("spawn anvil");
     let deployer =
         PrivateKeySigner::from_bytes(&B256::from_slice(&anvil.keys()[0].to_bytes())).unwrap();
-    let keys: Vec<SecretKey> = (1..=3).map(secret).collect();
+    let keys: Vec<SecretKey> = (1..=opts.members).map(secret).collect();
     let holder = secret(9);
     let guardians: Vec<Address> = keys
         .iter()
@@ -240,7 +243,7 @@ async fn setup_with(opts: Opts) -> Option<Env> {
     let mut st = MockState::new();
     let admit = st.new_wallet_key();
     let set = st.add_set(SetParams {
-        seats: 3,
+        seats: u32::from(opts.members),
         unlockthreshold: opts.unlock_threshold,
         cancelthreshold: opts.cancel_threshold,
         slashthreshold: 2,
@@ -1002,11 +1005,9 @@ async fn d_restart_mid_flow_signs_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e_leader_takeover() {
     let Some(env) = setup().await else { return };
-    let mut engines = vec![
-        env.engine(0).await,
-        env.engine(1).await,
-        env.engine(2).await,
-    ];
+    // the leader's engine stalls, its API still answers (01/V-2, review M-1: a takeover signs a
+    // fresh vault only on every previous leader's signed "I hold no unlock for it")
+    let (mut engines, _urls) = networked(&env).await;
     lock_and_mint(&env, &mut engines).await;
     let r = YcashRecipient::p2pkh([0x55; 20]);
     let nonce = env.burn(300_000_000, &r).await;
@@ -1075,11 +1076,9 @@ async fn e2_leader_back_after_the_release_adopts_it() {
     // "matured unmatched"; once the burn is scanned the leader must adopt that release, not
     // assign the burn to itself and post a second unlock.
     let Some(env) = setup().await else { return };
-    let mut engines = vec![
-        env.engine(0).await,
-        env.engine(1).await,
-        env.engine(2).await,
-    ];
+    // the leader's engine stalls, its API still answers (01/V-2, review M-1: a takeover signs a
+    // fresh vault only on every previous leader's signed "I hold no unlock for it")
+    let (mut engines, _urls) = networked(&env).await;
     lock_and_mint(&env, &mut engines).await;
     let r = YcashRecipient::p2pkh([0x56; 20]);
     let nonce = env.burn(300_000_000, &r).await;
@@ -1889,10 +1888,35 @@ async fn unlock_hex(
         .unwrap()
         .hex
         .to_string();
-    match memo {
+    let with = match memo {
         Some(m) => hawkeye_ycash::tx::insert_op_return(&built, &m.encode()).unwrap(),
         None => built,
+    };
+    // as Hawkeye builds them: no change output, funded exactly (review H-1)
+    let value = {
+        let st = env.mock.state();
+        u64::try_from(st.templates[vault].valuezat()).unwrap()
+    };
+    hawkeye::engine::sign::fund_exactly(
+        &env.mock.client(),
+        &with,
+        &CoreOutPoint::new(vault.txid.0, vault.vout),
+        value,
+    )
+    .await
+    .unwrap()
+}
+
+/// The set's vaults no transaction (mempool included) spends.
+async fn free_vaults(env: &Env) -> Vec<OutPoint> {
+    let c = env.mock.client();
+    let mut out = vec![];
+    for v in vaults(env) {
+        if c.gettxout(&v.txid, v.vout, true).await.unwrap().is_some() {
+            out.push(v);
+        }
     }
+    out
 }
 
 fn vaults(env: &Env) -> Vec<OutPoint> {
@@ -1941,6 +1965,7 @@ async fn k1_signing_routes_authenticated_and_inert_at_threshold_one() {
     let Some(env) = setup().await else { return };
     let (mut engines, urls) = networked(&env).await;
     lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
     let r = YcashRecipient::p2pkh([0x44; 20]);
     let nonce = env.burn(300_000_000, &r).await;
     env.eth_mine(3).await;
@@ -1948,7 +1973,8 @@ async fn k1_signing_routes_authenticated_and_inert_at_threshold_one() {
     let k = BurnKey::new(dep_of(&engines[0]), nonce);
     let b = engines[1].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
     let memo = hawkeye_core::memo::HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
-    let hex = unlock_hex(&env, &vaults(&env)[0], &r, 300_000_000, Some(&memo)).await;
+    let free = free_vaults(&env).await;
+    let hex = unlock_hex(&env, &free[0], &r, 300_000_000, Some(&memo)).await;
     let req = UnlockSignRequest { hex: hex.clone() };
     let signs = || env.mock.state().calls_to("set_signunlock").len();
     let before = signs();
@@ -2137,14 +2163,26 @@ async fn k_unlock_cosign_endpoint() {
         .unwrap();
     assert_eq!(again.body.hex, ok.body.hex);
     assert_eq!(signs(), before + 1, "a repeat calls no node");
-    // another spend of the same vault is never co-signed
-    let other = unlock_hex(&env, &vault, &r, 300_000_000, Some(&memo)).await;
+    // another spend of the same vault (other outputs) is never co-signed; the same unlock
+    // re-funded (only its fee input differs) is the same spend: the existing signature
+    let refunded = unlock_hex(&env, &vault, &r, 300_000_000, Some(&memo)).await;
+    let merged = as_member(leader)
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: refunded })
+        .await
+        .unwrap();
+    assert_eq!(signs(), before + 1, "merged, not signed again");
+    assert_eq!(
+        hawkeye::engine::burn::unlock_signatures(&merged.body.hex).unwrap(),
+        1
+    );
+    let other = unlock_hex(&env, &vault, &r, 200_000_000, Some(&memo)).await;
     let e = as_member(leader)
         .unlock_sign(&urls[peer], &UnlockSignRequest { hex: other })
         .await
         .unwrap_err()
         .to_string();
-    assert!(e.contains("sign-once conflict"), "{e}");
+    assert!(e.contains("403"), "{e}");
+    assert_eq!(signs(), before + 1, "never signed");
     let rows = engines[peer]
         .ctx()
         .db(|t| t.unlock_burn_rows(&env.set.0, &k))
@@ -2198,11 +2236,13 @@ async fn k2_per_burn_sign_once() {
     );
 }
 
-/// (k3) Finding 05/N-1: a co-signed (not leader) unlock for the burn in the leader's ledger is
-/// never re-sent; it holds the burn until it is dead (its fee input spent `C_Y` deep), then
-/// the leader signs another vault.
+/// (k3) Audit 01/V-2 on finding 05/N-1: a co-signed (not leader) unlock for the burn sits in the
+/// leader's ledger and its fee input is spent `C_Y` deep — the point where the old rule declared
+/// it dead and signed another vault. It is still revivable (anyone may re-fund it); an attacker
+/// does, and the leader re-sends it re-funded too: the burn is paid **once**, on that vault, and
+/// no member ever signs a second vault for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn k3_attacker_prefilled_record_is_not_reused() {
+async fn k3_revived_cosigned_unlock_pays_the_burn_once() {
     use hawkeye_core::memo::HawkeyeMemo;
     use hawkeye_store::{UnlockBurn, UnlockOrigin, YcashSignKey};
     let Some(env) = setup().await else { return };
@@ -2214,37 +2254,16 @@ async fn k3_attacker_prefilled_record_is_not_reused() {
     env.eth_mine(3).await;
     let leader = leader_index(&env, nonce);
     let k = BurnKey::new(dep_of(&engines[0]), nonce);
-    // the pre-fix attack: an unlock of V1 for the burn, signed and recorded as a co-signature in
-    // the leader's ledger, never broadcast
-    engines[leader].tick().await;
-    let mempool_before = unlocks_for(&env, nonce).len();
-    assert_eq!(mempool_before, 1, "the leader posted it");
-    // (set the stage again on a fresh env would be heavier: instead the attack is planted on the
-    // next burn, before the leader sees it)
-    let nonce2 = env.burn(300_000_000, &r).await;
-    env.eth_mine(3).await;
-    let leader2 = leader_index(&env, nonce2);
-    let k2 = BurnKey::new(dep_of(&engines[0]), nonce2);
-    let _ = k;
-    let b2_hash = {
-        engines[(leader2 + 1) % 3].tick().await;
-        engines[(leader2 + 1) % 3]
-            .ctx()
-            .db(|t| t.burn(&k2))
-            .unwrap()
-            .unwrap()
-            .tx_hash
-    };
-    let spent_now: Vec<OutPoint> = unlocks_for(&env, nonce)
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
-    let free: Vec<OutPoint> = vaults(&env)
-        .into_iter()
-        .filter(|v| !spent_now.contains(v))
-        .collect();
-    let v1 = free[0];
-    let memo = HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce2, b2_hash);
+    let other = (leader + 1) % 3;
+    engines[other].tick().await;
+    let b_hash = engines[other]
+        .ctx()
+        .db(|t| t.burn(&k))
+        .unwrap()
+        .unwrap()
+        .tx_hash;
+    let v1 = vaults(&env)[0];
+    let memo = HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b_hash);
     let hex = unlock_hex(&env, &v1, &r, 300_000_000, Some(&memo)).await;
     let signed = env
         .mock
@@ -2257,13 +2276,13 @@ async fn k3_attacker_prefilled_record_is_not_reused() {
         set_id: env.set.0,
         prevout: CoreOutPoint::new(v1.txid.0, v1.vout),
     };
-    engines[leader2]
+    engines[leader]
         .ctx()
         .db(|t| {
             t.sign_once_unlock(
                 &key,
                 Some(&UnlockBurn {
-                    key: k2,
+                    key: k,
                     origin: UnlockOrigin::Cosign,
                     allow_double: false,
                 }),
@@ -2272,24 +2291,7 @@ async fn k3_attacker_prefilled_record_is_not_reused() {
             )
         })
         .unwrap();
-    // the leader holds the burn: it neither re-sends the co-signed bytes nor signs another vault
-    let sends = env.mock.state().calls_to("vault_send").len();
-    tick_all(&mut engines).await;
-    assert!(
-        unlocks_for(&env, nonce2).is_empty(),
-        "nothing posted for the burn"
-    );
-    assert_eq!(env.mock.state().calls_to("vault_send").len(), sends);
-    assert!(
-        engines[leader2]
-            .alarms()
-            .iter()
-            .any(|a| a.name == "unlock-held"),
-        "{:?}",
-        engines[leader2].alarms()
-    );
-    // its fee input is spent by another transaction and buried C_Y deep: the row dies and the
-    // leader signs another vault for the burn
+    // its fee input is spent elsewhere and buried C_Y + 1 deep
     let tx = Transaction::decode(&signed.hex.0).unwrap();
     let fee = tx.inputs.iter().find(|i| i.prevout != v1).unwrap().prevout;
     let spend = Transaction::new_v4(
@@ -2306,29 +2308,343 @@ async fn k3_attacker_prefilled_record_is_not_reused() {
         0,
     );
     env.mock.state().submit(spend.encode()).unwrap();
+    env.mine(C_Y + 1);
+    let builds = env.mock.state().calls_to("vault_buildunlock").len();
+    // the attacker revives the signed bytes: re-funded by anyone, still a valid unlock
+    let c = env.mock.client();
+    let revived = c.vault_refee(&signed.hex).await.unwrap();
+    c.vault_send(&revived.hex).await.unwrap();
+    for _ in 0..3 {
+        tick_all(&mut engines).await;
+    }
     env.mine(1);
-    tick_all(&mut engines).await; // seen spent: 1 block deep
-    assert!(unlocks_for(&env, nonce2).is_empty());
-    env.mine(1);
-    tick_all(&mut engines).await; // C_Y deep: dead
-    tick_all(&mut engines).await; // another vault
-    let rows = engines[leader2]
-        .ctx()
-        .db(|t| t.unlock_burn_rows(&env.set.0, &k2))
-        .unwrap();
-    let dead = rows.iter().find(|r| r.prevout == key.prevout).unwrap();
-    assert!(
-        dead.dead_reason
-            .as_deref()
-            .is_some_and(|r| r.contains("fee input")),
-        "{dead:?}"
+    for _ in 0..u32::from(DELAY) + 2 {
+        tick_all(&mut engines).await;
+        env.mine(1);
+    }
+    tick_all(&mut engines).await;
+    assert_eq!(
+        env.mock.state().calls_to("vault_buildunlock").len(),
+        builds,
+        "no member built another unlock for the burn"
     );
-    let live: Vec<_> = rows.iter().filter(|r| r.is_live()).collect();
-    assert_eq!(live.len(), 1);
-    assert_eq!(live[0].origin, UnlockOrigin::Leader);
-    let posted = unlocks_for(&env, nonce2);
-    assert_eq!(posted.len(), 1, "one unlock for the burn");
-    assert_ne!(posted[0].1, v1, "on another vault");
+    for (i, e) in engines.iter().enumerate() {
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert_eq!(b.state, BurnState::Released, "attestor {i}");
+        let paying: Vec<_> = e
+            .ctx()
+            .db(|t| {
+                let mut v = vec![];
+                for st in [
+                    IntentState::Matched,
+                    IntentState::Released,
+                    IntentState::Unmatched,
+                    IntentState::CancelSent,
+                    IntentState::Cancelled,
+                ] {
+                    v.extend(t.intents_in_state(st)?);
+                }
+                Ok(v)
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|i| {
+                i.memo.as_deref().is_some_and(|m| {
+                    hawkeye_core::memo::HawkeyeMemo::decode(m).is_ok_and(|m| m.reference == nonce)
+                })
+            })
+            .collect();
+        assert_eq!(paying.len(), 1, "attestor {i}: one intent pays the burn");
+        assert_eq!(
+            paying[0].origin_vault,
+            Some(key.prevout),
+            "on the co-signed vault"
+        );
+        for row in e.ctx().db(|t| t.unlock_burn_rows(&env.set.0, &k)).unwrap() {
+            assert_eq!(
+                row.prevout, key.prevout,
+                "attestor {i}: never a second vault"
+            );
+            assert!(row.is_live(), "never declared dead");
+        }
+    }
+}
+
+/// (k8) Takeover with prior signed bytes (audit 01/V-2): the burn's leader signed an unlock
+/// that never left (its send failed) and went silent. The takeover leader finds those bytes
+/// on the old leader's `GET /burns/<nonce>`, adopts them and sends them re-funded on the same
+/// vault, instead of signing a second vault that a revival of the first would double.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8_takeover_resends_the_previous_signed_unlock() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, _urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x49; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    env.mock
+        .state()
+        .inject_error("vault_send", -26, "16: mock refusal");
+    engines[leader].tick().await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "the send failed");
+    let first = engines[leader]
+        .ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap()
+        .unwrap()
+        .prevout;
+    let builds = env.mock.state().calls_to("vault_buildunlock").len();
+    // the leader falls silent; the others take the burn over after TAKEOVER blocks
+    for _ in 0..TAKEOVER + 1 {
+        env.mine(1);
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+    }
+    // the takeover leader sent it, and it is mined: every watching attestor links the burn to
+    // an intent of the previous leader's vault
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert!(
+            matches!(
+                b.state,
+                BurnState::IntentPending | BurnState::IntentConfirmed
+            ),
+            "attestor {i}: {:?}",
+            b.state
+        );
+        let intent = e
+            .ctx()
+            .db(|t| t.intent(&b.intent.unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intent.origin_vault,
+            Some(first),
+            "the previous leader's vault"
+        );
+    }
+    assert_eq!(
+        env.mock.state().calls_to("vault_buildunlock").len(),
+        builds,
+        "no new unlock was built"
+    );
+    let next = (0..3)
+        .find(|i| {
+            *i != leader
+                && engines[*i]
+                    .ctx()
+                    .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+                    .unwrap()
+                    .is_some()
+        })
+        .expect("the takeover leader recorded it");
+    let row = engines[next]
+        .ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.prevout, first);
+    assert_eq!(row.origin, hawkeye_store::UnlockOrigin::Leader);
+}
+
+/// (k9) The same at `unlockThreshold = 2`: the silent leader's unlock carries its own and a
+/// co-signer's signature; whichever member takes over — the co-signer re-sending its row, or
+/// the third adopting it from a peer — sends those bytes re-funded and builds nothing new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k9_takeover_at_unlock_threshold_two_resends_the_cosigned_unlock() {
+    let Some(env) = setup_with(views(2, 1)).await else {
+        return;
+    };
+    let (mut engines, _urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x49; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    env.mock
+        .state()
+        .inject_error("vault_send", -26, "16: mock refusal");
+    engines[leader].tick().await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "the send failed");
+    let first = engines[leader]
+        .ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap()
+        .unwrap()
+        .prevout;
+    let builds = env.mock.state().calls_to("vault_buildunlock").len();
+    // the leader falls silent; the others take the burn over after TAKEOVER blocks
+    for _ in 0..TAKEOVER + 1 {
+        env.mine(1);
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+    }
+    // the takeover leader sent it, and it is mined: every watching attestor links the burn to
+    // an intent of the previous leader's vault
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert!(
+            matches!(
+                b.state,
+                BurnState::IntentPending | BurnState::IntentConfirmed
+            ),
+            "attestor {i}: {:?}",
+            b.state
+        );
+        let intent = e
+            .ctx()
+            .db(|t| t.intent(&b.intent.unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intent.origin_vault,
+            Some(first),
+            "the previous leader's vault"
+        );
+    }
+    assert_eq!(
+        env.mock.state().calls_to("vault_buildunlock").len(),
+        builds,
+        "no new unlock was built"
+    );
+    let next = (0..3)
+        .find(|i| {
+            *i != leader
+                && engines[*i]
+                    .ctx()
+                    .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+                    .unwrap()
+                    .is_some()
+        })
+        .expect("the takeover leader recorded it");
+    let row = engines[next]
+        .ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.prevout, first);
+    assert!(
+        matches!(
+            row.origin,
+            hawkeye_store::UnlockOrigin::Leader | hawkeye_store::UnlockOrigin::Cosign
+        ),
+        "its own co-signed row re-sent, or the previous unlock adopted: {:?}",
+        row.origin
+    );
+}
+
+/// (k10) A co-signer asked again for the **same** unlock re-funded (other fee inputs, 01/V-2)
+/// adds the signature it already made over that sighash — no new signature, no sign-once
+/// conflict; another unlock of the vault is still refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k10_cosigner_merges_its_signature_into_a_refunded_unlock() {
+    use hawkeye::peers::UnlockSignRequest;
+    use hawkeye_core::memo::HawkeyeMemo;
+    let Some(env) = setup_with(views(2, 1)).await else {
+        return;
+    };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x4a; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let peer = (leader + 1) % 3;
+    engines[peer].tick().await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let b = engines[peer].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    let memo = HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
+    let vault = vaults(&env)[0];
+    let hex = unlock_hex(&env, &vault, &r, 300_000_000, Some(&memo)).await;
+    let as_leader = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[leader]));
+    let first = as_leader
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: hex.clone() })
+        .await
+        .unwrap();
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    // the same unlock, re-funded: other fee inputs, same template input and outputs
+    let refunded = env
+        .mock
+        .client()
+        .vault_refee(&hex.parse().unwrap())
+        .await
+        .unwrap()
+        .hex
+        .to_string();
+    assert_ne!(refunded, hex);
+    let again = as_leader
+        .unlock_sign(
+            &urls[peer],
+            &UnlockSignRequest {
+                hex: refunded.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        env.mock.state().calls_to("set_signunlock").len(),
+        signs,
+        "no new signature"
+    );
+    let ours = Transaction::decode_hex(&again.body.hex).unwrap();
+    let base = Transaction::decode_hex(&refunded).unwrap();
+    assert_eq!(ours.outputs, base.outputs);
+    assert_eq!(
+        ours.inputs.iter().map(|i| i.prevout).collect::<Vec<_>>(),
+        base.inputs.iter().map(|i| i.prevout).collect::<Vec<_>>(),
+        "the re-funded inputs"
+    );
+    assert_eq!(
+        hawkeye::engine::burn::unlock_signatures(&again.body.hex).unwrap(),
+        1
+    );
+    let had = Transaction::decode_hex(&first.body.hex).unwrap();
+    let sig = |t: &Transaction| {
+        let i = t.inputs.iter().position(|i| i.prevout == vault).unwrap();
+        t.inputs[i].script_sig.clone()
+    };
+    assert_eq!(
+        sig(&ours),
+        sig(&had),
+        "the signature it made the first time"
+    );
+    // another unlock of the vault (other outputs) is still refused
+    let other = unlock_hex(&env, &vault, &r, 200_000_000, Some(&memo)).await;
+    let e = as_leader
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: other })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("403"), "{e}");
 }
 
 /// (k3b) A leader's own unlock that never left (vault_send failed) and whose fee input was then
@@ -2396,8 +2712,9 @@ async fn k3b_unsendable_leader_unlock_is_refunded() {
     env.mock.state().submit(spend.encode()).unwrap();
     env.mine(1);
     let signs = env.mock.state().calls_to("set_signunlock").len();
+    let refees = env.mock.state().calls_to("vault_refee").len();
     engines[leader].tick().await; // re-sent: Missing inputs → vault_refee → sent
-    assert_eq!(env.mock.state().calls_to("vault_refee").len(), 1);
+    assert_eq!(env.mock.state().calls_to("vault_refee").len(), refees + 1);
     let posted = unlocks_for(&env, nonce);
     assert_eq!(posted.len(), 1, "the re-funded unlock is in the mempool");
     assert_eq!(
@@ -4464,4 +4781,1368 @@ async fn q_audit_ledger_detects_missing_record() {
         c.execute_batch("PRAGMA user_version = 1;").unwrap();
     }
     assert!(Store::open_readonly(&copy).is_err());
+}
+
+// ------------------------------------------------------------------------------------------
+// (r) the review of fix/unlock-revival (01/V-2): H-1 bounded value, H-2 authenticated bytes and
+// orphans, M-1 signed "none", M-2 dead inference from the ledger, M-3 evicted unlocks
+
+/// An unlock of `vault` to `r` with burn `memo`, **as the node builds it** (with its change
+/// output), signed through `node`: what a malicious or careless builder would hand out.
+async fn fat_unlock(
+    env: &Env,
+    node: &hawkeye_ycash::YcashRpc,
+    vault: &OutPoint,
+    r: &YcashRecipient,
+    memo: &hawkeye_core::memo::HawkeyeMemo,
+) -> (String, String) {
+    let built = env
+        .mock
+        .client()
+        .vault_buildunlock(
+            vault,
+            &[hawkeye_ycash::types::Recipient::script(
+                r.script(),
+                Amount(300_000_000),
+            )],
+        )
+        .await
+        .unwrap()
+        .hex
+        .to_string();
+    let with = hawkeye_ycash::tx::insert_op_return(&built, &memo.encode()).unwrap();
+    let signed = node
+        .set_signunlock(&with.parse().unwrap())
+        .await
+        .unwrap()
+        .hex
+        .to_string();
+    (with, signed)
+}
+
+/// (r1) H-1: a co-signer refuses an unlock that moves more than the vault's value (here the
+/// node's change output, which any re-funder would pay).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r1_cosigner_refuses_an_unlock_with_change() {
+    use hawkeye::peers::UnlockSignRequest;
+    let Some(env) = setup_with(views(2, 1)).await else {
+        return;
+    };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x61; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let peer = (leader + 1) % 3;
+    engines[peer].tick().await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let b = engines[peer].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    let memo = hawkeye_core::memo::HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
+    let vault = free_vaults(&env).await[0];
+    let built = env
+        .mock
+        .client()
+        .vault_buildunlock(
+            &vault,
+            &[hawkeye_ycash::types::Recipient::script(
+                r.script(),
+                Amount(300_000_000),
+            )],
+        )
+        .await
+        .unwrap()
+        .hex
+        .to_string();
+    let with = hawkeye_ycash::tx::insert_op_return(&built, &memo.encode()).unwrap();
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    let e = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[leader]))
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: with })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("403") && e.contains("no change"), "{e}");
+    assert_eq!(env.mock.state().calls_to("set_signunlock").len(), signs);
+}
+
+/// (r2) H-1 at takeover: the silent previous leader serves a signed unlock carrying a change
+/// output (the theft: the adopter's `vault_refee` would pay it). The takeover leader rejects it,
+/// funds nothing, signs nothing fresh (that member did not say "none"), and alarms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r2_takeover_never_funds_a_fat_unlock() {
+    use hawkeye_store::{UnlockBurn, UnlockOrigin, YcashSignKey};
+    let Some(env) = setup().await else { return };
+    let (mut engines, _urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x62; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    let other = (leader + 1) % 3;
+    let b = engines[other].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    let memo = hawkeye_core::memo::HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
+    let vault = free_vaults(&env).await[0];
+    let (built, signed) = fat_unlock(&env, &env.mock.client(), &vault, &r, &memo).await;
+    let key = YcashSignKey {
+        domain: hawkeye_store::SignDomain::YcashUnlock,
+        set_id: env.set.0,
+        prevout: CoreOutPoint::new(vault.txid.0, vault.vout),
+    };
+    engines[leader]
+        .ctx()
+        .db(|t| {
+            t.sign_once_unlock(
+                &key,
+                Some(&UnlockBurn {
+                    key: k,
+                    origin: UnlockOrigin::Leader,
+                    allow_double: false,
+                }),
+                &built,
+                |_| Ok::<_, String>((signed.clone(), [0x33; 32])),
+            )
+        })
+        .unwrap();
+    // the leader ticks once (its burn is ASSIGNED, so it serves the bytes), its send fails, it
+    // falls silent
+    env.mock
+        .state()
+        .inject_error("vault_send", -26, "16: mock refusal");
+    engines[leader].tick().await;
+    let refees = env.mock.state().calls_to("vault_refee").len();
+    let builds = env.mock.state().calls_to("vault_buildunlock").len();
+    for _ in 0..TAKEOVER + 2 {
+        env.mine(1);
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+    }
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "nothing was sent for the burn"
+    );
+    assert_eq!(
+        env.mock.state().calls_to("vault_refee").len(),
+        refees,
+        "nobody funded the fat unlock"
+    );
+    assert_eq!(
+        env.mock.state().calls_to("vault_buildunlock").len(),
+        builds,
+        "no fresh vault"
+    );
+    assert!(
+        engines.iter().enumerate().any(
+            |(i, e)| i != leader && e.alarms().iter().any(|a| a.name == "unlock-prior-unknown")
+        ),
+        "the takeover leader holds and alarms"
+    );
+}
+
+/// (r3) H-1: `send_refunded` never sends a re-fund that would cost this wallet more than the fee
+/// bound (a change output to pay).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r3_refund_is_bounded() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let vault = free_vaults(&env).await[0];
+    let r = YcashRecipient::p2pkh([0x63; 20]);
+    let memo = hawkeye_core::memo::HawkeyeMemo::burn_release(dep_of(&engines[0]), 77, [0x77; 32]);
+    let (_, signed) = fat_unlock(&env, &env.mock.client(), &vault, &r, &memo).await;
+    let sends = env.mock.state().calls_to("vault_send").len();
+    let e = hawkeye::engine::sign::send_refunded(
+        &env.mock.client(),
+        &signed.parse().unwrap(),
+        &CoreOutPoint::new(vault.txid.0, vault.vout),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("review H-1"), "{e}");
+    assert_eq!(
+        env.mock.state().calls_to("vault_send").len(),
+        sends,
+        "not sent"
+    );
+    // the same unlock funded exactly costs the fee only
+    let exact = unlock_hex(&env, &vault, &r, 300_000_000, Some(&memo)).await;
+    let tx = Transaction::decode_hex(&exact).unwrap();
+    let value = u64::try_from(env.mock.state().templates[&vault].valuezat()).unwrap();
+    hawkeye::engine::sign::unlock_value_bounded(&tx, value).unwrap();
+    assert_eq!(
+        hawkeye::engine::sign::refund_cost(&tx, value, 10_000).unwrap(),
+        10_000
+    );
+}
+
+/// (r4) H-2: the public `GET /burns/<nonce>` never carries signed bytes; `POST /burns/unlock` is
+/// for members only and serves nothing once the burn is paid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r4_signed_unlock_bytes_are_members_only_and_unpaid_only() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x64; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    for _ in 0..u32::from(DELAY) + 4 {
+        tick_all(&mut engines).await;
+        env.mine(1);
+    }
+    tick_all(&mut engines).await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let b = engines[leader].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    assert_eq!(b.state, BurnState::Released);
+    let body: serde_json::Value = reqwest::get(format!("{}/burns/{nonce}", urls[leader]))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body.get("unlock").is_none(), "{body}");
+    let e = Peers::new(vec![])
+        .unwrap()
+        .burn_unlock(&urls[leader], nonce)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("401"), "{e}");
+    let other = (leader + 1) % 3;
+    let a = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[other]))
+        .burn_unlock(&urls[leader], nonce)
+        .await
+        .unwrap();
+    assert_eq!(a.responder, Some(env.key_of_index(leader)));
+    assert!(a.body.held, "the leader signed it");
+    assert_eq!(a.body.unlock, None, "paid: never served");
+    assert_eq!(a.body.state, "RELEASED");
+}
+
+/// (r5) H-2: a member holds a signed unlock of V1 for a burn that was paid from V2. It marks V1
+/// due and reports it; the roll leader (a member that never signed V1) rolls V1, which spends
+/// it: the orphaned bytes can never pay the burn again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r5_orphaned_unlock_vault_is_rolled() {
+    use hawkeye_store::{UnlockBurn, UnlockOrigin, YcashSignKey};
+    let Some(env) = setup_with(views(1, 1)).await else {
+        return;
+    };
+    let (mut engines, _urls) = networked(&env).await;
+    let to = env.holder.eth_address();
+    let (v1, _) = env.lock_aged(1_000_000_000, &to, 2000);
+    drive_mint(&env, &mut engines, &v1).await;
+    let (v2, _) = env.lock_aged(1_000_000_000, &to, 1000);
+    drive_mint(&env, &mut engines, &v2).await;
+    let r = YcashRecipient::p2pkh([0x65; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let holder = (leader + 1) % 3;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    engines[holder].tick().await;
+    let b = engines[holder].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    let memo = hawkeye_core::memo::HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
+    let v1r = OutPoint::new(Hash256(v1.txid), v1.vout);
+    // the holder signed an unlock of V1 for the burn on its own node; it never left
+    let hex = unlock_hex(&env, &v1r, &r, 300_000_000, Some(&memo)).await;
+    let signed = env
+        .node(holder)
+        .set_signunlock(&hex.parse().unwrap())
+        .await
+        .unwrap();
+    engines[holder]
+        .ctx()
+        .db(|t| {
+            t.sign_once_unlock(
+                &YcashSignKey {
+                    domain: hawkeye_store::SignDomain::YcashUnlock,
+                    set_id: env.set.0,
+                    prevout: v1,
+                },
+                Some(&UnlockBurn {
+                    key: k,
+                    origin: UnlockOrigin::Cosign,
+                    allow_double: false,
+                }),
+                &hex,
+                |_| Ok::<_, String>((signed.hex.to_string(), signed.sighash.0)),
+            )
+        })
+        .unwrap();
+    // the leader pays the burn from V2 (the nearest ownerHeight); it is released
+    let mut rolled = false;
+    for _ in 0..u32::from(DELAY) + 4 * TAKEOVER + 12 {
+        tick_all(&mut engines).await;
+        env.mine(1);
+        if env
+            .mock
+            .client()
+            .gettxout(&v1r.txid, v1r.vout, true)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            rolled = true;
+            break;
+        }
+    }
+    tick_all(&mut engines).await;
+    let b = engines[leader].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    assert!(
+        matches!(b.state, BurnState::Released | BurnState::IntentConfirmed),
+        "{:?}",
+        b.state
+    );
+    let paid = engines[leader]
+        .ctx()
+        .db(|t| t.intent(&b.intent.unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(paid.origin_vault, Some(v2), "paid from V2");
+    assert!(rolled, "V1 was spent");
+    let rolls: Vec<_> = engines[leader]
+        .ctx()
+        .db(|t| {
+            let mut v = t.intents_in_state(IntentState::Matched)?;
+            v.extend(t.intents_in_state(IntentState::Released)?);
+            Ok(v)
+        })
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.origin_vault == Some(v1))
+        .collect();
+    assert_eq!(rolls.len(), 1, "one spend of V1");
+    assert_eq!(
+        rolls[0].classification.as_deref(),
+        Some("matched-roll"),
+        "a roll, never a second payment of the burn"
+    );
+}
+
+/// (r6) M-1: the previous leader is unreachable: its takeover successor signs no fresh vault
+/// (it may hold a signed unlock), alarms, and goes on once the previous leader answers "none".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r6_unreachable_previous_leader_holds_the_burn() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x66; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    drop(engines);
+    // three APIs; the leader's port is closed (its process is down)
+    let mut listeners = vec![];
+    let mut urls = vec![];
+    for _ in 0..3 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", l.local_addr().unwrap()));
+        listeners.push(Some(l));
+    }
+    let leader_addr = listeners[leader].as_ref().unwrap().local_addr().unwrap();
+    listeners[leader] = None;
+    let mut engines = vec![];
+    for i in 0..3 {
+        let peers = (0..3)
+            .filter(|j| *j != i)
+            .map(|j| urls[j].clone())
+            .collect();
+        engines.push(env.engine_with_peers(i, peers).await);
+    }
+    for (i, l) in listeners.into_iter().enumerate() {
+        if let Some(l) = l {
+            let ctx = engines[i].ctx().clone();
+            tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+        }
+    }
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    for _ in 0..TAKEOVER + 2 {
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+        env.mine(1);
+    }
+    assert!(unlocks_for(&env, nonce).is_empty(), "held");
+    assert_eq!(env.mock.state().calls_to("set_signunlock").len(), signs);
+    assert!(
+        engines.iter().enumerate().any(
+            |(i, e)| i != leader && e.alarms().iter().any(|a| a.name == "unlock-prior-unknown")
+        ),
+    );
+    // the previous leader's API is back (it holds nothing): the takeover goes on
+    let l = tokio::net::TcpListener::bind(leader_addr).await.unwrap();
+    let ctx = engines[leader].ctx().clone();
+    tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    assert_eq!(
+        unlocks_for(&env, nonce).len(),
+        1,
+        "the fresh unlock, now confirmed safe"
+    );
+}
+
+/// The leader of `nonce` signs its unlock but the send fails: `(leader, vault)`.
+async fn unsent_unlock(env: &Env, e: &mut Engine, nonce: u64) -> CoreOutPoint {
+    env.mock
+        .state()
+        .inject_error("vault_send", -26, "16: mock refusal");
+    e.tick().await;
+    assert!(unlocks_for(env, nonce).is_empty());
+    let k = BurnKey::new(dep_of(e), nonce);
+    e.ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap()
+        .unwrap()
+        .prevout
+}
+
+/// Spend `vault` with a transaction that is not the unlock (it bypasses scripts: the mock).
+fn spend_otherwise(env: &Env, vault: &CoreOutPoint) {
+    let spend = Transaction::new_v4(
+        vec![TxIn {
+            prevout: OutPoint::new(Hash256(vault.txid), vault.vout),
+            script_sig: vec![0x51],
+            sequence: u32::MAX,
+        }],
+        vec![TxOut {
+            value: 1000,
+            script_pubkey: YcashRecipient::p2pkh([0x15; 20]).script(),
+        }],
+        0,
+        0,
+    );
+    env.mock.state().submit(spend.encode()).unwrap();
+}
+
+fn row_of(
+    e: &Engine,
+    env: &Env,
+    nonce: u64,
+    vault: &CoreOutPoint,
+) -> hawkeye_store::UnlockBurnRecord {
+    let k = BurnKey::new(dep_of(e), nonce);
+    e.ctx()
+        .db(|t| t.unlock_burn_rows(&env.set.0, &k))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.prevout == *vault)
+        .unwrap()
+}
+
+/// (r7) M-2: the conflicting spend of the vault is reorged away: the dead inference reads the
+/// ledger's spend record (rewound by the reorg), so blocks mined afterwards never fast-forward
+/// the row to dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r7_reorged_conflict_never_makes_a_row_dead() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x67; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let mut e = env.engine_with(leader, vec![], |p| p.takeover = 1000).await;
+    drop(engines);
+    let vault = unsent_unlock(&env, &mut e, nonce).await;
+    spend_otherwise(&env, &vault);
+    let height = env.mock.state().tip_height() + 1;
+    env.mine(1);
+    e.tick().await;
+    assert!(row_of(&e, &env, nonce, &vault).is_live());
+    env.reorg_from(height);
+    for _ in 0..C_Y + 3 {
+        e.tick().await;
+        env.mine(1);
+    }
+    e.tick().await;
+    assert!(
+        row_of(&e, &env, nonce, &vault).is_live(),
+        "a reorged-away conflict never counts"
+    );
+}
+
+/// (r8) M-2: the follower lags the tip: no dead inference until it has recorded the vault's
+/// spender at the tip; then a conflicting spend `C_Y` deep is dead (the positive control).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r8_lagging_follower_never_declares_dead() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x68; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let mut e = env.engine_with(leader, vec![], |p| p.takeover = 1000).await;
+    drop(engines);
+    let vault = unsent_unlock(&env, &mut e, nonce).await;
+    spend_otherwise(&env, &vault);
+    env.mine(1);
+    for _ in 0..C_Y + 3 {
+        env.mock
+            .state()
+            .inject_error("getblockhash", -1, "mock: the node is busy");
+        e.tick().await;
+        env.mine(1);
+    }
+    assert!(
+        row_of(&e, &env, nonce, &vault).is_live(),
+        "the follower never recorded the spend"
+    );
+    e.tick().await; // caught up: the spend, C_Y deep, is another transaction's
+    let row = row_of(&e, &env, nonce, &vault);
+    assert!(
+        row.dead_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("spent by another transaction")),
+        "{row:?}"
+    );
+}
+
+/// (r9) M-3: the leader's unlock leaves the mempool unmined: after `max(TAKEOVER, C_Y)` blocks
+/// the burn is assigned again and the same signed unlock is re-sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r9_evicted_unlock_is_resent() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x69; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    tick_all(&mut engines).await;
+    let posted = unlocks_for(&env, nonce);
+    assert_eq!(posted.len(), 1);
+    let (tx, vault) = posted[0].clone();
+    let txid = tx.txid();
+    {
+        let mut st = env.mock.state();
+        st.mempool.retain(|t| *t != txid);
+        st.txs.remove(&txid);
+    }
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    let mut back = false;
+    for _ in 0..TAKEOVER + 3 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+        if !unlocks_for(&env, nonce).is_empty() {
+            back = true;
+            break;
+        }
+    }
+    assert!(back, "re-sent");
+    let again = unlocks_for(&env, nonce);
+    assert_eq!(again[0].1, vault, "the same vault");
+    assert_eq!(
+        env.mock.state().calls_to("set_signunlock").len(),
+        signs,
+        "the same signature, no new one"
+    );
+    tick_all(&mut engines).await;
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert_eq!(b.state, BurnState::IntentPending, "linked again");
+    }
+}
+
+/// (r10) L-2: a ledger holding fewer sign-once records than its high-water mark is flagged
+/// restored; while flagged, a fresh unlock needs every member's signed "none" (`prior_unlock`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r10_ledger_restore_is_detected() {
+    let Some(env) = setup().await else { return };
+    let e = env.engine(0).await;
+    let hwm = env.dir.path().join("attestor0.db.hwm");
+    assert_eq!(hawkeye::restore::detect(e.ctx(), &hwm).await.unwrap(), None);
+    hawkeye::restore::write_hwm(&hwm, 5).unwrap();
+    let why = hawkeye::restore::detect(e.ctx(), &hwm)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(why.contains("high-water mark"), "{why}");
+    hawkeye::restore::check_restore(e.ctx(), &hwm)
+        .await
+        .unwrap();
+    assert!(
+        e.ctx()
+            .db(|t| t.meta(hawkeye::engine::burn::LEDGER_RESTORED))
+            .unwrap()
+            .is_some()
+    );
+    // the mark never goes down by itself
+    hawkeye::restore::write_hwm(&hwm, 2).unwrap();
+    assert_eq!(hawkeye::restore::read_hwm(&hwm), 5);
+}
+
+// ------------------------------------------------------------------------------------------
+// (s) re-review of fix/unlock-revival: N-1 non-current members, the owner's override, N-2 a
+// restored ledger never says "none", N-3 observed unlocks adopted
+
+/// Three engines whose APIs are served except the `down` one's (its port is closed). Returns
+/// the engines and the down member's address (to serve it later).
+async fn with_one_down(env: &Env, down: usize) -> (Vec<Engine>, std::net::SocketAddr) {
+    let mut listeners = vec![];
+    let mut urls = vec![];
+    for _ in 0..3 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", l.local_addr().unwrap()));
+        listeners.push(Some(l));
+    }
+    let addr = listeners[down].as_ref().unwrap().local_addr().unwrap();
+    listeners[down] = None;
+    let mut engines = vec![];
+    for i in 0..3 {
+        let peers = (0..3)
+            .filter(|j| *j != i)
+            .map(|j| urls[j].clone())
+            .collect();
+        engines.push(env.engine_with_peers(i, peers).await);
+    }
+    for (i, l) in listeners.into_iter().enumerate() {
+        if let Some(l) = l {
+            let ctx = engines[i].ctx().clone();
+            tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+        }
+    }
+    (engines, addr)
+}
+
+/// Lock, mint and burn; the burn's leader never ticks and its API is down; the others tick past
+/// the takeover: the burn is held (r6). Returns `(engines, leader, nonce)`.
+async fn held_takeover(env: &Env) -> (Vec<Engine>, usize, u64) {
+    let mut engines = three(env).await;
+    lock_and_mint(env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x71; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(env, nonce);
+    drop(engines);
+    let (mut engines, _) = with_one_down(env, leader).await;
+    for _ in 0..TAKEOVER + 2 {
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+        env.mine(1);
+    }
+    assert!(unlocks_for(env, nonce).is_empty(), "held");
+    (engines, leader, nonce)
+}
+
+/// (s1) N-1: once the unreachable previous leader is no longer a current member (here it left
+/// the set), its answer is not needed — a non-current member's set signature can never confirm
+/// (`CheckSetSigs`) — and the takeover signs a fresh vault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s1_a_member_no_longer_current_is_not_required() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, leader, nonce) = held_takeover(&env).await;
+    {
+        let mut st = env.mock.state();
+        let h = st.tip_height();
+        st.leave_member(&env.set, &PubKey(env.key_of_index(leader)), h);
+    }
+    env.mine(1);
+    for _ in 0..2 {
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+    }
+    assert_eq!(unlocks_for(&env, nonce).len(), 1, "no longer held");
+}
+
+/// (s2) The owner's override: a quorum — a strict majority of the other current members, never
+/// less than `unlockThreshold` — declares the unreachable leader gone; the hold is released. A self-declaration, a forged
+/// signature and a non-member's declaration are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2_declared_gone_by_a_quorum_releases_the_hold() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, leader, nonce) = held_takeover(&env).await;
+    let mk = env.key_of_index(leader);
+    let decl = |by: &SecretKey, member: [u8; 33]| gone_decl(&env, by, member, 2 * TAKEOVER);
+    // refusals, on every ledger
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let me = env.keys[i].clone();
+        assert!(
+            hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.keys[leader], mk))
+                .await
+                .is_err(),
+            "self-declaration"
+        );
+        let mut forged = decl(&me, mk);
+        forged.sig = decl(&env.keys[leader], mk).sig;
+        assert!(
+            hawkeye::engine::burn::record_gone(e.ctx(), None, &forged)
+                .await
+                .is_err(),
+            "forged"
+        );
+        assert!(
+            hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.holder, mk))
+                .await
+                .is_err(),
+            "not a member"
+        );
+    }
+    // n = 3, k = 1: the quorum is a strict majority of the two others, 2; one is not enough
+    let first = (leader + 2) % 3;
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let a = hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.keys[first], mk))
+            .await
+            .unwrap();
+        assert_eq!((a.declarations, a.quorum), (1, 2));
+    }
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "one declaration is not a quorum"
+    );
+    let second = (leader + 1) % 3;
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let a = hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.keys[second], mk))
+            .await
+            .unwrap();
+        assert_eq!((a.declarations, a.quorum), (2, 2));
+    }
+    for _ in 0..2 {
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+    }
+    assert_eq!(
+        unlocks_for(&env, nonce).len(),
+        1,
+        "released by the override"
+    );
+}
+
+/// (s3) N-2: a restored ledger never answers "none" (it cannot know what it signed before the
+/// backup).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_a_restored_ledger_answers_unknown() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let ask = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[1]));
+    let a = ask.burn_unlock(&urls[0], 5).await.unwrap();
+    assert!(!a.body.held && !a.body.restored, "an ordinary ledger: none");
+    engines[0]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    let a = ask.burn_unlock(&urls[0], 5).await.unwrap();
+    assert!(a.body.restored);
+    assert!(a.body.held, "restored: never 'none'");
+    assert_eq!(a.body.unlock, None);
+}
+
+/// (s4) N-3: the leader's unlock was observed in the mempool by the others, then evicted, and
+/// the leader is gone (API down). The re-finalized burn's takeover adopts the observed bytes
+/// (the same spend, re-funded) without the leader's answer and without building anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_a_divergent_leaders_evicted_unlock_is_adopted_not_rebuilt() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x72; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    drop(engines);
+    let (mut engines, _) = with_one_down(&env, leader).await;
+    // the leader posts; everyone observes it
+    tick_all(&mut engines).await;
+    tick_all(&mut engines).await;
+    let posted = unlocks_for(&env, nonce);
+    assert_eq!(posted.len(), 1);
+    let (tx, vault) = posted[0].clone();
+    // evicted, and the leader is gone for good
+    {
+        let mut st = env.mock.state();
+        let txid = tx.txid();
+        st.mempool.retain(|t| *t != txid);
+        st.txs.remove(&txid);
+    }
+    let builds = env.mock.state().calls_to("vault_buildunlock").len();
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    let mut back = false;
+    for _ in 0..3 * TAKEOVER + 4 {
+        env.mine(1);
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+        if !unlocks_for(&env, nonce).is_empty() {
+            back = true;
+            break;
+        }
+    }
+    assert!(back, "the observed unlock was re-sent");
+    assert_eq!(unlocks_for(&env, nonce)[0].1, vault, "on its own vault");
+    assert_eq!(
+        env.mock.state().calls_to("vault_buildunlock").len(),
+        builds,
+        "nothing rebuilt"
+    );
+    assert!(
+        env.mock.state().calls_to("set_signunlock").len() <= signs + 1,
+        "no fresh signature beyond the adopter's no-op pass"
+    );
+}
+
+/// (s2b) The override quorum at `k = 1`, `n = 4`: a strict majority of the three others (2).
+/// One declaration (a single, possibly malicious, member) releases nothing; a declaration from a
+/// member that then leaves the set stops counting; after three declarations (two from members
+/// still current: the majority of the three current members) the hold is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2b_one_declaration_is_not_a_quorum_at_k1_n4() {
+    let Some(env) = setup_with(Opts {
+        members: 4,
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    assert_eq!(hawkeye::engine::burn::gone_quorum(1, 4), 2);
+    assert_eq!(hawkeye::engine::burn::gone_quorum(1, 3), 2);
+    assert_eq!(hawkeye::engine::burn::gone_quorum(3, 4), 3);
+    assert_eq!(hawkeye::engine::burn::gone_quorum(1, 7), 4);
+    let mut engines = vec![];
+    for i in 0..4 {
+        engines.push(env.engine(i).await);
+    }
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x73; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let mut live: Vec<[u8; 33]> = (0..4).map(|i| env.key_of_index(i)).collect();
+    hawkeye_core::keys::sort_members(&mut live);
+    let leader = (0..4)
+        .find(|i| env.key_of_index(*i) == live[(nonce % 4) as usize])
+        .unwrap();
+    drop(engines);
+    // four APIs, the leader's down
+    let mut listeners = vec![];
+    let mut urls = vec![];
+    for _ in 0..4 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", l.local_addr().unwrap()));
+        listeners.push(Some(l));
+    }
+    listeners[leader] = None;
+    let mut engines = vec![];
+    for i in 0..4 {
+        let peers = (0..4)
+            .filter(|j| *j != i)
+            .map(|j| urls[j].clone())
+            .collect();
+        engines.push(env.engine_with_peers(i, peers).await);
+    }
+    for (i, l) in listeners.into_iter().enumerate() {
+        if let Some(l) = l {
+            let ctx = engines[i].ctx().clone();
+            tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+        }
+    }
+    for _ in 0..2 * TAKEOVER + 2 {
+        tick_except(&mut engines, leader).await;
+        env.mine(1);
+    }
+    assert!(unlocks_for(&env, nonce).is_empty(), "held");
+    let mk = env.key_of_index(leader);
+    let decl = |by: &SecretKey| gone_decl(&env, by, mk, 2 * TAKEOVER);
+    let others: Vec<usize> = (0..4).filter(|i| *i != leader).collect();
+    let declare = |by: usize, engines: &Vec<Engine>| {
+        let d = decl(&env.keys[by]);
+        let ctxs: Vec<_> = others.iter().map(|i| engines[*i].ctx().clone()).collect();
+        async move {
+            let mut last = None;
+            for c in ctxs {
+                last = Some(
+                    hawkeye::engine::burn::record_gone(&c, None, &d)
+                        .await
+                        .unwrap(),
+                );
+            }
+            last.unwrap()
+        }
+    };
+    // one member alone (the attack): no release
+    let a = declare(others[0], &engines).await;
+    assert_eq!((a.declarations, a.quorum), (1, 2));
+    tick_except(&mut engines, leader).await;
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "one declaration releases nothing"
+    );
+    // its declarer leaves the set: its declaration stops counting
+    {
+        let mut st = env.mock.state();
+        let h = st.tip_height();
+        st.leave_member(&env.set, &PubKey(env.key_of_index(others[0])), h);
+    }
+    env.mine(1);
+    tick_except(&mut engines, leader).await;
+    // three: released
+    let a = declare(others[1], &engines).await;
+    assert_eq!(
+        (a.declarations, a.quorum),
+        (1, 2),
+        "the leaver's declaration no longer counts (n = 3 current now)"
+    );
+    tick_except(&mut engines, leader).await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "still no quorum");
+    let a = declare(others[2], &engines).await;
+    assert_eq!((a.declarations, a.quorum), (2, 2), "{a:?}");
+    // the burn may sit with the member that left until the takeover moves it on
+    let mut released = false;
+    for _ in 0..3 * TAKEOVER + 3 {
+        tick_except(&mut engines, leader).await;
+        if !unlocks_for(&env, nonce).is_empty() {
+            released = true;
+            break;
+        }
+        env.mine(1);
+    }
+    assert!(released, "released by a majority");
+}
+
+/// Tick every engine but `skip`.
+async fn tick_except(engines: &mut [Engine], skip: usize) {
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != skip {
+            e.tick().await;
+        }
+    }
+}
+
+/// A declaration by `by` that `member` (its current membership) is gone, expiring `blocks` ahead.
+fn gone_decl(
+    env: &Env,
+    by: &SecretKey,
+    member: [u8; 33],
+    blocks: u32,
+) -> hawkeye::peers::GoneDeclaration {
+    let (seq, tip) = {
+        let st = env.mock.state();
+        let seq = st.sets[&env.set]
+            .memberlist
+            .iter()
+            .find(|m| m.key.0 == member)
+            .map_or(0, |m| m.joinheight);
+        (seq, st.tip_height())
+    };
+    gone_decl_at(env, by, member, seq, tip + blocks)
+}
+
+fn gone_decl_at(
+    env: &Env,
+    by: &SecretKey,
+    member: [u8; 33],
+    seq: u32,
+    expiry: u32,
+) -> hawkeye::peers::GoneDeclaration {
+    hawkeye::peers::GoneDeclaration {
+        member: hex::encode(member),
+        declarer: hex::encode(by.public_key()),
+        seq,
+        expiry,
+        sig: hex::encode(
+            hawkeye_core::peerauth::sign(
+                by,
+                &hawkeye_core::peerauth::gone_msg(&env.set.0, &member, seq, expiry),
+            )
+            .unwrap(),
+        ),
+        reason: "test".into(),
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// (t) final re-review: R-1 restored reports, R-2 scoped declarations, R-3 bounded growth
+
+fn restore_report(vault: &OutPoint, count: u32, event: &str) -> hawkeye::peers::OrphanRequest {
+    hawkeye::peers::OrphanRequest {
+        nonce: 0,
+        vault: format!("{}:{}", vault.txid, vault.vout),
+        restored: true,
+        count,
+        event: event.into(),
+    }
+}
+
+/// (t1) R-1: a restored report is refused from a reporter that does not say it is restored;
+/// without evidence (this ledger never saw the reporter sign a spend of the vault) a reporter gets
+/// 4 reports per 4,032-block window, across all its events — a fresh event id resets nothing; past
+/// that, refused and alarmed `restore-report-flood`, which clears once the window has passed; a
+/// vault already marked is never marked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t1_restored_reports_need_evidence_and_are_rate_limited() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    for _ in 0..5 {
+        lock_and_mint(&env, &mut engines).await;
+    }
+    let vs = free_vaults(&env).await;
+    assert!(vs.len() >= 5);
+    let reporter = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[1]));
+    // not restored: refused
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&vs[0], 2, "ab"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("does not show its ledger restored"), "{e}");
+    engines[1]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    // four uncorroborated, each under a new event id
+    for (n, v) in vs[..4].iter().enumerate() {
+        let a = reporter
+            .orphaned(&urls[0], &restore_report(v, 1, &format!("e{n}")))
+            .await
+            .unwrap();
+        assert!(a.body.marked);
+    }
+    // a fifth, under yet another event: refused, the window counts across events
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&vs[4], 1, "ff"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("uncorroborated") && e.contains("cap 4"), "{e}");
+    // a vault already marked: never again
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&vs[0], 1, "aa"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("already rolled"), "{e}");
+    engines[0].tick().await;
+    assert!(
+        engines[0]
+            .alarms()
+            .iter()
+            .any(|a| a.name == "restore-report-flood")
+    );
+    // the window passes: the alarm clears
+    env.mine(hawkeye::engine::roll::RESTORE_WINDOW + 2);
+    engines[0].tick().await;
+    assert!(
+        !engines[0]
+            .alarms()
+            .iter()
+            .any(|a| a.name == "restore-report-flood"),
+        "{:?}",
+        engines[0].alarms()
+    );
+}
+
+/// (t5) R-1 lineage: a vault rolled for a restored report is rolled for real (roll intent, then
+/// its release into a new vault); that successor is never marked for a restored report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t5_the_successor_of_a_restore_rolled_vault_is_never_marked() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let v = free_vaults(&env).await[0];
+    let vc = CoreOutPoint::new(v.txid.0, v.vout);
+    engines[1]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    let reporter = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[1]));
+    for i in [0usize, 2] {
+        let a = reporter
+            .orphaned(&urls[i], &restore_report(&v, 1, "ab"))
+            .await
+            .unwrap();
+        assert!(a.body.marked);
+    }
+    // the reporter's own ledger marks it too (as its restore check does)
+    engines[1]
+        .ctx()
+        .db(|t| {
+            t.transition_vault(
+                &vc,
+                VaultState::RollDue,
+                None,
+                Some("restore orphan (test)"),
+            )
+        })
+        .unwrap();
+    // the roll, its window, its release
+    let mut successor = None;
+    for _ in 0..4 * TAKEOVER + u32::from(DELAY) + 10 {
+        tick_all(&mut engines).await;
+        env.mine(1);
+        successor = engines[0]
+            .ctx()
+            .db(|t| {
+                let mut out = None;
+                for i in t.intents_in_state(IntentState::Released)? {
+                    if i.origin_vault == Some(vc)
+                        && let Some(r) = i.released_txid
+                    {
+                        for x in t.vaults_in_state(VaultState::Live)? {
+                            if x.outpoint.txid == r {
+                                out = Some(x.outpoint);
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .unwrap();
+        if successor.is_some() {
+            break;
+        }
+    }
+    let succ = successor.expect("the roll was released into a new vault");
+    let so = OutPoint::new(Hash256(succ.txid), succ.vout);
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&so, 1, "cd"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("descends"), "{e}");
+}
+
+/// (t2) R-2: an expired declaration does not count; a declaration naming another membership
+/// (seq) of the member is refused; a declaration about a member that is not in the set is
+/// refused (R-3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t2_declarations_are_scoped_and_expire() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, leader, nonce) = held_takeover(&env).await;
+    let mk = env.key_of_index(leader);
+    let others: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+    // a quorum (2 of the 2 others), but expiring in one block
+    for &d in &others {
+        for &i in &others {
+            hawkeye::engine::burn::record_gone(
+                engines[i].ctx(),
+                None,
+                &gone_decl(&env, &env.keys[d], mk, 1),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    env.mine(2); // past their expiry
+    for _ in 0..3 {
+        tick_except(&mut engines, leader).await;
+        env.mine(1);
+    }
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "expired declarations release nothing"
+    );
+    // the positive control: the same quorum, not expired, releases
+    for &d in &others {
+        for &i in &others {
+            hawkeye::engine::burn::record_gone(
+                engines[i].ctx(),
+                None,
+                &gone_decl(&env, &env.keys[d], mk, 4),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    tick_except(&mut engines, leader).await;
+    tick_except(&mut engines, leader).await;
+    assert_eq!(unlocks_for(&env, nonce).len(), 1, "a live quorum releases");
+    // another membership of the member
+    let seq = {
+        let st = env.mock.state();
+        st.sets[&env.set]
+            .memberlist
+            .iter()
+            .find(|m| m.key.0 == mk)
+            .unwrap()
+            .joinheight
+    };
+    let tip = env.mock.state().tip_height();
+    let e = hawkeye::engine::burn::record_gone(
+        engines[others[0]].ctx(),
+        None,
+        &gone_decl_at(&env, &env.keys[others[1]], mk, seq + 1, tip + 4),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("membership"), "{e}");
+    // too far ahead
+    let e = hawkeye::engine::burn::record_gone(
+        engines[others[0]].ctx(),
+        None,
+        &gone_decl_at(&env, &env.keys[others[1]], mk, seq, tip + 100 * TAKEOVER),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("expires"), "{e}");
+    // not a member of the set at all
+    let stranger = secret(50).public_key();
+    let e = hawkeye::engine::burn::record_gone(
+        engines[others[0]].ctx(),
+        None,
+        &gone_decl_at(&env, &env.keys[others[1]], stranger, 0, tip + 4),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("not in the set's member list"), "{e}");
+}
+
+/// (t3) R-2 and the `gone-member-answered` path: a member declared gone by a quorum answers
+/// (here: its ledger is restored, so it answers "held"); its declarations are dropped, the alarm
+/// is raised, and its hold stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t3_a_declared_member_that_answers_keeps_its_hold() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x74; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    drop(engines);
+    let (mut engines, addr) = with_one_down(&env, leader).await;
+    for _ in 0..TAKEOVER + 2 {
+        tick_except(&mut engines, leader).await;
+        env.mine(1);
+    }
+    let mk = env.key_of_index(leader);
+    let others: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+    for &d in &others {
+        for &i in &others {
+            hawkeye::engine::burn::record_gone(engines[i].ctx(), None, &{
+                // uppercase keys: stored and deleted normalised (R-2 nit)
+                let mut g = gone_decl(&env, &env.keys[d], mk, 3 * TAKEOVER);
+                g.member = g.member.to_uppercase();
+                g.declarer = g.declarer.to_uppercase();
+                g
+            })
+            .await
+            .unwrap();
+        }
+    }
+    // stored under the lowercase keys whatever the declarations' case
+    for &i in &others {
+        let n = engines[i]
+            .ctx()
+            .db(|t| t.meta_prefix(&format!("gone/{}/", hex::encode(mk))))
+            .unwrap()
+            .len();
+        assert_eq!(n, 2, "normalised keys");
+    }
+    // the member comes back before anyone acts: restored, it answers "held"
+    engines[leader]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    let l = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let ctx = engines[leader].ctx().clone();
+    tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+    tick_except(&mut engines, leader).await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "its hold stands");
+    assert!(
+        engines.iter().enumerate().any(
+            |(i, e)| i != leader && e.alarms().iter().any(|a| a.name == "gone-member-answered")
+        ),
+        "alarmed"
+    );
+    let left = engines[others[0]]
+        .ctx()
+        .db(|t| t.meta_prefix(&format!("gone/{}/", hex::encode(mk))))
+        .unwrap();
+    let left1 = engines[others[1]]
+        .ctx()
+        .db(|t| t.meta_prefix(&format!("gone/{}/", hex::encode(mk))))
+        .unwrap();
+    assert!(
+        left.is_empty() || left1.is_empty(),
+        "the taking-over ledger dropped the declarations once the member answered"
+    );
+}
+
+/// (t4) R-3: the observed unlocks of a burn released `C_Y` deep are pruned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t4_observed_unlocks_are_pruned_after_release() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x75; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    tick_all(&mut engines).await;
+    tick_all(&mut engines).await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let prefix = format!("observed_unlock/{k}/");
+    assert!(
+        engines
+            .iter()
+            .any(|e| !e.ctx().db(|t| t.meta_prefix(&prefix)).unwrap().is_empty()),
+        "observed while pending"
+    );
+    for _ in 0..u32::from(DELAY) + C_Y + 4 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert_eq!(b.state, BurnState::Released);
+        assert!(
+            e.ctx().db(|t| t.meta_prefix(&prefix)).unwrap().is_empty(),
+            "pruned"
+        );
+    }
 }

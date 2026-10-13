@@ -372,6 +372,37 @@ impl Tx<'_> {
 
     /// `FINALIZED | WAITING_CAP | ASSIGNED → ASSIGNED(leader)` at Ycash `height` (assignment or
     /// takeover, §5.2).
+    /// Every member this ledger ever assigned burn `k` to, in order (from the event log: the
+    /// leaders that could have signed an unlock for it, review M-1).
+    pub fn burn_leaders(&self, k: &BurnKey) -> Result<Vec<PubKey33>> {
+        let mut out: Vec<PubKey33> = vec![];
+        for e in self.events_for(crate::state::ObjectKind::Burn, &k.to_string())? {
+            if e.to != BurnState::Assigned.as_str() {
+                continue;
+            }
+            let Some(h) = e.detail.as_deref().and_then(|d| d.strip_prefix("leader ")) else {
+                continue;
+            };
+            let mut key = [0u8; 33];
+            if hex::decode_to_slice(h, &mut key).is_ok() && !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `INTENT_PENDING → FINALIZED`: the intent left the mempool unmined (review M-3): the burn is
+    /// assigned again, so its leader re-sends (or adopts) the signed unlock.
+    pub fn burn_intent_evicted(&self, k: &BurnKey, height: u32) -> Result<()> {
+        self.burn_edge(
+            k,
+            BurnState::Finalized,
+            Some(height.into()),
+            Some("intent evicted: neither mined nor in the mempool"),
+        )?;
+        Ok(())
+    }
+
     pub fn assign_burn(&self, k: &BurnKey, leader: &PubKey33, height: u32) -> Result<()> {
         let detail = format!("leader {}", crate::hx(leader));
         self.burn_edge(k, BurnState::Assigned, Some(height.into()), Some(&detail))?;

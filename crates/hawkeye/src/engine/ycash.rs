@@ -175,6 +175,47 @@ pub fn link_burn(
     Ok(())
 }
 
+/// The ledger key prefix of the unlocks observed for a burn (review N-3).
+pub fn observed_unlock_prefix(burn: &BurnKey) -> String {
+    format!("observed_unlock/{burn}/")
+}
+
+/// Keep, in the ledger, every unlock observed on Ycash (mempool or block) whose memo names a burn
+/// of this deployment: its raw bytes, its vault and every attributed set signer (review N-3). A
+/// burn re-finalized after its unlock left the mempool adopts **that** transaction (it is the
+/// same spend, whoever led it), and every one of its signers must say "none" before a fresh
+/// vault is signed, even if this ledger never recorded that signer as the burn's leader.
+fn remember_observed_unlock(t: &Tx<'_>, p: &Params, obs: &UnlockObs) -> Result<(), StoreError> {
+    if obs.selector != Some(1) || obs.intents.is_empty() {
+        return Ok(());
+    }
+    let Some(m) = obs
+        .memo
+        .as_deref()
+        .and_then(|m| hawkeye_core::memo::HawkeyeMemo::decode_for(p.bridge_kind, m).ok())
+    else {
+        return Ok(());
+    };
+    if m.kind != hawkeye_core::memo::MemoKind::BurnRelease
+        || !m.is_for(p.bridge_kind, &p.deployment)
+    {
+        return Ok(());
+    }
+    let burn = BurnKey::new(p.deployment, m.reference);
+    let key = format!("{}{}", observed_unlock_prefix(&burn), hex::encode(obs.txid));
+    let signers: Vec<String> = obs
+        .attribution
+        .as_ref()
+        .map(|a| a.signers.iter().map(|s| hex::encode(s.pubkey)).collect())
+        .unwrap_or_default();
+    let v = serde_json::json!({
+        "raw": hex::encode(&obs.raw),
+        "vault": obs.vault.to_string(),
+        "signers": signers,
+    });
+    t.set_meta(&key, &v.to_string())
+}
+
 /// Record an unlock's intents and classify them (§3.2). `first_seen` is the height it was first
 /// seen at (the tip for a mempool sighting), `confirmed` its block height.
 pub fn apply_unlock(
@@ -186,6 +227,7 @@ pub fn apply_unlock(
     confirmed: Option<u32>,
     members: &[PubKey33],
 ) -> Result<(), StoreError> {
+    remember_observed_unlock(t, p, obs)?;
     for (vout, ip, value) in &obs.intents {
         if ip.tag != p.tag() || ip.set_id != p.set_id || ip.cancel_set_id != p.set_id {
             continue;

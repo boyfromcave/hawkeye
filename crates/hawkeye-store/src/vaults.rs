@@ -131,6 +131,17 @@ impl Tx<'_> {
 
     /// `LIVE → ROLL_DUE`, `ROLL_DUE → ROLLING`; returns the state left. `SPENT` and `ROLLED`
     /// go through [`Tx::vault_spent`].
+    /// The height a vault was last marked `ROLL_DUE` at (event log), if it was.
+    pub fn vault_due_height(&self, op: &OutPoint) -> Result<Option<u32>> {
+        Ok(self
+            .events_for(crate::state::ObjectKind::Vault, &op.to_string())?
+            .into_iter()
+            .rev()
+            .find(|e| e.to == VaultState::RollDue.as_str())
+            .and_then(|e| e.height)
+            .and_then(|h| u32::try_from(h).ok()))
+    }
+
     pub fn transition_vault(
         &self,
         op: &OutPoint,

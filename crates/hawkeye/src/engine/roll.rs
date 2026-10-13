@@ -25,7 +25,7 @@ use hawkeye_store::{IntentState, LockState, SignDomain, VaultRecord, VaultState,
 use hawkeye_ycash::tx::{Transaction, insert_op_return};
 use hawkeye_ycash::types::Recipient;
 use hawkeye_ycash::{Amount, ErrorReason, HexBytes};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::Engine;
 use super::sign::SetSigning;
@@ -34,6 +34,309 @@ use hawkeye_core::setsig::Role;
 
 /// Blocks added to the new `ownerHeight` beyond `MIN_OWNER_AGE + ROLL_MARGIN`.
 pub const ROLL_SLACK: u32 = 10;
+
+/// Whether vault `vault` is **orphaned** for burn `burn` in this ledger (review H-2): the burn was
+/// paid by another vault's intent, mined at least `C_Y` deep, while `vault` (whose signed unlock
+/// for the same burn some member holds) is still in the ledger as a live set vault. Returns the
+/// paying intent.
+pub(crate) fn orphan_of(
+    t: &hawkeye_store::Tx<'_>,
+    burn: &hawkeye_store::BurnKey,
+    vault: &hawkeye_core::OutPoint,
+    tip: u32,
+    confirmations: u32,
+) -> Result<Option<hawkeye_core::OutPoint>, hawkeye_store::StoreError> {
+    use hawkeye_store::BurnState;
+    let Some(b) = t.burn(burn)? else {
+        return Ok(None);
+    };
+    if !matches!(b.state, BurnState::IntentConfirmed | BurnState::Released) {
+        return Ok(None);
+    }
+    let Some(op) = b.intent else { return Ok(None) };
+    let Some(i) = t.intent(&op)? else {
+        return Ok(None);
+    };
+    let deep = i
+        .confirmed_height
+        .is_some_and(|h| (tip + 1).saturating_sub(h) >= confirmations);
+    if !deep || i.origin_vault.is_none() || i.origin_vault == Some(*vault) {
+        return Ok(None);
+    }
+    let live = t
+        .vault(vault)?
+        .is_some_and(|v| matches!(v.state, VaultState::Live | VaultState::RollDue));
+    Ok(live.then_some(op))
+}
+
+/// The `meta` key prefix of the vaults a restored ledger's node wallet signed an unlock of with
+/// no record here (review N-2): `restore_orphan/<txid:vout>`.
+pub const RESTORE_ORPHAN_PREFIX: &str = "restore_orphan/";
+
+/// The most vaults one restore report may say its event covers (a sanity bound, review R-1).
+pub const MAX_RESTORE_REPORT: u32 = 64;
+/// The rolling window of the per-reporter restore-report caps, Ycash blocks (~7 days).
+pub const RESTORE_WINDOW: u32 = 4_032;
+/// Corroborated restored reports accepted per reporter per window (this ledger saw the reporter
+/// set-sign a spend of the vault), across all its restore events.
+pub const RESTORE_CORROBORATED_CAP: usize = 64;
+/// Uncorroborated restored reports accepted per reporter per window, across all its events.
+pub const RESTORE_UNCORROBORATED_CAP: usize = 4;
+/// `restore_report/<reporter>/<height:010>/<vault>` → `c` | `u`: the restored reports accepted
+/// here, by the height they were accepted at (the rolling window).
+pub const RESTORE_REPORT_PREFIX: &str = "restore_report/";
+/// `restore_rolled/<vault>`: vaults a restored report marked to roll — never marked again.
+pub const RESTORE_ROLLED_PREFIX: &str = "restore_rolled/";
+/// `restore_lineage/<vault>`: a vault created by the release of the roll of a restore-rolled
+/// vault (or of one of its successors) — never marked for a restored report either.
+pub const RESTORE_LINEAGE_PREFIX: &str = "restore_lineage/";
+/// `restore_flood/<reporter>` → the height of the last refusal for volume (alarm
+/// `restore-report-flood`, cleared once the window passes).
+pub const RESTORE_FLOOD_PREFIX: &str = "restore_flood/";
+
+/// Whether `member`, asked once per restore event (cached), answered — signed — that its ledger
+/// is restored. Only the reporter is asked: its URL is learnt from its signed answers and cached.
+/// (A malicious member can lie here; the evidence rule and the caps are what bound it.)
+async fn reporter_says_restored(
+    ctx: &super::Ctx,
+    member: &hawkeye_core::PubKey33,
+    event: &str,
+) -> bool {
+    let key = (*member, event.to_owned());
+    if let Some(v) = ctx
+        .auth
+        .restore_answers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return *v;
+    }
+    let known = ctx
+        .auth
+        .peer_url
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(member)
+        .cloned();
+    let urls: Vec<String> = match known {
+        Some(u) => vec![u],
+        None => ctx.peers.urls().to_vec(),
+    };
+    let mut answer = None;
+    for peer in urls {
+        if let Ok(a) = ctx.peers.burn_unlock(&peer, 0).await
+            && let Some(who) = a.responder
+        {
+            ctx.auth
+                .peer_url
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(who, peer.clone());
+            if who == *member {
+                answer = Some(a.body.restored);
+                break;
+            }
+        }
+    }
+    let v = answer.unwrap_or(false);
+    if answer.is_some() {
+        ctx.auth
+            .restore_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, v);
+    }
+    v
+}
+
+/// Whether `vault` descends, through the release of a roll, from a vault a restored report
+/// marked (review R-1): the roll's intent has the marked vault as origin and its release creates
+/// the successor. Records every successor found (`restore_lineage/`), generation by generation.
+pub(crate) fn restore_lineage_contains(
+    t: &hawkeye_store::Tx<'_>,
+    vault: &hawkeye_core::OutPoint,
+) -> Result<bool, hawkeye_store::StoreError> {
+    let roots: Vec<String> = t
+        .meta_prefix(RESTORE_ROLLED_PREFIX)?
+        .into_iter()
+        .map(|(k, _)| k[RESTORE_ROLLED_PREFIX.len()..].to_owned())
+        .chain(
+            t.meta_prefix(RESTORE_LINEAGE_PREFIX)?
+                .into_iter()
+                .map(|(k, _)| k[RESTORE_LINEAGE_PREFIX.len()..].to_owned()),
+        )
+        .collect();
+    if roots.iter().any(|r| *r == vault.to_string()) {
+        return Ok(true);
+    }
+    let mut frontier: Vec<hawkeye_core::OutPoint> = roots
+        .iter()
+        .filter_map(|r| super::slash::parse_outpoint(r).ok())
+        .collect();
+    let mut found = false;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(x) = frontier.pop() {
+        if !seen.insert(x) {
+            continue;
+        }
+        let mut released = vec![];
+        for st in [IntentState::Released, IntentState::Matched] {
+            for i in t.intents_in_state(st)? {
+                if i.origin_vault == Some(x)
+                    && i.classification.as_deref() == Some("matched-roll")
+                    && let Some(r) = i.released_txid
+                {
+                    released.push(r);
+                }
+            }
+        }
+        for r in released {
+            for v in t
+                .vaults_in_state(VaultState::Live)?
+                .into_iter()
+                .chain(t.vaults_in_state(VaultState::RollDue)?)
+            {
+                if v.outpoint.txid == r {
+                    let key = format!("{RESTORE_LINEAGE_PREFIX}{}", v.outpoint);
+                    if t.meta(&key)?.is_none() {
+                        t.set_meta(&key, &x.to_string())?;
+                    }
+                    found |= v.outpoint == *vault;
+                    frontier.push(v.outpoint);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// `POST /vaults/orphaned` with `restored` (review N-2; R-1 as decided 2026-10-13): acted on only
+/// with **evidence** — this ledger saw the reporter set-sign a spend of the vault — within
+/// [`RESTORE_CORROBORATED_CAP`] per reporter per [`RESTORE_WINDOW`] blocks; without evidence
+/// only [`RESTORE_UNCORROBORATED_CAP`] per reporter per window, counted across all its events
+/// (a fresh event id resets nothing). Never for a vault a restored report already marked, nor any
+/// successor of one (the vault its roll's release created, and so on). The reporter must also
+/// say, signed, that it is restored (asked once per event). Refusals for volume are recorded and
+/// alarmed (`restore-report-flood`).
+async fn verify_restore_report(
+    ctx: &super::Ctx,
+    requester: hawkeye_core::PubKey33,
+    vault: &hawkeye_core::OutPoint,
+    req: &crate::peers::OrphanRequest,
+) -> Result<crate::peers::OrphanResponse> {
+    let rep = hex::encode(requester);
+    let tip = ctx.ycash.getblockcount().await?;
+    let flood = |why: String| -> anyhow::Error {
+        let _ = ctx.db(|t| t.set_meta(&format!("{RESTORE_FLOOD_PREFIX}{rep}"), &tip.to_string()));
+        warn!(event = "restore_report_flood", reporter = %rep, reason = %why);
+        anyhow!("{why}")
+    };
+    ensure!(
+        !req.event.is_empty()
+            && req.event.len() <= 64
+            && req.event.bytes().all(|b| b.is_ascii_hexdigit()),
+        "a restore report names its restore event (hex)"
+    );
+    if req.count == 0 || req.count > MAX_RESTORE_REPORT {
+        return Err(flood(format!(
+            "a restore event reports {} vaults: 1..={MAX_RESTORE_REPORT}",
+            req.count
+        )));
+    }
+    ensure!(
+        reporter_says_restored(ctx, &requester, &req.event).await,
+        "the reporter's own signed /burns/unlock answer does not show its ledger restored"
+    );
+    let (already, corroborated, window) = ctx.db(|t| {
+        let already = t
+            .meta(&format!("{RESTORE_ROLLED_PREFIX}{vault}"))?
+            .is_some()
+            || restore_lineage_contains(t, vault)?;
+        let corroborated = t.seen_set_sig_by(&ctx.params.set_id, vault, &requester)?;
+        let from = tip.saturating_sub(RESTORE_WINDOW);
+        let window: Vec<(String, String)> = t
+            .meta_prefix(&format!("{RESTORE_REPORT_PREFIX}{rep}/"))?
+            .into_iter()
+            .filter(|(k, _)| {
+                k.split('/')
+                    .nth(2)
+                    .and_then(|h| h.parse::<u32>().ok())
+                    .is_some_and(|h| h > from)
+            })
+            .collect();
+        Ok((already, corroborated, window))
+    })?;
+    ensure!(
+        !already,
+        "vault {vault} was already rolled for a restored report (or descends from such a roll)"
+    );
+    let kind = if corroborated { "c" } else { "u" };
+    let used = window.iter().filter(|(_, v)| v == kind).count();
+    let cap = if corroborated {
+        RESTORE_CORROBORATED_CAP
+    } else {
+        RESTORE_UNCORROBORATED_CAP
+    };
+    if used >= cap {
+        return Err(flood(format!(
+            "{rep} already made {used} {} restored reports in the last {RESTORE_WINDOW} blocks \
+             (cap {cap})",
+            if corroborated {
+                "corroborated"
+            } else {
+                "uncorroborated"
+            }
+        )));
+    }
+    let op = op_rpc(vault);
+    ensure!(
+        ctx.ycash.gettxout(&op.txid, op.vout, true).await?.is_some(),
+        "vault {vault} is spent"
+    );
+    let marked = ctx.db(|t| {
+        t.set_meta(
+            &format!("{RESTORE_REPORT_PREFIX}{rep}/{tip:010}/{vault}"),
+            kind,
+        )?;
+        let m = mark_orphan(t, vault, 0, tip)?;
+        t.set_meta(&format!("{RESTORE_ROLLED_PREFIX}{vault}"), &rep)?;
+        Ok(m)
+    })?;
+    warn!(event = "orphan_marked_restored", vault = %vault, reporter = %rep,
+          restore_event = %req.event, corroborated, marked);
+    Ok(crate::peers::OrphanResponse { marked })
+}
+
+/// Mark an orphaned vault `ROLL_DUE` (from `LIVE`): its roll leader — never a member that signed
+/// it — rolls it now, which spends it, so the orphaned signed unlock dies (review H-2).
+pub(crate) fn mark_orphan(
+    t: &hawkeye_store::Tx<'_>,
+    vault: &hawkeye_core::OutPoint,
+    nonce: u64,
+    tip: u32,
+) -> Result<bool, hawkeye_store::StoreError> {
+    if t.vault(vault)?.is_some_and(|v| v.state == VaultState::Live) {
+        t.transition_vault(
+            vault,
+            VaultState::RollDue,
+            Some(tip),
+            Some(&format!(
+                "orphaned signed unlock of burn {nonce}: rolled so it can never confirm"
+            )),
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The height a roll's takeover counts from: when the vault fell due by `ROLL_MARGIN` (or was
+/// created, if born due) — or, earlier, when it was marked `ROLL_DUE` for another reason (an
+/// orphaned signed unlock, review H-2: the vault is rolled so the old bytes die).
+pub fn roll_due_from(owner_height: u32, margin: u32, created: u32, marked: Option<u32>) -> u32 {
+    let natural = owner_height.saturating_sub(margin).max(created);
+    marked.map_or(natural, |m| natural.min(m))
+}
 
 /// The new `ownerHeight` a roll at `tip` writes.
 pub fn rolled_owner_height(tip: u32, min_owner_age: u32, roll_margin: u32) -> u32 {
@@ -109,6 +412,172 @@ impl Engine {
         Ok(())
     }
 
+    /// Orphaned signed unlocks this attestor holds (review H-2): a burn paid by another vault
+    /// while the vault of the unlock it signed for it is unspent. Those bytes stay revivable
+    /// (01/V-2) — a second payment of the burn — until the vault is spent, which this attestor
+    /// can never do itself (sign-once per vault). So it marks the vault `ROLL_DUE` and tells the
+    /// other members (`POST /vaults/orphaned`, every 20 ticks), whose roll leader rolls it.
+    pub(crate) async fn orphans(&mut self) -> Result<()> {
+        let p = self.ctx.params.clone();
+        let tip = self.mem.tip;
+        // review R-1: a reporter refused for volume, within the window (older refusals expire);
+        // and the lineage of restore-rolled vaults, followed as their rolls are released
+        let floods = self.ctx.db(|t| {
+            for (k, v) in t.meta_prefix(RESTORE_FLOOD_PREFIX)? {
+                if v.parse::<u32>()
+                    .map_or(true, |h| tip.saturating_sub(h) > RESTORE_WINDOW)
+                {
+                    t.delete_meta_prefix(&k)?;
+                }
+            }
+            let _ = restore_lineage_contains(t, &hawkeye_core::OutPoint::new([0; 32], 0))?;
+            t.meta_prefix(RESTORE_FLOOD_PREFIX)
+        })?;
+        if floods.is_empty() {
+            self.clear_alarm("restore-report-flood");
+        } else {
+            self.alarm(
+                "restore-report-flood",
+                format!(
+                    "restored-ledger orphan reports refused for volume from {}",
+                    floods
+                        .iter()
+                        .map(|(k, _)| &k[RESTORE_FLOOD_PREFIX.len()..])
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+        // review R-3: observed unlocks of a burn released C_Y deep are no longer needed
+        let observed = self.ctx.db(|t| t.meta_prefix("observed_unlock/"))?;
+        let mut done = std::collections::BTreeSet::new();
+        for (k, _) in observed {
+            let Some(burn) = k
+                .strip_prefix("observed_unlock/")
+                .and_then(|r| r.rsplit_once('/'))
+                .map(|(b, _)| b.to_owned())
+            else {
+                continue;
+            };
+            let Some(nonce) = burn.rsplit(':').next().and_then(|n| n.parse::<u64>().ok()) else {
+                continue;
+            };
+            let key = hawkeye_store::BurnKey::new(p.deployment, nonce);
+            if key.to_string() != burn || done.contains(&nonce) {
+                continue;
+            }
+            let released_deep = self.ctx.db(|t| {
+                let Some(b) = t.burn(&key)? else {
+                    return Ok(false);
+                };
+                if b.state != hawkeye_store::BurnState::Released {
+                    return Ok(false);
+                }
+                let h = match b.intent {
+                    Some(op) => t.intent(&op)?.and_then(|i| i.released_height),
+                    None => None,
+                };
+                Ok(h.is_some_and(|h| (tip + 1).saturating_sub(h) >= p.confirmations))
+            })?;
+            if released_deep {
+                done.insert(nonce);
+                let n = self
+                    .ctx
+                    .db(|t| t.delete_meta_prefix(&super::ycash::observed_unlock_prefix(&key)))?;
+                debug!(event = "observed_unlock_pruned", nonce, records = n);
+            }
+        }
+        let rows = self.ctx.db(|t| t.live_unlock_rows(&p.set_id))?;
+        for r in rows {
+            let Some(paid_by) = self
+                .ctx
+                .db(|t| orphan_of(t, &r.key, &r.prevout, tip, p.confirmations))?
+            else {
+                continue;
+            };
+            let op = op_rpc(&r.prevout);
+            if self
+                .ctx
+                .ycash
+                .gettxout(&op.txid, op.vout, true)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
+            if self
+                .ctx
+                .db(|t| mark_orphan(t, &r.prevout, r.key.nonce, tip))?
+            {
+                warn!(event = "unlock_orphaned", nonce = r.key.nonce, vault = %r.prevout,
+                      paid_by = %paid_by, "the burn was paid by another vault: rolling this one");
+            }
+            let last = self.mem.orphan_reported.get(&r.prevout).copied();
+            if last.is_some_and(|t| self.mem.ticks < t + 20) {
+                continue;
+            }
+            self.mem.orphan_reported.insert(r.prevout, self.mem.ticks);
+            let req = crate::peers::OrphanRequest {
+                nonce: r.key.nonce,
+                vault: r.prevout.to_string(),
+                restored: false,
+                count: 0,
+                event: String::new(),
+            };
+            for peer in self.ctx.peers.urls().to_vec() {
+                match self.ctx.peers.orphaned(&peer, &req).await {
+                    Ok(a) => info!(event = "orphan_reported", peer = %peer, vault = %r.prevout,
+                                   marked = a.body.marked),
+                    Err(e) => info!(event = "orphan_report_failed", peer = %peer, error = %e),
+                }
+            }
+        }
+        // review N-2: vaults the node wallet signed an unlock of that a restored ledger has no
+        // record of (restore::check_restore): rolled, whatever burn those bytes pay, until spent
+        let restore_orphans = self.ctx.db(|t| t.meta_prefix(RESTORE_ORPHAN_PREFIX))?;
+        let restore_count = u32::try_from(restore_orphans.len()).unwrap_or(u32::MAX);
+        let restore_event = hex::encode(
+            &hawkeye_core::bytes::sha256(
+                self.ctx
+                    .db(|t| t.meta(super::burn::LEDGER_RESTORED))?
+                    .unwrap_or_default()
+                    .as_bytes(),
+            )[..16],
+        );
+        for (k, _) in restore_orphans {
+            let Ok(vault) = super::slash::parse_outpoint(&k[RESTORE_ORPHAN_PREFIX.len()..]) else {
+                continue;
+            };
+            let op = op_rpc(&vault);
+            if self
+                .ctx
+                .ycash
+                .gettxout(&op.txid, op.vout, true)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
+            self.ctx.db(|t| mark_orphan(t, &vault, 0, tip))?;
+            let last = self.mem.orphan_reported.get(&vault).copied();
+            if last.is_some_and(|t| self.mem.ticks < t + 20) {
+                continue;
+            }
+            self.mem.orphan_reported.insert(vault, self.mem.ticks);
+            let req = crate::peers::OrphanRequest {
+                nonce: 0,
+                vault: vault.to_string(),
+                restored: true,
+                count: restore_count,
+                event: restore_event.clone(),
+            };
+            for peer in self.ctx.peers.urls().to_vec() {
+                let _ = self.ctx.peers.orphaned(&peer, &req).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Rolls this attestor signed whose unlock is neither mined nor in the mempool: re-send the
     /// stored bytes (sign-once: never rebuilt, never re-signed).
     async fn resend_rolls(&mut self) -> Result<()> {
@@ -163,10 +632,8 @@ impl Engine {
                 continue; // being spent, or signed for another spend
             }
             // takeover counts from the moment it fell due (or was created, if born due)
-            let due_from = v
-                .owner_height
-                .saturating_sub(p.roll_margin)
-                .max(v.created_height);
+            let marked = self.ctx.db(|t| t.vault_due_height(&v.outpoint))?;
+            let due_from = roll_due_from(v.owner_height, p.roll_margin, v.created_height, marked);
             let since = tip.saturating_sub(due_from);
             let Some(leader) =
                 mint_leader_for(&lock_id(&v.outpoint), self.live(), since, p.takeover)
@@ -243,6 +710,9 @@ impl Engine {
         .await?;
         let with_memo = insert_op_return(&built.hex.to_string(), &memo.encode())
             .map_err(|e| anyhow!("memo: {e}"))?;
+        // no change output: whoever ever funds these bytes pays the fee only (H-1)
+        let with_memo =
+            super::sign::fund_exactly(&self.ctx.ycash, &with_memo, &v.outpoint, value).await?;
         let signer = SetSigning::prepare(&self.ctx, &with_memo, Role::Unlock, v.outpoint).await?;
         let rec = self.ctx.db(|t| {
             // a roll pays no burn: per vault only
@@ -305,4 +775,39 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// `POST /vaults/orphaned` (authenticated): mark a vault orphaned here only if this ledger itself
+/// shows the burn paid by another vault `C_Y` deep while the vault is live (review H-2).
+pub async fn verify_orphan(
+    ctx: &super::Ctx,
+    requester: Option<hawkeye_core::PubKey33>,
+    req: &crate::peers::OrphanRequest,
+) -> Result<crate::peers::OrphanResponse> {
+    let requester = requester.ok_or_else(|| anyhow!("member-signed requests only"))?;
+    let vault = super::slash::parse_outpoint(&req.vault)?;
+    if req.restored {
+        return verify_restore_report(ctx, requester, &vault, req).await;
+    }
+    let k = hawkeye_store::BurnKey::new(ctx.params.deployment, req.nonce);
+    let tip = ctx.ycash.getblockcount().await?;
+    let conf = ctx.params.confirmations;
+    let paid_by = ctx
+        .db(|t| orphan_of(t, &k, &vault, tip, conf))?
+        .ok_or_else(|| {
+            anyhow!(
+                "vault {vault} is not orphaned here: burn {} is not paid by another vault C_Y \
+                 deep, or the vault is not live",
+                req.nonce
+            )
+        })?;
+    let op = op_rpc(&vault);
+    ensure!(
+        ctx.ycash.gettxout(&op.txid, op.vout, true).await?.is_some(),
+        "vault {vault} is spent"
+    );
+    let marked = ctx.db(|t| mark_orphan(t, &vault, req.nonce, tip))?;
+    info!(event = "orphan_marked", vault = %vault, nonce = req.nonce, paid_by = %paid_by,
+          requester = %hex::encode(requester), marked);
+    Ok(crate::peers::OrphanResponse { marked })
 }

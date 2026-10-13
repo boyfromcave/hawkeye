@@ -552,6 +552,8 @@ Lock:   SEEN → CONFIRMED → POLICY_OK | POLICY_REJECTED
 Burn:   SEEN(unfinalized) → FINALIZED → (ORPHANED | ASSIGNED(leader, deadline))
         ASSIGNED → INTENT_PENDING(intent) → INTENT_CONFIRMED → RELEASED
         INTENT_* → CANCELLED (by a watcher; the burn returns to FINALIZED for reassignment)
+        INTENT_PENDING → FINALIZED (its unlock left the mempool unmined for max(TAKEOVER, C_Y)
+              blocks: reassigned, so the signed unlock is re-sent or adopted — HK-16)
         FINALIZED → WAITING_CAP(epoch) when S-3 would refuse
 Intent (any, seen on Ycash): OBSERVED → MATCHED(burn | roll) | UNMATCHED → CANCEL_SENT →
         CANCELLED | MATURED_UNMATCHED (alarm: the window was missed)
@@ -697,11 +699,27 @@ signatures (§4.6) and answer signed; TLS (`https://`) is the transport; authori
 Ycash set, so a removed member is refused at once. `/unlock/sign` is inert at `unlockThreshold =
 1`; above it a peer co-signs only for the requester that leads the burn (or roll) in its own
 ledger, and records the signature per burn as well as per vault (schema v6: one live vault per
-burn; a record is *dead* only when its transaction can no longer confirm — a fee input or the
-vault spent by another transaction at least `C_Y` deep — and then one more vault may be signed).
-The leader re-sends only an unlock it signed as leader whose fee inputs are its wallet's, and
-adopts a peer's co-signature only on its own transaction byte for byte with more valid
-signatures of distinct current members (findings 05/N-1, 05/L-1). The attest agent's
+burn). **A signed unlock stays revivable while its vault is unspent** (audit 01/V-2: set
+signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, so anyone holding the bytes can re-fund
+them), so a record is *dead* — and one more vault may be signed for the burn — only when its
+**vault** is spent by another transaction at least `C_Y` deep; a fee-input spend never counts
+(HK-16). The burn's leader re-sends the live unlock it holds, re-funded when a fee input is gone
+or not its wallet's — its own as leader, or one it co-signed and now leads after a takeover. A
+takeover leader holding none asks the peers `POST /burns/unlock` (authenticated, answer signed; a
+peer serves its signed unlock only to a current member and only while the burn is unpaid in its
+ledger — never on the public `GET /burns/<nonce>`) and adopts a valid one; it signs a fresh vault
+only once every previous leader of the burn (every member, while the ledger is flagged restored)
+has answered, signed, that it holds none — an unreachable one holds the burn. Every unlock, roll
+and cancel moves exactly its template coin's value (no change output: built, then funded exactly
+with `vault_refee`), co-signers and adopters refuse anything else, and a re-fund is sent only if
+it costs at most 0.001 YEC, so nobody can be made to pay outputs by funding someone else's bytes.
+A member holding a signed unlock whose burn was paid by another vault marks that vault due and
+reports it (`POST /vaults/orphaned`); a roll leader that never signed it rolls it, and the
+orphaned bytes die. A burn whose unlock left the mempool unmined goes back to its leader after
+`max(TAKEOVER, C_Y)` blocks. A co-signer asked again for the same unlock (other fee inputs or
+signatures) adds the signature it already made, never a new one. A peer's co-signature is
+adopted only on our own transaction byte for byte with more valid signatures of distinct
+current members (findings 05/N-1, 05/L-1). The attest agent's
 iroh-gossip (ycash-dd `contrib/yellowback/attest`) may replace the transport later.
 
 **Dependencies.** Exact pins, `Cargo.lock` committed, `cargo build --locked`, `cargo deny` (the
@@ -864,3 +882,4 @@ from the members' compressed keys.
 | HK-14 | (2026-10-12, remedial report 05/M-1) The member key is hot in the node wallet in `"wallet"` mode, in clear; `[keys] ycash_signing = "self"` keeps it out of the wallet (Hawkeye signs set and act messages itself; the ledger is then the only Ycash equivocation guard); on mainnet the Ethereum gas account is separate from the member key |
 | HK-12 | (2026-10-11, D-Q-29..D-Q-31) An attestor leaves by `hawkeye leave` (`set_leave`) and recovers its bond by `hawkeye withdraw-bond` after the set's `maturity` (≥ 16,128 on mainnet: the mainnet row's 1,152 became 16,128); slashing reaches members in their exit delay (§2.4, §5.3 step 5) |
 | HK-15 | (audit 05/L-4) Optimistic mode falls back to the threshold path automatically once every live member is barred from a lock (`vetoed`, or a recorded griefer of it); the challenger of a proposal that matched a policy-OK lock gets a `GRIEFING` case (`SET_REMOVE burn=0`) and is not waited for as that lock's proposer (§5.3 step 2) |
+| HK-16 | (2026-10-13, audit 01/V-2 on 05/N-1; review of fix/unlock-revival) Never sign a second unlock for a burn while an unlock any member signed for it could still confirm: a signed unlock is revivable (re-fundable) until its vault is spent by another transaction `C_Y` deep (from the ledger's spend record, the follower at the tip) or its intent is cancelled `C_Y` deep; fee-input spends never make it dead. Leader and co-signed rows are re-sent re-funded by the burn's leader; a takeover leader adopts a peer's signed unlock (`POST /burns/unlock`, members only, unpaid burns only) and signs a fresh vault only on every previous leader's signed "none" (every member's while the ledger is flagged restored); unlocks, rolls and cancels carry no change output and a re-fund costs at most 0.001 YEC; orphaned vaults are rolled; evicted unlocks are re-sent after `max(TAKEOVER, C_Y)` blocks; only signers still current in the set are required (a non-current member's signature can never confirm, `CheckSetSigs`), observed unlocks of the burn are adopted first and their signers required, a restored ledger answers "unknown", and the owner's override `hawkeye declare-leader-gone` (a quorum of `max(k, floor((n_current − 1)/2) + 1)` — a strict majority of the current members other than the gone one, never less than `unlockThreshold` — each a signed, recorded declaration bound to the member's join height and an expiry height (≤ 10 × TAKEOVER), dropped when the member answers or heartbeats; a declarer that leaves stops counting; it applies only while the declared member stays silent) releases a permanently gone member's holds |

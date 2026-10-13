@@ -71,6 +71,92 @@ pub struct BurnView {
     pub intent: Option<String>,
 }
 
+/// `POST /burns/unlock` request (authenticated, review H-2): the signed unlock a peer holds for a
+/// burn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BurnUnlockRequest {
+    /// The burn nonce (this deployment).
+    pub nonce: u64,
+}
+
+/// `POST /burns/unlock` answer (signed by the peer, HK-13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BurnUnlockResponse {
+    /// The burn nonce.
+    pub nonce: u64,
+    /// The burn's state in the peer's ledger (`unknown` when it has none).
+    pub state: String,
+    /// The peer's ledger is flagged restored (review N-2): `held` is then `true` whatever it
+    /// finds — it cannot know what it signed before the backup.
+    #[serde(default)]
+    pub restored: bool,
+    /// The peer holds a live (non-drill) signed unlock for the burn: it, or a co-signer, signed
+    /// one that may still confirm (01/V-2). `false` is the peer's signed statement that it holds
+    /// none (review M-1).
+    pub held: bool,
+    /// That signed unlock (hex), served only while the burn is unpaid in the peer's ledger
+    /// (`FINALIZED`, `ASSIGNED`, `WAITING_CAP`): a takeover leader re-sends it (re-funded)
+    /// instead of signing another vault for the burn. Never on the public `GET /burns/<nonce>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock: Option<String>,
+}
+
+/// `POST /vaults/orphaned` request (authenticated, review H-2): a member that holds a signed
+/// unlock of `vault` for burn `nonce` reports that the burn was paid by another vault.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrphanRequest {
+    /// The burn nonce.
+    pub nonce: u64,
+    /// The orphaned vault (`txid:vout`).
+    pub vault: String,
+    /// Review N-2: the reporter's ledger was restored and its node wallet signed an unlock of
+    /// this vault it has no record of (the burn is unknown): roll it so those bytes die.
+    #[serde(default)]
+    pub restored: bool,
+    /// With `restored`: how many vaults this restore event reports in all (review R-1: the
+    /// receiver accepts no more than that, and never more than `MAX_RESTORE_REPORT`).
+    #[serde(default)]
+    pub count: u32,
+    /// With `restored`: the restore event (hex), scoping `count`.
+    #[serde(default)]
+    pub event: String,
+}
+
+/// `POST /members/gone` request (authenticated): the requester's signed declaration that
+/// `member` is permanently gone (the owner's override, 2026-10-13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoneDeclaration {
+    /// The member declared gone (66 hex).
+    pub member: String,
+    /// The declaring member (66 hex): the requester.
+    pub declarer: String,
+    /// The member's join height (the membership declared gone, review R-2).
+    pub seq: u32,
+    /// The last Ycash height the declaration counts at (review R-2).
+    pub expiry: u32,
+    /// `sign_compact(declarer, gone_msg(set, member, seq, expiry))`, 130 hex.
+    pub sig: String,
+    /// Why (kept with the record).
+    pub reason: String,
+}
+
+/// `POST /members/gone` answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoneAnswer {
+    /// Declarations of the member this ledger now holds, from distinct current members.
+    pub declarations: u32,
+    /// The quorum: a strict majority of the current members other than the declared one, never
+    /// less than `unlockThreshold` ([`crate::engine::burn::gone_quorum`]).
+    pub quorum: u32,
+}
+
+/// `POST /vaults/orphaned` answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrphanResponse {
+    /// The vault was marked `ROLL_DUE` here now.
+    pub marked: bool,
+}
+
 /// `POST /slash/sign` request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SlashSignRequest {
@@ -197,6 +283,30 @@ impl Peers {
             return Err(anyhow!("{peer}: HTTP {}", r.status()));
         }
         Ok(r.json().await?)
+    }
+
+    /// `POST <peer>/members/gone` (authenticated).
+    pub async fn declare_gone(
+        &self,
+        peer: &str,
+        req: &GoneDeclaration,
+    ) -> Result<Signed<GoneAnswer>> {
+        self.post_signed(peer, "/members/gone", req).await
+    }
+
+    /// `POST <peer>/vaults/orphaned` (authenticated).
+    pub async fn orphaned(
+        &self,
+        peer: &str,
+        req: &OrphanRequest,
+    ) -> Result<Signed<OrphanResponse>> {
+        self.post_signed(peer, "/vaults/orphaned", req).await
+    }
+
+    /// `POST <peer>/burns/unlock` (authenticated; the answer is signed).
+    pub async fn burn_unlock(&self, peer: &str, nonce: u64) -> Result<Signed<BurnUnlockResponse>> {
+        self.post_signed(peer, "/burns/unlock", &BurnUnlockRequest { nonce })
+            .await
     }
 
     /// `POST <peer><path>` with `req` as JSON, signed when this client has a member key; the

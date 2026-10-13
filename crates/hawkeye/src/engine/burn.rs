@@ -184,16 +184,20 @@ impl Engine {
     }
 
     /// Judge the live unlock that pays a burn here (remedial report 05/H-1 §4.4, finding
-    /// 05/N-1): re-sent only if this attestor signed it **as the burn's leader** and every fee
-    /// input still unspent is this wallet's; dead only when it can no longer confirm — the vault
-    /// spent by another transaction at least `C_Y` deep, or, for a row this attestor did not
-    /// sign as leader, a fee input spent so deep while the vault is unspent.
+    /// 05/N-1; audit 01/V-2).
     ///
-    /// A leader's unlock whose fee input is gone is **not** dead (audit 01/V-2): the set
-    /// signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, so anyone holding the signed
-    /// bytes can re-fund it (`vault_refee`) and it would still pay the burn. Signing another
-    /// vault for the burn would then risk a double payment; it is re-sent instead, and
-    /// [`super::sign::send_set_signed`] re-funds it.
+    /// **An unlock this member signed stays revivable while its vault is unspent.** The set
+    /// signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, so anyone holding the signed bytes
+    /// can re-fund them (`vault_refee`, or by hand) whatever happened to their fee inputs; a
+    /// second unlock signed for the burn meanwhile would let the burn be paid twice. So:
+    ///
+    /// - vault unspent: the bytes are re-sent — re-funded when a fee input is gone or is not this
+    ///   wallet's (a co-signed row adopted as the burn's new leader, takeover) — never replaced.
+    ///   A fee-input spend no longer makes a row dead. Only a drill row is held, never sent;
+    /// - vault spent by this unlock (any funding of it: the ledger links an intent of the vault
+    ///   to this burn, or the stored transaction is known): it is out;
+    /// - vault spent by **another** transaction at least `C_Y` deep: the bytes can no longer
+    ///   confirm — dead, and one more vault may be signed for the burn; shallower: held.
     async fn judge_live_unlock(
         &mut self,
         row: &UnlockBurnRecord,
@@ -205,107 +209,127 @@ impl Engine {
         let vault = row.prevout;
         let ycash = self.ctx.ycash.clone();
         let rpc = |op: &CoreOutPoint| op_rpc(op);
-        // the vault: unspent, spent by this unlock (it is out), or by another transaction
         if ycash
             .gettxout(&rpc(&vault).txid, vault.vout, true)
             .await?
             .is_none()
         {
-            if ycash.getrawtransaction(&tx.txid()).await.is_ok() {
-                return Ok(LiveUnlock::Out);
-            }
             if ycash
                 .gettxout(&rpc(&vault).txid, vault.vout, false)
                 .await?
                 .is_some()
             {
                 return Ok(LiveUnlock::Hold(format!(
-                    "vault {vault} is spent in the mempool by another transaction"
+                    "vault {vault} is spent in the mempool (by this unlock or another)"
                 )));
             }
-            let since = *self.mem.conflict_seen.entry(vault).or_insert(tip);
-            let depth = tip + 1 - since.min(tip + 1);
+            // spent in a block: judged from the ledger's own spend record, with the follower at
+            // the tip (review M-2): a reorg rewinds the record, so depth is never fast-forwarded
+            let caught_up = self
+                .ctx
+                .db(|t| t.cursor(hawkeye_store::Chain::Ycash))?
+                .is_some_and(|c| c.height >= u64::from(tip));
+            let rec = self.ctx.db(|t| t.vault(&vault))?;
+            let (Some(spent_txid), Some(spent_height), true) = (
+                rec.as_ref().and_then(|v| v.spent_txid),
+                rec.as_ref().and_then(|v| v.spent_height),
+                caught_up,
+            ) else {
+                return Ok(LiveUnlock::Hold(format!(
+                    "vault {vault} is spent; waiting for the follower to record the spend at the tip"
+                )));
+            };
+            let depth = (tip + 1).saturating_sub(spent_height);
+            let spender = ycash
+                .getrawtransaction(&hawkeye_ycash::Hash256::from_internal(spent_txid))
+                .await
+                .ok()
+                .and_then(|raw| Transaction::decode(raw.as_slice()).ok());
+            let ours = spender
+                .as_ref()
+                .is_some_and(|sp| super::sign::same_spend_any_signatures(&tx, sp, &vault).is_ok());
+            if ours {
+                // this unlock (any funding of it) spent the vault: it is out, unless its intent
+                // was cancelled C_Y deep — then the vault is gone and the bytes are dead, and
+                // the burn (re-finalized by the cancel) may be paid from another vault (L-1)
+                let cancelled = self.ctx.db(|t| {
+                    let mut c = None;
+                    for st in [IntentState::Cancelled] {
+                        for i in t.intents_in_state(st)? {
+                            if i.outpoint.txid == spent_txid && i.origin_vault == Some(vault) {
+                                c = i.cancel_height.or(c);
+                            }
+                        }
+                    }
+                    Ok(c)
+                })?;
+                if let Some(ch) = cancelled
+                    && (tip + 1).saturating_sub(ch) >= cy
+                {
+                    return Ok(LiveUnlock::Dead(format!(
+                        "its intent was cancelled at height {ch} ({} blocks deep): vault {vault} \
+                         is gone",
+                        (tip + 1).saturating_sub(ch)
+                    )));
+                }
+                return Ok(LiveUnlock::Out);
+            }
+            if spender.is_none() {
+                return Ok(LiveUnlock::Hold(format!(
+                    "vault {vault} spent by {} which this node cannot show",
+                    hawkeye_core::bytes::txid_to_display(&spent_txid)
+                )));
+            }
             if depth >= cy {
                 return Ok(LiveUnlock::Dead(format!(
-                    "vault {vault} spent by another transaction, at least {depth} blocks deep (seen spent since height {since})"
+                    "vault {vault} spent by another transaction {} at height {spent_height} ({depth} blocks deep)",
+                    hawkeye_core::bytes::txid_to_display(&spent_txid)
                 )));
             }
             return Ok(LiveUnlock::Hold(format!(
                 "vault {vault} spent by another transaction {depth} < C_Y {cy} blocks deep"
             )));
         }
-        let mut foreign = vec![];
-        let mut lost = vec![];
+        if row.origin == UnlockOrigin::Drill {
+            return Ok(LiveUnlock::Hold(format!(
+                "a drill unlock of vault {vault} pays this burn here; it is never re-sent"
+            )));
+        }
+        // every input but the vault: still unspent and this wallet's, else re-funded
+        let mut refund = row.origin != UnlockOrigin::Leader;
         for i in &tx.inputs {
             let op = op_core(&i.prevout);
             if op == vault {
                 continue;
             }
-            match ycash
+            let mine = match ycash
                 .gettxout(&i.prevout.txid, i.prevout.vout, true)
                 .await?
             {
-                Some(info) => {
-                    let mine = match info
-                        .script_pub_key
-                        .addresses
-                        .as_ref()
-                        .and_then(|a| a.first())
-                    {
-                        Some(a) => ycash
-                            .validateaddress(a)
-                            .await
-                            .is_ok_and(|v| v.ismine == Some(true)),
-                        None => false,
-                    };
-                    if !mine {
-                        foreign.push(op.to_string());
-                    }
-                }
-                None if row.origin == UnlockOrigin::Leader => {
-                    // re-fundable (01/V-2): resent below, `send_set_signed` re-funds it
-                    lost.push(op.to_string());
-                }
-                None => {
-                    if ycash
-                        .gettxout(&i.prevout.txid, i.prevout.vout, false)
-                        .await?
-                        .is_some()
-                    {
-                        return Ok(LiveUnlock::Hold(format!(
-                            "fee input {op} is spent in the mempool by another transaction"
-                        )));
-                    }
-                    let since = *self.mem.conflict_seen.entry(op).or_insert(tip);
-                    let depth = tip + 1 - since.min(tip + 1);
-                    if depth >= cy {
-                        return Ok(LiveUnlock::Dead(format!(
-                            "fee input {op} spent at least {depth} blocks deep (seen spent since height {since}) while vault {vault} is unspent"
-                        )));
-                    }
-                    return Ok(LiveUnlock::Hold(format!(
-                        "fee input {op} spent {depth} < C_Y {cy} blocks deep"
-                    )));
-                }
-            }
+                Some(info) => match info
+                    .script_pub_key
+                    .addresses
+                    .as_ref()
+                    .and_then(|a| a.first())
+                {
+                    Some(a) => ycash
+                        .validateaddress(a)
+                        .await
+                        .is_ok_and(|v| v.ismine == Some(true)),
+                    None => false,
+                },
+                None => false,
+            };
+            refund |= !mine;
         }
-        if row.origin != UnlockOrigin::Leader {
-            return Ok(LiveUnlock::Hold(format!(
-                "a {} unlock of vault {vault} pays this burn here; it is never re-sent",
-                row.origin
-            )));
+        if refund {
+            info!(event = "unlock_refund_due", vault = %vault, origin = %row.origin,
+                  "fee inputs gone or not this wallet's: the signed unlock is re-sent re-funded (01/V-2)");
         }
-        if !foreign.is_empty() {
-            return Ok(LiveUnlock::Hold(format!(
-                "the unlock of vault {vault} has fee inputs this wallet does not hold: {}",
-                foreign.join(", ")
-            )));
-        }
-        if !lost.is_empty() {
-            info!(event = "unlock_refund_due", vault = %vault, lost = %lost.join(", "),
-                  "fee input(s) gone: the leader's unlock is re-sent re-funded (01/V-2)");
-        }
-        Ok(LiveUnlock::Resend(signed_hex.to_owned()))
+        Ok(LiveUnlock::Resend {
+            hex: signed_hex.to_owned(),
+            refund,
+        })
     }
 
     /// vault_buildunlock → memo → set_signunlock (sign-once, per vault **and** per burn) →
@@ -316,7 +340,10 @@ impl Engine {
         let nonce = b.key.nonce;
         let recipient =
             YcashRecipient::from_bytes(&b.recipient).map_err(|e| anyhow!("recipient: {e}"))?;
-        let (signed, template) = match self.ctx.db(|t| t.live_unlock_for_burn(&p.set_id, &b.key))? {
+        let (signed, template, refund) = match self
+            .ctx
+            .db(|t| t.live_unlock_for_burn(&p.set_id, &b.key))?
+        {
             Some(row) => {
                 let key = self.unlock_key_of(&row.prevout);
                 let rec = self.ctx.db(|t| t.ycash_signature(&key))?.ok_or_else(|| {
@@ -356,13 +383,51 @@ impl Engine {
                         );
                         return Ok(());
                     }
-                    LiveUnlock::Resend(h) => {
-                        info!(event = "unlock_resend", nonce);
+                    LiveUnlock::Resend { hex: h, refund } => {
+                        info!(event = "unlock_resend", nonce, origin = %row.origin, refund);
                         match self.complete_unlock(&h).await? {
-                            Some(h) => (h, row.prevout),
+                            Some(h) => (h, row.prevout, refund),
                             None => return Ok(()),
                         }
                     }
+                }
+            }
+            None if let Prior::Found(hex, vault) = {
+                let prior = self.prior_unlock(b).await?;
+                if let Prior::Unknown(why) = &prior {
+                    if self.mem.held_logged.insert(nonce) {
+                        warn!(event = "unlock_prior_unknown", nonce, reason = %why,
+                              "not signing a fresh vault while another member may hold a signed unlock (01/V-2)");
+                    }
+                    self.alarm(
+                        "unlock-prior-unknown",
+                        format!("burn {nonce}: {why}; a fresh unlock waits"),
+                    );
+                    return Ok(());
+                }
+                prior
+            } =>
+            {
+                // takeover (01/V-2): another member already signed an unlock for this burn,
+                // revivable while its vault is unspent; it is adopted, never doubled
+                let key = self.unlock_key_of(&vault);
+                let signer = SetSigning::prepare(&self.ctx, &hex, Role::Unlock, vault).await?;
+                let burn = UnlockBurn {
+                    key: b.key,
+                    origin: UnlockOrigin::Leader,
+                    allow_double: false,
+                };
+                let rec = self.ctx.db(|t| {
+                    t.sign_once_unlock(&key, Some(&burn), &hex, |h| {
+                        let o = signer.sign(h)?;
+                        Ok::<_, String>((o.hex, o.sighash))
+                    })
+                })?;
+                warn!(event = "unlock_adopted", nonce, vault = %vault,
+                      "takeover: the previous signed unlock of the burn is re-sent re-funded, no new vault is signed");
+                match self.complete_unlock(&rec.signed_hex).await? {
+                    Some(h) => (h, vault, true),
+                    None => return Ok(()),
                 }
             }
             None => {
@@ -405,6 +470,14 @@ impl Engine {
                     HawkeyeMemo::burn_release_for(p.bridge_kind, p.deployment, nonce, b.tx_hash);
                 let with_memo = insert_op_return(&built.hex.to_string(), &memo.encode())
                     .map_err(|e| anyhow!("memo: {e}"))?;
+                // no change output: whoever ever funds these bytes pays the fee only (H-1)
+                let with_memo = super::sign::fund_exactly(
+                    &self.ctx.ycash,
+                    &with_memo,
+                    &vault.outpoint,
+                    vault.value_zat,
+                )
+                .await?;
                 let signer =
                     SetSigning::prepare(&self.ctx, &with_memo, Role::Unlock, vault.outpoint)
                         .await?;
@@ -425,13 +498,18 @@ impl Engine {
                       recipient = %encode_address(&recipient, p.network), complete = complete.get());
                 super::drill_crash_point(&p, "unlock_signed");
                 match self.complete_unlock(&rec.signed_hex).await? {
-                    Some(h) => (h, vault.outpoint),
+                    Some(h) => (h, vault.outpoint, false),
                     None => return Ok(()),
                 }
             }
         };
         let hex: HexBytes = signed.parse().map_err(|e| anyhow!("{e}"))?;
-        let txid = match super::sign::send_set_signed(&self.ctx.ycash, &hex, &template).await {
+        let sent = if refund {
+            super::sign::send_refunded(&self.ctx.ycash, &hex, &template).await
+        } else {
+            super::sign::send_set_signed(&self.ctx.ycash, &hex, &template).await
+        };
+        let txid = match sent {
             Ok(t) => t,
             Err(e) if e.rpc().is_some_and(|r| r.is_already_known()) => {
                 // already broadcast; the watcher observes it from the mempool or a block
@@ -574,6 +652,288 @@ impl Engine {
         Ok(script)
     }
 
+    /// Before this leader signs a **fresh** vault for burn `b` (01/V-2, review M-1): has any
+    /// other member signed an unlock for it that may still confirm?
+    ///
+    /// Only a member that led the burn can have signed one first (co-signers sign only at the
+    /// leader's request, and at `unlockThreshold = 1` nobody co-signs), so the members asked are
+    /// the burn's previous leaders in this ledger — all other current members while the ledger
+    /// is flagged restored (L-2: its record of who led may be stale). Each must answer
+    /// `POST /burns/unlock` **signed** (HK-13): bytes it holds are validated and adopted
+    /// ([`Prior::Found`]); a signed `held = false` is its statement that it holds none. An
+    /// unreachable, erroring or unsigned peer is never taken for "none": the fresh build waits
+    /// ([`Prior::Unknown`]) — an unreachable previous leader holds the burn.
+    async fn prior_unlock(&mut self, b: &BurnRecord) -> Result<Prior> {
+        let me = self.ctx.me;
+        let restored = self.ledger_restored()?;
+        let current = self.current_member_keys();
+        let members = self.slashable_member_keys();
+        // review N-3: an unlock of this burn this ledger observed on Ycash (mempool or block)
+        // whose vault is still unspent is the burn's own spend: adopt it, whoever led it
+        if let Some((hex, vault)) = self.observed_unlock_for(b, &members).await? {
+            return Ok(Prior::Found(hex, vault));
+        }
+        let mut required: Vec<PubKey33> = if restored {
+            current.clone()
+        } else {
+            self.ctx.db(|t| t.burn_leaders(&b.key))?
+        };
+        // review N-3: every signer attributed on an unlock this ledger observed for the burn,
+        // even if this ledger never recorded it as the burn's leader (ledgers diverge)
+        for s in self.observed_signers(b)? {
+            if !required.contains(&s) {
+                required.push(s);
+            }
+        }
+        required.retain(|k| *k != me);
+        // review N-1: only a CURRENT member's set signature can ever confirm an unlock — the
+        // node's SetSnapshot::CheckSetSigs (ycash-dd src/vault/state.cpp:289-306) requires
+        // exactly k signatures, each recovering to a member current at the spend's height — so
+        // an unlock held by a member that is no longer current (removed, left) can never
+        // confirm, and that member need not answer. (A key that later rejoins is current again:
+        // it is then required again for every burn not yet freshly signed; for one already
+        // signed meanwhile, the watchers cancel a second intent as a benign race, and the
+        // orphan roll spends its vault.)
+        let gone_now: Vec<PubKey33> = required
+            .iter()
+            .filter(|k| !current.contains(*k))
+            .copied()
+            .collect();
+        required.retain(|k| current.contains(k));
+        // the owner's override (2026-10-13): a member declared permanently gone by a quorum —
+        // applied only after the peers were asked, and never to a member that answers
+        let members_now = self.mem.members.clone();
+        let tip = self.mem.tip;
+        let declared = self
+            .ctx
+            .db(|t| declared_gone(t, &members_now, self.unlock_quorum(), tip))?;
+        if !gone_now.is_empty() {
+            info!(event = "unlock_prior_excluded", nonce = b.key.nonce,
+                  not_current = %gone_now.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                  "members whose answer is not needed: not current (their signatures cannot confirm)");
+        }
+        if required.is_empty() {
+            return Ok(Prior::NoneConfirmed);
+        }
+        let mut none_from = std::collections::HashSet::new();
+        let mut held_from = std::collections::HashSet::new();
+        for peer in self.ctx.peers.urls().to_vec() {
+            let signed = match self.ctx.peers.burn_unlock(&peer, b.key.nonce).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(event = "unlock_prior_unreachable", nonce = b.key.nonce, peer = %peer,
+                          error = %format!("{e:#}"));
+                    continue;
+                }
+            };
+            let Some(who) = signed.responder.filter(|k| members.contains(k)) else {
+                warn!(event = "unlock_prior_unsigned", nonce = b.key.nonce, peer = %peer);
+                continue;
+            };
+            // review R-2: a member that answers, signed, is not gone: its declarations go
+            if self
+                .ctx
+                .db(|t| t.delete_meta_prefix(&format!("{GONE_PREFIX}{}/", hex::encode(who))))?
+                > 0
+            {
+                warn!(event = "gone_declarations_cleared", member = %hex::encode(who),
+                      "a member declared gone answered: its declarations are dropped");
+            }
+            if signed.body.held || signed.body.unlock.is_some() {
+                held_from.insert(who);
+            }
+            match (signed.body.unlock, signed.body.held) {
+                (Some(hex), _) => match self.check_prior_unlock(b, &hex, &members).await {
+                    Ok(vault) => {
+                        info!(event = "unlock_prior_found", nonce = b.key.nonce, peer = %peer,
+                              vault = %vault);
+                        return Ok(Prior::Found(hex, vault));
+                    }
+                    Err(e) => warn!(event = "unlock_prior_rejected", nonce = b.key.nonce,
+                                    peer = %peer, error = %format!("{e:#}")),
+                },
+                (None, false) => {
+                    none_from.insert(who);
+                }
+                (None, true) => info!(event = "unlock_prior_held", nonce = b.key.nonce,
+                                      peer = %peer, state = %signed.body.state,
+                                      "the peer holds an unlock it no longer serves (paid in its view)"),
+            }
+        }
+        // a member declared gone that nevertheless answered "held": the declaration was wrong
+        // (it is not gone, or not silent): its hold stands
+        let answered: Vec<PubKey33> = declared
+            .iter()
+            .filter(|k| held_from.contains(*k))
+            .copied()
+            .collect();
+        if !answered.is_empty() {
+            let who = answered
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>()
+                .join(",");
+            warn!(event = "gone_member_answered", nonce = b.key.nonce, members = %who,
+                  "a member declared gone answered that it holds a signed unlock for the burn: its hold stands");
+            self.alarm(
+                "gone-member-answered",
+                format!(
+                    "burn {}: member(s) {who} declared gone answered that they hold a signed \
+                     unlock: the override does not apply to them",
+                    b.key.nonce
+                ),
+            );
+        }
+        let overridden: Vec<PubKey33> = required
+            .iter()
+            .filter(|k| !none_from.contains(*k) && declared.contains(*k) && !held_from.contains(*k))
+            .copied()
+            .collect();
+        if !overridden.is_empty() {
+            warn!(event = "unlock_prior_overridden", nonce = b.key.nonce,
+                  declared_gone = %overridden.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                  "not waiting for member(s) declared gone by a quorum (owner's override)");
+        }
+        let missing: Vec<String> = required
+            .iter()
+            .filter(|k| !none_from.contains(*k) && !overridden.contains(*k))
+            .map(hex::encode)
+            .collect();
+        if missing.is_empty() {
+            Ok(Prior::NoneConfirmed)
+        } else {
+            Ok(Prior::Unknown(format!(
+                "no signed answer that they hold no unlock for it from {} (previous leaders{})",
+                missing.join(", "),
+                if restored {
+                    " and, the ledger being restored, every member"
+                } else {
+                    ""
+                }
+            )))
+        }
+    }
+
+    /// The unlock quorum `k` (the set's `unlockThreshold`; 1 before the set is read).
+    pub(crate) fn unlock_quorum(&self) -> u32 {
+        self.mem
+            .set
+            .as_ref()
+            .map_or(1, |s| s.set.params.unlockthreshold)
+            .max(1)
+    }
+
+    /// Every set signer attributed on an unlock of `b` this ledger observed (review N-3).
+    fn observed_signers(&self, b: &BurnRecord) -> Result<Vec<PubKey33>> {
+        let rows = self
+            .ctx
+            .db(|t| t.meta_prefix(&super::ycash::observed_unlock_prefix(&b.key)))?;
+        let mut out = vec![];
+        for (_, v) in rows {
+            let Ok(j) = serde_json::from_str::<serde_json::Value>(&v) else {
+                continue;
+            };
+            for s in j["signers"].as_array().into_iter().flatten() {
+                let mut k = [0u8; 33];
+                if let Some(h) = s.as_str()
+                    && hex::decode_to_slice(h, &mut k).is_ok()
+                    && !out.contains(&k)
+                {
+                    out.push(k);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// An unlock of `b` this ledger observed whose vault is still unspent and which passes the
+    /// adoption checks (review N-3): the burn's own spend, re-sent rather than rebuilt.
+    async fn observed_unlock_for(
+        &mut self,
+        b: &BurnRecord,
+        members: &[PubKey33],
+    ) -> Result<Option<(String, CoreOutPoint)>> {
+        let rows = self
+            .ctx
+            .db(|t| t.meta_prefix(&super::ycash::observed_unlock_prefix(&b.key)))?;
+        for (key, v) in rows {
+            let Some(raw) = serde_json::from_str::<serde_json::Value>(&v)
+                .ok()
+                .and_then(|j| j["raw"].as_str().map(str::to_owned))
+            else {
+                continue;
+            };
+            match self.check_prior_unlock(b, &raw, members).await {
+                Ok(vault) => {
+                    info!(event = "unlock_observed_found", nonce = b.key.nonce, vault = %vault,
+                          record = %key, "re-sending the burn's observed unlock");
+                    return Ok(Some((raw, vault)));
+                }
+                Err(e) => debug!(event = "unlock_observed_skipped", nonce = b.key.nonce,
+                                 record = %key, error = %format!("{e:#}")),
+            }
+        }
+        Ok(None)
+    }
+
+    /// The ledger was found restored from a backup (review L-2) and not yet acknowledged.
+    pub(crate) fn ledger_restored(&self) -> Result<bool> {
+        Ok(self
+            .ctx
+            .db(|t| t.meta(LEDGER_RESTORED))?
+            .is_some_and(|v| v != "acknowledged"))
+    }
+
+    async fn check_prior_unlock(
+        &mut self,
+        b: &BurnRecord,
+        hex: &str,
+        members: &[PubKey33],
+    ) -> Result<CoreOutPoint> {
+        use hawkeye_core::matcher::Classification;
+        let tx = Transaction::decode_hex(hex).map_err(|e| anyhow!("decode: {e}"))?;
+        let f = classify_unlock(&self.ctx, &tx).await?;
+        // H-1: adopting it means funding it: it may move the vault's value and nothing else
+        super::sign::unlock_value_bounded(&tx, f.coin.1)?;
+        anyhow::ensure!(
+            f.classification == Classification::MatchedBurn { nonce: b.key.nonce },
+            "it does not pay burn {} here: {}",
+            b.key.nonce,
+            hawkeye_store::classification_code(&f.classification)
+        );
+        let idx =
+            super::sign::input_index(&tx, &f.origin).ok_or_else(|| anyhow!("no vault input"))?;
+        let a = self
+            .ctx
+            .attributor
+            .attribute(
+                &tx.encode(),
+                idx,
+                &f.coin.0,
+                f.coin.1,
+                hawkeye_core::VAULT_BRANCH_ID,
+            )
+            .map_err(|e| anyhow!("signatures: {e}"))?;
+        anyhow::ensure!(!a.signers.is_empty(), "unsigned");
+        anyhow::ensure!(
+            a.signers.iter().all(|s| members.contains(&s.pubkey)),
+            "a signer is not a member of the set"
+        );
+        let mine = self.unlock_key_of(&f.origin);
+        if let Some(r) = self.ctx.db(|t| t.ycash_signature(&mine))? {
+            anyhow::ensure!(
+                Transaction::decode_hex(&r.signed_hex)
+                    .ok()
+                    .is_some_and(|o| {
+                        super::sign::same_spend_any_signatures(&o, &tx, &f.origin).is_ok()
+                    }),
+                "this attestor already signed another spend of vault {}",
+                f.origin
+            );
+        }
+        Ok(f.origin)
+    }
+
     /// The sign-once key of a vault's unlock.
     pub(crate) fn unlock_key_of(&self, vault: &CoreOutPoint) -> YcashSignKey {
         YcashSignKey {
@@ -681,14 +1041,202 @@ impl Engine {
     }
 }
 
+/// The `meta` key prefix of the declarations that a member is permanently gone:
+/// `gone/<member hex>/<declarer hex>` → `{sig, reason, at}` (the owner's override, 2026-10-13).
+pub const GONE_PREFIX: &str = "gone/";
+
+/// The quorum of declarations that declares a member gone (coordinator decision, 2026-10-13): a
+/// strict majority of the current members other than the declared one, and never less than the
+/// unlock threshold `k`: `max(k, floor((n_current − 1) / 2) + 1)`, `n_current` counting the
+/// declared member. (A quorum of `k` alone would let one member at `k = 1` release an honest but
+/// slow leader's hold and double a burn.)
+pub fn gone_quorum(k: u32, n_current: u32) -> u32 {
+    k.max(1).max(n_current.saturating_sub(1) / 2 + 1)
+}
+
+/// The members declared permanently gone in this ledger by at least [`gone_quorum`] distinct
+/// members that are current **now** (a declarer that left stops counting) and are not the member.
+/// A declaration counts only for the membership it names (`seq` = the member's join height now)
+/// and only up to its `expiry` height, and not once the member has acted (`lastact`, a heartbeat)
+/// after it was recorded (review R-2).
+pub(crate) fn declared_gone(
+    t: &hawkeye_store::Tx<'_>,
+    members: &[hawkeye_ycash::types::Member],
+    k: u32,
+    tip: u32,
+) -> Result<Vec<PubKey33>, hawkeye_store::StoreError> {
+    let current = members.iter().filter(|m| m.current).count();
+    let quorum = gone_quorum(k, u32::try_from(current).unwrap_or(u32::MAX));
+    Ok(gone_counts(t, members, tip)?
+        .into_iter()
+        .filter(|(_, ds)| ds.len() >= quorum as usize)
+        .map(|(m, _)| m)
+        .collect())
+}
+
+/// The valid declarations held here, by declared member: the distinct current declarers.
+fn gone_counts(
+    t: &hawkeye_store::Tx<'_>,
+    members: &[hawkeye_ycash::types::Member],
+    tip: u32,
+) -> Result<
+    std::collections::BTreeMap<PubKey33, std::collections::BTreeSet<PubKey33>>,
+    hawkeye_store::StoreError,
+> {
+    let current: Vec<PubKey33> = members
+        .iter()
+        .filter(|m| m.current)
+        .map(|m| m.key.0)
+        .collect();
+    let mut by: std::collections::BTreeMap<PubKey33, std::collections::BTreeSet<PubKey33>> =
+        Default::default();
+    for (key, v) in t.meta_prefix(GONE_PREFIX)? {
+        let mut parts = key[GONE_PREFIX.len()..].split('/');
+        let (Some(m), Some(d)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (mut mk, mut dk) = ([0u8; 33], [0u8; 33]);
+        if hex::decode_to_slice(m, &mut mk).is_err() || hex::decode_to_slice(d, &mut dk).is_err() {
+            continue;
+        }
+        let Some(member) = members.iter().find(|x| x.key.0 == mk) else {
+            continue;
+        };
+        let Ok(j) = serde_json::from_str::<serde_json::Value>(&v) else {
+            continue;
+        };
+        let (seq, expiry, height) = (
+            j["seq"].as_u64().unwrap_or(u64::MAX),
+            j["expiry"].as_u64().unwrap_or(0),
+            j["height"].as_u64().unwrap_or(0),
+        );
+        if seq != u64::from(member.joinheight)
+            || expiry < u64::from(tip)
+            || u64::from(member.lastact) > height
+        {
+            continue;
+        }
+        if dk != mk && current.contains(&dk) {
+            by.entry(mk).or_default().insert(dk);
+        }
+    }
+    Ok(by)
+}
+
+/// The longest a gone declaration may run, in `TAKEOVER` periods past the current tip.
+pub const GONE_MAX_TAKEOVERS: u32 = 10;
+
+/// Verify a declaration that `member` is gone and record it in the ledger (the CLI for its own,
+/// `POST /members/gone` for a peer's): `member` is in the set's member list (R-3) with join height
+/// `seq`; `expiry` is in the future and at most [`GONE_MAX_TAKEOVERS`] × `TAKEOVER` blocks ahead
+/// (R-2); the signature over [`hawkeye_core::peerauth::gone_msg`] recovers to the declarer, a
+/// current member other than `member` (and, from a peer, the requester). Returns the
+/// declarations now counting and the quorum.
+pub async fn record_gone(
+    ctx: &super::Ctx,
+    requester: Option<PubKey33>,
+    req: &crate::peers::GoneDeclaration,
+) -> Result<crate::peers::GoneAnswer> {
+    let parse = |h: &str, what: &str| -> Result<PubKey33> {
+        let mut k = [0u8; 33];
+        hex::decode_to_slice(h, &mut k).map_err(|_| anyhow!("{what} is not 66 hex"))?;
+        Ok(k)
+    };
+    let member = parse(&req.member, "member")?;
+    let declarer = parse(&req.declarer, "declarer")?;
+    if let Some(r) = requester {
+        anyhow::ensure!(r == declarer, "a declaration is sent by its own declarer");
+    }
+    anyhow::ensure!(declarer != member, "a member cannot declare itself gone");
+    let sig = hawkeye_core::peerauth::parse_sig(&req.sig).map_err(|e| anyhow!("sig: {e}"))?;
+    hawkeye_core::peerauth::verify(
+        &declarer,
+        &hawkeye_core::peerauth::gone_msg(&ctx.params.set_id, &member, req.seq, req.expiry),
+        &sig,
+    )
+    .map_err(|e| anyhow!("declaration signature: {e}"))?;
+    let set = ctx.ycash.set_getinfo(&ctx.set_hash(), None).await?;
+    let m = set
+        .memberlist
+        .iter()
+        .find(|m| m.key.0 == member)
+        .ok_or_else(|| anyhow!("{} is not in the set's member list", req.member))?;
+    anyhow::ensure!(
+        m.joinheight == req.seq,
+        "the declaration names membership {} of the member, its current one joined at {}",
+        req.seq,
+        m.joinheight
+    );
+    let tip = ctx.ycash.getblockcount().await?;
+    let horizon = GONE_MAX_TAKEOVERS.saturating_mul(ctx.params.takeover.max(1));
+    anyhow::ensure!(
+        req.expiry >= tip && req.expiry <= tip.saturating_add(horizon),
+        "the declaration expires at {}: it must lie in {tip}..={}",
+        req.expiry,
+        tip.saturating_add(horizon)
+    );
+    anyhow::ensure!(
+        set.memberlist
+            .iter()
+            .any(|m| m.key.0 == declarer && m.current),
+        "the declarer is not a current member"
+    );
+    let k = set.set.params.unlockthreshold;
+    let current = set.memberlist.iter().filter(|m| m.current).count();
+    let quorum = gone_quorum(k, u32::try_from(current).unwrap_or(u32::MAX));
+    let n = ctx.db(|t| {
+        // keys normalised to lowercase hex: the delete on an answer matches them (R-2)
+        let key = format!(
+            "{GONE_PREFIX}{}/{}",
+            hex::encode(member),
+            hex::encode(declarer)
+        );
+        let v = serde_json::json!({"sig": req.sig, "reason": req.reason, "seq": req.seq,
+                                   "expiry": req.expiry, "height": tip, "at": t.now()});
+        t.set_meta(&key, &v.to_string())?;
+        Ok(gone_counts(t, &set.memberlist, tip)?
+            .get(&member)
+            .map_or(0, |d| u32::try_from(d.len()).unwrap_or(u32::MAX)))
+    })?;
+    warn!(event = "member_declared_gone", member = %req.member, declarer = %req.declarer,
+          seq = req.seq, expiry = req.expiry, reason = %req.reason, declarations = n, quorum,
+          "operator override: the holds this member causes are released once the quorum is reached");
+    Ok(crate::peers::GoneAnswer {
+        declarations: n,
+        quorum,
+    })
+}
+
+/// The `meta` key set when the ledger is found restored from a backup (review L-2): its value
+/// says how; `acknowledged` once the operator clears it (`hawkeye acknowledge-ledger-restore`).
+pub const LEDGER_RESTORED: &str = "ledger_restored";
+
+/// What the peers said about other signed unlocks of a burn ([`Engine::prior_unlock`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Prior {
+    /// A valid signed unlock for it, and the vault it spends: adopt it.
+    Found(String, CoreOutPoint),
+    /// Every member that could have signed one says, signed, that it holds none.
+    NoneConfirmed,
+    /// Not known: hold the fresh build.
+    Unknown(String),
+}
+
 /// What a burn's live unlock here allows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LiveUnlock {
-    /// This attestor's own unlock as leader, sendable: re-send these bytes.
-    Resend(String),
+    /// The signed unlock may still confirm and this attestor leads the burn: re-send these
+    /// bytes (`refund`: re-fund every fee input first — gone, or not this wallet's).
+    Resend {
+        /// The signed bytes.
+        hex: String,
+        /// Re-fund before sending.
+        refund: bool,
+    },
     /// Not re-sent and not dead (yet): wait, alarm; takeover moves the burn on.
     Hold(String),
-    /// It can no longer confirm: mark it dead (one more vault may then be signed).
+    /// Its vault was spent by another transaction `C_Y` deep: it can no longer confirm; mark it
+    /// dead (one more vault may then be signed).
     Dead(String),
     /// It is broadcast or mined: the watcher follows it.
     Out,
@@ -811,7 +1359,140 @@ pub async fn verify_and_sign_unlock(
         anyhow!("unauthenticated request: unlock co-signing answers member-signed requests only")
     })?;
     let tx = Transaction::decode_hex(&req.hex).map_err(|e| anyhow!("unlock: {e}"))?;
-    // the vault input: unspent on this node (N-3)
+    let UnlockFacts {
+        origin,
+        vault: vp,
+        coin,
+        classification: c,
+        tip,
+    } = classify_unlock(ctx, &tx).await?;
+    // H-1: nothing but the vault's value moves (no change a re-funder would pay)
+    super::sign::unlock_value_bounded(&tx, coin.1)?;
+    let (matched, burn) = match c {
+        Classification::MatchedBurn { nonce } => {
+            let k = BurnKey::new(p.deployment, nonce);
+            let b = ctx
+                .db(|t| t.burn(&k))?
+                .ok_or_else(|| anyhow!("burn {nonce} is not in this ledger"))?;
+            anyhow::ensure!(
+                b.leader == Some(requester),
+                "the requester {} is not the burn's leader here (leader = {})",
+                hex::encode(requester),
+                b.leader.map_or("none".into(), hex::encode)
+            );
+            (
+                format!("burn {nonce}"),
+                Some(UnlockBurn {
+                    key: k,
+                    origin: UnlockOrigin::Cosign,
+                    allow_double: false,
+                }),
+            )
+        }
+        Classification::MatchedRoll { .. } => {
+            let due_here = ctx
+                .db(|t| t.vault(&origin))?
+                .is_some_and(|v| v.state == VaultState::RollDue);
+            anyhow::ensure!(
+                vp.owner_height <= tip.saturating_add(p.roll_margin) || due_here,
+                "a roll of a vault not yet within ROLL_MARGIN here, nor marked due (an orphaned \
+                 unlock) (ownerHeight {}, tip {tip})",
+                vp.owner_height
+            );
+            let mut live: Vec<PubKey33> = set
+                .memberlist
+                .iter()
+                .filter(|m| m.current && m.live)
+                .map(|m| m.key.0)
+                .collect();
+            hawkeye_core::keys::sort_members(&mut live);
+            let created = ctx
+                .db(|t| t.vault(&origin))?
+                .map_or(0, |v| v.created_height);
+            let marked = ctx.db(|t| t.vault_due_height(&origin))?;
+            let due_from =
+                super::roll::roll_due_from(vp.owner_height, p.roll_margin, created, marked);
+            let since = tip.saturating_sub(due_from);
+            let leader = mint_leader_for(&lock_id(&origin), &live, since, p.takeover);
+            anyhow::ensure!(
+                leader == Some(&requester),
+                "the requester {} is not the vault's roll leader here (leader = {})",
+                hex::encode(requester),
+                leader.map_or("none".into(), hex::encode)
+            );
+            ("roll".to_owned(), None)
+        }
+        other => anyhow::bail!(
+            "the intent does not match here: {}",
+            hawkeye_store::classification_code(&other)
+        ),
+    };
+    let key = YcashSignKey {
+        domain: SignDomain::YcashUnlock,
+        set_id: p.set_id,
+        prevout: origin,
+    };
+    // the same unlock asked again with other signatures or other fee inputs (a takeover
+    // leader re-sending the previous leader's bytes, 01/V-2): this attestor's signature is
+    // already made over that sighash; it is added to the request, never made again
+    if let Some(rec) = ctx.db(|t| t.ycash_signature(&key))?
+        && rec.built_hex != req.hex
+        && let Some(merged) = merge_own_signature(ctx, &rec.signed_hex, &req.hex, &origin, &coin)?
+    {
+        if let Some(b) = &burn {
+            anyhow::ensure!(
+                ctx.db(|t| t.unlock_burn_rows(&p.set_id, &b.key))?
+                    .iter()
+                    .any(|r| r.prevout == origin && r.is_live()),
+                "vault {origin} was signed here for another purpose"
+            );
+        }
+        info!(event = "unlock_cosign_merged", vault = %origin, matched = %matched,
+              requester = %hex::encode(requester));
+        return Ok(crate::peers::UnlockSignResponse {
+            complete: unlock_signatures(&merged)? >= need as usize,
+            hex: merged,
+            matched,
+        });
+    }
+    let signer = SetSigning::prepare(ctx, &req.hex, Role::Unlock, origin).await?;
+    let complete = std::cell::Cell::new(None);
+    let rec = ctx.db(|t| {
+        t.sign_once_unlock(&key, burn.as_ref(), &req.hex, |h| {
+            let o = signer.sign(h)?;
+            complete.set(Some(o.complete));
+            Ok::<_, String>((o.hex, o.sighash))
+        })
+    })?;
+    info!(event = "unlock_cosigned", vault = %origin, matched = %matched,
+          requester = %hex::encode(requester));
+    Ok(crate::peers::UnlockSignResponse {
+        complete: complete
+            .get()
+            .unwrap_or(unlock_signatures(&rec.signed_hex)? >= need as usize),
+        hex: rec.signed_hex,
+        matched,
+    })
+}
+
+/// What [`classify_unlock`] established about an unlock transaction.
+pub(crate) struct UnlockFacts {
+    /// The vault it spends.
+    pub origin: CoreOutPoint,
+    /// That vault's parameters.
+    pub vault: hawkeye_core::VaultParams,
+    /// That vault's script and value (from this node: it is unspent).
+    pub coin: (Vec<u8>, u64),
+    /// Its one intent's classification against this ledger.
+    pub classification: hawkeye_core::matcher::Classification,
+    /// This node's tip.
+    pub tip: u32,
+}
+
+/// Classify an unlock on this attestor's own node and ledger: it must spend one **unspent**
+/// vault of the bridge's tag of the set (`gettxout`, N-3) into exactly one intent (HK-8).
+pub(crate) async fn classify_unlock(ctx: &super::Ctx, tx: &Transaction) -> Result<UnlockFacts> {
+    let p = &ctx.params;
     let mut vault = None;
     for input in &tx.inputs {
         // unsigned, or carrying UNLOCK signatures already
@@ -834,17 +1515,20 @@ pub async fn verify_and_sign_unlock(
             && v.tag == p.tag()
             && v.set_id == p.set_id
         {
-            vault = Some((op_core(&input.prevout), v));
+            let coin = (
+                o.script_pub_key.hex.0.clone(),
+                u64::try_from(o.value.zat()).unwrap_or(0),
+            );
+            vault = Some((op_core(&input.prevout), v, coin));
             break;
         }
     }
-    let (origin, vp) = vault.ok_or_else(|| {
+    let (origin, vp, coin) = vault.ok_or_else(|| {
         anyhow!(
             "the transaction unlocks no unspent {} vault of this set",
             p.tag_text()
         )
     })?;
-    // its intents (one, HK-8)
     let mut intents = vec![];
     for (n, o) in tx.outputs.iter().enumerate() {
         let ip = match hawkeye_core::template::parse_intent(&o.script_pubkey) {
@@ -869,8 +1553,8 @@ pub async fn verify_and_sign_unlock(
         );
     };
     let tip = ctx.ycash.getblockcount().await?;
-    let outs = crate::convert::outputs(&tx);
-    let c = ctx.db(|t| {
+    let outs = crate::convert::outputs(tx);
+    let classification = ctx.db(|t| {
         Ok(super::ycash::classify(
             t,
             p,
@@ -885,82 +1569,70 @@ pub async fn verify_and_sign_unlock(
             },
         ))
     })?;
-    let (matched, burn) = match c {
-        Classification::MatchedBurn { nonce } => {
-            let k = BurnKey::new(p.deployment, nonce);
-            let b = ctx
-                .db(|t| t.burn(&k))?
-                .ok_or_else(|| anyhow!("burn {nonce} is not in this ledger"))?;
-            anyhow::ensure!(
-                b.leader == Some(requester),
-                "the requester {} is not the burn's leader here (leader = {})",
-                hex::encode(requester),
-                b.leader.map_or("none".into(), hex::encode)
-            );
-            (
-                format!("burn {nonce}"),
-                Some(UnlockBurn {
-                    key: k,
-                    origin: UnlockOrigin::Cosign,
-                    allow_double: false,
-                }),
-            )
-        }
-        Classification::MatchedRoll { .. } => {
-            anyhow::ensure!(
-                vp.owner_height <= tip.saturating_add(p.roll_margin),
-                "a roll of a vault not yet within ROLL_MARGIN here (ownerHeight {}, tip {tip})",
-                vp.owner_height
-            );
-            let mut live: Vec<PubKey33> = set
-                .memberlist
-                .iter()
-                .filter(|m| m.current && m.live)
-                .map(|m| m.key.0)
-                .collect();
-            hawkeye_core::keys::sort_members(&mut live);
-            let created = ctx
-                .db(|t| t.vault(&origin))?
-                .map_or(0, |v| v.created_height);
-            let due_from = vp.owner_height.saturating_sub(p.roll_margin).max(created);
-            let since = tip.saturating_sub(due_from);
-            let leader = mint_leader_for(&lock_id(&origin), &live, since, p.takeover);
-            anyhow::ensure!(
-                leader == Some(&requester),
-                "the requester {} is not the vault's roll leader here (leader = {})",
-                hex::encode(requester),
-                leader.map_or("none".into(), hex::encode)
-            );
-            ("roll".to_owned(), None)
-        }
-        other => anyhow::bail!(
-            "the intent does not match here: {}",
-            hawkeye_store::classification_code(&other)
-        ),
-    };
-    let key = YcashSignKey {
-        domain: SignDomain::YcashUnlock,
-        set_id: p.set_id,
-        prevout: origin,
-    };
-    let signer = SetSigning::prepare(ctx, &req.hex, Role::Unlock, origin).await?;
-    let complete = std::cell::Cell::new(None);
-    let rec = ctx.db(|t| {
-        t.sign_once_unlock(&key, burn.as_ref(), &req.hex, |h| {
-            let o = signer.sign(h)?;
-            complete.set(Some(o.complete));
-            Ok::<_, String>((o.hex, o.sighash))
-        })
-    })?;
-    info!(event = "unlock_cosigned", vault = %origin, matched = %matched,
-          requester = %hex::encode(requester));
-    Ok(crate::peers::UnlockSignResponse {
-        complete: complete
-            .get()
-            .unwrap_or(unlock_signatures(&rec.signed_hex)? >= need as usize),
-        hex: rec.signed_hex,
-        matched,
+    Ok(UnlockFacts {
+        origin,
+        vault: vp,
+        coin,
+        classification,
+        tip,
     })
+}
+
+/// This attestor's own UNLOCK signature on `stored` (the bytes it signed), added to `request`
+/// when `request` is the same unlock (only the fee inputs or the other signatures differ:
+/// under `SIGHASH_ALL|SIGHASH_ANYONECANPAY` the signature covers it, 01/V-2). `None` when it is
+/// another unlock (the per-vault sign-once refuses it) or holds no signature of this key.
+pub(crate) fn merge_own_signature(
+    ctx: &super::Ctx,
+    stored: &str,
+    request: &str,
+    vault: &CoreOutPoint,
+    coin: &(Vec<u8>, u64),
+) -> Result<Option<String>> {
+    let old = Transaction::decode_hex(stored).map_err(|e| anyhow!("{e}"))?;
+    let mut new = Transaction::decode_hex(request).map_err(|e| anyhow!("{e}"))?;
+    if super::sign::same_spend_any_signatures(&old, &new, vault).is_err() {
+        return Ok(None);
+    }
+    let (Some(oi), Some(ni)) = (
+        super::sign::input_index(&old, vault),
+        super::sign::input_index(&new, vault),
+    ) else {
+        return Ok(None);
+    };
+    let attribute = |t: &Transaction, i: usize| {
+        ctx.attributor.attribute(
+            &t.encode(),
+            i,
+            &coin.0,
+            coin.1,
+            hawkeye_core::VAULT_BRANCH_ID,
+        )
+    };
+    let Some(mine) = attribute(&old, oi)
+        .ok()
+        .and_then(|a| a.signers.into_iter().find(|s| s.pubkey == ctx.me))
+    else {
+        return Ok(None);
+    };
+    let mut args = super::sign::role_args(&new, ni, Role::Unlock)?;
+    let have: Vec<PubKey33> = if args.is_empty() {
+        vec![]
+    } else {
+        attribute(&new, ni)
+            .map_err(|e| anyhow!("the request's signatures: {e}"))?
+            .signers
+            .into_iter()
+            .map(|s| s.pubkey)
+            .collect()
+    };
+    if !have.contains(&ctx.me) {
+        args.push(mine.signature.to_vec());
+    }
+    let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+    new.inputs[ni].script_sig =
+        hawkeye_core::template::selector_script_sig(&refs, 1).map_err(|e| anyhow!("{e}"))?;
+    Ok(Some(new.encode_hex()))
 }
 
 #[cfg(test)]

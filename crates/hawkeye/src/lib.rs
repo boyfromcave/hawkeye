@@ -9,6 +9,7 @@
 //! | [`foreign`] | the foreign-chain adapter (`ForeignChain`; Ethereum today, NEAR plan §4) |
 //! | [`attribution`] | set-signature attribution behind a trait |
 //! | [`peers`] | the peer channel client and the API's wire types |
+//! | [`restore`] | ledger-restore detection (review L-2): the sign-record high-water mark |
 //! | [`peer_auth`] | the peer channel's member-key request / response authentication (HK-13) |
 //! | [`api`] | the axum status / peer API |
 //! | [`status`] | the status summary and Prometheus rendering |
@@ -29,4 +30,5 @@ pub mod foreign;
 pub mod keys;
 pub mod peer_auth;
 pub mod peers;
+pub mod restore;
 pub mod status;

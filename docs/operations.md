@@ -242,8 +242,12 @@ within a working day.
 | `slash-case-<id>` | page | a slash case waits for this operator (`auto_slash = false`, the mainnet default) | verify the evidence (section 10a) and vote |
 | `burn-over-cap` | ticket | a burn larger than the set's whole per-window unlock cap is parked out of the FIFO; later burns are served | governance: a `SET_PARAMS` raising `ratelimitbps`, or a decision to leave it parked |
 | `node-sign-restored` | page | `"wallet"` mode: the node wallet refuses every set signature (`set-sign-restored`, 07/F-5): it imported the member key (enrolment) or was restored from a seed, and its restore marker is set; no unlock or cancel is signed | if no other copy of the key can have signed: `hawkeye acknowledge-restore` (section 4 step 7, section 5 step 5); otherwise do not acknowledge, leave with the key |
-| `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet (takeover moves the burn on) | check the node's mempool and fee coins |
-| `unlock-dead` | ticket | a signed unlock can no longer confirm (its vault was spent by another transaction, or — for an unlock this attestor co-signed but did not lead — a fee input was spent); another vault may be signed | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
+| `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet: its vault is spent in the mempool, or in a block the follower has not recorded at the tip yet, or by another transaction not yet `C_Y` deep | check the node's mempool and the follower's lag |
+| `unlock-prior-unknown` | page | this attestor leads a burn others led before, and not every previous leader (every member, while `ledger-restored`) has answered `POST /burns/unlock`, signed, that it holds no signed unlock for it: no fresh vault is signed (an unreachable previous leader holds the burn, 01/V-2, review M-1) | bring the previous leader's Hawkeye and API back; it then re-sends or serves its bytes, or answers none |
+| `restore-report-flood` | page | another member's restored-ledger orphan reports were refused for volume (more vaults than its restore event stated, or more than 64), review R-1 | ask that operator; its reports are otherwise only accepted while its own signed `/burns/unlock` shows it restored |
+| `gone-member-answered` | page | a member declared gone (`declare-leader-gone`) answered that it holds a signed unlock for a burn: the declaration was wrong, the member's hold stands | find out why the member was declared gone; adopt or wait for its unlock |
+| `ledger-restored` | page | the ledger holds fewer sign-once records than its high-water mark (`hawkeye.db.hwm`), or the node wallet (`"wallet"` mode) signed an unlock or cancel the ledger has no record of: it was restored from a backup (review L-2); fresh unlocks wait for every member's signed "none" | `hawkeye audit-ledger`; ask the other attestors; then `hawkeye acknowledge-ledger-restore` |
+| `unlock-dead` | ticket | a signed unlock can no longer confirm: its **vault** was spent by another transaction at least `C_Y` deep (from the ledger's own spend record, the follower at the tip), or by this unlock whose intent was then cancelled `C_Y` deep; a fee-input spend never makes it dead (it can be re-funded, 01/V-2); one more vault may now be signed for the burn | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
 | `roll-overdue` | ticket | vaults past half their `ROLL_MARGIN` without a roll (HK-6) | check the roll leader and the rate limit |
 | `roll-waiting-cap` | ticket | rolls wait for rate-limit room | expected under load; governance if it persists |
 | `fee-coins-low` | ticket | fewer than 8 confirmed fee coins in the node wallet: a flood of intents can outrun the cancels | fund the wallet; `hawkeye split-coins --count 16` |
@@ -286,7 +290,109 @@ when `vault_send` answers `bad-txns-inputs-spent`, `Missing inputs` or `txn-memp
 calls `vault_refee`, checks that only the fee inputs changed (log `refee`; a refusal is
 `refee_refused` / `refee_failed`) and sends the re-funded spend, with no new signature. A leader's
 unlock whose fee input is gone is therefore re-sent, never declared dead: anyone holding its bytes
-could re-fund it, so signing another vault for the burn could pay it twice. By hand: `ycash-cli
+could re-fund it, so signing another vault for the burn could pay it twice.
+
+**One revivable unlock per burn (01/V-2 on 05/N-1; review of fix/unlock-revival).** The rule
+every attestor follows: it never signs a second unlock for a burn while an unlock it signed for
+that burn could still confirm. An unlock stops being revivable only when its **vault** is spent by
+another transaction at least `C_Y` deep — read from the ledger's own spend record with the
+follower at the tip, so a reorg cannot fast-forward it — or when this unlock spent the vault and
+its intent was then cancelled `C_Y` deep (log `unlock_dead`). In practice:
+
+- **No change outputs (H-1).** Every unlock, roll and cancel Hawkeye builds moves exactly the
+  template coin's value: the change output the node's build adds is dropped and the spend is
+  funded exactly with `vault_refee` (log `refee`), so whoever ever funds or re-funds those bytes
+  pays the fee and nothing else. Co-signers and takeover leaders refuse an unlock whose outputs
+  move more than the vault's value; a re-fund is sent only if it costs this wallet at most
+  0.001 YEC (`MAX_REFUND_ZAT`), else `refee_refused`.
+- An unlock this attestor co-signed (`unlockThreshold > 1`) and now leads after a takeover is
+  re-sent re-funded, with no new signature — log `unlock_resend` with `refund=true`.
+- A takeover leader that holds nothing for the burn asks every peer `POST /burns/unlock`
+  (authenticated; the answer is signed). A peer serves the signed unlock it holds only while the
+  burn is unpaid in its own ledger, and only to a current member — never on the public `GET
+  /burns/<nonce>`. A valid one is adopted (logs `unlock_prior_found`, `unlock_adopted`, `refee`).
+  A fresh vault is signed only when every previous leader of the burn in this ledger (every
+  member, while `ledger-restored`) has answered, signed, that it holds none; an unreachable or
+  unsigned answer counts for nothing (alarm `unlock-prior-unknown`, log `unlock_prior_unknown`).
+- A co-signer asked again for the same unlock re-funded adds the signature it already made (log
+  `unlock_cosign_merged`) and still refuses any other unlock of the vault.
+- **Orphans (H-2).** A member holding a signed unlock of a vault for a burn that was paid by
+  another vault `C_Y` deep marks that vault `ROLL_DUE` and reports it to the others (`POST
+  /vaults/orphaned`, logs `unlock_orphaned`, `orphan_reported`, `orphan_marked`): the vault's roll
+  leader — never a member that signed it — rolls it, which spends it, so the orphaned bytes die.
+- **Evicted unlocks (M-3).** A burn whose unlock left the mempool unmined goes back to its leader
+  after `max(TAKEOVER, C_Y)` blocks (log `burn_intent_evicted`), which re-sends it.
+
+- **Who must answer (review N-1, N-3).** The members asked are the burn's previous leaders in
+  this ledger plus every set signer attributed on an unlock of the burn this ledger observed on
+  Ycash; only those still **current** in the set are required — the node accepts an unlock only
+  with `unlockThreshold` signatures of members current at the spend height
+  (`SetSnapshot::CheckSetSigs`), so a removed or departed member's bytes can never confirm. An
+  unlock of the burn this ledger observed (mempool or block) whose vault is unspent is adopted
+  first, whoever led it, without asking anyone.
+- **A restored ledger never says "none" (N-2).** While `ledger-restored` is raised, this
+  attestor's `POST /burns/unlock` answers `held: true, restored: true`; in `"wallet"` mode every
+  vault its node wallet signed an unlock of with no ledger record is marked `ROLL_DUE` and reported
+  (`restore_orphan`, `orphan_marked_restored`) until it is spent. A receiver acts on such a report
+  only with **evidence** — its own ledger saw the reporter set-sign a spend of that vault — within
+  64 such reports per reporter per 4,032 blocks (~7 days); without evidence a reporter gets only 4
+  per window, counted across all its restore events (a new event id resets nothing). Past either
+  cap the report is refused and `restore-report-flood` raised; it clears once the window passes.
+  The reporter must also say, signed, that its ledger is restored (asked once per event). A vault a
+  restored report already marked is never marked again, nor any successor of it: the vault the
+  release of its roll created, and so on (review R-1).
+- **Observed unlocks are pruned** once their burn is released `C_Y` deep (review R-3).
+
+**A permanently gone member (owner's decision, 2026-10-13).** An unreachable previous leader
+holds its burns (`unlock-prior-unknown`); double-payment protection stays the default. Two ways
+out:
+
+1. **On chain (preferred):** remove the member from the set (`SET_REMOVE`, plan §2.3). It is no
+   longer current, its signatures can never confirm, and its answer stops being required at once.
+2. **Off chain, the operator override:** each attestor that agrees runs
+   `hawkeye declare-leader-gone <member key> --reason "<why>" [--expires-in <blocks>]`. It signs
+   a declaration (`sha256d("HawkeyeMemberGone" ‖ setId ‖ member ‖ seq ‖ expiry)` with its member
+   key), records it in its
+   ledger and sends it to every peer (`POST /members/gone`, authenticated); each ledger records it
+   after checking the signature and that the declarer is a current member other than the gone one
+   (logs `member_declared_gone`, `declare_leader_gone`, then `unlock_prior_excluded`). **Quorum: a
+   strict majority of the current members other than the gone one, and never less than
+   `unlockThreshold` (k): `max(k, floor((n − 1) / 2) + 1)`, n counting the gone member** (a
+   single member at `k = 1` could otherwise release an honest but slow leader's hold and double a
+   burn). Declarations from members that later leave the set stop counting. Each declaration names the
+   member's current membership (its join height) and an expiry height (`--expires-in`, default
+   2 × `TAKEOVER`, at most 10 × `TAKEOVER`); it counts only for that membership, until that height,
+   and not once the member has acted (a heartbeat) after it was recorded; all declarations about a
+   member are dropped as soon as it answers a peer, signed (log `gone_declarations_cleared`), and a
+   declaration about a key that is not in the set's member list is refused (review R-2, R-3). The override applies
+   only while the declared member stays silent: if it answers that it holds a signed unlock, the
+   adoption path wins and the alarm `gone-member-answered` is raised (log `gone_member_answered`;
+   the override itself logs `unlock_prior_overridden`). Only declare a member
+   gone when you are sure its signed unlocks are lost with it; if it comes back with them, the
+   watchers' benign-race cancel and the orphan roll are the remaining net.
+
+A member that answers `held: true` (or `restored: true`) without serving bytes can never be
+overridden, by design: the declarations about it are dropped the moment it answers. Only removing
+it from the set (`SET_REMOVE`) releases the burns it holds up.
+
+**Backups (N-2).** The restore check compares the ledger with `hawkeye.db.hwm`. A backup of the
+whole directory restores the mark with the ledger and defeats the check: back the two up
+separately (or not the mark at all), or rely on the `"wallet"`-mode check against the node
+wallet's `set_listsigned`.
+
+**Upgrading to this release (N-4).** Earlier releases built unlocks, rolls and cancels with a
+change output; this one refuses to co-sign, adopt or re-fund one (H-1). Before upgrading, let
+every in-flight burn and cancel settle (no burn `ASSIGNED`/`INTENT_PENDING` with a live signed
+unlock of the old shape), then upgrade every member of the set together. A remaining old-shape row
+is held: re-send it with the old release, or let its vault be spent. Each exactly-funded build
+releases the node wallet's locks on the fee coins of the discarded build (`lockunspent`); if that
+fails (`lockunspent_failed`), a node restart clears them. Members mark a vault `ROLL_DUE` at
+slightly different heights (when each sees the orphan), so the roll leader of an early-due vault
+can briefly differ between ledgers; at `unlockThreshold = 1` this only delays the roll by up to
+one `TAKEOVER`, above it a co-signer may refuse until its own takeover window agrees.
+
+Keep the peer API reachable to the other attestors: a takeover, and any fresh unlock of a burn
+someone else led, depends on their signed answers. By hand: `ycash-cli
 vault_refee <signed hex>`, then `vault_send` of the result. Re-funding needs a coin of exactly the
 missing value (within 1,000 zatoshi) or makes one with a self-send the spend chains on; keep fee
 coins confirmed (`fee-coins-low`). The node also remembers one build per vault and intent

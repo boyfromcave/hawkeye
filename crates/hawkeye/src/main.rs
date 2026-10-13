@@ -68,6 +68,29 @@ enum Cmd {
     /// other copy of the member key has signed: run it once after enrolment and the `SET_JOIN`, or
     /// after a restore (docs/operations.md §4, §5).
     AcknowledgeRestore,
+    /// Clear the ledger's restore flag (review L-2: `alarm ledger-restored`) after confirming no
+    /// unlock this member signed is missing from it (`audit-ledger`, and the other attestors'
+    /// answers): fresh unlocks then go back to asking only each burn's previous leaders. Resets
+    /// the ledger's high-water mark to its current record count.
+    AcknowledgeLedgerRestore,
+    /// The owner's override (2026-10-13) for a member that is permanently gone (a lost host and
+    /// disk): declare, signed by this attestor's member key, that `member` holds no signed unlock
+    /// that could ever be revived. The declaration is recorded in this ledger and sent to every
+    /// peer (`POST /members/gone`); once at least `unlockThreshold` distinct current members other
+    /// than it have declared it gone, a takeover no longer waits for that member's answer before
+    /// signing a fresh vault. Logged at `warn`. Run by each attestor that agrees; prefer removing
+    /// the member on Ycash (`SET_REMOVE`), after which its answer is not needed anyway.
+    DeclareLeaderGone {
+        /// The member's 33-byte compressed key (66 hex).
+        member: String,
+        /// Why (kept with the declaration).
+        #[arg(long, default_value = "permanently unreachable")]
+        reason: String,
+        /// Blocks the declaration counts for (default 2 × TAKEOVER; at most 10 × TAKEOVER). It
+        /// covers this membership only, and lapses as soon as the member answers or heartbeats.
+        #[arg(long)]
+        expires_in: Option<u32>,
+    },
     /// Key helpers.
     Keys {
         #[command(subcommand)]
@@ -309,6 +332,12 @@ async fn main() -> Result<()> {
         Cmd::Status { json, .. } => cli::status(&s, *json).await,
         Cmd::Enroll => cli::enroll(&s).await,
         Cmd::AcknowledgeRestore => cli::acknowledge_restore(&s).await,
+        Cmd::AcknowledgeLedgerRestore => cli::acknowledge_ledger_restore(&s),
+        Cmd::DeclareLeaderGone {
+            member,
+            reason,
+            expires_in,
+        } => cli::declare_leader_gone(&s, member, reason, *expires_in).await,
         Cmd::Lock {
             amount,
             amount_pos,

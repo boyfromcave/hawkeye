@@ -106,6 +106,25 @@ pub fn response_msg(request_msg: &Hash32, response_body: &[u8]) -> Hash32 {
     sha256d(&m)
 }
 
+/// The domain of a declaration that a member is permanently gone (the owner's override,
+/// 2026-10-13), 17 ASCII bytes.
+pub const GONE_DOMAIN: &[u8; 17] = b"HawkeyeMemberGone";
+
+/// `sha256d("HawkeyeMemberGone" ‖ set_id ‖ member ‖ seq (u32 LE) ‖ expiry (u32 LE))`: what an
+/// attestor signs to declare `member` permanently gone. `seq` is the member's join height — the
+/// membership the declaration is about (a key that leaves and rejoins is a new membership) — and
+/// `expiry` the last Ycash height the declaration counts at. A quorum of such declarations
+/// releases the holds that member causes while it stays silent.
+pub fn gone_msg(set_id: &Hash32, member: &PubKey33, seq: u32, expiry: u32) -> Hash32 {
+    let mut m = Vec::with_capacity(17 + 32 + 33 + 8);
+    m.extend_from_slice(GONE_DOMAIN);
+    m.extend_from_slice(set_id);
+    m.extend_from_slice(member);
+    m.extend_from_slice(&seq.to_le_bytes());
+    m.extend_from_slice(&expiry.to_le_bytes());
+    sha256d(&m)
+}
+
 /// Sign a request message with the member key.
 pub fn sign(key: &SecretKey, msg: &Hash32) -> Result<[u8; 65]> {
     sign_compact(key, msg)

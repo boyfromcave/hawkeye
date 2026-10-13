@@ -660,3 +660,47 @@ fn mint_one_amount_per_lock_is_a_sqlite_rule() {
     );
     assert!(raw.execute("DELETE FROM sign_once_mint", []).is_err());
 }
+
+/// Review L-3: a drill row is never a burn's live unlock (never re-sent or served), though the
+/// per-burn guard still counts it.
+#[test]
+fn drill_rows_are_never_the_live_unlock() {
+    use hawkeye_store::{UnlockBurn, UnlockOrigin};
+    let mut s = store();
+    let k = |n: u8| YcashSignKey {
+        domain: SignDomain::YcashUnlock,
+        set_id: SET,
+        prevout: op(n, 0),
+    };
+    let signed = |b: &str| Ok::<_, StoreError>((format!("signed({b})"), [0x22; 32]));
+    s.tx(|t| {
+        t.sign_once_unlock(
+            &k(1),
+            Some(&UnlockBurn {
+                key: burn_key(9),
+                origin: UnlockOrigin::Drill,
+                allow_double: true,
+            }),
+            "d1",
+            signed,
+        )?;
+        assert!(t.live_unlock_for_burn(&SET, &burn_key(9))?.is_none());
+        assert!(t.live_unlock_rows(&SET)?.is_empty());
+        // the guard still sees it
+        assert!(matches!(
+            t.sign_once_unlock(
+                &k(2),
+                Some(&UnlockBurn {
+                    key: burn_key(9),
+                    origin: UnlockOrigin::Leader,
+                    allow_double: false,
+                }),
+                "l2",
+                signed,
+            ),
+            Err(StoreError::SignOnceConflict { .. })
+        ));
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+}

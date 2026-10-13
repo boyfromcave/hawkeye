@@ -1,69 +1,68 @@
-05:39:51 removed /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6
-05:39:51 === hawkeye-devnet scenario demo (plan §8 D-1 + D-2), 2026-10-13 12:39:51 UTC
-05:39:51 ycashd: /Users/boy/projects/yellowback-workspace/ycash6/src/ycashd (node line ycash6 v6.22.0-rc1): Ycash Daemon version v6.22.0-rc1-047b561ac
-05:39:52 hawkeye: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/target-hk/debug/hawkeye (hawkeye 0.1.0)
-05:39:52 --- step 1: up
-05:39:52 hawkeye-devnet up: 4 regtest ycashd nodes (node0 user/miner, node1..3 attestors), vault upgrade 6d5b7a31 at height 110, bridge on ethereum (tag WYEC), dir /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6
-05:39:52   node line ycash6 v6.22.0-rc1 (Ycash Daemon version v6.22.0-rc1-047b561ac); extra start-up args: -i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025
-05:40:04   nodes up: rpc ports 2786, 2788, 2790, 2792
-05:40:04   mining 211 blocks on node0 (activation 110 + coinbase maturity 100)
-05:40:09   height 211: vault upgrade active (branch 6d5b7a31, activation 110), node0 balance 659.06250000 YEC
-05:40:09   attestor1: member key 03abf628050f6c22be00e40604fc1d49f7ea81603df3973063368364f79d8ad4d6, eth address 0xC9298FA0930b21B0f4B04c19585348941Cb066F0
-05:40:09   attestor2: member key 02ad63f966327eae5a98295cdfdebb7f69d2eac52c6eb9ee4ebd5cb718b2c7c250, eth address 0x45c8AC7C5493a5c21e312ed3F85105eBb7833816
-05:40:09   attestor3: member key 02279432af438908e0e448ab7718ffc1ea1d08861b5cf674a894dc3be83eb7084f, eth address 0x95bEBD1EE6186ae3Ed84c45b385dBBefA6CE984F
-05:40:09   holder (node0's Ethereum persona): 0x3d35Cd3626600937d38E74Bb3C46807Df85A744c
-05:40:11   funded attestor wallets: 8 coins x 2.5 YEC each (tx 264164bc0bd7bf85554dc22c624dccd93e050f6b8060de78ac07e1e3637150fd)
-05:40:12   set_create on node0: setid 368b6f6e89215847a85a14d324991c62edd314660322665a2e947088fe88eb20 (seats 3, unlock 1, cancel 1, slash 2, rate 5000 bps / 20, liveness 60, maturity 2, bondmin 1)
-05:40:12   anvil up on http://127.0.0.1:2793 (block time 1s, --slots-in-an-epoch 1: finalized = latest - 2)
-05:40:12   forge script script/Deploy.s.sol: guardians 0xC9298FA0930b21B0f4B04c19585348941Cb066F0,0x45c8AC7C5493a5c21e312ed3F85105eBb7833816,0x95bEBD1EE6186ae3Ed84c45b385dBBefA6CE984F, threshold 2, challenge window 12s, mint mode optimistic
-05:40:14   wYEC deployed: bridge 0x5FbDB2315678afecb367f032d93F642f64180aa3, token 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 (deploy block 1, threshold 2, challengeWindow 12s, mintMode optimistic) -> /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6/deployments/31337.json
-05:40:14   funded 7 Ethereum accounts with 1000 ETH each (anvil_setBalance; 3 gas accounts)
-05:40:14   attestor1 enrolled in node1's wallet (hawkeye enroll: {"eth_address":"0xC9298FA0930b21B0f4B04c19585348941Cb066F0","memberkey":"03abf628050f6c22be00e40604fc1d49f7ea81603df3973063368364f79d8ad4d6","near_guardian":"abf628050f6c22be00e40604fc1d49f7ea81603df3973063368364f79d8ad4d6aae029a3fd2ceef7a607cf37a60aaf794a0e3169c685e6a1493bd824f4375409"})
-05:40:14   attestor2 enrolled in node2's wallet (hawkeye enroll: {"eth_address":"0x45c8AC7C5493a5c21e312ed3F85105eBb7833816","memberkey":"02ad63f966327eae5a98295cdfdebb7f69d2eac52c6eb9ee4ebd5cb718b2c7c250","near_guardian":"ad63f966327eae5a98295cdfdebb7f69d2eac52c6eb9ee4ebd5cb718b2c7c2506efb4f5ffd43e59a127bd452725e8789b298240eb1fd03ab58bba8d1b794628a"})
-05:40:14   attestor3 enrolled in node3's wallet (hawkeye enroll: {"eth_address":"0x95bEBD1EE6186ae3Ed84c45b385dBBefA6CE984F","memberkey":"02279432af438908e0e448ab7718ffc1ea1d08861b5cf674a894dc3be83eb7084f","near_guardian":"279432af438908e0e448ab7718ffc1ea1d08861b5cf674a894dc3be83eb7084fc42864f64b95c497ce35d8d1153acdcd005b67c0840d58c7f0fc8f0e5cb896cc"})
-05:40:14   attestor1 SET_JOIN 9444ee43baf5879bc32c6b7ee8484271f95d17d4835c0bd7e9a6e06608fcd819 (bond 1 YEC at 04f82ff3775ae46a57dc0f3f18ae653728f9dfd11015e45fce6c952acd0f6b64:0, bond lock 5214)
-05:40:14   attestor2 SET_JOIN 8311e2231e48db3857242ea7f19151db436678f36a45376cae32a3cb9acfa895 (bond 1 YEC at 156bc0b595c468124be25812bcf5256049b81243c5296918bd2cfdb5348af8cd:0, bond lock 5214)
-05:40:14   attestor3 SET_JOIN 1abb46adbf71e8021945830a7b4a4fc1a67b3021577b58b1f6de876535c55c0e (bond 1 YEC at 9618b27726d3cbc86d5a92e053e2d0ae0bb3e85931a446d191a91685972bd92f:0, bond lock 5214)
-05:40:18   3 members current at height 216; lockedvalue 0E-8
-05:40:19   attestor1: node1's restore marker cleared (hawkeye acknowledge-restore: {"imported":null,"ledger_records":0,"pendingkeys":0,"present":null,"restored":false})
-05:40:19   attestor2: node2's restore marker cleared (hawkeye acknowledge-restore: {"imported":null,"ledger_records":0,"pendingkeys":0,"present":null,"restored":false})
-05:40:19   attestor3: node3's restore marker cleared (hawkeye acknowledge-restore: {"imported":null,"ledger_records":0,"pendingkeys":0,"present":null,"restored":false})
-05:40:19   hawkeye1 running (pid 41634) beside node1: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6/attestor1.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6/attestor1/hawkeye.log
-05:40:20   hawkeye2 running (pid 41636) beside node2: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6/attestor2.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6/attestor2/hawkeye.log
-05:40:20   hawkeye3 running (pid 41639) beside node3: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6/attestor3.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6/attestor3/hawkeye.log
-05:40:20   background miner: node0 mines 1 block every 2.0s (pid 41641; `pause` / `resume`)
-05:40:20 devnet up at height 216; `hawkeye-devnet status`, `hawkeye-devnet down`
-05:40:20 --- step 2: lock 10 YEC on node0 to the holder 0x3d35Cd3626600937d38E74Bb3C46807Df85A744c (a WYEC vault)
-05:40:20 hawkeye lock 10 --dest 0x3d35Cd3626600937d38E74Bb3C46807Df85A744c: {"amount_zat":1000000000,"lockid":"0x17c77b0819ff2de52f426f0191efd672bee220fd824fce037e032b42014444dc","owner":"016c33de29d5922323247a2ad794e919fdca59827effaf346d53c3048ddd01911a","owner_address":"yr2TQX25RgURSJ6PTrAW2WxotntaQpW85k5Y9r4scF4YsRmJkMyvp","owner_height":677,"to":"0x3d35Cd3626600937d38E74Bb3C46807Df85A744c","txid":"9d5ddbb2ef9d57b17999e84f8cbf92720e92cc2f05ca666d39de5da4beb084d8","vout":0}
-05:40:24   ok: lock 9d5ddbb2ef9d57b1 confirmed (3s, height 218)
-05:40:24 --- step 3: wait for the mint (wYEC balanceOf(holder) == 10e8; mint mode optimistic: proposeMint -> 12s challenge window -> executeMint)
-05:40:39   ok: holder holds 10 wYEC (15s, height 225)
-05:40:39   wYEC totalSupply 10
-05:40:39   bridge: proposalCount 1, threshold 2, challengeWindow 12s
-05:40:39   attestor3: 2026-10-13T12:40:26.432037Z  INFO event="mint_proposed" lock_id=0x17c77b0819ff2de52f426f0191efd672bee220fd824fce037e032b42014444dc proposal_id=1 amount=1000000000 to=0x3d35Cd3626600937d38E74Bb3C46807Df85A744c tx=0x81588e14940d02e4
-05:40:39   attestor3: 2026-10-13T12:40:39.407311Z  INFO event="mint_executed" lock_id=0x17c77b0819ff2de52f426f0191efd672bee220fd824fce037e032b42014444dc proposal_id=1 tx=0xb526dd9afe8561e53c4420d459ca77e59648ca68a1a3762b712e17fc74a9cf9e
-05:40:39 --- step 4: burn 4 wYEC to node0's smUCGiQM4dgPMqroJz4qBnbnSqbxgjKRRzu (recipientHash 73892edc94deec9e..)
-05:40:40 hawkeye burn 4 --recipient smUCGiQM4dgPMqroJz4qBnbnSqbxgjKRRzu: {"block":28,"nonce":0,"recipient":"0x0200a632ebaba3fc3a2e042c42678698203aaae175c6","recipient_kind":"p2pkh","recipienthash":"73892edc94deec9ee4f4ac0cc01e1c95f6c67b7208dbb8fadfb34844a18813f9","txhash":"0xa66b700c710ac56f824648c04b3c3ea791f75c0eddc0dd0d38ce71974067a300"}
-05:40:40 --- step 5: wait for the intent carrying the HKB1 memo
-05:40:46   ok: intent paying 4 YEC to the burn recipient, with an HKB1 kind-1 memo (6s, height 229)
-05:40:46   intent c4001223c87c6ab3b3f6f404523b962536ea7d938bfbd1113eadd0a7b74f8343:0: memo HKB1 chainId 31337 bridge 0x5fbdb2315678afecb367f032d93f642f64180aa3 nonce 0 burn tx 0xa66b700c710ac56f824648c04b3c3ea791f75c0eddc0dd0d38ce71974067a300; matures at 235
-05:40:46 --- step 6: wait for the release (node0 receives 4 YEC at smUCGiQM4dgPMqroJz4qBnbnSqbxgjKRRzu)
-05:41:00   ok: 4 YEC received at smUCGiQM4dgPMqroJz4qBnbnSqbxgjKRRzu (14s, height 235)
-05:41:00 --- step 7: rogue 1 YEC by attestor1 (an unlock with no burn behind it)
-05:41:00 hawkeye --config attestor1.toml rogue-unlock 1: {"intent":"7d39910aa2a2db1d58271dab90dcd021e1e00e3c0b9540585de7d056173b60c1:0","replay_burn":null,"txid":"7d39910aa2a2db1d58271dab90dcd021e1e00e3c0b9540585de7d056173b60c1","vault":"c4001223c87c6ab3b3f6f404523b962536ea7d938bfbd1113eadd0a7b74f8343:1"}
-05:41:00   rogue intent 7d39910aa2a2db1d58271dab90dcd021e1e00e3c0b9540585de7d056173b60c1:0
-05:41:00 --- step 8: wait for the cancel by another attestor (intent spent back into a vault)
-05:41:05   ok: rogue intent cancelled (5s, height 238)
-05:41:05   cancel 5c4de2c0b5ad1e63cb0d1c06b86cd6a42475fe604d722e5a4b19bdd54f452b37 funded by attestor3
-05:41:05   ok: cancel confirmed (0s, height 238)
-05:41:05 --- step 9: wait for the slash (attestor1 removed, bond frozen)
-05:41:05   ok: attestor1 status removed, bondfrozen true (0s, height 238)
-05:41:05   member 03abf628050f6c22..: {"bondfrozen": true, "bondlocktime": 5214, "bondoutpoint": "9444ee43baf5879bc32c6b7ee8484271f95d17d4835c0bd7e9a6e06608fcd819:0", "bondvalue": "1.00000000", "current": false, "joinheight": 214, "key": "03abf628050f6c22be00e40604fc1d49f7ea81603df3973063368364f79d8ad4d6", "lastact": 238, "live": false, "status": "removed", "wallet": false}
-05:41:05 --- step 10: the supply invariant
-05:41:05   wYEC totalSupply 6 <= WYEC value under the set 6 (2 vaults, 0 intents)
-05:41:05   attestor1 status: {"alarms": [{"detail": "member key 03abf628050f6c22be00e40604fc1d49f7ea81603df3973063368364f79d8ad4d6 is not a current member of the set", "name": "not-a-member", "since": 238}], "burns": {"ASSIGNED": 0, "CANCELLED": 0, "FINALIZED": 0, "INTENT_CONFIRMED": 0, "INTENT_PENDING": 0, "ORPHANED": 0, "RELE
-05:41:05   attestor2 status: {"alarms": [], "burns": {"ASSIGNED": 0, "CANCELLED": 0, "FINALIZED": 0, "INTENT_CONFIRMED": 0, "INTENT_PENDING": 0, "ORPHANED": 0, "RELEASED": 1, "SEEN": 0, "WAITING_CAP": 0}, "burns_over_cap": 0, "eth_address": "0x45c8AC7C5493a5c21e312ed3F85105eBb7833816", "eth_finalized_age_secs": 0, "ethereum": {
-05:41:05   attestor3 status: {"alarms": [], "burns": {"ASSIGNED": 0, "CANCELLED": 0, "FINALIZED": 0, "INTENT_CONFIRMED": 0, "INTENT_PENDING": 0, "ORPHANED": 0, "RELEASED": 1, "SEEN": 0, "WAITING_CAP": 0}, "burns_over_cap": 0, "eth_address": "0x95bEBD1EE6186ae3Ed84c45b385dBBefA6CE984F", "eth_finalized_age_secs": 0, "ethereum": {
-05:41:05 === PASS: lock -> mint, burn -> intent (HKB1) -> release, rogue -> cancel -> slash, invariant holds
-05:41:05 --- down
-05:41:10 devnet down (stopped: miner, hawkeye1, hawkeye2, hawkeye3, anvil, ycashd0, ycashd1, ycashd2, ycashd3); the directory /Users/boy/projects/yellowback-workspace/wt/scratch/fx-resync-b/devnet-6 is kept (`up` resumes, `clean` removes it)
+07:30:47 === hawkeye-devnet scenario demo (plan §8 D-1 + D-2), 2026-10-13 14:30:47 UTC
+07:30:47 ycashd: /Users/boy/projects/yellowback-workspace/wt/fx-unlock-revival-6/src/ycashd (node line ycash6 v6.22.0-rc1): Ycash Daemon version v6.22.0-rc1-4abe39056
+07:30:47 hawkeye: /Users/boy/projects/yellowback-workspace/wt/fx-unlock-revival-hk/target/debug/hawkeye (hawkeye 0.1.0)
+07:30:47 --- step 1: up
+07:30:47 hawkeye-devnet up: 4 regtest ycashd nodes (node0 user/miner, node1..3 attestors), vault upgrade 6d5b7a31 at height 110, bridge on ethereum (tag WYEC), dir /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-peer/rev5-6
+07:30:47   node line ycash6 v6.22.0-rc1 (Ycash Daemon version v6.22.0-rc1-4abe39056); extra start-up args: -i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025
+07:30:58   nodes up: rpc ports 2485, 2487, 2489, 2491
+07:30:58   mining 211 blocks on node0 (activation 110 + coinbase maturity 100)
+07:31:00   height 211: vault upgrade active (branch 6d5b7a31, activation 110), node0 balance 659.06250000 YEC
+07:31:00   attestor1: member key 02da26312de6c442770521380aa73ff4c239b7cf510f622cfa3afba34dc0da79e5, eth address 0x2a78a34D26E25bA5B502a111F2DFD9ee97c2D300
+07:31:00   attestor2: member key 02c60fcec3137fe577b767e4ce8557537312ef370d98294b60d38afd0b7e632495, eth address 0x5FD853D2c8b093B6e49838B78aC9d24eC2A9DB7f
+07:31:00   attestor3: member key 0288028b82d320009d812f7ea71b6f362407ce402c2797688cfc73284041d6043f, eth address 0x8A63FAF9Dea3269fD4060dFB9eDaAebb88D7A338
+07:31:00   holder (node0's Ethereum persona): 0x047FA1a14bC6eFA578e65090F3B43436a295d959
+07:31:03   funded attestor wallets: 8 coins x 2.5 YEC each (tx ce7b78347e4ccc999006abef3df235cd1a3bb89e2ae626c1c503d66e398ca785)
+07:31:04   set_create on node0: setid 6ac65ac1451b900b3f90f82c5c103ca0206565b65e4727cfbd11de5c80ab00be (seats 3, unlock 1, cancel 1, slash 2, rate 5000 bps / 20, liveness 60, maturity 2, bondmin 1)
+07:31:04   anvil up on http://127.0.0.1:2492 (block time 1s, --slots-in-an-epoch 1: finalized = latest - 2)
+07:31:04   forge script script/Deploy.s.sol: guardians 0x2a78a34D26E25bA5B502a111F2DFD9ee97c2D300,0x5FD853D2c8b093B6e49838B78aC9d24eC2A9DB7f,0x8A63FAF9Dea3269fD4060dFB9eDaAebb88D7A338, threshold 2, challenge window 12s, mint mode optimistic
+07:31:06   wYEC deployed: bridge 0x5FbDB2315678afecb367f032d93F642f64180aa3, token 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 (deploy block 1, threshold 2, challengeWindow 12s, mintMode optimistic) -> /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-peer/rev5-6/deployments/31337.json
+07:31:06   funded 7 Ethereum accounts with 1000 ETH each (anvil_setBalance; 3 gas accounts)
+07:31:06   attestor1 enrolled in node1's wallet (hawkeye enroll: {"eth_address":"0x2a78a34D26E25bA5B502a111F2DFD9ee97c2D300","memberkey":"02da26312de6c442770521380aa73ff4c239b7cf510f622cfa3afba34dc0da79e5","near_guardian":"da26312de6c442770521380aa73ff4c239b7cf510f622cfa3afba34dc0da79e5a3c854778cee103aa1410136d2e25eab8056da30068c961900ee1c85abd64f18"})
+07:31:06   attestor2 enrolled in node2's wallet (hawkeye enroll: {"eth_address":"0x5FD853D2c8b093B6e49838B78aC9d24eC2A9DB7f","memberkey":"02c60fcec3137fe577b767e4ce8557537312ef370d98294b60d38afd0b7e632495","near_guardian":"c60fcec3137fe577b767e4ce8557537312ef370d98294b60d38afd0b7e63249586191a53375bf6f933362ee78f6d563178820a3f6510447e70821df7e6ec601a"})
+07:31:07   attestor3 enrolled in node3's wallet (hawkeye enroll: {"eth_address":"0x8A63FAF9Dea3269fD4060dFB9eDaAebb88D7A338","memberkey":"0288028b82d320009d812f7ea71b6f362407ce402c2797688cfc73284041d6043f","near_guardian":"88028b82d320009d812f7ea71b6f362407ce402c2797688cfc73284041d6043f1dda79a9a9d5028a1b27c2ec4a69eb28284ba71f99fb3c02d54a7125e7aa5a72"})
+07:31:07   attestor1 SET_JOIN 57973ac6a1081273522d7f310528f8834f34192cc037690015624cdc26b76c83 (bond 1 YEC at 037c7b0af95c26a46442169bc48379852a5d90e20390e56578aebeb232f75b9d:0, bond lock 5214)
+07:31:07   attestor2 SET_JOIN c783dcfa9e02b1e6536d0cb0a8a25aba8e88e8289d7884d5f53fe8b0716f255c (bond 1 YEC at d7fe09392b57c51cc9fb8d3d11e5b9ee69910ef962ef0c1e28156fa20ed99810:0, bond lock 5214)
+07:31:07   attestor3 SET_JOIN 7b8f523423e0241efc702262cdef6cb0c8e71dcf47e815f65409f7a195c939a3 (bond 1 YEC at d9474bf4bc59b35207d6a06ca77dadcfe6660c01b5375a2da763955b88da32b2:0, bond lock 5214)
+07:31:08   3 members current at height 216; lockedvalue 0E-8
+07:31:09   attestor1: node1's restore marker cleared (hawkeye acknowledge-restore: {"imported":null,"ledger_records":0,"pendingkeys":0,"present":null,"restored":false})
+07:31:09   attestor2: node2's restore marker cleared (hawkeye acknowledge-restore: {"imported":null,"ledger_records":0,"pendingkeys":0,"present":null,"restored":false})
+07:31:09   attestor3: node3's restore marker cleared (hawkeye acknowledge-restore: {"imported":null,"ledger_records":0,"pendingkeys":0,"present":null,"restored":false})
+07:31:09   hawkeye1 running (pid 77246) beside node1: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-peer/rev5-6/attestor1.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-peer/rev5-6/attestor1/hawkeye.log
+07:31:10   hawkeye2 running (pid 77249) beside node2: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-peer/rev5-6/attestor2.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-peer/rev5-6/attestor2/hawkeye.log
+07:31:10   hawkeye3 running (pid 77263) beside node3: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-peer/rev5-6/attestor3.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-peer/rev5-6/attestor3/hawkeye.log
+07:31:10   background miner: node0 mines 1 block every 2.0s (pid 77265; `pause` / `resume`)
+07:31:10 devnet up at height 216; `hawkeye-devnet status`, `hawkeye-devnet down`
+07:31:10 --- step 2: lock 10 YEC on node0 to the holder 0x047FA1a14bC6eFA578e65090F3B43436a295d959 (a WYEC vault)
+07:31:11 hawkeye lock 10 --dest 0x047FA1a14bC6eFA578e65090F3B43436a295d959: {"amount_zat":1000000000,"lockid":"0x76278e5ecf870a0e660e8aead9f04e91fb5b6a191892f28f61e52a44e548b259","owner":"01cc4698d36142751141678135521419cbf6843abd12803ec7ef950353b9ee57fd","owner_address":"yr2U8q5Z67ovDDozndtAjudyiK7QmXShS6SUWxvLYDsmGmCV6hkhN","owner_height":677,"to":"0x047FA1a14bC6eFA578e65090F3B43436a295d959","txid":"a912f4486a2eebb1fd5f697399ff78ad12f30157920a1fb542d9640ce6921d39","vout":0}
+07:31:14   ok: lock a912f4486a2eebb1 confirmed (3s, height 218)
+07:31:14 --- step 3: wait for the mint (wYEC balanceOf(holder) == 10e8; mint mode optimistic: proposeMint -> 12s challenge window -> executeMint)
+07:31:30   ok: holder holds 10 wYEC (16s, height 226)
+07:31:30   wYEC totalSupply 10
+07:31:30   bridge: proposalCount 1, threshold 2, challengeWindow 12s
+07:31:30   attestor1: 2026-10-13T14:31:17.528492Z  INFO event="mint_proposed" lock_id=0x76278e5ecf870a0e660e8aead9f04e91fb5b6a191892f28f61e52a44e548b259 proposal_id=1 amount=1000000000 to=0x047FA1a14bC6eFA578e65090F3B43436a295d959 tx=0x1d5cfdeb93f0eb5b
+07:31:30   attestor1: 2026-10-13T14:31:30.430501Z  INFO event="mint_executed" lock_id=0x76278e5ecf870a0e660e8aead9f04e91fb5b6a191892f28f61e52a44e548b259 proposal_id=1 tx=0x3d4dfc3384acb6c08d9321bf501a0e618442792c36b596fcc238c4960b43c25a
+07:31:30 --- step 4: burn 4 wYEC to node0's smYhob8m6qzU9MDcsJTvp5R5rWmvxgeU5i5 (recipientHash 9bc612ab6ef00525..)
+07:31:31 hawkeye burn 4 --recipient smYhob8m6qzU9MDcsJTvp5R5rWmvxgeU5i5: {"block":27,"nonce":0,"recipient":"0x0200d7a9426e6d3784c2ee9cc679565ffd47d024ba94","recipient_kind":"p2pkh","recipienthash":"9bc612ab6ef00525f00993fe721bcf14cfa1d27626d0c71cfb90bb594dd2e277","txhash":"0xa20c56a6ae08c19c4703c514b294acf5c5660c02e2cc5397622bbd11b0651388"}
+07:31:31 --- step 5: wait for the intent carrying the HKB1 memo
+07:31:39   ok: intent paying 4 YEC to the burn recipient, with an HKB1 kind-1 memo (8s, height 230)
+07:31:39   intent cf0035c1228e5c59337c3281d4ec9713ed2e7f04ee3500ffe0788124b46cfa8a:0: memo HKB1 chainId 31337 bridge 0x5fbdb2315678afecb367f032d93f642f64180aa3 nonce 0 burn tx 0xa20c56a6ae08c19c4703c514b294acf5c5660c02e2cc5397622bbd11b0651388; matures at 236
+07:31:39 --- step 6: wait for the release (node0 receives 4 YEC at smYhob8m6qzU9MDcsJTvp5R5rWmvxgeU5i5)
+07:31:53   ok: 4 YEC received at smYhob8m6qzU9MDcsJTvp5R5rWmvxgeU5i5 (14s, height 236)
+07:31:53 --- step 7: rogue 1 YEC by attestor1 (an unlock with no burn behind it)
+07:31:53 hawkeye --config attestor1.toml rogue-unlock 1: {"intent":"d3b6c06f13ff7cdcee8ebcd5c205cbec8f1df1c1b427ecb08d4b8d5ba1199911:0","replay_burn":null,"txid":"d3b6c06f13ff7cdcee8ebcd5c205cbec8f1df1c1b427ecb08d4b8d5ba1199911","vault":"cf0035c1228e5c59337c3281d4ec9713ed2e7f04ee3500ffe0788124b46cfa8a:1"}
+07:31:53   rogue intent d3b6c06f13ff7cdcee8ebcd5c205cbec8f1df1c1b427ecb08d4b8d5ba1199911:0
+07:31:53 --- step 8: wait for the cancel by another attestor (intent spent back into a vault)
+07:32:00   ok: rogue intent cancelled (6s, height 239)
+07:32:00   cancel e94d9f047d6dc16d078c17e5e7e33f0144f35bf26d8de124338a74e66883da20 funded by attestor2
+07:32:01   ok: cancel confirmed (1s, height 240)
+07:32:01 --- step 9: wait for the slash (attestor1 removed, bond frozen)
+07:32:03   ok: attestor1 status removed, bondfrozen true (2s, height 241)
+07:32:03   member 02da26312de6c442..: {"bondfrozen": true, "bondlocktime": 5214, "bondoutpoint": "57973ac6a1081273522d7f310528f8834f34192cc037690015624cdc26b76c83:0", "bondvalue": "1.00000000", "current": false, "joinheight": 214, "key": "02da26312de6c442770521380aa73ff4c239b7cf510f622cfa3afba34dc0da79e5", "lastact": 239, "live": false, "status": "removed", "wallet": false}
+07:32:03 --- step 10: the supply invariant
+07:32:03   wYEC totalSupply 6 <= WYEC value under the set 6 (2 vaults, 0 intents)
+07:32:03   attestor1 status: {"alarms": [{"detail": "member key 02da26312de6c442770521380aa73ff4c239b7cf510f622cfa3afba34dc0da79e5 is not a current member of the set", "name": "not-a-member", "since": 241}], "burns": {"ASSIGNED": 0, "CANCELLED": 0, "FINALIZED": 0, "INTENT_CONFIRMED": 0, "INTENT_PENDING": 0, "ORPHANED": 0, "RELE
+07:32:03   attestor2 status: {"alarms": [], "burns": {"ASSIGNED": 0, "CANCELLED": 0, "FINALIZED": 0, "INTENT_CONFIRMED": 0, "INTENT_PENDING": 0, "ORPHANED": 0, "RELEASED": 1, "SEEN": 0, "WAITING_CAP": 0}, "burns_over_cap": 0, "eth_address": "0x5FD853D2c8b093B6e49838B78aC9d24eC2A9DB7f", "eth_finalized_age_secs": 0, "ethereum": {
+07:32:03   attestor3 status: {"alarms": [], "burns": {"ASSIGNED": 0, "CANCELLED": 0, "FINALIZED": 0, "INTENT_CONFIRMED": 0, "INTENT_PENDING": 0, "ORPHANED": 0, "RELEASED": 1, "SEEN": 0, "WAITING_CAP": 0}, "burns_over_cap": 0, "eth_address": "0x8A63FAF9Dea3269fD4060dFB9eDaAebb88D7A338", "eth_finalized_age_secs": 0, "ethereum": {
+07:32:03 === PASS: lock -> mint, burn -> intent (HKB1) -> release, rogue -> cancel -> slash, invariant holds
+07:32:03 --- down
+07:32:07 devnet down (stopped: miner, hawkeye1, hawkeye2, hawkeye3, anvil, ycashd0, ycashd1, ycashd2, ycashd3); the directory /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-peer/rev5-6 is kept (`up` resumes, `clean` removes it)
