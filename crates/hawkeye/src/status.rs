@@ -82,6 +82,15 @@ pub struct Status {
     pub live_members: u64,
     /// The supply check.
     pub supply: Supply,
+    /// Confirmed transparent wallet coins large enough to fund one vault spend (the cancel
+    /// capacity per block, remedial report 05/H-1 §4.5); `None` before the first count.
+    pub fee_coins: Option<u64>,
+    /// The foreign-chain account that sends and pays gas (Ethereum: the `[eth] sender_*` gas
+    /// account, else the member key's), and its balance (wei).
+    pub sender: Option<String>,
+    /// The sender's balance, base units (wei on Ethereum), as a decimal string (wei exceed the
+    /// JSON number range serde_json prints).
+    pub sender_balance: Option<String>,
     /// Raised alarms.
     pub alarms: Vec<Alarm>,
     /// Ticks run by this process.
@@ -193,6 +202,24 @@ pub fn render_metrics(s: &Status) -> String {
         "1 if wYEC supply <= locked vault value",
         &[(String::new(), f64::from(u8::from(s.supply.ok)))],
     );
+    if let Some(n) = s.fee_coins {
+        gauge(
+            "hawkeye_fee_coins",
+            "Confirmed wallet coins that can fund a vault spend (cancel capacity per block)",
+            &[(String::new(), n as f64)],
+        );
+    }
+    if let Some(b) = s
+        .sender_balance
+        .as_deref()
+        .and_then(|b| b.parse::<f64>().ok())
+    {
+        gauge(
+            "hawkeye_sender_balance",
+            "Balance of the foreign-chain sender (gas) account, base units",
+            &[(String::new(), b)],
+        );
+    }
     let alarms: Vec<(String, f64)> = s
         .alarms
         .iter()
@@ -238,6 +265,9 @@ mod tests {
         assert!(m.contains("# TYPE hawkeye_supply_ok gauge"));
         assert!(m.contains("hawkeye_eth_finalized_age_seconds 0"));
         assert!(m.contains("hawkeye_eth_finality_stalled 0"));
+        assert!(!m.contains("hawkeye_fee_coins"));
+        s.fee_coins = Some(3);
+        assert!(render_metrics(&s).contains("hawkeye_fee_coins 3"));
     }
 
     #[test]

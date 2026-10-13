@@ -64,14 +64,70 @@ leaving right after a fault does not escape it. A key cannot rejoin while its ol
 contract: rotate the member's guardian key out of the contract in the same governance round
 (`setGuardians` on Ethereum, `set_guardians` on NEAR). Until then Hawkeye's guardian-drift alarm reports the mismatch.
 
+### Key custody
+
+The member key is **hot on both chains**. Know what one copy of it gives away:
+
+- **In `[keys] ycash_signing = "wallet"` mode (the default), `hawkeye enroll` imports the member
+  key into the node wallet, and it sits there in clear.** Ycash disables wallet encryption
+  (`encryptwallet` needs the experimental `-developerencryptwallet`), so anyone who can read
+  `wallet.dat`, or who holds the RPC cookie or password (`dumpprivkey`), has the key. The
+  keystore's scrypt password protects only Hawkeye's own copy, at rest.
+- One copy of the key yields: the Ycash set signature (fraudulent intents, cancels, slash votes),
+  the guardian signature on Ethereum or NEAR (fraudulent mint proposals, admin rounds), the bond
+  once the exit delay passes, and — unless a separate gas account is configured — the gas balance.
+  (The YED price attestor's "a stolen hot key can only grief" does not hold for this key.)
+
+What to do about it:
+
+1. **Separate the gas key.** `[eth] sender_keystore` (with `sender_password_env`) names a
+   gas-only Ethereum account that sends and pays for this attestor's transactions; the member key
+   then only signs EIP-712 attestations. Mainnet refuses to start without one, and refuses the
+   member key as the sender. `hawkeye status` shows the sender and its balance; `gas-low` fires
+   below `[eth] min_sender_balance_wei` (default 0.05 ETH on mainnet).
+2. **Sign Ycash yourself: `[keys] ycash_signing = "self"`.** Hawkeye makes every set and act
+   signature with the key it loaded from its keystore (the ZIP-243 sighash, `SetSigMsg` and
+   `ActMsg` computed here, the signature placed in the transaction); the node wallet holds only fee
+   coins and never the member key, and `hawkeye enroll` imports nothing. Verified on regtest on
+   both node lines (`tests/regtest_self_signing.rs`: sighash parity with the node, unlock, cancel,
+   join and heartbeat acts). In this mode the node's own `set-sign-once` guard no longer applies:
+   **Hawkeye's ledger (`hawkeye.db`) is the only equivocation guard** — back it up, never run two
+   instances on one key, never restore an old copy. An attestor moving from `wallet` to `self`
+   should rotate (join with a fresh key, leave with the old one: the old secret has been in
+   `wallet.dat`).
+3. Keep the key files, the config (when it holds a secret) and the ledger owner-only: Hawkeye
+   refuses group/world-readable ones on mainnet (`--insecure-file-permissions` to insist) and
+   creates the ledger `0600`. `hawkeye keys encrypt --out <file>` writes a keystore `0600`.
+4. Run the node and Hawkeye as a dedicated user on an encrypted volume; send the RPC credentials
+   only to loopback or over TLS (Hawkeye refuses plain `http://` to another host unless `[ycash]
+   allow_insecure_rpc = true`).
+
+The bond stays bound to the member key (a separate bond owner is a consensus change: plan §10,
+CR-N7).
+
+## The peer channel
+
+Attestors talk to each other's APIs. The read-only routes (`/status`, `/locks/<id>`, …) are
+public. The signing routes — `POST /unlock/sign`, `/slash/sign`, `/cancel/sign` — answer only a
+request signed by a **current member** of the set (member-key signature over the method, path,
+set, deployment, a timestamp within 60 s, a one-time nonce and the body), and every answer is
+signed back (plan §4.6, HK-13). `/unlock/sign` is inert at `unlockThreshold = 1` (the mainnet
+shape) and `/cancel/sign` at `cancelThreshold = 1`. Use `https://` peer URLs (required on mainnet
+for any peer that is not loopback); `[peers] allow_from` adds an address check.
+
+Keep at least 8 confirmed fee coins in the node wallet (`fee-coins-low` below that):
+`hawkeye split-coins --count 16` splits the wallet into fresh coins in one transaction.
+
 ## Commands
 
 | Command | Who | What |
 |---|---|---|
 | `hawkeye run` | attestor | the daemon: attest, watch, heartbeat, serve the API |
 | `hawkeye status [--json]` | anyone | the ledger, the node and the other chain at a glance |
-| `hawkeye enroll` | attestor | import the member key into the node wallet (no rescan) |
+| `hawkeye enroll` | attestor | import the member key into the node wallet (no rescan; `ycash_signing = "self"`: nothing) |
 | `hawkeye keys derive --secret <hex>` | attestor | print the member key, its Ethereum address and NEAR guardian key |
+| `hawkeye keys encrypt --out <file>` | attestor | write a key (`HAWKEYE_SECRET`) as a keystore, owner-only |
+| `hawkeye split-coins [--count N]` | attestor | split the node wallet into N fresh fee coins |
 | `hawkeye lock <YEC> --dest <account>` | depositor | lock YEC for the bridge, minting to an Ethereum address or NEAR account |
 | `hawkeye burn <YEC> --recipient <address>` | holder | burn wYEC to a Ycash address (transparent or `sq…`) |
 | `hawkeye recover` | depositor | reclaim every bridge vault this wallet owns, once its owner path opens |

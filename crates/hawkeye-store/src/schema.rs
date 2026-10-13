@@ -8,10 +8,9 @@
 /// Every migration, in order. Entry `i` takes `user_version` from `i` to `i + 1`.
 ///
 /// **Merge note (remedial lanes, 2026-10-12):** `V6` is lane `bridge-peer`'s (audit 05/H-1:
-/// `sign_once_unlock_burn`, `meta`), `V7` this lane's (audit 05/H-2: `pending_mints.provisional`).
-/// On this branch alone V7 is the sixth entry; merged after H-1 the list is
-/// `[V1, V2, V3, V4, V5, V6, V7]`. V7 touches only `pending_mints`, so it applies on top of either.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V7];
+/// `sign_once_unlock_burn`, `meta`), `V7` lane `bridge-watch`'s (audit 05/H-2:
+/// `pending_mints.provisional`). V7 touches only `pending_mints`, so it applies on top of V6.
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
 
 /// Version 1: the H4 ledger.
 const V1: &str = r#"
@@ -572,4 +571,54 @@ DROP TABLE burns;
 ALTER TABLE burns_v5 RENAME TO burns;
 CREATE INDEX burns_state ON burns (state, nonce);
 CREATE INDEX burns_block ON burns (block_number);
+"#;
+
+/// Version 6 (remedial report 05/H-1 §4.3, plan HK-13): the **per-burn** sign-once dimension of
+/// unlock signatures. `sign_once_ycash` keys an unlock by its vault (one spend per vault, ever);
+/// this side table adds the burn it pays, so one burn has at most one *live* signed vault per
+/// attestor, whatever path signed it (`leader`: this attestor's own unlock as the burn's
+/// leader; `cosign`: a peer's unlock co-signed over `POST /unlock/sign`; `drill`: the
+/// `rogue-unlock --replay-burn` drill D-3, which exists to produce a double release). A row is
+/// *dead* only when its transaction can no longer confirm (a fee input spent at least `C_Y`
+/// deep while the vault is unspent); setting `dead_reason`/`dead_height` from NULL is the only
+/// mutation, and only once. `sign_once_ycash` is untouched (its PK includes `domain`, and SQLite
+/// cannot point a foreign key at a partial index: the pairing with the `ycash-unlock` record is
+/// enforced in `Tx::sign_once_unlock`). Pre-V6 unlock records are backfilled at start-up by
+/// `Store::backfill_unlock_burns` (memos are decoded in Rust, not SQL), all as `leader` — every
+/// pre-fix record was written by the leader path, the drill or the unauthenticated co-sign
+/// path, which cannot be told apart afterwards; `meta.backfill_unlock_burns = 'done'` records
+/// completion (an interrupted backfill reruns: its inserts are idempotent).
+const V6: &str = r#"
+CREATE TABLE sign_once_unlock_burn (
+    set_id        BLOB    NOT NULL CHECK (length(set_id) = 32),
+    chain_id      INTEGER NOT NULL CHECK (chain_id >= 0),
+    bridge        BLOB    NOT NULL CHECK (length(bridge) = 20),
+    nonce         INTEGER NOT NULL CHECK (nonce >= 0),
+    prevout_txid  BLOB    NOT NULL CHECK (length(prevout_txid) = 32),
+    prevout_vout  INTEGER NOT NULL CHECK (prevout_vout >= 0),
+    origin        TEXT    NOT NULL CHECK (origin IN ('leader', 'cosign', 'drill')),
+    signed_at     INTEGER NOT NULL,
+    dead_reason   TEXT,
+    dead_height   INTEGER CHECK (dead_height IS NULL OR dead_height >= 0),
+    CHECK ((dead_reason IS NULL) = (dead_height IS NULL)),
+    PRIMARY KEY (set_id, chain_id, bridge, nonce, prevout_txid, prevout_vout)
+) WITHOUT ROWID;
+CREATE INDEX sign_once_unlock_burn_live ON sign_once_unlock_burn (set_id, chain_id, bridge, nonce)
+    WHERE dead_reason IS NULL;
+CREATE INDEX sign_once_unlock_burn_vault ON sign_once_unlock_burn (set_id, prevout_txid, prevout_vout);
+CREATE TRIGGER sign_once_unlock_burn_immutable_update BEFORE UPDATE ON sign_once_unlock_burn
+    WHEN OLD.dead_reason IS NOT NULL OR NEW.dead_reason IS NULL
+      OR NEW.set_id != OLD.set_id OR NEW.chain_id != OLD.chain_id OR NEW.bridge != OLD.bridge
+      OR NEW.nonce != OLD.nonce OR NEW.prevout_txid != OLD.prevout_txid
+      OR NEW.prevout_vout != OLD.prevout_vout OR NEW.origin != OLD.origin
+      OR NEW.signed_at != OLD.signed_at
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_unlock_burn_immutable_delete BEFORE DELETE ON sign_once_unlock_burn
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+
+-- Ledger metadata (one-off jobs such as the V6 backfill).
+CREATE TABLE meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+) WITHOUT ROWID;
 "#;

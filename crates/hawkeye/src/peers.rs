@@ -1,13 +1,24 @@
-//! The peer channel v1 (plan §6 "Peer channel"): plain HTTP between known operators' status APIs.
-//! Mint signatures are collected with `GET /locks/<lockId>`, slash votes with `POST /slash/sign`,
-//! unlock co-signatures (`unlockThreshold > 1`) with `POST /unlock/sign`.
-//! Every answer is verified by the caller (signatures recover to guardians; acts are checked by
-//! the node), so the channel needs no authentication of its own in v1.
+//! The peer channel (plan §6 "Peer channel", §4.6, HK-13): HTTP(S) between the attestors'
+//! APIs. Mint signatures are collected with `GET /locks/<lockId>` (read-only, unsigned: users
+//! self-submit from it too), slash votes with `POST /slash/sign`, unlock co-signatures
+//! (`unlockThreshold > 1`) with `POST /unlock/sign`, cancel co-signatures
+//! (`cancelThreshold > 1`) with `POST /cancel/sign`.
+//!
+//! The three signing routes are **authenticated by member-key request signatures**
+//! ([`crate::peer_auth`], remedial report 05/H-1): every request carries the requester's member
+//! key, a timestamp, a nonce and a signature over them, the method, the path, the set, the
+//! deployment and the body; the server admits only a current member of the set, and signs its
+//! answer, which this client checks. The caller still verifies every answer's content on its own
+//! (signatures recover to distinct current members over the transaction it built; acts are
+//! checked by the node). TLS is the transport: `https://` peers, required on mainnet for any
+//! peer that is not loopback.
 
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+
+use crate::peer_auth::PeerSigner;
 
 /// `GET /locks/<lockId>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +100,38 @@ pub struct UnlockSignRequest {
     pub hex: String,
 }
 
+/// `POST /cancel/sign` request (`cancelThreshold > 1`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelSignRequest {
+    /// The cancel transaction (hex) with the set signatures gathered so far.
+    pub hex: String,
+    /// The intent it cancels (`txid:vout`, display order).
+    pub intent: String,
+}
+
+/// `POST /cancel/sign` answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelSignResponse {
+    /// The cancel with this attestor's set signature added.
+    pub hex: String,
+    /// `cancelThreshold` reached.
+    pub complete: bool,
+    /// Signatures now on the cancel.
+    pub signatures: u32,
+    /// Signatures needed.
+    pub required: u32,
+}
+
+/// An answer of a signing route and who signed it (`None`: an unsigned answer, accepted only
+/// with `[peers] require_auth = false`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signed<T> {
+    /// The answer.
+    pub body: T,
+    /// The responder's member key, verified over the answer and the request.
+    pub responder: Option<hawkeye_core::PubKey33>,
+}
+
 /// `POST /unlock/sign` answer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnlockSignResponse {
@@ -112,10 +155,13 @@ pub struct ApiError {
 pub struct Peers {
     http: reqwest::Client,
     urls: Vec<String>,
+    signer: Option<PeerSigner>,
 }
 
 impl Peers {
-    /// A client for `urls` (5 s timeout per request).
+    /// A client for `urls` (5 s timeout per request), with no member key: it can read
+    /// (`GET /locks`) but its signing requests carry no authentication (refused by a peer that
+    /// requires it). The daemon uses [`Peers::with_signer`].
     pub fn new(urls: Vec<String>) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
@@ -125,7 +171,14 @@ impl Peers {
                 .into_iter()
                 .map(|u| u.trim_end_matches('/').to_owned())
                 .collect(),
+            signer: None,
         })
+    }
+
+    /// Sign every request to a signing route with `signer` and check the answers' signatures.
+    pub fn with_signer(mut self, signer: PeerSigner) -> Self {
+        self.signer = Some(signer);
+        self
     }
 
     /// The configured peers.
@@ -146,28 +199,67 @@ impl Peers {
         Ok(r.json().await?)
     }
 
+    /// `POST <peer><path>` with `req` as JSON, signed when this client has a member key; the
+    /// answer's signature is checked.
+    async fn post_signed<Q: Serialize, A: for<'de> Deserialize<'de>>(
+        &self,
+        peer: &str,
+        path: &str,
+        req: &Q,
+    ) -> Result<Signed<A>> {
+        let body = serde_json::to_vec(req)?;
+        let mut rb = self
+            .http
+            .post(format!("{peer}{path}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        let signed = match &self.signer {
+            Some(s) => {
+                let sr = s.sign(path, &body)?;
+                for (n, v) in &sr.headers {
+                    rb = rb.header(*n, v);
+                }
+                Some(sr.msg)
+            }
+            None => None,
+        };
+        let r = rb.body(body).send().await?;
+        let status = r.status();
+        let headers = r.headers().clone();
+        let bytes = r.bytes().await?;
+        if !status.is_success() {
+            let why = serde_json::from_slice::<ApiError>(&bytes)
+                .map(|e| e.error)
+                .unwrap_or_default();
+            return Err(anyhow!("{peer}: HTTP {status}: {why}"));
+        }
+        let responder = match (&self.signer, signed) {
+            (Some(s), Some(msg)) => s
+                .check_response(&msg, &headers, &bytes)
+                .map_err(|e| anyhow!("{peer}: {e}"))?,
+            _ => None,
+        };
+        Ok(Signed {
+            body: serde_json::from_slice(&bytes)?,
+            responder,
+        })
+    }
+
     /// `POST <peer>/unlock/sign`.
     pub async fn unlock_sign(
         &self,
         peer: &str,
         req: &UnlockSignRequest,
-    ) -> Result<UnlockSignResponse> {
-        let r = self
-            .http
-            .post(format!("{peer}/unlock/sign"))
-            .json(req)
-            .send()
-            .await?;
-        if !r.status().is_success() {
-            let status = r.status();
-            let why = r
-                .json::<ApiError>()
-                .await
-                .map(|e| e.error)
-                .unwrap_or_default();
-            return Err(anyhow!("{peer}: HTTP {status}: {why}"));
-        }
-        Ok(r.json().await?)
+    ) -> Result<Signed<UnlockSignResponse>> {
+        self.post_signed(peer, "/unlock/sign", req).await
+    }
+
+    /// `POST <peer>/cancel/sign`.
+    pub async fn cancel_sign(
+        &self,
+        peer: &str,
+        req: &CancelSignRequest,
+    ) -> Result<Signed<CancelSignResponse>> {
+        self.post_signed(peer, "/cancel/sign", req).await
     }
 
     /// `POST <peer>/slash/sign`.
@@ -175,22 +267,7 @@ impl Peers {
         &self,
         peer: &str,
         req: &SlashSignRequest,
-    ) -> Result<SlashSignResponse> {
-        let r = self
-            .http
-            .post(format!("{peer}/slash/sign"))
-            .json(req)
-            .send()
-            .await?;
-        if !r.status().is_success() {
-            let status = r.status();
-            let why = r
-                .json::<ApiError>()
-                .await
-                .map(|e| e.error)
-                .unwrap_or_default();
-            return Err(anyhow!("{peer}: HTTP {status}: {why}"));
-        }
-        Ok(r.json().await?)
+    ) -> Result<Signed<SlashSignResponse>> {
+        self.post_signed(peer, "/slash/sign", req).await
     }
 }

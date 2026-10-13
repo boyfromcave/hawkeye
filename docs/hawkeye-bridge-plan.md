@@ -368,20 +368,40 @@ released, reported, and refundable by a threshold mint to the burner with the sy
 `lockId = sha256("hawkeye-refund" ‖ chainId ‖ bridge ‖ nonce)` (Q-3: the Foundation's call; needs
 `k`-of-n signatures, never one).
 
-### 3.5 F-5: one key, two chains, and signing it twice (HK-7)
+### 3.5 F-5: one key, two chains, and signing it twice (HK-7, HK-14)
 
 The member key is the bond key, the heartbeat key, the Ycash set-signing key and the Ethereum
-guardian key (upgrade plan D-U4, wyec design §2.5). Hawkeye:
+guardian key (upgrade plan D-U4, wyec design §2.5). **It is hot on both chains** (remedial report
+05/M-1): in the default `[keys] ycash_signing = "wallet"` mode `hawkeye enroll` imports it into
+the node wallet (`importprivkey`, no rescan), where it sits **in clear** — Ycash disables wallet
+encryption (`encryptwallet` needs the experimental `-developerencryptwallet`, ycash-dd
+`src/wallet/rpcwallet.cpp`, same on ycash6) — so one read of `wallet.dat` or of the RPC cookie
+(`dumpprivkey`) yields the Ycash set signature, the guardian signature, the bond after the exit
+delay and the gas balance. The keystore (Ethereum keystore v3, scrypt) protects Hawkeye's own copy
+at rest only. Hawkeye:
 
-- signs on Ycash through the node wallet (`set_signunlock`, `set_signcancel`, `set_heartbeat`,
-  `set_signact`), so the node's **sign-once guard** (upgrade finding (70)) protects the Ycash side;
+- in `"wallet"` mode signs on Ycash through the node wallet (`set_signunlock`, `set_signcancel`,
+  `set_heartbeat`, `set_signact`), so the node's **sign-once guard** (upgrade finding (70))
+  protects the Ycash side as well as Hawkeye's ledger;
+- in **`"self"` mode** (HK-14; recommended on mainnet once the ledger backup discipline is in
+  place) makes every set and act signature itself: the ZIP-243 sighash of the template input
+  under the next block's branch id, `SetSigMsg` / `ActMsg`, `sign_compact`, the signature placed
+  where `SignSetInPlace` / `SignActInPlace` put it (the template scriptSig; the act `OP_RETURN`
+  after the payload); the node wallet funds and signs fee inputs only (`vault_send`,
+  `set_sendact`) and never holds the member key. Proven on regtest on both node lines
+  (`crates/hawkeye/tests/regtest_self_signing.rs`: sighash parity with `set_signunlock` /
+  `set_signcancel`, a self-signed unlock, cancel, `SET_JOIN` and `SET_HEARTBEAT` confirmed,
+  `dumpprivkey` of the member address refused). The node's guard then no longer applies: the
+  ledger's sign-once records (per prevout, and per burn, HK-13) are the only equivocation guard;
 - signs EIP-712 itself and keeps its own persistent sign-once record keyed by `lockId` (one
   `(amount, to)` ever) — the mint-side equivalent of the guard;
-- holds the key in an encrypted keystore (Ethereum keystore v3, scrypt) and imports it into the
-  node wallet once at enrolment (`importprivkey`, no rescan); a remote-signer backend (KMS/HSM,
-  `web3signer`) is a phase-H8 option behind the same `Signer` trait;
+- sends Ethereum transactions from a **separate gas account** (`[eth] sender_keystore`, required
+  and distinct from the member key on mainnet); the member key only attests; `gas-low` alarms;
 - checks at start-up that `keccak256(uncompressed pubkey)[12:]` of every current set member is a
   guardian on the contract and vice versa; a mismatch refuses to start (rotation drift).
+
+A remote-signer backend (KMS/HSM, `web3signer`) is a phase-H8 option; `"self"` mode is its
+prerequisite. A bond key separate from the member key is a consensus change (CR-N7).
 
 ---
 
@@ -490,6 +510,29 @@ or ZIP-243 recomputed in H8), and recovers the signer from the 65-byte signature
 Vectors: the node's `src/test/data/vault_vectors.json` (`setSigMsgs`, `signatures`), byte-identical on
 both lines.
 
+### 4.6 Peer request authentication (HK-13, remedial report 05/H-1)
+
+Every `POST` to a signing route (`/unlock/sign`, `/slash/sign`, `/cancel/sign`) carries
+`X-Hawkeye-Member` (66 lowercase hex: the compressed member key), `X-Hawkeye-Time` (unix seconds,
+decimal, no leading zeros), `X-Hawkeye-Nonce` (32 lowercase hex: 16 random bytes) and
+`X-Hawkeye-Sig` (130 lowercase hex: a 65-byte compact recoverable signature, header 31..34, low S)
+over
+
+```
+msg = sha256d( "HawkeyePeerReq" (14) ‖ set_id (32, internal) ‖ chain_id (u64 LE) ‖ bridge (20)
+             ‖ u8 len ‖ method ‖ u16 LE len ‖ path ‖ timestamp (u64 LE) ‖ nonce (16) ‖ sha256(body) )
+```
+
+The server admits it only if the headers are well formed, `|now − time| ≤ 60 s`, `(member,
+nonce)` was not seen in the last 120 s, the signature recovers to the member, and the member is a
+**current** member of the set (a member in its exit delay is not); else `401`/`403`. The answer
+carries `X-Hawkeye-Member` / `X-Hawkeye-Sig` over `sha256d("HawkeyePeerResp" ‖ msg ‖
+sha256(answer body))`, which the client checks (a current member, the peer whose signatures it
+counts). Vector: `crates/hawkeye-core/tests/peerauth.rs` (set `0x11…11`, chain 31337, bridge
+`0x5FbDB2…0aa3`, `POST /unlock/sign`, time 1760000000, nonce `00…0f`, body `{"hex":"00"}` →
+`msg = fd8d6317…747a7c`). `[peers] require_auth` (default true; false refused on mainnet) and
+`allow_from` (CIDRs, a belt) configure it; mainnet peer URLs are `https://` or loopback.
+
 ---
 
 ## 5. The engine
@@ -585,7 +628,21 @@ later nonces are served. It is released when the set's cap rises to its amount (
 raising `ratelimitbps`, or more value locked), re-checked every tick, no restart; the alarm clears
 when none is left. The node's `bad-txns-vault-rate` on such a burn routes to the same branch.
 `hawkeye burn` refuses an over-cap amount unless `--allow-over-cap` (audit 05/M-2). Ycash fees come from the leader's transparent coins (keep ≥ 8 coins, finding
-(76)); Ethereum gas from the leader's account. Protocol fees (O-2 "bps fee") are out of v1 (Q-4).
+(76)); Ethereum gas from the attestor's gas account (§3.5). Protocol fees (O-2 "bps fee") are out of
+v1 (Q-4).
+
+**Cancel capacity (remedial report 05/H-1, finding 05/N-2).** One cancel is one transaction funded
+from confirmed P2PKH coins (the node's `Fund`), so an attestor sends at most as many cancels per
+block as it holds confirmed fee coins. Every 20 ticks Hawkeye counts them (`listunspent 1`,
+P2PKH, ≥ `VAULT_RPC_FEE + VAULT_RPC_MIN_CHANGE`), publishes `fee_coins` / `hawkeye_fee_coins`,
+alarms `fee-coins-low` below 8 and `fee-coins-exhausted` at 0 (also on the first unfunded
+cancel); `hawkeye split-coins --count N` restores capacity with one `sendmany`. Unmatched intents
+are cancelled nearest deadline first. At `cancelThreshold > 1` the intent's **cancel leader** (the
+mint schedule over the intent outpoint, live members other than its signer) builds the cancel and
+gathers co-signatures over `POST /cancel/sign`; a peer co-signs only an intent its own ledger
+judged unmatched. (Known limit: there is no cancel takeover; a silent cancel leader stalls a
+`cancelThreshold > 1` cancel. The §2 rows use 1.) Chained cancels from unconfirmed change would
+need CR-N5 (§10).
 
 ---
 
@@ -630,9 +687,18 @@ token addresses, deploy block; set id; mint mode and `k`; `C_Y`, `MIN_OWNER_AGE`
 **Operations.** Structured logs (`tracing`, JSON), Prometheus metrics (`/metrics`: heights, lag,
 pending burns, intents, cancels, supply margin, set liveness, key balance), a read-only status API
 (`/status`, `/burns/<nonce>`, `/locks/<lockId>` with the mint signatures so users can self-submit),
-a systemd unit and a container image. Peer channel (H5): authenticated by member keys; v1 may use
-plain HTTPS between known operators, reusing the attest agent's iroh-gossip later (ycash-dd
-`contrib/yellowback/attest`).
+a systemd unit and a container image. **Peer channel** (H5, HK-13): the signing routes
+(`/unlock/sign`, `/slash/sign`, `/cancel/sign`) are authenticated by member-key request
+signatures (§4.6) and answer signed; TLS (`https://`) is the transport; authorisation follows the
+Ycash set, so a removed member is refused at once. `/unlock/sign` is inert at `unlockThreshold =
+1`; above it a peer co-signs only for the requester that leads the burn (or roll) in its own
+ledger, and records the signature per burn as well as per vault (schema v6: one live vault per
+burn; a record is *dead* only when its transaction can no longer confirm — a fee input or the
+vault spent by another transaction at least `C_Y` deep — and then one more vault may be signed).
+The leader re-sends only an unlock it signed as leader whose fee inputs are its wallet's, and
+adopts a peer's co-signature only on its own transaction byte for byte with more valid
+signatures of distinct current members (findings 05/N-1, 05/L-1). The attest agent's
+iroh-gossip (ycash-dd `contrib/yellowback/attest`) may replace the transport later.
 
 **Dependencies.** Exact pins, `Cargo.lock` committed, `cargo build --locked`, `cargo deny` (the
 attest agent's discipline). Candidate set: `tokio`, `alloy` (provider, sol-types, signer-local,
@@ -753,6 +819,9 @@ from the members' compressed keys.
 | CR-N4 | ycash-dd, ycash6 | quantum line: a post-quantum owner through the `vault_*` surface (client survey C-4) | `hawkeye lock` builds the V itself (CR-N1) and may not call `yed_*` | **done** on ycash-dd `q/wallet` (`vault_getnewowner`, Q5); ycash6 to follow |
 | CR-N2 | ycash-dd, ycash6 | `vault_buildunlock` `"data"` parameter (an OP_RETURN output) | the memo without a tx codec in Hawkeye | no |
 | CR-N3 | ycash-dd, ycash6 | cross-set `SET_REMOVE` (finding (26)) | only if the Foundation insists on an open challenger set (§2.1) | no |
+| CR-N5 | ycash-dd, ycash6 | `vault_buildcancel` / `Fund` may spend this wallet's own unconfirmed change (`nDepth ≥ 0` for outputs of transactions this wallet sent), so `k` cancels can chain within one block from one coin (remedial report 05/H-1 §4.6) | raises per-block cancel capacity from "confirmed fee coins" to the mempool chain limit; wallet-only, no consensus footprint | no — `split-coins` and the `fee-coins-low` alarm suffice at HK-1 |
+| CR-N6 | ycash-dd, ycash6 | `set_signact` taking an externally made member signature, an unsigned `set_heartbeat` (05/M-1 §4.4) | only if the act signature could not be reproduced from the RPC surface | **not needed**: verified on regtest on both lines — `set_buildact` + Hawkeye's `ActMsg` signature appended to the act output + `set_sendact` (and `set_signact` accepts it as an existing signature) |
+| CR-N7 | ycash-dd, ycash6 | QS-7b `bondOwner`: `SET_JOIN` names a separate bond key, so the hot member key cannot spend the bond after the exit delay (05/M-1) | the only way a stolen member key cannot take the bond | no (consensus change, owner decision, next upgrade round) |
 | CR-U1 | workspace | upgrade plan §4.1: the recovery row's "no intent names it" is not what the template does; add the single-attestation row to §4.2; reference this plan from §4.3 and P5 | accuracy (§3.1) | no |
 | CR-WS | workspace | `repos.yaml`, README components table, CLAUDE.md layout, `docs/mapping.md` §23 rows for Hawkeye | the workspace manifest | no |
 
@@ -782,10 +851,12 @@ from the members' compressed keys.
 | HK-4 | Every unlock carries the 73-byte `HKB1` memo; one burn pays once |
 | HK-5 | `ycashRecipient` version 2 (§4.2): `0x02`, kind (P2PKH, P2SH, PQPKH), then a 20-byte hash160 or `scheme ‖ keyHash` (33 bytes); 22 or 35 bytes, validated by both contracts; transparent or `TX_PQPKH`, never shielded. (Revision 1 was the 32-byte transparent-only form; retired 2026-10-11, Q-7.) |
 | HK-6 | Minimum owner age, drain-nearest-expiry, rolls, and a supply alarm answer F-1 |
-| HK-7 | One key on both chains; Ycash signing via the node wallet (its sign-once guard), EIP-712 via Hawkeye with its own sign-once record |
+| HK-7 | One key on both chains; Ycash signing via the node wallet (its sign-once guard) or, since HK-14, by Hawkeye itself; EIP-712 via Hawkeye with its own sign-once record |
 | HK-8 | No batching and no burn splitting in v1 (one burn ↔ one intent ↔ one vault input); a burn above the set's full-window cap is parked out of the FIFO until the cap rises (§5.5, audit 05/M-2) — splitting it stays the v2 design option |
 | HK-9 | Deterministic leader by `nonce mod |live|`, takeover after `TAKEOVER` blocks; every attestor verifies everything |
 | HK-11 | Contract facts Hawkeye relies on (Foundry-tested in `eth/test/`): mint signatures carry no nonce (the `lockId` is the only replay key, valid across rotations while the signers remain guardians); one shared `adminNonce` serialises admin rounds (run one at a time); `setPaused` to the current state reverts; high-S signatures are rejected |
 | HK-10 | Hawkeye reaches the node only through stock and `set_*`/`vault_*` RPCs, and Ethereum only through standard JSON-RPC |
+| HK-13 | (2026-10-12, remedial report 05/H-1) The peer channel is authenticated by member-key request signatures (§4.6) and answers are signed; `/unlock/sign` is inert at `unlockThreshold = 1` and above it co-signs only for the burn's (or roll's) leader; every unlock signature is recorded per burn as well as per vault (one live vault per burn); co-signatures are adopted only after checking; cancels are gathered at `cancelThreshold > 1` and cancel capacity is measured (§5.5) |
+| HK-14 | (2026-10-12, remedial report 05/M-1) The member key is hot in the node wallet in `"wallet"` mode, in clear; `[keys] ycash_signing = "self"` keeps it out of the wallet (Hawkeye signs set and act messages itself; the ledger is then the only Ycash equivocation guard); on mainnet the Ethereum gas account is separate from the member key |
 | HK-12 | (2026-10-11, D-Q-29..D-Q-31) An attestor leaves by `hawkeye leave` (`set_leave`) and recovers its bond by `hawkeye withdraw-bond` after the set's `maturity` (≥ 16,128 on mainnet: the mainnet row's 1,152 became 16,128); slashing reaches members in their exit delay (§2.4, §5.3 step 5) |
 | HK-15 | (audit 05/L-4) Optimistic mode falls back to the threshold path automatically once every live member is barred from a lock (`vetoed`, or a recorded griefer of it); the challenger of a proposal that matched a policy-OK lock gets a `GRIEFING` case (`SET_REMOVE burn=0`) and is not waited for as that lock's proposer (§5.3 step 2) |

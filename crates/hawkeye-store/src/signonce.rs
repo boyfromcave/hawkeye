@@ -521,3 +521,370 @@ impl Tx<'_> {
         }
     }
 }
+
+/// Who produced an unlock signature recorded per burn (schema v6, remedial report 05/H-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnlockOrigin {
+    /// This attestor's own unlock, as the burn's leader: the only kind it ever re-sends.
+    Leader,
+    /// A peer's unlock co-signed over `POST /unlock/sign` (`unlockThreshold > 1`).
+    Cosign,
+    /// Drill D-3 (`rogue-unlock --replay-burn`): a deliberate second unlock for a burn.
+    Drill,
+}
+
+impl UnlockOrigin {
+    /// The ledger text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Leader => "leader",
+            Self::Cosign => "cosign",
+            Self::Drill => "drill",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "leader" => Self::Leader,
+            "cosign" => Self::Cosign,
+            "drill" => Self::Drill,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for UnlockOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The burn an unlock signature pays, for [`Tx::sign_once_unlock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnlockBurn {
+    /// The burn.
+    pub key: crate::BurnKey,
+    /// Who signs.
+    pub origin: UnlockOrigin,
+    /// Drill D-3 only: skip the per-burn check (the drill produces the double release the
+    /// watchers must cancel). Refused unless `origin` is [`UnlockOrigin::Drill`].
+    pub allow_double: bool,
+}
+
+/// One row of the per-burn unlock record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlockBurnRecord {
+    /// The set.
+    pub set_id: Hash32,
+    /// The burn.
+    pub key: crate::BurnKey,
+    /// The vault the signed unlock spends.
+    pub prevout: OutPoint,
+    /// Who signed.
+    pub origin: UnlockOrigin,
+    /// Unix seconds.
+    pub signed_at: i64,
+    /// Why the signed transaction can no longer confirm, once dead.
+    pub dead_reason: Option<String>,
+    /// The Ycash height the row was marked dead at.
+    pub dead_height: Option<u32>,
+}
+
+impl UnlockBurnRecord {
+    /// Not marked dead.
+    pub fn is_live(&self) -> bool {
+        self.dead_reason.is_none()
+    }
+}
+
+const UNLOCK_BURN_COLS: &str = "set_id, chain_id, bridge, nonce, prevout_txid, prevout_vout, \
+                                origin, signed_at, dead_reason, dead_height";
+
+fn unlock_burn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UnlockBurnRecord> {
+    let origin: String = r.get(6)?;
+    Ok(UnlockBurnRecord {
+        set_id: r.get(0)?,
+        key: crate::BurnKey::new(
+            hawkeye_core::Deployment {
+                chain_id: r.get(1)?,
+                bridge: hawkeye_core::EthAddress(r.get(2)?),
+            },
+            r.get(3)?,
+        ),
+        prevout: OutPoint::new(r.get(4)?, r.get(5)?),
+        origin: UnlockOrigin::parse(&origin).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                "unlock origin".into(),
+            )
+        })?,
+        signed_at: r.get(7)?,
+        dead_reason: r.get(8)?,
+        dead_height: r.get(9)?,
+    })
+}
+
+impl Tx<'_> {
+    /// [`Tx::sign_once_ycash`] for the unlock domain **with the burn dimension** (schema v6,
+    /// remedial report 05/H-1 §4.3): one live vault per burn, ever, per attestor.
+    ///
+    /// 1. A per-vault record with the same `built_hex`: returned, `sign` not called (with a
+    ///    burn, its per-burn row must exist and name this vault, else the ledger is corrupt).
+    ///    A different `built_hex`: [`StoreError::SignOnceConflict`].
+    /// 2. With a burn (and not `allow_double`): a **live** row naming this burn with another
+    ///    vault → [`StoreError::SignOnceConflict`] (`key` = `burn <chainId:bridge:nonce>`).
+    /// 3. `sign(built_hex)`; 4. the `sign_once_ycash` record, then the per-burn row, in this
+    ///    transaction.
+    ///
+    /// `burn = None` is for rolls (they pay no burn).
+    pub fn sign_once_unlock<F, E>(
+        &self,
+        key: &YcashSignKey,
+        burn: Option<&UnlockBurn>,
+        built_hex: &str,
+        sign: F,
+    ) -> Result<YcashSignRecord>
+    where
+        F: FnOnce(&str) -> core::result::Result<(String, Hash32), E>,
+        E: Into<SignerError>,
+    {
+        if key.domain != SignDomain::YcashUnlock {
+            return Err(StoreError::Invalid(format!(
+                "{} is not the unlock sign-once domain",
+                key.domain
+            )));
+        }
+        if let Some(b) = burn
+            && b.allow_double
+            && b.origin != UnlockOrigin::Drill
+        {
+            return Err(StoreError::Invalid(
+                "allow_double is for the drill origin only".into(),
+            ));
+        }
+        if let Some(old) = self.ycash_signature(key)? {
+            if old.built_hex != built_hex {
+                return Err(StoreError::SignOnceConflict {
+                    domain: key.domain.as_str(),
+                    key: key_id(key),
+                    detail: "a different transaction was already signed for this prevout".into(),
+                });
+            }
+            if let Some(b) = burn {
+                let rows = self.unlock_burn_rows(&key.set_id, &b.key)?;
+                if !rows.iter().any(|r| r.prevout == key.prevout) {
+                    return Err(StoreError::corrupt(format!(
+                        "unlock of {} is recorded without its burn {} row",
+                        key.prevout, b.key
+                    )));
+                }
+            }
+            return Ok(old);
+        }
+        if let Some(b) = burn
+            && !b.allow_double
+            && let Some(live) = self
+                .unlock_burn_rows(&key.set_id, &b.key)?
+                .into_iter()
+                .find(|r| r.is_live() && r.prevout != key.prevout)
+        {
+            return Err(StoreError::SignOnceConflict {
+                domain: key.domain.as_str(),
+                key: format!("burn {}", b.key),
+                detail: format!(
+                    "a live {} unlock of vault {} already pays this burn",
+                    live.origin, live.prevout
+                ),
+            });
+        }
+        let (signed_hex, sighash) = sign(built_hex).map_err(|e| StoreError::Signer(e.into()))?;
+        self.conn().execute(
+            "INSERT INTO sign_once_ycash (domain, set_id, prevout_txid, prevout_vout, sighash,
+                                          built_hex, signed_hex, signed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                key.domain,
+                key.set_id,
+                key.prevout.txid,
+                key.prevout.vout,
+                sighash,
+                built_hex,
+                signed_hex,
+                self.now()
+            ],
+        )?;
+        if let Some(b) = burn {
+            self.insert_unlock_burn(&key.set_id, &b.key, &key.prevout, b.origin, false)?;
+        }
+        self.ycash_signature(key)?
+            .ok_or_else(|| StoreError::corrupt("sign-once record vanished"))
+    }
+
+    fn insert_unlock_burn(
+        &self,
+        set_id: &Hash32,
+        k: &crate::BurnKey,
+        prevout: &OutPoint,
+        origin: UnlockOrigin,
+        or_ignore: bool,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            &format!(
+                "INSERT {} INTO sign_once_unlock_burn (set_id, chain_id, bridge, nonce,
+                     prevout_txid, prevout_vout, origin, signed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                if or_ignore { "OR IGNORE" } else { "" }
+            ),
+            params![
+                set_id,
+                k.deployment.chain_id,
+                k.deployment.bridge.0,
+                k.nonce,
+                prevout.txid,
+                prevout.vout,
+                origin.as_str(),
+                self.now()
+            ],
+        )?)
+    }
+
+    /// Every per-burn unlock row of `burn` under `set_id`, oldest first (live and dead).
+    pub fn unlock_burn_rows(
+        &self,
+        set_id: &Hash32,
+        burn: &crate::BurnKey,
+    ) -> Result<Vec<UnlockBurnRecord>> {
+        self.all(
+            &format!(
+                "SELECT {UNLOCK_BURN_COLS} FROM sign_once_unlock_burn
+                 WHERE set_id = ?1 AND chain_id = ?2 AND bridge = ?3 AND nonce = ?4
+                 ORDER BY signed_at, prevout_txid, prevout_vout"
+            ),
+            params![
+                set_id,
+                burn.deployment.chain_id,
+                burn.deployment.bridge.0,
+                burn.nonce
+            ],
+            unlock_burn_row,
+        )
+    }
+
+    /// The per-burn rows naming a vault (the burns an unlock of it was signed for).
+    pub fn unlock_burns_of_vault(
+        &self,
+        set_id: &Hash32,
+        prevout: &OutPoint,
+    ) -> Result<Vec<UnlockBurnRecord>> {
+        self.all(
+            &format!(
+                "SELECT {UNLOCK_BURN_COLS} FROM sign_once_unlock_burn
+                 WHERE set_id = ?1 AND prevout_txid = ?2 AND prevout_vout = ?3
+                 ORDER BY signed_at"
+            ),
+            params![set_id, prevout.txid, prevout.vout],
+            unlock_burn_row,
+        )
+    }
+
+    /// The live unlock that pays `burn` here, if any: its vault and origin.
+    pub fn live_unlock_for_burn(
+        &self,
+        set_id: &Hash32,
+        burn: &crate::BurnKey,
+    ) -> Result<Option<UnlockBurnRecord>> {
+        Ok(self
+            .unlock_burn_rows(set_id, burn)?
+            .into_iter()
+            .find(UnlockBurnRecord::is_live))
+    }
+
+    /// Mark the live row `(burn, prevout)` dead: its transaction can no longer confirm. Only a
+    /// live row can be marked, once; an unknown or already dead row is
+    /// [`StoreError::Invalid`]. The event log records the reason.
+    pub fn mark_unlock_dead(
+        &self,
+        set_id: &Hash32,
+        burn: &crate::BurnKey,
+        prevout: &OutPoint,
+        reason: &str,
+        height: u32,
+    ) -> Result<()> {
+        let n = self.conn().execute(
+            "UPDATE sign_once_unlock_burn SET dead_reason = ?7, dead_height = ?8
+             WHERE set_id = ?1 AND chain_id = ?2 AND bridge = ?3 AND nonce = ?4
+               AND prevout_txid = ?5 AND prevout_vout = ?6 AND dead_reason IS NULL",
+            params![
+                set_id,
+                burn.deployment.chain_id,
+                burn.deployment.bridge.0,
+                burn.nonce,
+                prevout.txid,
+                prevout.vout,
+                reason,
+                height
+            ],
+        )?;
+        if n != 1 {
+            return Err(StoreError::Invalid(format!(
+                "no live unlock of {prevout} for burn {burn}"
+            )));
+        }
+        self.log(
+            crate::state::ObjectKind::Burn,
+            &burn.to_string(),
+            None,
+            "UNLOCK_DEAD",
+            Some(u64::from(height)),
+            Some(&format!("vault {prevout}: {reason}")),
+        )
+    }
+
+    /// A metadata value.
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        self.one("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+    }
+
+    /// Set a metadata value.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// The V6 backfill (see [`crate::Store::backfill_unlock_burns`]): one `leader` row per
+    /// pre-V6 unlock record whose signed transaction names a burn (`decode`). Idempotent.
+    pub fn backfill_unlock_burns(
+        &self,
+        decode: &dyn Fn(&str) -> Option<(hawkeye_core::Deployment, u64)>,
+    ) -> Result<usize> {
+        let recs: Vec<(Hash32, OutPoint, String)> = self.all(
+            "SELECT set_id, prevout_txid, prevout_vout, signed_hex FROM sign_once_ycash
+             WHERE domain = 'ycash-unlock' ORDER BY signed_at",
+            [],
+            |r| Ok((r.get(0)?, OutPoint::new(r.get(1)?, r.get(2)?), r.get(3)?)),
+        )?;
+        let mut n = 0;
+        for (set_id, prevout, hex) in recs {
+            let Some((dep, nonce)) = decode(&hex) else {
+                continue;
+            };
+            n += self.insert_unlock_burn(
+                &set_id,
+                &crate::BurnKey::new(dep, nonce),
+                &prevout,
+                UnlockOrigin::Leader,
+                true,
+            )?;
+        }
+        self.set_meta(BACKFILL_UNLOCK_BURNS, "done")?;
+        Ok(n)
+    }
+}
+
+/// The `meta` key recording the V6 backfill.
+pub const BACKFILL_UNLOCK_BURNS: &str = "backfill_unlock_burns";

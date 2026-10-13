@@ -10,7 +10,7 @@
 //! | [`burns`] | burns on the foreign chain (§1.3), the matcher's burn lookup |
 //! | [`intents`] | intents seen on Ycash and their classification (§3.2, §5.3) |
 //! | [`vaults`] | the set's vault outputs (§3.1) |
-//! | [`signonce`] | sign-once records: the bridge's `Mint` attestation by `lockId`, `Challenge` by `(lockId, proposalId)`, the drill's rogue `Mint`, Ycash set/act signatures by `(set, prevout)` (HK-7) |
+//! | [`signonce`] | sign-once records: the bridge's `Mint` attestation by `lockId`, `Challenge` by `(lockId, proposalId)`, the drill's rogue `Mint`, Ycash set/act signatures by `(set, prevout)` (HK-7), unlocks also by the burn they pay (v6, HK-13) |
 //! | [`slash`] | slash cases (§2.3, §5.3) |
 //! | [`progress`] | restart state (v2): deferred mint checks, slash votes gathered and given, set signatures seen |
 //! | [`chain`] | chain cursors and reorg rewinds (§5.4) |
@@ -55,7 +55,8 @@ pub use intents::{IntentRecord, NewIntent, classification_code};
 pub use locks::{LockRecord, NewLock};
 pub use progress::{PendingMintRecord, SeenSetSig, SlashProgress, VoteGiven};
 pub use signonce::{
-    ChallengeSignRecord, ChallengedProposal, MintSignRecord, YcashSignKey, YcashSignRecord,
+    ChallengeSignRecord, ChallengedProposal, MintSignRecord, UnlockBurn, UnlockBurnRecord,
+    UnlockOrigin, YcashSignKey, YcashSignRecord,
 };
 pub use slash::{NewSlashCase, SlashCaseRecord};
 pub use state::{
@@ -79,9 +80,20 @@ fn system_clock() -> i64 {
 
 impl Store {
     /// Open (creating if absent) the ledger file at `path` and migrate it to the current
-    /// schema.
+    /// schema. A new ledger is created mode `0600` before SQLite opens it, and its `-wal` /
+    /// `-shm` files are held to `0600` too (remedial report 05/L-2: the sign-once ledger is
+    /// owner-only; SQLite's unix VFS gives `-wal`/`-shm` the main file's mode since 3.7, and the
+    /// mode is set again here regardless).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::init(Connection::open(path)?)
+        let path = path.as_ref();
+        create_private(path)?;
+        let s = Self::init(Connection::open(path)?)?;
+        for ext in ["-wal", "-shm"] {
+            let mut side = path.as_os_str().to_owned();
+            side.push(ext);
+            restrict_private(Path::new(&side))?;
+        }
+        Ok(s)
     }
 
     /// An in-memory ledger (tests, simulations).
@@ -166,6 +178,23 @@ impl Store {
         self.tx(|t| t.sign_once_mint(lock_id, amount, to, digest, sign))
     }
 
+    /// The schema-v6 backfill of the per-burn unlock record (remedial report 05/H-1 §4.3): once
+    /// per ledger (`meta.backfill_unlock_burns`), one `leader` row per pre-v6 unlock record
+    /// whose signed transaction names a burn. `decode` maps a signed unlock's hex to the burn its
+    /// memo names (the daemon passes the `HKB1`/`HKN1` memo decoder; this crate decodes no
+    /// transactions). Returns the rows inserted (0 when already done).
+    pub fn backfill_unlock_burns(
+        &mut self,
+        decode: impl Fn(&str) -> Option<(hawkeye_core::Deployment, u64)>,
+    ) -> Result<usize> {
+        self.tx(|t| {
+            if t.meta(signonce::BACKFILL_UNLOCK_BURNS)?.as_deref() == Some("done") {
+                return Ok(0);
+            }
+            t.backfill_unlock_burns(&decode)
+        })
+    }
+
     /// [`Tx::sign_once_ycash`] in its own transaction.
     pub fn sign_once_ycash<F, E>(
         &mut self,
@@ -179,6 +208,50 @@ impl Store {
     {
         self.tx(|t| t.sign_once_ycash(key, built_hex, sign))
     }
+}
+
+/// Create `path` empty with mode `0600` if it does not exist (unix).
+#[cfg(unix)]
+fn create_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(StoreError::corrupt(format!(
+            "cannot create the ledger {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Clear the group and world bits of `path` if it exists (unix).
+#[cfg(unix)]
+fn restrict_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(m) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let mode = m.permissions().mode();
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700))
+            .map_err(|e| StoreError::corrupt(format!("cannot restrict {}: {e}", path.display())))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_private(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn migrate(conn: &mut Connection) -> Result<()> {

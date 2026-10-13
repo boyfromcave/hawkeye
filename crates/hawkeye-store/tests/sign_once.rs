@@ -453,3 +453,117 @@ fn drill_mint_only_for_unknown_locks_and_once() {
     })
     .unwrap();
 }
+
+/// Schema v6 (remedial report 05/H-1 §4.3): one live vault per burn, whatever signed it; the
+/// per-vault record still applies; rolls carry no burn; the drill may double; a dead row frees
+/// the burn for one more vault.
+#[test]
+fn unlock_sign_once_has_a_burn_dimension() {
+    use hawkeye_store::{UnlockBurn, UnlockOrigin};
+    let mut s = store();
+    let k = |n: u8| YcashSignKey {
+        domain: SignDomain::YcashUnlock,
+        set_id: SET,
+        prevout: op(n, 0),
+    };
+    let burn = |origin| UnlockBurn {
+        key: burn_key(7),
+        origin,
+        allow_double: false,
+    };
+    let signed = |b: &str| Ok::<_, StoreError>((format!("signed({b})"), [0x22; 32]));
+    let never = |_: &str| -> Result<(String, [u8; 32]), StoreError> { panic!("signed") };
+    s.tx(|t| {
+        // the leader signs burn 7 on V1
+        let r = t.sign_once_unlock(&k(1), Some(&burn(UnlockOrigin::Leader)), "u1", signed)?;
+        assert_eq!(r.signed_hex, "signed(u1)");
+        // idempotent
+        assert_eq!(
+            t.sign_once_unlock(&k(1), Some(&burn(UnlockOrigin::Leader)), "u1", never)?,
+            r
+        );
+        // burn 7 on V2: refused, the signer is never called, whoever asks
+        for origin in [UnlockOrigin::Leader, UnlockOrigin::Cosign] {
+            match t.sign_once_unlock(&k(2), Some(&burn(origin)), "u2", never) {
+                Err(StoreError::SignOnceConflict { domain, key, .. }) => {
+                    assert_eq!(domain, "ycash-unlock");
+                    assert_eq!(key, format!("burn {}", burn_key(7)));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // a roll of V2 still signs
+        t.sign_once_unlock(&k(2), None, "roll2", signed)?;
+        // a different burn on V3 signs
+        let b8 = UnlockBurn {
+            key: burn_key(8),
+            origin: UnlockOrigin::Cosign,
+            allow_double: false,
+        };
+        t.sign_once_unlock(&k(3), Some(&b8), "u3", signed)?;
+        assert_eq!(
+            t.live_unlock_for_burn(&SET, &burn_key(8))?.unwrap().origin,
+            UnlockOrigin::Cosign
+        );
+        // the drill doubles burn 7 on V4 (allow_double), recorded as a drill row
+        let drill = UnlockBurn {
+            key: burn_key(7),
+            origin: UnlockOrigin::Drill,
+            allow_double: true,
+        };
+        t.sign_once_unlock(&k(4), Some(&drill), "u4", signed)?;
+        // allow_double is the drill's alone
+        let bad = UnlockBurn {
+            origin: UnlockOrigin::Leader,
+            ..drill
+        };
+        assert!(matches!(
+            t.sign_once_unlock(&k(5), Some(&bad), "u5", never),
+            Err(StoreError::Invalid(_))
+        ));
+        // a cancel key is not the unlock domain
+        let cancel = YcashSignKey {
+            domain: SignDomain::YcashCancel,
+            ..k(6)
+        };
+        assert!(matches!(
+            t.sign_once_unlock(&cancel, None, "c", never),
+            Err(StoreError::Invalid(_))
+        ));
+        // the V1 row dies (its fee input spent C_Y deep): V5 may now pay burn 7, once
+        t.mark_unlock_dead(&SET, &burn_key(7), &op(1, 0), "fee input spent", 40)?;
+        assert!(
+            t.mark_unlock_dead(&SET, &burn_key(7), &op(1, 0), "again", 41)
+                .is_err(),
+            "dead once"
+        );
+        let live: Vec<_> = t
+            .unlock_burn_rows(&SET, &burn_key(7))?
+            .into_iter()
+            .filter(|r| r.is_live())
+            .collect();
+        assert_eq!(live.len(), 1, "the drill row");
+        assert_eq!(live[0].origin, UnlockOrigin::Drill);
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+    // the drill row is live too: a leader may not add a third vault while it lives
+    s.tx(|t| {
+        assert!(matches!(
+            t.sign_once_unlock(&k(5), Some(&burn(UnlockOrigin::Leader)), "u5", never),
+            Err(StoreError::SignOnceConflict { .. })
+        ));
+        t.mark_unlock_dead(&SET, &burn_key(7), &op(4, 0), "drill fee spent", 42)?;
+        t.sign_once_unlock(&k(5), Some(&burn(UnlockOrigin::Leader)), "u5", signed)?;
+        let dead = t
+            .unlock_burn_rows(&SET, &burn_key(7))?
+            .into_iter()
+            .find(|r| r.prevout == op(1, 0))
+            .unwrap();
+        assert_eq!(dead.dead_reason.as_deref(), Some("fee input spent"));
+        assert_eq!(dead.dead_height, Some(40));
+        assert_eq!(t.unlock_burns_of_vault(&SET, &op(5, 0))?.len(), 1);
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+}

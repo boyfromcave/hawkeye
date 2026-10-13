@@ -85,6 +85,9 @@ pub struct YcashSection {
     /// Extension: the first Ycash height the follower reads (default: the upgrade's activation
     /// height, or the tip if unscheduled).
     pub start_height: Option<u32>,
+    /// Send the RPC credentials over plain `http://` to a host that is not loopback anyway (the
+    /// YED attest agent's override; logged at `error` on every mainnet start).
+    pub allow_insecure_rpc: Option<bool>,
 }
 
 /// `[foreign]`.
@@ -149,6 +152,19 @@ pub struct EthSection {
     /// `latest − depth` (alone: depth-only; with `finality = "finalized"`: the fallback when the
     /// node has no `finalized` tag).
     pub depth: Option<u64>,
+    /// The **gas account** (remedial report 05/M-1): a keystore of a separate, gas-only
+    /// Ethereum key that sends and pays for this attestor's transactions. Required on mainnet,
+    /// and distinct from the member key; absent elsewhere, the member key sends.
+    pub sender_keystore: Option<PathBuf>,
+    /// The environment variable holding the sender keystore's password (default
+    /// `HAWKEYE_SENDER_PASSWORD`).
+    pub sender_password_env: Option<String>,
+    /// The sender key as 64 hex digits (devnets only: refused on mainnet; never printed by
+    /// `Debug`).
+    pub sender_secret_hex: Option<Redacted<String>>,
+    /// Raise `gas-low` when the sender's balance is below this many wei (default 0.05 ETH on
+    /// mainnet, 0 — no alarm — elsewhere).
+    pub min_sender_balance_wei: Option<String>,
 }
 
 /// `[bridge]`.
@@ -199,6 +215,11 @@ pub struct KeysSection {
     pub keystore: Option<PathBuf>,
     /// The environment variable holding the keystore password.
     pub password_env: Option<String>,
+    /// Who makes the member key's Ycash set and act signatures (remedial report 05/M-1):
+    /// `"wallet"` (default: the node wallet, which then holds the key **in clear** after
+    /// `hawkeye enroll`) or `"self"` (Hawkeye signs with its keystore key; the node wallet holds
+    /// only fee coins and never the member key).
+    pub ycash_signing: Option<String>,
 }
 
 /// `[store]`.
@@ -255,9 +276,18 @@ pub struct PolicySection {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeersSection {
-    /// Other attestors' API base URLs.
+    /// Other attestors' API base URLs (mainnet: `https://`, or loopback).
     #[serde(default)]
     pub urls: Vec<String>,
+    /// Sign every request to a peer's signing route with the member key and refuse unsigned
+    /// requests and answers (default true; `false` is refused on mainnet and exists for the
+    /// rolling upgrade of a regtest/testnet set only, HK-13).
+    pub require_auth: Option<bool>,
+    /// When non-empty, the signing routes also check the peer's address against these
+    /// networks (CIDR). Behind a reverse proxy this is the proxy's address: a belt, not the
+    /// mechanism.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
 }
 
 /// `[devnet]`.
@@ -339,18 +369,29 @@ pub struct Settings {
     pub params: Params,
     /// The key source.
     pub key: Option<KeySource>,
+    /// The Ethereum gas account (`[eth] sender_*`); `None`: the member key sends.
+    pub eth_sender: Option<KeySource>,
     /// The ledger file.
     pub store_path: PathBuf,
     /// API listen address.
     pub listen: SocketAddr,
     /// Peer API URLs.
     pub peers: Vec<String>,
+    /// The peer channel's authentication settings.
+    pub peer_auth: crate::peer_auth::PeerAuthConfig,
+    /// `[ycash] allow_insecure_rpc` overrode the transport rule (`rpc_url` is plain http to a
+    /// host that is not loopback).
+    pub insecure_rpc: bool,
+    /// The config file carries a secret (`rpc_password`, `secret_hex`, `sender_secret_hex`):
+    /// it must not be group/world readable ([`Settings::check_file_permissions`]).
+    pub config_has_secrets: bool,
     /// Log level.
     pub log_level: String,
     /// Log as JSON.
     pub log_json: bool,
-    /// Testnet: the parameters below the (quartered) mainnet floors ([`crate::floors`]), logged at
-    /// start-up. Mainnet refuses them instead; regtest is unconstrained.
+    /// Warnings found while checking, logged at start-up: testnet parameters below the
+    /// (quartered) mainnet floors ([`crate::floors`]; mainnet refuses them instead, regtest is
+    /// unconstrained), and transport warnings (05/L-2, HK-13).
     pub warnings: Vec<String>,
 }
 
@@ -399,6 +440,23 @@ pub struct Params {
     pub fallback_to_threshold: bool,
     /// The first Ycash height to follow (default: the upgrade's activation height).
     pub ycash_start_height: Option<u32>,
+    /// Who makes the member key's Ycash signatures (`[keys] ycash_signing`).
+    pub ycash_signing: YcashSigning,
+    /// The `gas-low` floor of the foreign-chain sender, wei (0: no alarm).
+    pub min_sender_balance_wei: u128,
+}
+
+/// Who makes the member key's Ycash set and act signatures (remedial report 05/M-1, HK-14).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum YcashSigning {
+    /// The node wallet (`set_signunlock`, `set_signcancel`, `set_signact`, `set_heartbeat`):
+    /// the member key is imported into `wallet.dat`, in clear.
+    #[default]
+    Wallet,
+    /// Hawkeye itself, with the key it loaded from its keystore: the ZIP-243 sighash and the
+    /// `SetSigMsg` / `ActMsg` computed here, the signature placed in the transaction, the node
+    /// wallet signing only its fee inputs. `hawkeye enroll` imports nothing.
+    SelfSigned,
 }
 
 impl Params {
@@ -475,6 +533,8 @@ pub(crate) fn sample_params(drills: bool, mainnet: bool) -> Params {
         drills,
         fallback_to_threshold: true,
         ycash_start_height: None,
+        ycash_signing: YcashSigning::Wallet,
+        min_sender_balance_wei: 0,
     }
 }
 
@@ -680,7 +740,10 @@ impl Config {
             (Some(h), None) => {
                 ensure!(
                     !mainnet,
-                    "mainnet refuses keys.secret_hex: use an encrypted keystore"
+                    "mainnet refuses keys.secret_hex: use a keystore (note: the keystore \
+                     protects the file at rest only; in [keys] ycash_signing = \"wallet\" mode \
+                     the node wallet holds the same key in clear after `hawkeye enroll` — see \
+                     README 'Key custody')"
                 );
                 Some(KeySource::Hex(h.clone()))
             }
@@ -695,12 +758,94 @@ impl Config {
             (None, None) => None,
             (Some(_), Some(_)) => bail!("keys: give secret_hex or keystore, not both"),
         };
+        let ycash_signing = match self.keys.ycash_signing.as_deref() {
+            None | Some("wallet") => YcashSigning::Wallet,
+            Some("self") => YcashSigning::SelfSigned,
+            Some(other) => bail!("keys.ycash_signing {other:?}: \"wallet\" or \"self\""),
+        };
+        let eth_sender = match eth.map(|e| (&e.sender_secret_hex, &e.sender_keystore, e)) {
+            None | Some((None, None, _)) => None,
+            Some((Some(h), None, _)) => {
+                ensure!(
+                    !mainnet,
+                    "mainnet refuses eth.sender_secret_hex: use eth.sender_keystore"
+                );
+                Some(KeySource::Hex(h.clone()))
+            }
+            Some((None, Some(p), e)) => Some(KeySource::Keystore {
+                path: resolve(p),
+                password_env: e
+                    .sender_password_env
+                    .clone()
+                    .unwrap_or_else(|| "HAWKEYE_SENDER_PASSWORD".into()),
+            }),
+            Some((Some(_), Some(_), _)) => {
+                bail!("eth: give sender_secret_hex or sender_keystore, not both")
+            }
+        };
+        let min_sender_balance_wei = match eth.and_then(|e| e.min_sender_balance_wei.as_deref()) {
+            Some(w) => w
+                .parse::<u128>()
+                .map_err(|e| anyhow!("eth.min_sender_balance_wei {w:?}: {e}"))?,
+            None if mainnet => 50_000_000_000_000_000, // 0.05 ETH
+            None => 0,
+        };
+        if mainnet && foreign == BridgeKind::Ethereum {
+            ensure!(
+                eth_sender.is_some(),
+                "mainnet refuses the member key as the Ethereum sender: configure [eth] \
+                 sender_keystore (a gas-only account)"
+            );
+        }
         if mainnet {
             ensure!(!self.devnet.drills, "mainnet refuses [devnet] drills");
             ensure!(
                 !matches!(finality, Finality::Depth { .. }),
                 "mainnet refuses a depth-only Ethereum finality"
             );
+        }
+        let require_auth = self.peers.require_auth.unwrap_or(true);
+        ensure!(
+            !(mainnet && !require_auth),
+            "mainnet refuses [peers] require_auth = false: the peer channel is authenticated by \
+             member-key signatures (HK-13)"
+        );
+        let allow_from = self
+            .peers
+            .allow_from
+            .iter()
+            .map(|c| crate::peer_auth::Cidr::parse(c).map_err(|e| anyhow!("peers.allow_from: {e}")))
+            .collect::<Result<Vec<_>>>()?;
+        let mut warnings = vec![];
+        for u in &self.peers.urls {
+            if mainnet {
+                check_transport(u).map_err(|e| anyhow!("peers.urls {u:?}: {e}"))?;
+            } else if let Err(e) = check_transport(u) {
+                warnings.push(format!("peers.urls {u:?}: {e}"));
+            }
+        }
+        // remedial report 05/L-2: the RPC credentials go to loopback or over TLS
+        let insecure_rpc = match check_transport(&self.ycash.rpc_url) {
+            Ok(()) => false,
+            Err(e) if self.ycash.allow_insecure_rpc == Some(true) => {
+                warnings.push(format!(
+                    "ycash.rpc_url {:?}: {e} — allowed by [ycash] allow_insecure_rpc",
+                    self.ycash.rpc_url
+                ));
+                true
+            }
+            Err(e) => bail!(
+                "ycash.rpc_url {:?}: {e}; set [ycash] allow_insecure_rpc = true to insist",
+                self.ycash.rpc_url
+            ),
+        };
+        for (what, url) in [
+            ("eth.rpc_url", eth.map(|e| e.rpc_url.as_str())),
+            ("near.rpc_url", near.as_ref().map(|n| n.rpc_url.as_str())),
+        ] {
+            if let Some(w) = url.and_then(|u| foreign_url_warning(what, u)) {
+                warnings.push(w);
+            }
         }
         let listen: SocketAddr = self
             .api
@@ -732,11 +877,13 @@ impl Config {
             drills: self.devnet.drills,
             fallback_to_threshold: mainnet || self.bridge.fallback_to_threshold.unwrap_or(true),
             ycash_start_height: self.ycash.start_height,
+            ycash_signing,
+            min_sender_balance_wei,
         };
-        let warnings =
-            crate::floors::check_static(&params, &self.network.name).map_err(|e| anyhow!("{e}"))?;
+        warnings.extend(
+            crate::floors::check_static(&params, &self.network.name).map_err(|e| anyhow!("{e}"))?,
+        );
         Ok(Settings {
-            warnings,
             network,
             network_name: self.network.name.clone(),
             ycash_url: self.ycash.rpc_url.clone(),
@@ -749,12 +896,39 @@ impl Config {
             near,
             params,
             key,
+            eth_sender,
             store_path: resolve(&self.store.path),
             listen,
             peers: self.peers.urls.clone(),
+            peer_auth: crate::peer_auth::PeerAuthConfig {
+                require_auth,
+                allow_from,
+            },
+            insecure_rpc,
+            config_has_secrets: self.has_secrets(),
+            warnings,
             log_level: self.log.level.clone(),
             log_json,
         })
+    }
+}
+
+impl KeySource {
+    /// Load the key (`what` names it in errors).
+    pub fn load(&self, what: &str) -> Result<SecretKey> {
+        match self {
+            KeySource::Hex(h) => SecretKey::from_hex(h.expose().trim_start_matches("0x"))
+                .map_err(|e| anyhow!("{what} secret_hex: {e}")),
+            KeySource::Keystore { path, password_env } => {
+                let pw = std::env::var(password_env)
+                    .with_context(|| format!("{what} keystore password variable {password_env}"))?;
+                let signer =
+                    alloy::signers::local::PrivateKeySigner::decrypt_keystore(path, pw.as_bytes())
+                        .map_err(|e| anyhow!("{what} keystore {}: {e}", path.display()))?;
+                let bytes: [u8; 32] = signer.credential().to_bytes().into();
+                SecretKey::from_bytes(&bytes).map_err(|e| anyhow!("{what} keystore key: {e}"))
+            }
+        }
     }
 }
 
@@ -763,19 +937,120 @@ impl Settings {
     pub fn load_key(&self) -> Result<SecretKey> {
         match &self.key {
             None => bail!("[keys] has no secret_hex or keystore"),
-            Some(KeySource::Hex(h)) => SecretKey::from_hex(h.expose().trim_start_matches("0x"))
-                .map_err(|e| anyhow!("keys.secret_hex: {e}")),
-            Some(KeySource::Keystore { path, password_env }) => {
-                let pw = std::env::var(password_env)
-                    .with_context(|| format!("keystore password variable {password_env}"))?;
-                let signer =
-                    alloy::signers::local::PrivateKeySigner::decrypt_keystore(path, pw.as_bytes())
-                        .map_err(|e| anyhow!("keystore {}: {e}", path.display()))?;
-                let bytes: [u8; 32] = signer.credential().to_bytes().into();
-                SecretKey::from_bytes(&bytes).map_err(|e| anyhow!("keystore key: {e}"))
-            }
+            Some(k) => k.load("keys."),
         }
     }
+
+    /// Load the Ethereum gas account's key (`None`: the member key sends). On mainnet it must
+    /// differ from the member key (05/M-1).
+    pub fn load_eth_sender(&self, member: &SecretKey) -> Result<Option<SecretKey>> {
+        let Some(src) = &self.eth_sender else {
+            return Ok(None);
+        };
+        let k = src.load("eth.sender_")?;
+        if k.eth_address() == member.eth_address() {
+            ensure!(
+                !self.params.mainnet,
+                "mainnet refuses the member key as the Ethereum sender: configure [eth] \
+                 sender_keystore with a gas-only account"
+            );
+        }
+        Ok(Some(k))
+    }
+}
+
+impl Config {
+    /// Whether the file itself holds a secret (then it must be owner-only, 05/L-2).
+    pub fn has_secrets(&self) -> bool {
+        self.ycash.rpc_password.is_some()
+            || self.keys.secret_hex.is_some()
+            || self
+                .eth
+                .as_ref()
+                .is_some_and(|e| e.sender_secret_hex.is_some())
+    }
+}
+
+/// A foreign-chain endpoint carries no Hawkeye credential, but a provider URL often embeds an
+/// API key in its path or query: warn when it is plain http to a host that is not loopback.
+pub fn foreign_url_warning(what: &str, url: &str) -> Option<String> {
+    if check_transport(url).is_ok() {
+        return None;
+    }
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let (authority, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let secretish = authority.contains('@')
+        || tail.contains('?')
+        || tail.split(['/', '?']).any(|seg| {
+            seg.len() >= 16
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    Some(if secretish {
+        format!("{what} embeds a secret in the URL and is not https: {url:?}")
+    } else {
+        format!("{what} is plain http to a host that is not loopback: {url:?}")
+    })
+}
+
+/// The group/world mode bits of `path` if any are set (unix; `None` elsewhere or if absent).
+pub fn loose_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::metadata(path).ok()?.permissions().mode();
+        (m & 0o077 != 0).then_some(m & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+impl Settings {
+    /// The secret-bearing files must be owner-only (remedial report 05/L-2): the config file
+    /// when it holds a secret, every keystore and key file, and the ledger. Refused on mainnet
+    /// unless `insecure` (`--insecure-file-permissions`), warned (returned) elsewhere.
+    pub fn check_file_permissions(&self, config: &Path, insecure: bool) -> Result<Vec<String>> {
+        let mut files: Vec<(&str, PathBuf)> = vec![];
+        if self.config_has_secrets {
+            files.push(("the config file (it holds a secret)", config.to_path_buf()));
+        }
+        if let Some(KeySource::Keystore { path, .. }) = &self.key {
+            files.push(("the keystore", path.clone()));
+        }
+        if let Some(KeySource::Keystore { path, .. }) = &self.eth_sender {
+            files.push(("the Ethereum sender keystore", path.clone()));
+        }
+        if let Some(n) = &self.near {
+            files.push(("the NEAR relayer key file", n.relayer_key_file.clone()));
+        }
+        files.push(("the ledger", self.store_path.clone()));
+        let mut out = vec![];
+        for (what, p) in files {
+            if let Some(m) = loose_mode(&p) {
+                let msg = format!(
+                    "{what} {} is group/world readable (mode {m:o}): chmod 600 it (or pass \
+                     --insecure-file-permissions)",
+                    p.display()
+                );
+                if self.params.mainnet && !insecure {
+                    bail!("{msg}");
+                }
+                out.push(msg);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The transport rule for a URL that carries credentials or the peer channel (remedial reports
+/// 05/H-1 §4.1, 05/L-2): `https://`, or plain `http://` to a loopback host only
+/// ([`hawkeye_ycash::transport::credentials_safe`]).
+pub fn check_transport(url: &str) -> Result<()> {
+    hawkeye_ycash::transport::credentials_safe(url).map_err(|e| anyhow!("{e}"))
 }
 
 /// The directory a config path's relative paths resolve against.
@@ -938,7 +1213,11 @@ format = "text"
                     &format!("secret_hex = \"{}\"", "01".repeat(32)),
                     "keystore = \"k.json\"",
                 )
-                .replace("drills = true", "drills = false");
+                .replace("drills = true", "drills = false")
+                .replace(
+                    "finality = \"finalized\"\n",
+                    "finality = \"finalized\"\nsender_keystore = \"s.json\"\n",
+                );
             Config::parse(&text).unwrap().settings(d.path())
         };
         std::fs::write(
@@ -1050,7 +1329,14 @@ format = "text"
                     &format!("secret_hex = \"{}\"", "01".repeat(32)),
                     "keystore = \"k.json\"",
                 )
-                .replace("drills = true", "drills = false");
+                .replace("drills = true", "drills = false")
+                .replace(
+                    "finality = \"finalized\"
+",
+                    "finality = \"finalized\"
+sender_keystore = \"s.json\"
+",
+                );
             Config::parse(&mainnet_values(&text))
                 .unwrap()
                 .settings(d.path())
@@ -1273,6 +1559,242 @@ format = "text"
             Config::parse(include_str!("../../../config/ethereum-anvil.example.toml")).unwrap();
         assert_eq!(eth.foreign.kind.as_deref(), Some("ethereum"));
         assert!(eth.near.is_none() && eth.eth.is_some());
+    }
+
+    /// HK-13: `[peers] require_auth` defaults to true, false is refused on mainnet; mainnet
+    /// peers must be https or loopback; `allow_from` parses CIDRs.
+    #[test]
+    fn peer_channel_settings() {
+        let d = dir();
+        let s = Config::parse(&sample("regtest", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert!(s.peer_auth.require_auth);
+        assert!(s.peer_auth.allow_from.is_empty());
+        let s = Config::parse(&sample("regtest", "").replace(
+            "[peers]\n",
+            "[peers]\nrequire_auth = false\nallow_from = [\"10.0.0.0/8\", \"::1\"]\n",
+        ))
+        .unwrap()
+        .settings(d.path())
+        .unwrap();
+        assert!(!s.peer_auth.require_auth);
+        assert_eq!(s.peer_auth.allow_from.len(), 2);
+        let e = Config::parse(
+            &sample("regtest", "").replace("[peers]\n", "[peers]\nallow_from = [\"10.0.0/8\"]\n"),
+        )
+        .unwrap()
+        .settings(d.path())
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("allow_from"), "{e}");
+        // mainnet
+        let mainnet = |peers: &str| {
+            let text = mainnet_values(&sample("mainnet", ""))
+                .replace("mint_mode = \"threshold\"", "mint_mode = \"optimistic\"")
+                .replace("mint_threshold = 1\n", "")
+                .replace(
+                    &format!("secret_hex = \"{}\"", "01".repeat(32)),
+                    "keystore = \"k.json\"",
+                )
+                .replace("drills = true", "drills = false")
+                .replace(
+                    "urls = [\"http://127.0.0.1:7802\", \"http://127.0.0.1:7803\"]",
+                    peers,
+                )
+                .replace(
+                    "finality = \"finalized\"\n",
+                    "finality = \"finalized\"\nsender_keystore = \"s.json\"\n",
+                );
+            std::fs::write(
+                d.path().join("31337.json"),
+                DEPLOYMENT.replace(r#""threshold":1"#, r#""threshold":2"#),
+            )
+            .unwrap();
+            Config::parse(&text).unwrap().settings(d.path())
+        };
+        mainnet("urls = [\"https://a.example:7801\", \"http://127.0.0.1:7803\"]").unwrap();
+        let e = format!(
+            "{:#}",
+            mainnet("urls = [\"http://1.2.3.4:7801\"]").unwrap_err()
+        );
+        assert!(e.contains("not loopback"), "{e}");
+        let e = format!(
+            "{:#}",
+            mainnet("urls = []\nrequire_auth = false").unwrap_err()
+        );
+        assert!(e.contains("require_auth = false"), "{e}");
+    }
+
+    fn mainnet_text(extra_eth: &str) -> String {
+        mainnet_values(&sample("mainnet", ""))
+            .replace("mint_mode = \"threshold\"", "mint_mode = \"optimistic\"")
+            .replace("mint_threshold = 1\n", "")
+            .replace(
+                &format!("secret_hex = \"{}\"", "01".repeat(32)),
+                "keystore = \"k.json\"",
+            )
+            .replace("drills = true", "drills = false")
+            .replace(
+                "finality = \"finalized\"\n",
+                &format!("finality = \"finalized\"\n{extra_eth}"),
+            )
+    }
+
+    fn dir2() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("31337.json"),
+            DEPLOYMENT.replace(r#""threshold":1"#, r#""threshold":2"#),
+        )
+        .unwrap();
+        d
+    }
+
+    /// 05/M-1: mainnet needs a gas account distinct from the member key; the signing mode
+    /// parses; the sender's hex form is refused on mainnet.
+    #[test]
+    fn gas_sender_and_signing_mode() {
+        let d = dir2();
+        let e = format!(
+            "{:#}",
+            Config::parse(&mainnet_text(""))
+                .unwrap()
+                .settings(d.path())
+                .unwrap_err()
+        );
+        assert!(e.contains("member key as the Ethereum sender"), "{e}");
+        let s = Config::parse(&mainnet_text("sender_keystore = \"s.json\"\n"))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert!(matches!(s.eth_sender, Some(KeySource::Keystore { .. })));
+        assert_eq!(s.params.min_sender_balance_wei, 50_000_000_000_000_000);
+        let e = format!(
+            "{:#}",
+            Config::parse(&mainnet_text(&format!(
+                "sender_secret_hex = \"{}\"\n",
+                "02".repeat(32)
+            )))
+            .unwrap()
+            .settings(d.path())
+            .unwrap_err()
+        );
+        assert!(e.contains("sender_secret_hex"), "{e}");
+        // regtest: the member key sends by default; a hex sender is loaded and may equal it
+        let d1 = dir();
+        let s = Config::parse(&sample("regtest", ""))
+            .unwrap()
+            .settings(d1.path())
+            .unwrap();
+        assert!(s.eth_sender.is_none());
+        assert_eq!(s.params.min_sender_balance_wei, 0);
+        assert_eq!(s.params.ycash_signing, YcashSigning::Wallet);
+        let s = Config::parse(
+            &sample("regtest", "")
+                .replace(
+                    "finality = \"finalized\"\n",
+                    &format!(
+                        "finality = \"finalized\"\nsender_secret_hex = \"{}\"\n",
+                        "02".repeat(32)
+                    ),
+                )
+                .replace("[keys]\n", "[keys]\nycash_signing = \"self\"\n"),
+        )
+        .unwrap()
+        .settings(d1.path())
+        .unwrap();
+        assert_eq!(s.params.ycash_signing, YcashSigning::SelfSigned);
+        let member = s.load_key().unwrap();
+        let sender = s.load_eth_sender(&member).unwrap().unwrap();
+        assert_ne!(sender.eth_address(), member.eth_address());
+        let e = Config::parse(
+            &sample("regtest", "").replace("[keys]\n", "[keys]\nycash_signing = \"hsm\"\n"),
+        )
+        .unwrap()
+        .settings(d1.path())
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("ycash_signing"), "{e}");
+    }
+
+    /// 05/L-2: the RPC credentials go to loopback or TLS unless `allow_insecure_rpc`; a
+    /// provider URL with a key in it over plain http is warned about.
+    #[test]
+    fn rpc_transport_rule() {
+        let d = dir();
+        let with = |url: &str, extra: &str| {
+            Config::parse(&sample("regtest", "").replace(
+                "rpc_url = \"http://127.0.0.1:18232\"\n",
+                &format!("rpc_url = \"{url}\"\n{extra}"),
+            ))
+            .unwrap()
+            .settings(d.path())
+        };
+        let e = with("http://10.0.0.5:18232", "").unwrap_err().to_string();
+        assert!(
+            e.contains("not loopback") && e.contains("allow_insecure_rpc"),
+            "{e}"
+        );
+        let s = with("http://10.0.0.5:18232", "allow_insecure_rpc = true\n").unwrap();
+        assert!(s.insecure_rpc);
+        assert!(s.warnings.iter().any(|w| w.contains("allow_insecure_rpc")));
+        let s = with("https://node.example:18232", "").unwrap();
+        assert!(!s.insecure_rpc && s.warnings.is_empty());
+        assert!(with("http://[::1]:18232", "").is_ok());
+        assert!(with("http://localhost:18232", "").is_ok());
+        assert!(with("http://ycashd.internal:18232", "").is_err());
+        assert!(
+            foreign_url_warning("eth.rpc_url", "http://eth.example/v3/0123456789abcdef0123")
+                .unwrap()
+                .contains("embeds a secret")
+        );
+        assert!(
+            foreign_url_warning("eth.rpc_url", "https://eth.example/v3/0123456789abcdef").is_none()
+        );
+        assert!(foreign_url_warning("eth.rpc_url", "http://127.0.0.1:8545").is_none());
+    }
+
+    /// 05/L-2: group/world-readable secret-bearing files are refused on mainnet (unless the
+    /// override), warned elsewhere; owner-only files pass.
+    #[cfg(unix)]
+    #[test]
+    fn file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir();
+        let cfg = d.path().join("hawkeye.toml");
+        std::fs::write(&cfg, sample("regtest", "")).unwrap();
+        let chmod = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        chmod(&cfg, 0o644);
+        let s = Config::read(&cfg).unwrap().settings(d.path()).unwrap();
+        assert!(s.config_has_secrets);
+        let w = s.check_file_permissions(&cfg, false).unwrap();
+        assert!(w.iter().any(|w| w.contains("config file")), "{w:?}");
+        chmod(&cfg, 0o600);
+        assert!(s.check_file_permissions(&cfg, false).unwrap().is_empty());
+        // mainnet: refused, the override accepts
+        let d2 = dir2();
+        let mcfg = d2.path().join("hawkeye.toml");
+        let text = mainnet_text("sender_keystore = \"s.json\"\n");
+        std::fs::write(&mcfg, &text).unwrap();
+        std::fs::write(d2.path().join("k.json"), "{}").unwrap();
+        chmod(&d2.path().join("k.json"), 0o640);
+        chmod(&mcfg, 0o600);
+        let s = Config::read(&mcfg).unwrap().settings(d2.path()).unwrap();
+        let e = s
+            .check_file_permissions(&mcfg, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("keystore") && e.contains("--insecure-file-permissions"),
+            "{e}"
+        );
+        assert_eq!(s.check_file_permissions(&mcfg, true).unwrap().len(), 1);
+        chmod(&d2.path().join("k.json"), 0o600);
+        s.check_file_permissions(&mcfg, false).unwrap();
     }
 
     #[test]
