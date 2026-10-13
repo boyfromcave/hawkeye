@@ -173,6 +173,7 @@ async fn setup(mode: MintMode) -> Env {
     for k in &keys {
         st.add_member(&set, PubKey(k.public_key()), true);
     }
+    st.add_wallet_coins(10, 100_000_000);
     st.mine(1);
     let mock = MockYcashd::start_with(st).await.unwrap();
     Env {
@@ -208,6 +209,8 @@ impl Env {
             auto_slash: true,
             drills: true,
             ycash_start_height: Some(1),
+            ycash_signing: hawkeye::config::YcashSigning::Wallet,
+            min_sender_balance_wei: 0,
         }
     }
 
@@ -233,6 +236,7 @@ impl Env {
             store: Arc::new(Mutex::new(store)),
             attributor: Arc::new(MockAttributor { set: self.set.0 }),
             peers: Peers::new(vec![]).unwrap(),
+            auth: Arc::new(hawkeye::peer_auth::AuthState::default()),
             status: Arc::new(RwLock::new(Status::default())),
             network_name: "regtest".into(),
         })
