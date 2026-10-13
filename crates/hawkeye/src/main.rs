@@ -26,6 +26,10 @@ enum Cmd {
         /// As JSON.
         #[arg(long)]
         json: bool,
+        /// The effective parameters, the set's and the contract's, each against its mainnet floor
+        /// (`OK` / `BELOW FLOOR`; audit 05/M-4).
+        #[arg(long)]
+        params: bool,
     },
     /// Import the member key into the node wallet (no rescan).
     Enroll,
@@ -181,7 +185,8 @@ async fn main() -> Result<()> {
     init_logging(&s.log_level, s.log_json);
     match &args.cmd {
         Cmd::Run => daemon::run(&s).await,
-        Cmd::Status { json } => cli::status(&s, *json).await,
+        Cmd::Status { json, params: true } => cli::status_params(&s, *json).await,
+        Cmd::Status { json, .. } => cli::status(&s, *json).await,
         Cmd::Enroll => cli::enroll(&s).await,
         Cmd::Lock {
             amount,

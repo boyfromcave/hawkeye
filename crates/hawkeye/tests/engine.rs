@@ -2963,3 +2963,89 @@ async fn o5_unbounded_mint_cap_pauses_own_mints_on_mainnet() {
     let l = dev[0].ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap();
     assert_ne!(l.state, LockState::PolicyOk, "signed off mainnet");
 }
+
+// ------------------------------------------------------------------------------------------
+// audit 05/M-4: live parameter floors
+
+/// `heartbeat_blocks` (10) above `livenesswindow / 4`: refused at start-up on mainnet; on regtest
+/// the engine raises `heartbeat-too-slow` once a `SET_PARAMS` shrinks the window (the 60-tick
+/// re-check), and clears it when the window grows back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r_heartbeat_floor_live() {
+    let Some(env) = setup().await else {
+        return;
+    };
+    let set_window = |w: u32| {
+        env.mock
+            .state()
+            .sets
+            .get_mut(&env.set)
+            .unwrap()
+            .set
+            .params
+            .livenesswindow = w;
+    };
+    set_window(20);
+    let main = env
+        .engine_with(0, vec![], |p| {
+            p.mainnet = true;
+            p.drills = false;
+        })
+        .await;
+    let e = hawkeye::daemon::startup_checks(main.ctx())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("mainnet refuses bridge.heartbeat_blocks 10") && e.contains("livenesswindow 20"),
+        "{e}"
+    );
+    drop(main);
+    set_window(1000);
+    let mut e = vec![env.engine(0).await];
+    hawkeye::daemon::startup_checks(e[0].ctx()).await.unwrap();
+    tick_all(&mut e).await;
+    assert!(!e[0].alarms().iter().any(|a| a.name == "heartbeat-too-slow"));
+    set_window(20);
+    for _ in 0..60 {
+        tick_all(&mut e).await;
+    }
+    let a = e[0].alarms();
+    assert!(a.iter().any(|a| a.name == "heartbeat-too-slow"), "{a:?}");
+    set_window(1000);
+    for _ in 0..60 {
+        tick_all(&mut e).await;
+    }
+    assert!(!e[0].alarms().iter().any(|a| a.name == "heartbeat-too-slow"));
+}
+
+/// Vaults of the bridge's tag and set whose delay is not `bridge.delay`: counted at start-up
+/// (warned) and raised by the engine as `params-drift`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r2_delay_mismatch_warns() {
+    let Some(env) = setup().await else {
+        return;
+    };
+    env.lock(1_000_000_000, &env.holder.eth_address());
+    let mut e = vec![env.engine_with(0, vec![], |p| p.delay = 12).await];
+    assert_eq!(
+        hawkeye::daemon::vault_delay_mismatch(e[0].ctx())
+            .await
+            .unwrap(),
+        (1, 1)
+    );
+    hawkeye::daemon::startup_checks(e[0].ctx()).await.unwrap();
+    tick_all(&mut e).await;
+    assert!(
+        e[0].alarms().iter().any(|a| a.name == "params-drift"),
+        "{:?}",
+        e[0].alarms()
+    );
+    let same = env.engine(1).await;
+    assert_eq!(
+        hawkeye::daemon::vault_delay_mismatch(same.ctx())
+            .await
+            .unwrap(),
+        (0, 1)
+    );
+}

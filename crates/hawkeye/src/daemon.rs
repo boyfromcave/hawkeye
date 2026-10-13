@@ -89,6 +89,27 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
             set.set.params.maturity
         );
     }
+    // the live floors (audit 05/M-4): the heartbeat against livenesswindow refuses on mainnet
+    let locked = u64::try_from(set.set.lockedvalue.0).unwrap_or(0);
+    for r in crate::floors::live_rows(&ctx.params, &set.set.params, locked) {
+        if r.ok {
+            continue;
+        }
+        if r.param == "bridge.heartbeat_blocks" && ctx.params.mainnet {
+            bail!("mainnet refuses {r}: every member would go DORMANT (audit 05/M-4)");
+        }
+        warn!(event = "startup_param_below_floor", detail = %r, why = r.why);
+    }
+    let (other, total) = vault_delay_mismatch(ctx).await?;
+    if other > 0 {
+        warn!(
+            event = "vault_delay_mismatch",
+            other,
+            total,
+            delay = ctx.params.delay,
+            "vaults of this tag and set carry another delay: the lock policy rejects every one of them"
+        );
+    }
     if !set
         .memberlist
         .iter()
@@ -135,8 +156,32 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// How many of the bridge's live vaults (its tag, its set) carry a `delay` other than the
+/// configured one, of how many (audit 05/M-4: such a lock is rejected by the policy).
+pub async fn vault_delay_mismatch(ctx: &Ctx) -> Result<(usize, usize)> {
+    let rows = ctx
+        .ycash
+        .vault_list(Some(&hawkeye_ycash::types::VaultListFilter {
+            tag: Some(ctx.params.tag_text()),
+            setid: Some(ctx.set_hash()),
+            kind: Some(hawkeye_ycash::types::TemplateKind::Vault),
+            ..Default::default()
+        }))
+        .await
+        .context("vault_list")?;
+    let vaults: Vec<_> = rows.iter().filter_map(|r| r.as_vault()).collect();
+    let other = vaults
+        .iter()
+        .filter(|v| v.fields.delay != u32::from(ctx.params.delay))
+        .count();
+    Ok((other, vaults.len()))
+}
+
 /// Run the daemon until SIGINT/SIGTERM.
 pub async fn run(s: &Settings) -> Result<()> {
+    for w in &s.warnings {
+        warn!(event = "config_below_floor", detail = %w);
+    }
     let key = s.load_key()?;
     let ctx = connect(s, key, Arc::new(CoreAttributor)).await?;
     startup_checks(&ctx).await?;

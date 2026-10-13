@@ -575,6 +575,7 @@ impl Engine {
                 .map_err(|e| anyhow!("mint available: {e}"))?;
             self.mint_cap_changed(avail == u128::MAX);
         }
+        self.check_live_floors().await?;
         let mismatch = guardian_mismatch(&self.ctx, &self.mem.members).await?;
         match mismatch {
             None => {
@@ -585,6 +586,41 @@ impl Engine {
                 self.mem.guardian_drift = true;
                 self.alarm("guardian-drift", d);
             }
+        }
+        Ok(())
+    }
+
+    /// The live parameter floors (audit 05/M-4), with the guardian check (start, every 60
+    /// ticks): `heartbeat_blocks` against the set's current `livenesswindow` (a `SET_PARAMS` can
+    /// shrink it) → `heartbeat-too-slow`, logged as an error on mainnet but never a pause (the
+    /// heartbeats are the fix); vaults of the bridge's tag and set with another `delay` →
+    /// `params-drift`.
+    async fn check_live_floors(&mut self) -> Result<()> {
+        if let Some(set) = &self.mem.set {
+            match crate::floors::heartbeat_breach(&self.ctx.params, &set.set.params) {
+                Some(r) => {
+                    if self.ctx.params.mainnet {
+                        tracing::error!(event = "heartbeat_too_slow", detail = %r);
+                    }
+                    self.alarm(
+                        "heartbeat-too-slow",
+                        format!("{r}: members would go DORMANT"),
+                    );
+                }
+                None => self.clear_alarm("heartbeat-too-slow"),
+            }
+        }
+        let (other, total) = crate::daemon::vault_delay_mismatch(&self.ctx).await?;
+        if other > 0 {
+            self.alarm(
+                "params-drift",
+                format!(
+                    "{other} of {total} vaults carry a delay other than bridge.delay {}",
+                    self.ctx.params.delay
+                ),
+            );
+        } else {
+            self.clear_alarm("params-drift");
         }
         Ok(())
     }
