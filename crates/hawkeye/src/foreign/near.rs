@@ -318,6 +318,8 @@ impl ForeignChain for NearChain {
             Ok(BridgeInfo {
                 threshold: c.threshold,
                 challenge_window: c.challenge_window_sec,
+                mint_cap: c.mint_cap,
+                cap_window: u128::from(c.cap_window_sec),
             })
         })
     }

@@ -12,6 +12,29 @@ pub const MAINNET: u64 = 1;
 /// The smallest contract threshold mainnet accepts, in every mode (plan §3.3).
 pub const MAINNET_MIN_THRESHOLD: u8 = 2;
 
+/// Two epochs of 32 slots of 12 s: the nominal time to finality on Ethereum mainnet.
+pub const ETH_FINALITY_NOMINAL_SECS: u64 = 2 * 32 * 12; // 768
+
+/// The smallest `challengeWindow` mainnet accepts (audit 05/H-2; wyec's
+/// `MIN_MAINNET_CHALLENGE_WINDOW`, the same two hours). The watcher's usable share is ¾ of the
+/// window (`challenge_due` keeps a quarter as margin), and that share must cover two finality
+/// periods (a one-epoch stall still leaves a challenge in time even for an attestor on the old,
+/// finalized-only scan), `C_Y` = 20 Ycash blocks for the lock-absent rule (20 × 75 s) and a
+/// submission margin (600 s): ¾ W ≥ 1,536 + 1,500 + 600 ⇒ W ≥ 4,848 s, rounded up to two hours.
+/// A floor below which Hawkeye refuses to start, not a recommendation: the P8 value may be far
+/// larger.
+pub const MAINNET_MIN_CHALLENGE_WINDOW_SECS: u64 = 2 * 60 * 60; // 7_200
+
+// The derivation holds: three quarters of the floor cover two finality periods, 20 Ycash blocks
+// of 75 s and the 600 s submission margin.
+const _: () = assert!(
+    MAINNET_MIN_CHALLENGE_WINDOW_SECS * 3 / 4 >= 2 * ETH_FINALITY_NOMINAL_SECS + 20 * 75 + 600
+);
+
+/// `finalized` not advancing for this long while new blocks keep coming is a finality stall:
+/// three epochs (it normally moves every 6.4 min).
+pub const ETH_FINALITY_STALL_SECS: u64 = 3 * 32 * 12; // 1_152
+
 /// The mint path Hawkeye uses. One `WyecBridge` serves both; the mode is how Hawkeye drives it.
 ///
 /// - `Optimistic` (the Foundation's model): the mint leader calls `proposeMint` with its own
@@ -61,6 +84,24 @@ pub fn check_contract_threshold(chain_id: u64, threshold: u8) -> Result<()> {
     Ok(())
 }
 
+/// Audit 05/H-2, the mainnet window floor: the contract's `challengeWindow` must be at least
+/// [`MAINNET_MIN_CHALLENGE_WINDOW_SECS`] on chain [`MAINNET`]; other chains accept any window.
+pub fn check_challenge_window(chain_id: u64, window: u64) -> Result<()> {
+    if chain_id == MAINNET && window < MAINNET_MIN_CHALLENGE_WINDOW_SECS {
+        return Err(Error::ChallengeWindowTooShort(window));
+    }
+    Ok(())
+}
+
+/// Audit 05/H-2, the mainnet rate-limit rule: `mintCap` must be non-zero on chain [`MAINNET`]
+/// (0 is the contract's "no limit"); other chains accept 0.
+pub fn check_mint_cap(chain_id: u64, mint_cap: u128) -> Result<()> {
+    if chain_id == MAINNET && mint_cap == 0 {
+        return Err(Error::MintCapUnbounded);
+    }
+    Ok(())
+}
+
 impl fmt::Display for MintMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -95,6 +136,27 @@ mod tests {
         assert!(check_contract_threshold(MAINNET, 2).is_ok());
         assert!(check_contract_threshold(31_337, 1).is_ok());
         assert!(check_contract_threshold(31_337, 0).is_err());
+    }
+
+    #[test]
+    fn mainnet_window_and_cap_floors() {
+        assert_eq!(MAINNET_MIN_CHALLENGE_WINDOW_SECS, 7_200);
+        assert_eq!(ETH_FINALITY_NOMINAL_SECS, 768);
+        assert_eq!(ETH_FINALITY_STALL_SECS, 1_152);
+        assert!(matches!(
+            check_challenge_window(MAINNET, 7_199),
+            Err(Error::ChallengeWindowTooShort(7_199))
+        ));
+        assert!(check_challenge_window(MAINNET, 7_200).is_ok());
+        assert!(check_challenge_window(31_337, 60).is_ok());
+        assert!(check_challenge_window(11_155_111, 1).is_ok());
+        assert!(matches!(
+            check_mint_cap(MAINNET, 0),
+            Err(Error::MintCapUnbounded)
+        ));
+        assert!(check_mint_cap(MAINNET, 1).is_ok());
+        assert!(check_mint_cap(31_337, 0).is_ok());
+        assert!(check_mint_cap(11_155_111, 0).is_ok());
     }
 
     #[test]

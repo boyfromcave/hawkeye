@@ -5,28 +5,18 @@ import {Vm} from "forge-std/Vm.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {WrappedYcash} from "wyec/WrappedYcash.sol";
 import {WyecBridge} from "wyec/WyecBridge.sol";
-import {BridgeTestBase} from "./utils/BridgeTestBase.sol";
-import {WyecEip712} from "./utils/WyecEip712.sol";
+import {BridgeTestBase} from "wyec-test/utils/BridgeTestBase.sol";
+import {WyecEip712} from "wyec-test/utils/WyecEip712.sol";
 
 /// Hawkeye's assumptions about wyec's optimistic mint (wyec-contract-design.md §4.5; plan §3.3,
 /// §5.3), the path its `mint_mode = optimistic` drives: the leader proposes with its own Mint
 /// signature, watchers challenge with a Challenge signature, anyone executes after the window. Each
 /// test names one assumption the engine (crates/hawkeye/src/engine/mint.rs) or the adapter
-/// (crates/hawkeye-eth) relies on.
-contract OptimisticMintTest is BridgeTestBase {
+/// (crates/hawkeye-eth) relies on. wyec's own suites run beside these at the pin
+/// (test/Upstream.t.sol); the fixture and the encoding are wyec's test/utils, not a copy.
+contract HawkeyeOptimisticMintTest is BridgeTestBase {
     bytes32 constant LOCK = keccak256("opt-lock");
     uint256 constant AMOUNT = 7e8;
-
-    event MintProposed(
-        bytes32 indexed lockId,
-        uint256 indexed proposalId,
-        address indexed proposer,
-        address to,
-        uint256 amount,
-        uint64 eta
-    );
-    event MintChallenged(bytes32 indexed lockId, uint256 indexed proposalId, address indexed challenger);
-    event Minted(bytes32 indexed lockId, address indexed to, uint256 amount);
 
     function g(uint256 i) internal view returns (uint256) {
         return guardianKeys[i];
@@ -106,7 +96,7 @@ contract OptimisticMintTest is BridgeTestBase {
         bridge.proposeMint(LOCK, 0, alice, sig);
         // a signature over other fields recovers to someone else
         sig = sign(g(0), mintDigest(address(bridge), LOCK, AMOUNT, alice));
-        vm.expectRevert();
+        expectNotGuardian(mintDigest(address(bridge), LOCK, AMOUNT + 1, alice), sig);
         bridge.proposeMint(LOCK, AMOUNT + 1, alice, sig);
         mintTo(alice, AMOUNT, LOCK);
         vm.expectRevert(abi.encodeWithSelector(WyecBridge.LockConsumed.selector, LOCK));
@@ -162,7 +152,7 @@ contract OptimisticMintTest is BridgeTestBase {
         bridge.challengeMint(none, 1, sig);
         // a signature for another proposal id recovers to someone else
         sig = sign(g(1), challengeDigest(address(bridge), LOCK, id + 1));
-        vm.expectRevert();
+        expectNotGuardian(challengeDigest(address(bridge), LOCK, id), sig);
         bridge.challengeMint(LOCK, id, sig);
         assertEq(uint8(status(LOCK)), uint8(WyecBridge.ProposalStatus.Pending));
     }

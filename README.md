@@ -155,9 +155,12 @@ node change.
 ## Build and try it
 
 ```bash
-cargo build --locked && cargo test --locked
+cargo build --locked && make test      # make test = cargo test, failing (not skipping) without anvil
 cd eth && ./tools/fetch-wyec.sh && forge test
 ```
+
+The Ethereum-backed Rust suites need `anvil` on PATH; without it they print `SKIPPED` and pass
+vacuously, which `make test` (and CI, `HAWKEYE_REQUIRE_ANVIL=1`) turns into a failure.
 
 The Ethereum contracts come from [wyec](https://github.com/boyfromcave/wyec) at a pinned commit
 (`eth/tools/fetch-wyec.sh`). To see the whole bridge work on one machine, real regtest nodes, anvil

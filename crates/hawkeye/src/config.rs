@@ -385,12 +385,14 @@ pub struct Settings {
     /// The config file carries a secret (`rpc_password`, `secret_hex`, `sender_secret_hex`):
     /// it must not be group/world readable ([`Settings::check_file_permissions`]).
     pub config_has_secrets: bool,
-    /// Warnings found while checking (logged once logging is up).
-    pub warnings: Vec<String>,
     /// Log level.
     pub log_level: String,
     /// Log as JSON.
     pub log_json: bool,
+    /// Warnings found while checking, logged at start-up: testnet parameters below the
+    /// (quartered) mainnet floors ([`crate::floors`]; mainnet refuses them instead, regtest is
+    /// unconstrained), and transport warnings (05/L-2, HK-13).
+    pub warnings: Vec<String>,
 }
 
 /// The engine's parameters (everything the tick reads from configuration).
@@ -878,6 +880,9 @@ impl Config {
             ycash_signing,
             min_sender_balance_wei,
         };
+        warnings.extend(
+            crate::floors::check_static(&params, &self.network.name).map_err(|e| anyhow!("{e}"))?,
+        );
         Ok(Settings {
             network,
             network_name: self.network.name.clone(),
@@ -1187,6 +1192,109 @@ format = "text"
         assert!(!s.params.fallback_to_threshold);
     }
 
+    /// `sample`'s devnet `[bridge]` values replaced by values at the mainnet floors.
+    fn mainnet_values(text: &str) -> String {
+        text.replace("delay = 6\n", "delay = 288\n")
+            .replace("confirmations = 2\n", "confirmations = 20\n")
+            .replace("min_owner_age = 400\n", "min_owner_age = 105120\n")
+            .replace("roll_margin = 50\n", "roll_margin = 348\n")
+            .replace("takeover_blocks = 4\n", "takeover_blocks = 20\n")
+    }
+
+    /// Audit 05/M-4: the devnet values are refused on mainnet with the named floor, warned on
+    /// testnet, accepted on regtest; the floor values pass.
+    #[test]
+    fn mainnet_parameter_floors() {
+        let d = dir();
+        let main = |text: String| {
+            let text = text
+                .replace("mint_threshold = 1\n", "mint_threshold = 2\n")
+                .replace(
+                    &format!("secret_hex = \"{}\"", "01".repeat(32)),
+                    "keystore = \"k.json\"",
+                )
+                .replace("drills = true", "drills = false")
+                .replace(
+                    "finality = \"finalized\"\n",
+                    "finality = \"finalized\"\nsender_keystore = \"s.json\"\n",
+                );
+            Config::parse(&text).unwrap().settings(d.path())
+        };
+        std::fs::write(
+            d.path().join("31337.json"),
+            DEPLOYMENT.replace(r#""threshold":1"#, r#""threshold":2"#),
+        )
+        .unwrap();
+        let e = format!("{:#}", main(sample("mainnet", "")).unwrap_err());
+        assert!(
+            e.contains(
+                "mainnet refuses bridge.confirmations 2: needs >= 20 (MAINNET_MIN_CONFIRMATIONS"
+            ),
+            "{e}"
+        );
+        assert!(
+            e.contains("mainnet refuses bridge.min_owner_age 400"),
+            "{e}"
+        );
+        assert!(e.contains("mainnet refuses bridge.delay 6"), "{e}");
+        let s = main(mainnet_values(&sample("mainnet", ""))).unwrap();
+        assert!(s.warnings.is_empty());
+        // one below its floor
+        let e = format!(
+            "{:#}",
+            main(
+                mainnet_values(&sample("mainnet", ""))
+                    .replace("confirmations = 20\n", "confirmations = 19\n")
+            )
+            .unwrap_err()
+        );
+        assert!(e.contains("mainnet refuses bridge.confirmations 19"), "{e}");
+        // testnet warns, regtest is silent
+        let s = Config::parse(&sample("testnet", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert!(
+            s.warnings
+                .iter()
+                .any(|w| w.contains("bridge.confirmations 2")),
+            "{:?}",
+            s.warnings
+        );
+        let s = Config::parse(&sample("regtest", ""))
+            .unwrap()
+            .settings(d.path())
+            .unwrap();
+        assert!(s.warnings.is_empty());
+    }
+
+    /// The mainnet example config passes the mainnet checks (its deployment file aside).
+    #[test]
+    fn mainnet_example_config_passes() {
+        let d = dir();
+        std::fs::write(
+            d.path().join("1.json"),
+            DEPLOYMENT
+                .replace(r#""chainId":31337"#, r#""chainId":1"#)
+                .replace(r#""threshold":1"#, r#""threshold":4"#),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/ethereum-mainnet.example.toml"
+        ))
+        .unwrap()
+        .replace("../eth/deployments/1.json", "1.json");
+        let s = Config::parse(&text).unwrap().settings(d.path()).unwrap();
+        assert!(s.params.mainnet);
+        assert!(s.warnings.is_empty());
+        assert!(
+            crate::floors::static_rows(&s.params, 1)
+                .iter()
+                .all(|r| r.ok)
+        );
+    }
+
     #[test]
     fn mainnet_refuses_dev_options() {
         let d = dir();
@@ -1223,10 +1331,15 @@ format = "text"
                 )
                 .replace("drills = true", "drills = false")
                 .replace(
-                    "finality = \"finalized\"\n",
-                    "finality = \"finalized\"\nsender_keystore = \"s.json\"\n",
+                    "finality = \"finalized\"
+",
+                    "finality = \"finalized\"
+sender_keystore = \"s.json\"
+",
                 );
-            Config::parse(&text).unwrap().settings(d.path())
+            Config::parse(&mainnet_values(&text))
+                .unwrap()
+                .settings(d.path())
         };
         dep(2);
         let s = mainnet("optimistic", None).unwrap();
@@ -1478,7 +1591,7 @@ format = "text"
         assert!(e.contains("allow_from"), "{e}");
         // mainnet
         let mainnet = |peers: &str| {
-            let text = sample("mainnet", "")
+            let text = mainnet_values(&sample("mainnet", ""))
                 .replace("mint_mode = \"threshold\"", "mint_mode = \"optimistic\"")
                 .replace("mint_threshold = 1\n", "")
                 .replace(
@@ -1515,7 +1628,7 @@ format = "text"
     }
 
     fn mainnet_text(extra_eth: &str) -> String {
-        sample("mainnet", "")
+        mainnet_values(&sample("mainnet", ""))
             .replace("mint_mode = \"threshold\"", "mint_mode = \"optimistic\"")
             .replace("mint_threshold = 1\n", "")
             .replace(

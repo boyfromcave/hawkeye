@@ -8,7 +8,7 @@ import {WyecBridge} from "wyec/WyecBridge.sol";
 import {Deploy} from "../script/Deploy.s.sol";
 
 /// script/Deploy.s.sol in-process: predicted-address deployment and the deployment file.
-contract DeployScriptTest is Test {
+contract HawkeyeDeployScriptTest is Test {
     using stdJson for string;
 
     // Configs are passed in, not through the environment: forge runs tests in parallel and
@@ -23,7 +23,9 @@ contract DeployScriptTest is Test {
         c.mintCap = 1000e8;
         c.capWindow = 1 days;
         c.mintMode = "optimistic";
-        c.file = string.concat(vm.projectRoot(), "/deployments/.test-", name, ".json");
+        // `.test-hawkeye-`: wyec's own Deploy.t.sol (run through Upstream.t.sol, in parallel) writes
+        // `.test-<name>.json` into the same directory.
+        c.file = string.concat(vm.projectRoot(), "/deployments/.test-hawkeye-", name, ".json");
     }
 
     function test_Deploy_PairAndFile() public {
@@ -86,6 +88,32 @@ contract DeployScriptTest is Test {
         string memory file = c.file;
         Deploy.Result memory r = new Deploy().deploy(c);
         assertEq(WyecBridge(r.bridge).threshold(), 1);
+        vm.removeFile(file);
+    }
+
+    /// wyec's mainnet constructor floors (audit 05/H-2), refused by the script before
+    /// broadcasting; a config meeting them deploys on chain id 1.
+    function test_Deploy_MainnetWindowAndCapFloors() public {
+        Deploy d = new Deploy();
+        vm.chainId(1);
+        Deploy.Config memory c = config("mainnet-floors");
+        c.challengeWindow = 2 hours - 1;
+        vm.expectRevert(bytes("CHALLENGE_WINDOW must be >= 2 hours on mainnet"));
+        d.deploy(c);
+
+        c = config("mainnet-floors");
+        c.challengeWindow = 2 hours;
+        c.mintCap = 0;
+        c.capWindow = 0;
+        vm.expectRevert(bytes("MINT_CAP is required on mainnet"));
+        d.deploy(c);
+
+        c = config("mainnet-floors");
+        c.challengeWindow = 2 hours;
+        string memory file = c.file;
+        Deploy.Result memory r = d.deploy(c);
+        assertEq(WyecBridge(r.bridge).challengeWindow(), 2 hours);
+        assertEq(WyecBridge(r.bridge).MIN_MAINNET_CHALLENGE_WINDOW(), 2 hours);
         vm.removeFile(file);
     }
 

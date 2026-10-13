@@ -1,0 +1,63 @@
+# Hawkeye over the Ethereum mainnet bridge (WyecBridge + WrappedYcash, tag WYEC): one attestor of
+# the mainnet Ycash set. Every [bridge] value below is the plan §2 / §3.1 / §4.1 mainnet proposal
+# and is calibrated by yb-calibration for the release (P8); none may be below Hawkeye's mainnet
+# floors (crates/hawkeye/src/floors.rs, audit 05/M-4), which refuse to start otherwise.
+# `hawkeye status --params` prints each value against its floor, the set's live parameters and the
+# contract's.
+#
+# Relative paths resolve against this file's directory.
+
+[network]
+name = "mainnet"
+
+[ycash]
+rpc_url = "http://127.0.0.1:8232"
+rpc_user = "hawkeye"
+rpc_password = "change-me"
+
+[foreign]
+kind = "ethereum"
+
+[eth]
+rpc_url = "http://127.0.0.1:8545"              # your own execution + consensus client
+deployment = "../eth/deployments/1.json"        # the committed mainnet deployment
+finality = "finalized"                          # mainnet refuses a depth-only finality
+sender_keystore = "gas-key.json"                # a gas-only account: mainnet refuses the member key as sender (05/M-1)
+sender_password_env = "HAWKEYE_SENDER_PASSWORD"
+
+[bridge]
+set_id = "1111111111111111111111111111111111111111111111111111111111111111"   # the mainnet set
+delay = 1152             # 24 h vault challenge window          floor 288, >= 4 x confirmations   (calibrated by yb-calibration, P8)
+confirmations = 40       # C_Y, ~50 min                          floor 20                          (calibrated by yb-calibration, P8)
+min_owner_age = 841000   # MIN_OWNER_AGE, ~2 years               floor 105,120                     (calibrated by yb-calibration, P8)
+roll_margin = 2880       # ROLL_MARGIN, ~2.5 days                >= delay + takeover + 2 x C_Y     (calibrated by yb-calibration, P8)
+takeover_blocks = 48     # TAKEOVER                              >= C_Y, <= delay / 4               (calibrated by yb-calibration, P8)
+heartbeat_blocks = 288   # 6 h                                   <= the set's livenesswindow / 4   (calibrated by yb-calibration, P8)
+min_lock = "1"           # YEC                                   > 0                               (calibrated by yb-calibration, P8)
+max_lock = "10000"       # YEC; keep it within one rate-limit window's cap                          (calibrated by yb-calibration, P8)
+mint_mode = "optimistic"
+
+[keys]
+keystore = "member-key.json"                    # mainnet refuses secret_hex
+password_env = "HAWKEYE_KEYSTORE_PASSWORD"
+ycash_signing = "self"                          # the member key never enters wallet.dat (05/M-1, HK-14; README "Key custody")
+
+[store]
+path = "hawkeye.db"
+
+[api]
+listen = "127.0.0.1:7801"
+
+[policy]
+auto_slash = false
+
+[peers]
+urls = []                                       # https:// (or loopback) only on mainnet (HK-13)
+require_auth = true                             # member-key signed peer requests; mainnet refuses false
+
+[devnet]
+drills = false                                  # mainnet refuses drills
+
+[log]
+level = "info"
+format = "json"

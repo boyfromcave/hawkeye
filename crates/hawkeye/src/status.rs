@@ -97,6 +97,11 @@ pub struct Status {
     pub ticks: u64,
     /// Errors of the last tick.
     pub last_errors: Vec<String>,
+    /// The foreign chain's finalized height has not moved for the stall threshold while its head
+    /// advanced (alarm `eth-finality-stall`, audit 05/H-2).
+    pub finality_stalled: bool,
+    /// Seconds since the finalized height last moved (0 before the first observation).
+    pub eth_finalized_age_secs: u64,
 }
 
 fn esc(s: &str) -> String {
@@ -222,6 +227,16 @@ pub fn render_metrics(s: &Status) -> String {
         .collect();
     gauge("hawkeye_alarm", "Raised alarms", &alarms);
     gauge(
+        "hawkeye_eth_finalized_age_seconds",
+        "Seconds since the foreign chain's finalized block last moved",
+        &[(String::new(), s.eth_finalized_age_secs as f64)],
+    );
+    gauge(
+        "hawkeye_eth_finality_stalled",
+        "1 while finality is stalled (the head advances, finalized does not)",
+        &[(String::new(), f64::from(u8::from(s.finality_stalled)))],
+    );
+    gauge(
         "hawkeye_ticks_total",
         "Engine ticks run",
         &[(String::new(), s.ticks as f64)],
@@ -248,6 +263,8 @@ mod tests {
         assert!(m.contains("hawkeye_burn_over_cap 1"));
         assert!(m.contains("hawkeye_alarm{name=\"supply\"} 1"));
         assert!(m.contains("# TYPE hawkeye_supply_ok gauge"));
+        assert!(m.contains("hawkeye_eth_finalized_age_seconds 0"));
+        assert!(m.contains("hawkeye_eth_finality_stalled 0"));
         assert!(!m.contains("hawkeye_fee_coins"));
         s.fee_coins = Some(3);
         assert!(render_metrics(&s).contains("hawkeye_fee_coins 3"));

@@ -49,6 +49,18 @@ pub enum Error {
         "the bridge's threshold is {0}: mainnet needs >= 2 in every mint mode (one key would skip the challenge window)"
     )]
     ThresholdTooLow(u8),
+    /// The contract's `challengeWindow` is below the mainnet floor
+    /// ([`MAINNET_MIN_CHALLENGE_WINDOW_SECS`](crate::mode::MAINNET_MIN_CHALLENGE_WINDOW_SECS),
+    /// audit 05/H-2): a watcher could not challenge a proposal before it executes.
+    #[error(
+        "the bridge's challengeWindow is {0} s: mainnet needs >= {min} s (a watcher must see and challenge a proposal inside the window, Ethereum finality included)",
+        min = crate::mode::MAINNET_MIN_CHALLENGE_WINDOW_SECS
+    )]
+    ChallengeWindowTooShort(u64),
+    /// The contract's `mintCap` is 0 (no rate limit) on mainnet (audit 05/H-2): a proposal that
+    /// slips through would mint without bound.
+    #[error("the bridge's mintCap is 0 (no rate limit): mainnet needs a bounded mint rate")]
+    MintCapUnbounded,
     /// The node has no `finalized` block and no fallback depth is configured.
     #[error("the node reports no finalized block and no fallback confirmation depth is configured")]
     NoFinalized,

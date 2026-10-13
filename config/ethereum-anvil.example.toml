@@ -24,6 +24,10 @@ deployment = "../eth/deployments/31337.json"   # as eth/script/Deploy.s.sol writ
 finality = "finalized"
 
 [bridge]
+# Mainnet floors (crates/hawkeye/src/floors.rs, audit 05/M-4; see ethereum-mainnet.example.toml):
+# these devnet values are refused on mainnet (confirmations >= 20, delay >= 288, min_owner_age
+# >= 105,120, takeover/roll_margin relations, heartbeat_blocks <= livenesswindow / 4) and warned on
+# testnet.
 set_id = "1111111111111111111111111111111111111111111111111111111111111111"
 delay = 6
 confirmations = 2

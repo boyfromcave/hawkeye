@@ -289,6 +289,10 @@ pub struct BridgeInfo {
     pub threshold: u8,
     /// The optimistic path's challenge window, seconds.
     pub challenge_window: u64,
+    /// The mint rate limit, base units per window (0: no limit; saturated at `u128::MAX`).
+    pub mint_cap: u128,
+    /// The rate limit's window, seconds (saturated at `u128::MAX`).
+    pub cap_window: u128,
 }
 
 /// The attestation scheme of a bridge contract: what a guardian signs, how, and who signed.
@@ -345,14 +349,41 @@ pub trait ForeignChain: AttestationScheme + Send + Sync {
 
     // ------------------------------------------------------------- start-up
 
-    /// Read the live bridge's threshold and challenge window and hold them to the plan §3.3
-    /// rules (`mainnet`: threshold ≥ 2 in every mode).
+    /// Read the live bridge's threshold, challenge window and rate limit and hold them to the
+    /// mainnet rules (`mainnet`: threshold ≥ 2 in every mode, plan §3.3; on Ethereum also
+    /// `challengeWindow` ≥ two hours and a non-zero `mintCap`, audit 05/H-2).
     fn check_bridge(&self, mainnet: bool) -> BoxFut<'_, BridgeInfo>;
 
     // ------------------------------------------------------------- cursor and scanning
 
     /// The highest height treated as final.
     fn finalized_height(&self) -> BoxFut<'_, u64>;
+
+    /// The chain's head, final or not (Ethereum: `latest`). The optimistic path's events are
+    /// read up to here, ahead of finality (audit 05/H-2). Default:
+    /// [`finalized_height`](Self::finalized_height), for a chain whose final head is its head for this purpose
+    /// (NEAR: Doomslug finality, about two blocks).
+    fn latest_height(&self) -> BoxFut<'_, u64> {
+        self.finalized_height()
+    }
+
+    /// `MintProposed` and `MintChallenged` only, in `[from, to]`, which need not be final (audit
+    /// 05/H-2): a challenge binds `(lockId, proposalId)`, so it is harmless if its proposal's
+    /// block reorgs out, and the contract runs the window at its head, not at finality. The
+    /// batch's `to_hash` is not meaningful (no cursor is kept for this range). Default: the
+    /// full [`scan`](Self::scan), filtered.
+    fn scan_proposals(&self, from: u64, to: u64) -> BoxFut<'_, ScanBatch> {
+        Box::pin(async move {
+            let mut b = self.scan(from, to).await?;
+            b.events.retain(|e| {
+                matches!(
+                    e.event,
+                    ForeignEvent::MintProposed { .. } | ForeignEvent::MintChallenged { .. }
+                )
+            });
+            Ok(b)
+        })
+    }
 
     /// The bridge's events in `[from, to]` (both final), in chain order.
     fn scan(&self, from: u64, to: u64) -> BoxFut<'_, ScanBatch>;

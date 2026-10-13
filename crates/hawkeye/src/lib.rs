@@ -23,6 +23,7 @@ pub mod config;
 pub mod convert;
 pub mod daemon;
 pub mod engine;
+pub mod floors;
 pub mod foreign;
 pub mod keys;
 pub mod peer_auth;

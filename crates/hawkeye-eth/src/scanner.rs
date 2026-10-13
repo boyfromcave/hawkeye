@@ -119,6 +119,14 @@ pub fn topics() -> Vec<B256> {
     ]
 }
 
+/// The topic-0 values of the optimistic path's events (also read at `latest`, audit 05/H-2).
+pub fn proposal_topics() -> Vec<B256> {
+    vec![
+        WyecBridge::MintProposed::SIGNATURE_HASH,
+        WyecBridge::MintChallenged::SIGNATURE_HASH,
+    ]
+}
+
 /// Decodes one bridge log. `Ok(None)` for a topic the scanner does not know.
 pub fn decode_log(log: &Log) -> Result<Option<ScannedEvent>> {
     let Some(t0) = log.topic0().copied() else {
@@ -263,6 +271,23 @@ impl EthClient {
     /// cap `eth_getLogs` by range or result count). The caller chooses `to` (normally
     /// [`finalized_block_number`](Self::finalized_block_number)).
     pub async fn scan(&self, from: u64, to: u64) -> Result<Vec<ScannedEvent>> {
+        self.scan_topics(from, to, topics()).await
+    }
+
+    /// `MintProposed` and `MintChallenged` only, in `[from, to]`: the optimistic path's events,
+    /// which the engine also reads at `latest`, ahead of finality (audit 05/H-2). A challenge
+    /// binds `(lockId, proposalId)`, so acting on an unfinalized proposal is safe; waiting for
+    /// finality is not (the contract runs the window at `latest`).
+    pub async fn scan_proposals(&self, from: u64, to: u64) -> Result<Vec<ScannedEvent>> {
+        self.scan_topics(from, to, proposal_topics()).await
+    }
+
+    async fn scan_topics(
+        &self,
+        from: u64,
+        to: u64,
+        topics: Vec<B256>,
+    ) -> Result<Vec<ScannedEvent>> {
         let mut out = Vec::new();
         let mut start = from;
         let mut span = self.log_chunk.max(1);
@@ -270,7 +295,7 @@ impl EthClient {
             let end = start.saturating_add(span - 1).min(to);
             let filter = Filter::new()
                 .address(self.bridge)
-                .event_signature(topics())
+                .event_signature(topics.clone())
                 .from_block(start)
                 .to_block(end);
             match self.provider.get_logs(&filter).await {

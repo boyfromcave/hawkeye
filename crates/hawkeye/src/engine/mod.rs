@@ -11,7 +11,11 @@
 //!    (through the [`ForeignChain`] adapter, NEAR plan §4 item 2); every
 //!    `Minted` and every optimistic proposal must match a policy-OK lock (watcher, §5.3 step 2):
 //!    a proposal that does not is challenged within the contract's window (sign-once), in every
-//!    mint mode;
+//!    mint mode. Proposals and challenges are also read at the chain's head, ahead of finality
+//!    (audit 05/H-2): the contract runs the window at `latest`, so a finalized-only watcher would
+//!    see a proposal two epochs late and not at all while finality stalls. A finality stall
+//!    raises `eth-finality-stall` and, on mainnet, pauses this attestor's own mint-side acts
+//!    (never its challenges);
 //! 4. **watch** ([`watch`]) — every intent of the set (blocks, `vault_list`, mempool) classified
 //!    (§3.2); unmatched ones cancelled once (sign-once) and their signer put in a slash case;
 //!    equivocations submitted;
@@ -32,6 +36,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use hawkeye_core::bytes::{Hash32, txid_to_display};
@@ -185,6 +190,25 @@ pub(crate) struct Memory {
     /// Once-only warnings about a lock's proposals (a mismatching one holding it, no eligible
     /// proposer, the rate limit).
     pub squat_logged: mint::ProposalKeys,
+    /// The foreign chain's head at the last proposal scan (audit 05/H-2).
+    pub eth_latest: u64,
+    /// The last block the head-of-chain proposal scan covered (it re-reads
+    /// [`mint::PROPOSAL_RESCAN_DEPTH`] blocks below it each tick).
+    pub latest_scanned: u64,
+    /// Proposals already handled by the head-of-chain scan: `(lockId, tx) → block`, pruned once
+    /// the block is final.
+    pub provisional_seen: HashMap<(Hash32, Hash32), u64>,
+    /// Unfinalized fraudulent proposals already challenged: `(lockId, tx)`.
+    pub provisional_challenged: HashSet<(Hash32, Hash32)>,
+    /// The finality watch: the finalized height, since when it has not moved, and the head then.
+    pub finality_watch: Option<FinalityWatch>,
+    /// `finalized` has not moved for [`ETH_FINALITY_STALL_SECS`](hawkeye_eth::mode::ETH_FINALITY_STALL_SECS)
+    /// while the head advanced.
+    pub finality_stalled: bool,
+    /// The bridge's `mintCap` was set to 0 (no limit) on mainnet.
+    pub mint_cap_unbounded: bool,
+    /// Added to the wall clock (tests drive the finality watch without waiting).
+    pub clock_offset: Duration,
     /// Peers whose co-signatures failed the adoption checks, by URL: consecutive failures
     /// (two or more: asked last).
     pub peer_backoff: HashMap<String, u32>,
@@ -197,6 +221,17 @@ pub(crate) struct Memory {
     pub fee_coins: Option<u64>,
     /// The foreign-chain sender and its balance at the last gas check.
     pub sender: Option<(String, u128)>,
+}
+
+/// When the foreign chain's finalized height last moved (audit 05/H-2).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FinalityWatch {
+    /// The finalized height.
+    pub finalized: u64,
+    /// When it was first seen at this value.
+    pub since: Instant,
+    /// The head when it was.
+    pub latest_then: u64,
 }
 
 /// The engine.
@@ -227,6 +262,23 @@ impl Engine {
         self.mem.alarms.values().cloned().collect()
     }
 
+    /// Move this engine's clock forward by `by` (tests: the finality-stall watch without a
+    /// twenty-minute wait). The ledger's own timestamps are unaffected.
+    #[doc(hidden)]
+    pub fn advance_clock(&mut self, by: Duration) {
+        self.mem.clock_offset += by;
+    }
+
+    /// The engine's clock: the wall clock plus [`advance_clock`](Self::advance_clock)'s offset.
+    pub(crate) fn instant(&self) -> Instant {
+        Instant::now() + self.mem.clock_offset
+    }
+
+    /// Whether the finality watch reports a stall (audit 05/H-2).
+    pub fn finality_stalled(&self) -> bool {
+        self.mem.finality_stalled
+    }
+
     /// One pass of the loop. Idempotent: running it twice on the same chains changes nothing.
     pub async fn tick(&mut self) -> TickReport {
         self.mem.ticks += 1;
@@ -249,6 +301,7 @@ impl Engine {
         step!("ycash", self.follow_ycash());
         step!("vaults", self.sync_vaults());
         step!("eth", self.scan_eth());
+        step!("eth-latest", self.scan_proposals_latest());
         step!("minted", self.check_pending_mints());
         step!("guardians", self.check_guardians());
         step!("fees", self.check_fee_coins());
@@ -539,6 +592,9 @@ impl Engine {
             cursor: ecursor,
             lag: self.mem.eth_finalized.saturating_sub(ecursor),
         };
+        let eth_finalized_age_secs = self.mem.finality_watch.map_or(0, |w| {
+            self.instant().saturating_duration_since(w.since).as_secs()
+        });
         Ok(Status {
             version: env!("CARGO_PKG_VERSION").into(),
             network: self.ctx.network_name.clone(),
@@ -572,16 +628,32 @@ impl Engine {
             alarms: self.alarms(),
             ticks: self.mem.ticks,
             last_errors: report.errors.clone(),
+            finality_stalled: self.mem.finality_stalled,
+            eth_finalized_age_secs,
         })
     }
 
     /// Re-read the guardian set when due (start, rotation events, every 60 ticks) and compare it
-    /// with the current members' guardians (Ethereum: their addresses; plan §3.5, D-15).
+    /// with the current members' guardians (Ethereum: their addresses; plan §3.5, D-15); on
+    /// mainnet also re-read whether the mint rate limit is unbounded.
     async fn check_guardians(&mut self) -> Result<()> {
         if !self.mem.guardian_check_due && !self.mem.ticks.is_multiple_of(60) {
             return Ok(());
         }
         self.mem.guardian_check_due = false;
+        if self.ctx.params.mainnet {
+            // the rate limit as the contract holds it now (audit 05/H-2): `mintAvailable()` is
+            // the maximum exactly when `mintCap` is 0; read at start and every 60 ticks, so a
+            // restart past the `MintLimitChanged` event keeps the pause
+            let avail = self
+                .ctx
+                .foreign
+                .mint_available()
+                .await
+                .map_err(|e| anyhow!("mint available: {e}"))?;
+            self.mint_cap_changed(avail == u128::MAX);
+        }
+        self.check_live_floors().await?;
         let mismatch = guardian_mismatch(&self.ctx, &self.mem.members).await?;
         match mismatch {
             None => {
@@ -596,9 +668,54 @@ impl Engine {
         Ok(())
     }
 
+    /// The live parameter floors (audit 05/M-4), with the guardian check (start, every 60
+    /// ticks): `heartbeat_blocks` against the set's current `livenesswindow` (a `SET_PARAMS` can
+    /// shrink it) → `heartbeat-too-slow`, logged as an error on mainnet but never a pause (the
+    /// heartbeats are the fix); vaults of the bridge's tag and set with another `delay` →
+    /// `params-drift`.
+    async fn check_live_floors(&mut self) -> Result<()> {
+        if let Some(set) = &self.mem.set {
+            match crate::floors::heartbeat_breach(&self.ctx.params, &set.set.params) {
+                Some(r) => {
+                    if self.ctx.params.mainnet {
+                        tracing::error!(event = "heartbeat_too_slow", detail = %r);
+                    }
+                    self.alarm(
+                        "heartbeat-too-slow",
+                        format!("{r}: members would go DORMANT"),
+                    );
+                }
+                None => self.clear_alarm("heartbeat-too-slow"),
+            }
+        }
+        let (other, total) = crate::daemon::vault_delay_mismatch(&self.ctx).await?;
+        if other > 0 {
+            self.alarm(
+                "params-drift",
+                format!(
+                    "{other} of {total} vaults carry a delay other than bridge.delay {}",
+                    self.ctx.params.delay
+                ),
+            );
+        } else {
+            self.clear_alarm("params-drift");
+        }
+        Ok(())
+    }
+
     /// Whether signing is paused by guardian drift (mainnet only; elsewhere an alarm).
     pub(crate) fn signing_paused(&self) -> bool {
         self.mem.guardian_drift && self.ctx.params.mainnet
+    }
+
+    /// Whether this attestor's own mint-side acts — `Mint` signatures, proposals, executions,
+    /// threshold mints — are paused (mainnet only; elsewhere the alarms alone): guardian drift,
+    /// a finality stall, or an unbounded `mintCap` (audit 05/H-2). Never consulted by
+    /// challenges, cancels, heartbeats, releases or slash votes: those are the defence.
+    pub(crate) fn mint_paused(&self) -> bool {
+        self.signing_paused()
+            || (self.ctx.params.mainnet
+                && (self.mem.finality_stalled || self.mem.mint_cap_unbounded))
     }
 
     /// Live members sorted (the leader order).
