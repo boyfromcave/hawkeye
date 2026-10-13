@@ -57,8 +57,18 @@ impl EthereumChain {
         Self { client, scheme }
     }
 
-    /// Connect the configured deployment (`[eth]`), sending from `key`'s account.
-    pub async fn connect(s: &Settings, key: &SecretKey) -> anyhow::Result<Self> {
+    /// Connect the configured deployment (`[eth]`) for the attestor whose member key is
+    /// `member`: transactions are sent (and gas paid) by the `[eth] sender_*` gas account when
+    /// one is configured (required on mainnet, remedial report 05/M-1), else by `member`'s
+    /// account. EIP-712 attestations are always the member key's ([`ForeignChain::sign`]).
+    pub async fn connect(s: &Settings, member: &SecretKey) -> anyhow::Result<Self> {
+        let sender = s.load_eth_sender(member)?;
+        Self::connect_sending_as(s, sender.as_ref().unwrap_or(member)).await
+    }
+
+    /// Connect the configured deployment, sending from exactly `key`'s account (`hawkeye
+    /// burn`: the holder's).
+    pub async fn connect_sending_as(s: &Settings, key: &SecretKey) -> anyhow::Result<Self> {
         let d = s
             .deployment
             .as_ref()
@@ -254,6 +264,21 @@ impl ForeignChain for EthereumChain {
             chain_id: self.client.chain_id(),
             bridge: eth_addr(&self.client.bridge_address()),
         }
+    }
+
+    fn sender_balance(&self) -> BoxFut<'_, Option<(String, u128)>> {
+        Box::pin(async move {
+            let Some(who) = self.client.sender() else {
+                return Ok(None);
+            };
+            let wei = self
+                .client
+                .provider()
+                .get_balance(who)
+                .await
+                .map_err(|e| ForeignError::new(format!("eth_getBalance: {e}")))?;
+            Ok(Some((who.to_checksum(None), sat(wei))))
+        })
     }
 
     fn check_bridge(&self, mainnet: bool) -> BoxFut<'_, BridgeInfo> {

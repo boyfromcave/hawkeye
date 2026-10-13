@@ -53,6 +53,7 @@ use crate::status::{Alarm, Heights, Status, Supply};
 pub mod burn;
 pub mod mint;
 pub mod roll;
+pub mod sign;
 pub mod slash;
 pub mod watch;
 pub mod ycash;
@@ -76,6 +77,9 @@ pub struct Ctx {
     pub attributor: Arc<dyn Attributor>,
     /// The other attestors' APIs.
     pub peers: Peers,
+    /// The peer API's authentication state: settings, the set snapshot the engine publishes
+    /// every tick, the replay cache (remedial report 05/H-1).
+    pub auth: Arc<crate::peer_auth::AuthState>,
     /// The latest status summary.
     pub status: Arc<RwLock<Status>>,
     /// `regtest` / `testnet` / `mainnet`.
@@ -181,6 +185,18 @@ pub(crate) struct Memory {
     /// Once-only warnings about a lock's proposals (a mismatching one holding it, no eligible
     /// proposer, the rate limit).
     pub squat_logged: mint::ProposalKeys,
+    /// Peers whose co-signatures failed the adoption checks, by URL: consecutive failures
+    /// (two or more: asked last).
+    pub peer_backoff: HashMap<String, u32>,
+    /// A signed unlock's fee input (or vault) first seen spent in a block, at this tip: the
+    /// dead-marker rule counts `C_Y` from here (a lower bound on the spend's depth).
+    pub conflict_seen: HashMap<CoreOutPoint, u32>,
+    /// Once-only warnings about a burn held by a live unlock this attestor will not re-send.
+    pub held_logged: HashSet<u64>,
+    /// The fee coins counted at the last capacity check.
+    pub fee_coins: Option<u64>,
+    /// The foreign-chain sender and its balance at the last gas check.
+    pub sender: Option<(String, u128)>,
 }
 
 /// The engine.
@@ -235,6 +251,7 @@ impl Engine {
         step!("eth", self.scan_eth());
         step!("minted", self.check_pending_mints());
         step!("guardians", self.check_guardians());
+        step!("fees", self.check_fee_coins());
         step!("watch", self.watch());
         step!("locks", self.evaluate_locks());
         step!("mint", self.mint());
@@ -244,6 +261,7 @@ impl Engine {
         step!("slash", self.slash());
         step!("heartbeat", self.heartbeat());
         step!("supply", self.supply());
+        step!("gas", self.check_gas());
         self.publish_status(&report);
         report
     }
@@ -274,6 +292,7 @@ impl Engine {
             .map(|v| u64::try_from(v.valuezat).unwrap_or(0))
             .sum();
         self.supply().await?;
+        self.check_gas().await?;
         self.compute_status(&TickReport::default())
     }
 
@@ -320,6 +339,7 @@ impl Engine {
         self.mem.tip = tip;
         self.mem.members = info.memberlist.clone();
         self.mem.live = live;
+        self.ctx.auth.publish(&info);
         self.mem.set = Some(info);
         if !self.is_current_member() {
             self.alarm(
@@ -333,6 +353,15 @@ impl Engine {
             self.clear_alarm("not-a-member");
         }
         Ok(())
+    }
+
+    /// Whether a peer's answer may be counted: signed by a current member, or unsigned when
+    /// `[peers] require_auth = false` (regtest transition).
+    pub(crate) fn responder_ok(&self, responder: Option<PubKey33>) -> bool {
+        match responder {
+            Some(k) => self.current_member_keys().contains(&k),
+            None => !self.ctx.auth.config.require_auth,
+        }
     }
 
     /// Whether this attestor's key is a current member.
@@ -378,16 +407,34 @@ impl Engine {
         if next < last.saturating_add(every) {
             return Ok(());
         }
-        let r = self
-            .ctx
-            .ycash
-            .set_heartbeat(
-                &self.ctx.set_hash(),
-                Some(&hawkeye_ycash::PubKey(self.ctx.me)),
-            )
-            .await?;
+        let txid = match self.ctx.params.ycash_signing {
+            crate::config::YcashSigning::Wallet => {
+                self.ctx
+                    .ycash
+                    .set_heartbeat(
+                        &self.ctx.set_hash(),
+                        Some(&hawkeye_ycash::PubKey(self.ctx.me)),
+                    )
+                    .await?
+                    .txid
+            }
+            crate::config::YcashSigning::SelfSigned => {
+                // 05/M-1: built and funded by the wallet, the act signature made here
+                let built = self
+                    .ctx
+                    .ycash
+                    .set_buildact(&hawkeye_ycash::types::BuildAct::Heartbeat {
+                        setid: self.ctx.set_hash(),
+                        memberkey: hawkeye_ycash::PubKey(self.ctx.me),
+                    })
+                    .await?;
+                let (signed, _, _) = sign::self_sign_act(&self.ctx.key, &built.hex.to_string())?;
+                let h: hawkeye_ycash::HexBytes = signed.parse().map_err(|e| anyhow!("{e}"))?;
+                self.ctx.ycash.set_sendact(&h).await?
+            }
+        };
         self.mem.last_heartbeat = Some(next);
-        info!(event = "heartbeat", txid = %r.txid, height = next);
+        info!(event = "heartbeat", txid = %txid, height = next);
         Ok(())
     }
 
@@ -411,6 +458,34 @@ impl Engine {
         } else {
             self.clear_alarm("supply");
         }
+        Ok(())
+    }
+
+    /// The gas account's balance (every 20 ticks; remedial report 05/M-1): `gas-low` below
+    /// `[eth] min_sender_balance_wei`.
+    async fn check_gas(&mut self) -> Result<()> {
+        if self.mem.sender.is_some() && !self.mem.ticks.is_multiple_of(20) {
+            return Ok(());
+        }
+        let Some((who, bal)) = self
+            .ctx
+            .foreign
+            .sender_balance()
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+        else {
+            return Ok(());
+        };
+        let floor = self.ctx.params.min_sender_balance_wei;
+        if floor > 0 && bal < floor {
+            self.alarm(
+                "gas-low",
+                format!("the sender {who} holds {bal} wei < {floor}: fund it"),
+            );
+        } else {
+            self.clear_alarm("gas-low");
+        }
+        self.mem.sender = Some((who, bal));
         Ok(())
     }
 
@@ -484,6 +559,9 @@ impl Engine {
                 locked_vault_value: self.mem.locked_value,
                 ok: !supply_alarm,
             },
+            fee_coins: self.mem.fee_coins,
+            sender: self.mem.sender.as_ref().map(|s| s.0.clone()),
+            sender_balance: self.mem.sender.as_ref().map(|s| s.1),
             alarms: self.alarms(),
             ticks: self.mem.ticks,
             last_errors: report.errors.clone(),

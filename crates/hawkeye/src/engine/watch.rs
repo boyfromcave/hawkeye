@@ -9,10 +9,13 @@ use anyhow::{Result, anyhow};
 use hawkeye_core::IntentParams;
 use hawkeye_core::OutPoint as CoreOutPoint;
 use hawkeye_core::bytes::txid_to_display;
+use hawkeye_core::leader::mint_leader_for;
+use hawkeye_core::lock::lock_id;
 use hawkeye_core::matcher::Classification;
 use hawkeye_core::memo::{HawkeyeMemo, MemoKind};
 use hawkeye_core::policy::TxOut as CoreTxOut;
 use hawkeye_core::script::op_return_script;
+use hawkeye_core::setsig::Role;
 use hawkeye_store::{
     BurnKey, BurnState, FaultKind, IntentRecord, IntentState, NewSlashCase, SignDomain,
     YcashSignKey, classification_code,
@@ -22,9 +25,11 @@ use hawkeye_ycash::tx::Transaction;
 use hawkeye_ycash::types::{TemplateKind as RpcKind, VaultListFilter};
 use tracing::{info, warn};
 
+use super::Engine;
+use super::sign::{Adoption, SetSigning, input_index, role_args};
 use super::ycash::{IntentFacts, classify, link_burn};
-use super::{Engine, block_on};
 use crate::convert::{op_core, op_rpc};
+use crate::peers::{CancelSignRequest, CancelSignResponse};
 
 impl Engine {
     /// One watcher pass.
@@ -103,9 +108,13 @@ impl Engine {
         // c. re-classify (consumption changes as intents are mined) and link burns
         self.reclassify()?;
         // d. act on unmatched intents
-        let unmatched = self
+        let mut unmatched = self
             .ctx
             .db(|t| t.intents_in_state(IntentState::Unmatched))?;
+        // nearest cancel deadline first (finding 05/N-2): a confirmed intent's window closes at
+        // confirmed + delay; a mempool intent's has not started
+        let delay = u32::from(p.delay);
+        unmatched.sort_by_key(|i| i.confirmed_height.unwrap_or(tip + 1).saturating_add(delay));
         for i in unmatched {
             if let Err(e) = self.handle_unmatched(&i).await {
                 warn!(event = "cancel_failed", intent = %i.outpoint, error = %format!("{e:#}"));
@@ -117,10 +126,10 @@ impl Engine {
             .db(|t| t.intents_in_state(IntentState::CancelSent))?;
         for i in sent {
             let key = cancel_key(p.set_id, &i.outpoint);
-            if let Some(rec) = self.ctx.db(|t| t.ycash_signature(&key))?
-                && let Ok(h) = rec.signed_hex.parse::<HexBytes>()
+            if self.ctx.db(|t| t.ycash_signature(&key))?.is_some()
+                && !self.mem.mempool_spent.contains(&i.outpoint)
             {
-                let _ = self.ctx.ycash.vault_send(&h).await;
+                let _ = self.cancel(&i.outpoint).await;
             }
             if i.confirmed_height.is_some() && !self.mem.intent_rows.contains_key(&i.outpoint) {
                 continue;
@@ -276,14 +285,33 @@ impl Engine {
             }
             return Ok(());
         }
+        let need = self
+            .mem
+            .set
+            .as_ref()
+            .map_or(1, |s| s.set.params.cancelthreshold);
+        let leads = need <= 1 || self.cancel_leader(&i.outpoint, i.signer_key) == Some(self.ctx.me);
         if self.mem.mempool_spent.contains(&i.outpoint) {
             tracing::debug!(event = "intent_cancel_pending", intent = %i.outpoint,
                   "a spend of the intent (another attestor's cancel) is in the mempool");
-        } else if let Some(txid) = self.cancel(&i.outpoint).await? {
-            self.ctx
-                .db(|t| t.intent_cancel_sent(&i.outpoint, &txid, Some(tip)))?;
-            warn!(event = "intent_cancel_sent", intent = %i.outpoint, reason = %code,
-                  cancel_txid = %txid_to_display(&txid), signer = ?i.signer_key.map(hex::encode));
+        } else if !leads {
+            tracing::debug!(event = "intent_cancel_left_to_leader", intent = %i.outpoint,
+                  leader = ?self.cancel_leader(&i.outpoint, i.signer_key).map(hex::encode),
+                  "cancelThreshold > 1: the intent's cancel leader builds, the others co-sign");
+        } else {
+            match self.cancel(&i.outpoint).await {
+                Ok(CancelOutcome::Sent(txid)) => {
+                    self.ctx
+                        .db(|t| t.intent_cancel_sent(&i.outpoint, &txid, Some(tip)))?;
+                    warn!(event = "intent_cancel_sent", intent = %i.outpoint, reason = %code,
+                          cancel_txid = %txid_to_display(&txid),
+                          signer = ?i.signer_key.map(hex::encode));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(event = "cancel_failed", intent = %i.outpoint, error = %format!("{e:#}"))
+                }
+            }
         }
         let benign = code == "unmatched:consumed-burn:benign-race";
         if benign {
@@ -346,36 +374,294 @@ impl Engine {
         Ok(self.ctx.db(|t| t.ycash_signature(&key))?.is_some())
     }
 
-    /// Cancel an intent once: the stored signed cancel if there is one, else
-    /// vault_buildcancel → set_signcancel (sign-once) → vault_send. `None`: it was already
-    /// broadcast (the txid is then learnt when it is mined).
-    pub(crate) async fn cancel(
-        &mut self,
+    /// The member that builds an intent's cancel when `cancelThreshold > 1` (the others
+    /// co-sign over `POST /cancel/sign`): the mint schedule over the intent outpoint's id, live
+    /// members other than the intent's signer. Two members building two cancels of one intent would each refuse the
+    /// other's (sign-once), so exactly one builds.
+    pub(crate) fn cancel_leader(
+        &self,
         op: &CoreOutPoint,
-    ) -> Result<Option<hawkeye_core::bytes::Hash32>> {
+        signer: Option<hawkeye_core::PubKey33>,
+    ) -> Option<hawkeye_core::PubKey33> {
+        // never the intent's own signer: it leaves its own intent to the others
+        let live: Vec<_> = self
+            .live()
+            .iter()
+            .filter(|k| Some(**k) != signer)
+            .copied()
+            .collect();
+        mint_leader_for(&lock_id(op), &live, 0, 0).copied()
+    }
+
+    /// Cancel an intent once: the stored signed cancel if there is one, else
+    /// vault_buildcancel → set_signcancel (sign-once) → [`Engine::complete_cancel`] (the peers'
+    /// co-signatures when `cancelThreshold > 1`) → vault_send.
+    pub(crate) async fn cancel(&mut self, op: &CoreOutPoint) -> Result<CancelOutcome> {
         let key = cancel_key(self.ctx.params.set_id, op);
         let signed = match self.ctx.db(|t| t.ycash_signature(&key))? {
             Some(rec) => rec.signed_hex,
             None => {
-                let built = self.ctx.ycash.vault_buildcancel(&op_rpc(op)).await?;
-                let ycash = self.ctx.ycash.clone();
+                let built = match self.ctx.ycash.vault_buildcancel(&op_rpc(op)).await {
+                    Ok(b) => b,
+                    Err(e)
+                        if e.rpc().is_some_and(|r| {
+                            r.code == hawkeye_ycash::error::codes::WALLET_INSUFFICIENT_FUNDS
+                        }) =>
+                    {
+                        warn!(event = "cancel_unfunded", intent = %op, error = %e);
+                        self.alarm(
+                            "fee-coins-exhausted",
+                            format!(
+                                "no confirmed fee coin to fund the cancel of {op}: run `hawkeye \
+                                 split-coins`"
+                            ),
+                        );
+                        return Err(e.into());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let built_hex = built.hex.to_string();
+                let signer = SetSigning::prepare(&self.ctx, &built_hex, Role::Cancel, *op).await?;
                 let rec = self.ctx.db(|t| {
-                    t.sign_once_ycash(&key, &built.hex.to_string(), |h| {
-                        let hex: HexBytes = h.parse().map_err(|e| format!("{e}"))?;
-                        let r = block_on(ycash.set_signcancel(&hex)).map_err(|e| e.to_string())?;
-                        Ok::<_, String>((r.hex.to_string(), r.sighash.0))
+                    t.sign_once_ycash(&key, &built_hex, |h| {
+                        let o = signer.sign(h)?;
+                        Ok::<_, String>((o.hex, o.sighash))
                     })
                 })?;
                 rec.signed_hex
             }
         };
-        let hex: HexBytes = signed.parse().map_err(|e| anyhow!("{e}"))?;
+        let Some(complete) = self.complete_cancel(op, &signed).await? else {
+            return Ok(CancelOutcome::Incomplete);
+        };
+        let hex: HexBytes = complete.parse().map_err(|e| anyhow!("{e}"))?;
         match self.ctx.ycash.vault_send(&hex).await {
-            Ok(t) => Ok(Some(t.0)),
-            Err(e) if e.rpc().is_some_and(|r| r.is_already_known()) => Ok(None),
+            Ok(t) => Ok(CancelOutcome::Sent(t.0)),
+            Err(e) if e.rpc().is_some_and(|r| r.is_already_known()) => {
+                Ok(CancelOutcome::AlreadyKnown)
+            }
             Err(e) => Err(e.into()),
         }
     }
+
+    /// A cancel with at least `cancelThreshold` signatures: as is at threshold 1 (the §2 row),
+    /// else with the peers' co-signatures gathered over `POST /cancel/sign` and checked like
+    /// unlock co-signatures ([`Adoption`]). `None` while still short.
+    pub(crate) async fn complete_cancel(
+        &mut self,
+        op: &CoreOutPoint,
+        signed: &str,
+    ) -> Result<Option<String>> {
+        let need = self
+            .mem
+            .set
+            .as_ref()
+            .map_or(1, |s| s.set.params.cancelthreshold) as usize;
+        let ours = Transaction::decode_hex(signed).map_err(|e| anyhow!("{e}"))?;
+        let idx = input_index(&ours, op).ok_or_else(|| anyhow!("the cancel spends no {op}"))?;
+        let mut have = role_args(&ours, idx, Role::Cancel)?.len();
+        if have >= need {
+            return Ok(Some(signed.to_owned()));
+        }
+        let (spk, value) = self
+            .intent_coin_of(op)
+            .await?
+            .ok_or_else(|| anyhow!("intent {op} unknown"))?;
+        let members = self.current_member_keys();
+        let mut current = ours;
+        let mut hex = signed.to_owned();
+        let mut peers = self.ctx.peers.urls().to_vec();
+        peers.sort_by_key(|u| u32::from(self.mem.peer_backoff.get(u).copied().unwrap_or(0) >= 2));
+        for peer in peers {
+            let req = CancelSignRequest {
+                hex: hex.clone(),
+                intent: op.to_string(),
+            };
+            match self.ctx.peers.cancel_sign(&peer, &req).await {
+                Ok(r) => {
+                    let check = if self.responder_ok(r.responder) {
+                        Adoption {
+                            ours: &current,
+                            idx,
+                            role: Role::Cancel,
+                            need,
+                            coin: (&spk, value),
+                            members: &members,
+                        }
+                        .check(&self.ctx, &r.body.hex)
+                    } else {
+                        Err(anyhow!("the answer is not signed by a current member"))
+                    };
+                    match check {
+                        Ok(signers) => {
+                            self.mem.peer_backoff.remove(&peer);
+                            info!(event = "cancel_signature_received", peer = %peer, intent = %op,
+                                  signatures = signers.len(), required = need);
+                            hex = r.body.hex;
+                            current = Transaction::decode_hex(&hex).map_err(|e| anyhow!("{e}"))?;
+                            have = signers.len();
+                        }
+                        Err(e) => {
+                            *self.mem.peer_backoff.entry(peer.clone()).or_default() += 1;
+                            warn!(event = "cancel_signature_rejected", peer = %peer, intent = %op,
+                                  error = %format!("{e:#}"));
+                        }
+                    }
+                    if have >= need {
+                        return Ok(Some(hex));
+                    }
+                }
+                Err(e) => info!(event = "cancel_signature_refused", peer = %peer, error = %e),
+            }
+        }
+        warn!(event = "cancel_incomplete", intent = %op, signatures = have, required = need);
+        Ok(None)
+    }
+
+    /// The fee-coin capacity check (every 20 ticks; finding 05/N-2, plan §5.5 / finding (76)):
+    /// confirmed transparent P2PKH wallet coins of at least `VAULT_RPC_FEE +
+    /// VAULT_RPC_MIN_CHANGE`, each one cancel this block (the node's `Fund` spends confirmed
+    /// coins only). `fee-coins-low` below [`FEE_COINS_FLOOR`], `fee-coins-exhausted` at 0.
+    pub(crate) async fn check_fee_coins(&mut self) -> Result<()> {
+        if self.mem.fee_coins.is_some() && !self.mem.ticks.is_multiple_of(20) {
+            return Ok(());
+        }
+        let coins = self.ctx.ycash.listunspent(Some(1), None, None).await?;
+        let n = count_fee_coins(&coins);
+        self.mem.fee_coins = Some(n);
+        if n == 0 {
+            self.alarm(
+                "fee-coins-exhausted",
+                "no confirmed wallet coin can fund a cancel: run `hawkeye split-coins`".into(),
+            );
+        } else {
+            self.clear_alarm("fee-coins-exhausted");
+        }
+        if n < FEE_COINS_FLOOR {
+            self.alarm(
+                "fee-coins-low",
+                format!(
+                    "{n} confirmed fee coins < {FEE_COINS_FLOOR}: a flood of intents can outrun \
+                     the cancels (`hawkeye split-coins --count 16`)"
+                ),
+            );
+        } else {
+            self.clear_alarm("fee-coins-low");
+        }
+        Ok(())
+    }
+
+    /// The script and value of an intent output (ledger cache or the node).
+    async fn intent_coin_of(&mut self, op: &CoreOutPoint) -> Result<Option<(Vec<u8>, u64)>> {
+        if let Some(o) = self
+            .ctx
+            .ycash
+            .gettxout(&op_rpc(op).txid, op.vout, true)
+            .await?
+        {
+            return Ok(Some((
+                o.script_pub_key.hex.0,
+                u64::try_from(o.value.zat()).unwrap_or(0),
+            )));
+        }
+        let raw = match self.mem.raw_txs.get(&op.txid) {
+            Some(r) => r.clone(),
+            None => return Ok(None),
+        };
+        let tx = Transaction::decode(&raw).map_err(|e| anyhow!("{e}"))?;
+        Ok(tx
+            .outputs
+            .get(op.vout as usize)
+            .map(|o| (o.script_pubkey.clone(), u64::try_from(o.value).unwrap_or(0))))
+    }
+}
+
+/// What [`Engine::cancel`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelOutcome {
+    /// Broadcast now.
+    Sent(hawkeye_core::bytes::Hash32),
+    /// Already in the mempool or mined (the txid is learnt when it is mined).
+    AlreadyKnown,
+    /// Short of `cancelThreshold`: retried next tick.
+    Incomplete,
+}
+
+/// `VAULT_RPC_FEE` (ycash-dd `src/policy/policy.h:131`, ycash6 `:189`).
+pub const VAULT_RPC_FEE_ZAT: i64 = 10_000;
+/// `VAULT_RPC_MIN_CHANGE` (`src/rpc/vault.cpp:58` on both lines).
+pub const VAULT_RPC_MIN_CHANGE_ZAT: i64 = 1_000;
+/// Below this many fee coins `fee-coins-low` is raised (plan §5.5, finding (76)).
+pub const FEE_COINS_FLOOR: u64 = 8;
+
+/// The coins of `listunspent` that can fund one vault spend alone: spendable, confirmed,
+/// P2PKH, at least `VAULT_RPC_FEE + VAULT_RPC_MIN_CHANGE`.
+pub fn count_fee_coins(coins: &[hawkeye_ycash::stock::Unspent]) -> u64 {
+    coins
+        .iter()
+        .filter(|u| {
+            u.spendable
+                && u.confirmations >= 1
+                && hawkeye_core::script::parse_p2pkh(&u.script_pub_key.0).is_some()
+                && u.amount_zat >= VAULT_RPC_FEE_ZAT + VAULT_RPC_MIN_CHANGE_ZAT
+        })
+        .count() as u64
+}
+
+/// `POST /cancel/sign` (`cancelThreshold > 1` only): co-sign a member's cancel of an intent only
+/// if this attestor's own ledger has judged that intent **unmatched** (`UNMATCHED` or
+/// `CANCEL_SENT`: never one it matched, never one it has not seen), the transaction's template
+/// input is that intent, and the request is member-signed ([`crate::peer_auth`]); then sign
+/// once per intent on this node (`ycash-cancel`).
+pub async fn verify_and_sign_cancel(
+    ctx: &super::Ctx,
+    requester: Option<hawkeye_core::PubKey33>,
+    req: &CancelSignRequest,
+) -> Result<CancelSignResponse> {
+    let set = super::burn::set_snapshot(ctx).await?;
+    let need = set.set.params.cancelthreshold;
+    anyhow::ensure!(
+        need > 1,
+        "cancel co-signing is disabled: the set's cancelThreshold is 1 (HK-1); any member \
+         cancels alone"
+    );
+    let requester = requester.ok_or_else(|| {
+        anyhow!("unauthenticated request: cancel co-signing answers member-signed requests only")
+    })?;
+    let op = super::slash::parse_outpoint(&req.intent)?;
+    let tx = Transaction::decode_hex(&req.hex).map_err(|e| anyhow!("cancel: {e}"))?;
+    let idx = input_index(&tx, &op).ok_or_else(|| anyhow!("the transaction spends no {op}"))?;
+    role_args(&tx, idx, Role::Cancel)?;
+    let i = ctx
+        .db(|t| t.intent(&op))?
+        .ok_or_else(|| anyhow!("intent {op} is not in this ledger: not judged here"))?;
+    anyhow::ensure!(
+        matches!(i.state, IntentState::Unmatched | IntentState::CancelSent),
+        "intent {op} is {} here ({}): not cancelled",
+        i.state,
+        i.classification.as_deref().unwrap_or("unclassified")
+    );
+    let key = cancel_key(ctx.params.set_id, &op);
+    let signer = SetSigning::prepare(ctx, &req.hex, Role::Cancel, op).await?;
+    let status = std::cell::Cell::new(None);
+    let rec = ctx.db(|t| {
+        t.sign_once_ycash(&key, &req.hex, |h| {
+            let o = signer.sign(h)?;
+            status.set(Some((o.complete, o.signatures, o.required)));
+            Ok::<_, String>((o.hex, o.sighash))
+        })
+    })?;
+    let signed = Transaction::decode_hex(&rec.signed_hex).map_err(|e| anyhow!("{e}"))?;
+    let n = role_args(&signed, idx, Role::Cancel)?.len() as u32;
+    let (complete, signatures, required) = status.get().unwrap_or((n >= need, n, need));
+    info!(event = "cancel_cosigned", intent = %op, requester = %hex::encode(requester),
+          signatures, required);
+    Ok(CancelSignResponse {
+        hex: rec.signed_hex,
+        complete,
+        signatures,
+        required,
+    })
 }
 
 /// Adopt the recorded release of `i` as burn `nonce`'s: intent `MATURED_UNMATCHED → RELEASED`,

@@ -319,7 +319,8 @@ pub trait AttestationScheme {
 /// Reads are of the chain's **final** state where the chain distinguishes (the scan cursor never
 /// passes [`finalized_height`](Self::finalized_height)); [`now`](Self::now) is the latest
 /// block's clock, the one a proposal's `eta` is compared with. Writes are signed and paid by the
-/// adapter's own sender (Ethereum: the member key's account; NEAR: the operator's relayer key)
+/// adapter's own sender (Ethereum: the `[eth] sender_*` gas account, else the member key's;
+/// NEAR: the operator's relayer key)
 /// and return once mined; a contract rejection is a [`ForeignError`] with
 /// [`is_revert`](ForeignError::is_revert).
 pub trait ForeignChain: AttestationScheme + Send + Sync {
@@ -334,6 +335,12 @@ pub trait ForeignChain: AttestationScheme + Send + Sync {
     /// The 4-byte magic of this bridge's Hawkeye memo (Ethereum `HKB1`, NEAR `HKN1`).
     fn memo_magic(&self) -> [u8; 4] {
         self.kind().memo_magic()
+    }
+
+    /// The account that sends this adapter's transactions and its balance in the chain's
+    /// base unit (Ethereum: wei), for the `gas-low` alarm; `None` when not tracked.
+    fn sender_balance(&self) -> BoxFut<'_, Option<(String, u128)>> {
+        Box::pin(async { Ok(None) })
     }
 
     // ------------------------------------------------------------- start-up
@@ -434,13 +441,20 @@ pub trait ForeignChain: AttestationScheme + Send + Sync {
     fn burn(&self, amount: u64, ycash_recipient: Vec<u8>) -> BoxFut<'_, Burned>;
 }
 
-/// Connect the configured foreign chain. Ethereum: `key`'s account signs and pays gas. NEAR:
-/// the operator's relayer key (`[near] relayer_key_file`) sends; `key` only attests.
+/// Connect the configured foreign chain for the member key `key`. Ethereum: the `[eth]
+/// sender_*` gas account sends and pays gas when configured (required on mainnet, 05/M-1), else
+/// `key`'s account; `key` attests. NEAR: the operator's relayer key (`[near] relayer_key_file`)
+/// sends; `key` only attests.
 pub async fn connect(s: &Settings, key: &SecretKey) -> Result<Arc<dyn ForeignChain>> {
     match s.foreign {
         BridgeKind::Ethereum => Ok(Arc::new(EthereumChain::connect(s, key).await?)),
         BridgeKind::Near => near::connect_as(s, None).await,
     }
+}
+
+/// Ethereum only: connect sending from exactly `key`'s account (a holder's `hawkeye burn`).
+pub async fn connect_sending_as(s: &Settings, key: &SecretKey) -> Result<Arc<dyn ForeignChain>> {
+    Ok(Arc::new(EthereumChain::connect_sending_as(s, key).await?))
 }
 
 #[cfg(test)]

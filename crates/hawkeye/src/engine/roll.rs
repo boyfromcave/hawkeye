@@ -27,8 +27,10 @@ use hawkeye_ycash::types::Recipient;
 use hawkeye_ycash::{Amount, ErrorReason, HexBytes};
 use tracing::{info, warn};
 
-use super::{Engine, block_on};
+use super::Engine;
+use super::sign::SetSigning;
 use crate::convert::{op_core, op_rpc};
+use hawkeye_core::setsig::Role;
 
 /// Blocks added to the new `ownerHeight` beyond `MIN_OWNER_AGE + ROLL_MARGIN`.
 pub const ROLL_SLACK: u32 = 10;
@@ -240,12 +242,12 @@ impl Engine {
         let with_memo = insert_op_return(&built.hex.to_string(), &memo.encode())
             .map_err(|e| anyhow!("memo: {e}"))?;
         let key = self.unlock_key(&v.outpoint);
-        let ycash = self.ctx.ycash.clone();
+        let signer = SetSigning::prepare(&self.ctx, &with_memo, Role::Unlock, v.outpoint).await?;
         let rec = self.ctx.db(|t| {
-            let rec = t.sign_once_ycash(&key, &with_memo, |h| {
-                let hex: HexBytes = h.parse().map_err(|e| format!("{e}"))?;
-                let r = block_on(ycash.set_signunlock(&hex)).map_err(|e| e.to_string())?;
-                Ok::<_, String>((r.hex.to_string(), r.sighash.0))
+            // a roll pays no burn: per vault only
+            let rec = t.sign_once_unlock(&key, None, &with_memo, |h| {
+                let o = signer.sign(h)?;
+                Ok::<_, String>((o.hex, o.sighash))
             })?;
             t.transition_vault(
                 &v.outpoint,

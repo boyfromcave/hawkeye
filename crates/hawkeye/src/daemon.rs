@@ -13,8 +13,11 @@ use crate::attribution::{Attributor, CoreAttributor};
 use crate::config::Settings;
 use crate::engine::{Ctx, Engine, guardian_mismatch};
 use crate::foreign::{self, MAINNET_MIN_THRESHOLD};
+use crate::peer_auth::{AuthState, PeerSigner};
 use crate::peers::Peers;
 use crate::status::Status;
+use hawkeye_core::Deployment;
+use hawkeye_core::memo::{MemoKind, parse_memo_script_for};
 
 /// Connect to both chains (the foreign one through its adapter, [`foreign::connect`]) and open
 /// the ledger. The adapter must be the configured deployment and speak the memo this build's
@@ -38,8 +41,24 @@ pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributo
         String::from_utf8_lossy(&foreign.memo_magic()),
         s.params.bridge_kind
     );
-    let store =
+    let mut store =
         Store::open(&s.store_path).with_context(|| format!("ledger {}", s.store_path.display()))?;
+    let backfilled = store
+        .backfill_unlock_burns(|hex| burn_named_by(&s.params, hex))
+        .context("ledger v6 backfill")?;
+    if backfilled > 0 {
+        info!(
+            event = "ledger_backfill",
+            table = "sign_once_unlock_burn",
+            rows = backfilled
+        );
+    }
+    let peers = Peers::new(s.peers.clone())?.with_signer(PeerSigner {
+        key: key.clone(),
+        set_id: s.params.set_id,
+        deployment: s.params.deployment,
+        require_auth: s.peer_auth.require_auth,
+    });
     Ok(Ctx {
         params: Arc::new(s.params.clone()),
         me: key.public_key(),
@@ -48,10 +67,22 @@ pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributo
         foreign,
         store: Arc::new(Mutex::new(store)),
         attributor,
-        peers: Peers::new(s.peers.clone())?,
+        peers,
+        auth: Arc::new(AuthState::new(s.peer_auth.clone())),
         status: Arc::new(RwLock::new(Status::default())),
         network_name: s.network_name.clone(),
     })
+}
+
+/// The burn a signed unlock pays, from its `HKB1`/`HKN1` burn memo (the v6 backfill).
+pub fn burn_named_by(p: &crate::config::Params, hex: &str) -> Option<(Deployment, u64)> {
+    let tx = hawkeye_ycash::tx::Transaction::decode_hex(hex).ok()?;
+    tx.outputs.iter().find_map(
+        |o| match parse_memo_script_for(p.bridge_kind, &o.script_pubkey) {
+            Ok(Some(m)) if m.kind == MemoKind::BurnRelease => Some((m.deployment, m.reference)),
+            _ => None,
+        },
+    )
 }
 
 /// The start-up checks: the node's network, the set exists with at least the network's minimum
@@ -109,6 +140,28 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
         .check_bridge(ctx.params.mainnet)
         .await
         .map_err(|e| anyhow!("{e}"))?;
+    if set.set.params.unlockthreshold <= 1 {
+        info!(
+            event = "peer_unlock_sign_disabled",
+            unlock_threshold = set.set.params.unlockthreshold,
+            "POST /unlock/sign is inert: at unlockThreshold 1 (HK-1) the leader completes its \
+             own unlocks and no peer co-signs"
+        );
+    }
+    if set.set.params.cancelthreshold <= 1 {
+        info!(
+            event = "peer_cancel_sign_disabled",
+            cancel_threshold = set.set.params.cancelthreshold,
+            "POST /cancel/sign is inert: at cancelThreshold 1 any member cancels alone"
+        );
+    }
+    if !ctx.auth.config.require_auth {
+        warn!(
+            event = "peer_auth_not_required",
+            "[peers] require_auth = false: unsigned peer requests are admitted (regtest/testnet \
+             rolling upgrade only)"
+        );
+    }
     let (threshold, window) = (bridge.threshold, bridge.challenge_window);
     if threshold < MAINNET_MIN_THRESHOLD {
         warn!(
@@ -134,9 +187,9 @@ pub async fn run(s: &Settings) -> Result<()> {
         .await
         .with_context(|| format!("api listen {}", s.listen))?;
     info!(event = "api_listening", addr = %s.listen);
-    let app = crate::api::router(ctx.clone());
+    let api_ctx = ctx.clone();
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = crate::api::serve(listener, api_ctx).await {
             error!(event = "api_failed", error = %e);
         }
     });
