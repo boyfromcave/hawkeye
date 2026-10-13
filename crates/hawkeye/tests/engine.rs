@@ -2198,11 +2198,13 @@ async fn k2_per_burn_sign_once() {
     );
 }
 
-/// (k3) Finding 05/N-1: a co-signed (not leader) unlock for the burn in the leader's ledger is
-/// never re-sent; it holds the burn until it is dead (its fee input spent `C_Y` deep), then
-/// the leader signs another vault.
+/// (k3) Audit 01/V-2 on finding 05/N-1: a co-signed (not leader) unlock for the burn sits in the
+/// leader's ledger and its fee input is spent `C_Y` deep — the point where the old rule declared
+/// it dead and signed another vault. It is still revivable (anyone may re-fund it); an attacker
+/// does, and the leader re-sends it re-funded too: the burn is paid **once**, on that vault, and
+/// no member ever signs a second vault for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn k3_attacker_prefilled_record_is_not_reused() {
+async fn k3_revived_cosigned_unlock_pays_the_burn_once() {
     use hawkeye_core::memo::HawkeyeMemo;
     use hawkeye_store::{UnlockBurn, UnlockOrigin, YcashSignKey};
     let Some(env) = setup().await else { return };
@@ -2214,37 +2216,16 @@ async fn k3_attacker_prefilled_record_is_not_reused() {
     env.eth_mine(3).await;
     let leader = leader_index(&env, nonce);
     let k = BurnKey::new(dep_of(&engines[0]), nonce);
-    // the pre-fix attack: an unlock of V1 for the burn, signed and recorded as a co-signature in
-    // the leader's ledger, never broadcast
-    engines[leader].tick().await;
-    let mempool_before = unlocks_for(&env, nonce).len();
-    assert_eq!(mempool_before, 1, "the leader posted it");
-    // (set the stage again on a fresh env would be heavier: instead the attack is planted on the
-    // next burn, before the leader sees it)
-    let nonce2 = env.burn(300_000_000, &r).await;
-    env.eth_mine(3).await;
-    let leader2 = leader_index(&env, nonce2);
-    let k2 = BurnKey::new(dep_of(&engines[0]), nonce2);
-    let _ = k;
-    let b2_hash = {
-        engines[(leader2 + 1) % 3].tick().await;
-        engines[(leader2 + 1) % 3]
-            .ctx()
-            .db(|t| t.burn(&k2))
-            .unwrap()
-            .unwrap()
-            .tx_hash
-    };
-    let spent_now: Vec<OutPoint> = unlocks_for(&env, nonce)
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
-    let free: Vec<OutPoint> = vaults(&env)
-        .into_iter()
-        .filter(|v| !spent_now.contains(v))
-        .collect();
-    let v1 = free[0];
-    let memo = HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce2, b2_hash);
+    let other = (leader + 1) % 3;
+    engines[other].tick().await;
+    let b_hash = engines[other]
+        .ctx()
+        .db(|t| t.burn(&k))
+        .unwrap()
+        .unwrap()
+        .tx_hash;
+    let v1 = vaults(&env)[0];
+    let memo = HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b_hash);
     let hex = unlock_hex(&env, &v1, &r, 300_000_000, Some(&memo)).await;
     let signed = env
         .mock
@@ -2257,13 +2238,13 @@ async fn k3_attacker_prefilled_record_is_not_reused() {
         set_id: env.set.0,
         prevout: CoreOutPoint::new(v1.txid.0, v1.vout),
     };
-    engines[leader2]
+    engines[leader]
         .ctx()
         .db(|t| {
             t.sign_once_unlock(
                 &key,
                 Some(&UnlockBurn {
-                    key: k2,
+                    key: k,
                     origin: UnlockOrigin::Cosign,
                     allow_double: false,
                 }),
@@ -2272,24 +2253,7 @@ async fn k3_attacker_prefilled_record_is_not_reused() {
             )
         })
         .unwrap();
-    // the leader holds the burn: it neither re-sends the co-signed bytes nor signs another vault
-    let sends = env.mock.state().calls_to("vault_send").len();
-    tick_all(&mut engines).await;
-    assert!(
-        unlocks_for(&env, nonce2).is_empty(),
-        "nothing posted for the burn"
-    );
-    assert_eq!(env.mock.state().calls_to("vault_send").len(), sends);
-    assert!(
-        engines[leader2]
-            .alarms()
-            .iter()
-            .any(|a| a.name == "unlock-held"),
-        "{:?}",
-        engines[leader2].alarms()
-    );
-    // its fee input is spent by another transaction and buried C_Y deep: the row dies and the
-    // leader signs another vault for the burn
+    // its fee input is spent elsewhere and buried C_Y + 1 deep
     let tx = Transaction::decode(&signed.hex.0).unwrap();
     let fee = tx.inputs.iter().find(|i| i.prevout != v1).unwrap().prevout;
     let spend = Transaction::new_v4(
@@ -2306,29 +2270,343 @@ async fn k3_attacker_prefilled_record_is_not_reused() {
         0,
     );
     env.mock.state().submit(spend.encode()).unwrap();
+    env.mine(C_Y + 1);
+    let builds = env.mock.state().calls_to("vault_buildunlock").len();
+    // the attacker revives the signed bytes: re-funded by anyone, still a valid unlock
+    let c = env.mock.client();
+    let revived = c.vault_refee(&signed.hex).await.unwrap();
+    c.vault_send(&revived.hex).await.unwrap();
+    for _ in 0..3 {
+        tick_all(&mut engines).await;
+    }
     env.mine(1);
-    tick_all(&mut engines).await; // seen spent: 1 block deep
-    assert!(unlocks_for(&env, nonce2).is_empty());
-    env.mine(1);
-    tick_all(&mut engines).await; // C_Y deep: dead
-    tick_all(&mut engines).await; // another vault
-    let rows = engines[leader2]
-        .ctx()
-        .db(|t| t.unlock_burn_rows(&env.set.0, &k2))
-        .unwrap();
-    let dead = rows.iter().find(|r| r.prevout == key.prevout).unwrap();
-    assert!(
-        dead.dead_reason
-            .as_deref()
-            .is_some_and(|r| r.contains("fee input")),
-        "{dead:?}"
+    for _ in 0..u32::from(DELAY) + 2 {
+        tick_all(&mut engines).await;
+        env.mine(1);
+    }
+    tick_all(&mut engines).await;
+    assert_eq!(
+        env.mock.state().calls_to("vault_buildunlock").len(),
+        builds,
+        "no member built another unlock for the burn"
     );
-    let live: Vec<_> = rows.iter().filter(|r| r.is_live()).collect();
-    assert_eq!(live.len(), 1);
-    assert_eq!(live[0].origin, UnlockOrigin::Leader);
-    let posted = unlocks_for(&env, nonce2);
-    assert_eq!(posted.len(), 1, "one unlock for the burn");
-    assert_ne!(posted[0].1, v1, "on another vault");
+    for (i, e) in engines.iter().enumerate() {
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert_eq!(b.state, BurnState::Released, "attestor {i}");
+        let paying: Vec<_> = e
+            .ctx()
+            .db(|t| {
+                let mut v = vec![];
+                for st in [
+                    IntentState::Matched,
+                    IntentState::Released,
+                    IntentState::Unmatched,
+                    IntentState::CancelSent,
+                    IntentState::Cancelled,
+                ] {
+                    v.extend(t.intents_in_state(st)?);
+                }
+                Ok(v)
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|i| {
+                i.memo.as_deref().is_some_and(|m| {
+                    hawkeye_core::memo::HawkeyeMemo::decode(m).is_ok_and(|m| m.reference == nonce)
+                })
+            })
+            .collect();
+        assert_eq!(paying.len(), 1, "attestor {i}: one intent pays the burn");
+        assert_eq!(
+            paying[0].origin_vault,
+            Some(key.prevout),
+            "on the co-signed vault"
+        );
+        for row in e.ctx().db(|t| t.unlock_burn_rows(&env.set.0, &k)).unwrap() {
+            assert_eq!(
+                row.prevout, key.prevout,
+                "attestor {i}: never a second vault"
+            );
+            assert!(row.is_live(), "never declared dead");
+        }
+    }
+}
+
+/// (k8) Takeover with prior signed bytes (audit 01/V-2): the burn's leader signed an unlock
+/// that never left (its send failed) and went silent. The takeover leader finds those bytes
+/// on the old leader's `GET /burns/<nonce>`, adopts them and sends them re-funded on the same
+/// vault, instead of signing a second vault that a revival of the first would double.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8_takeover_resends_the_previous_signed_unlock() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, _urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x49; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    env.mock
+        .state()
+        .inject_error("vault_send", -26, "16: mock refusal");
+    engines[leader].tick().await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "the send failed");
+    let first = engines[leader]
+        .ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap()
+        .unwrap()
+        .prevout;
+    let builds = env.mock.state().calls_to("vault_buildunlock").len();
+    // the leader falls silent; the others take the burn over after TAKEOVER blocks
+    for _ in 0..TAKEOVER + 1 {
+        env.mine(1);
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+    }
+    // the takeover leader sent it, and it is mined: every watching attestor links the burn to
+    // an intent of the previous leader's vault
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert!(
+            matches!(
+                b.state,
+                BurnState::IntentPending | BurnState::IntentConfirmed
+            ),
+            "attestor {i}: {:?}",
+            b.state
+        );
+        let intent = e
+            .ctx()
+            .db(|t| t.intent(&b.intent.unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intent.origin_vault,
+            Some(first),
+            "the previous leader's vault"
+        );
+    }
+    assert_eq!(
+        env.mock.state().calls_to("vault_buildunlock").len(),
+        builds,
+        "no new unlock was built"
+    );
+    let next = (0..3)
+        .find(|i| {
+            *i != leader
+                && engines[*i]
+                    .ctx()
+                    .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+                    .unwrap()
+                    .is_some()
+        })
+        .expect("the takeover leader recorded it");
+    let row = engines[next]
+        .ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.prevout, first);
+    assert_eq!(row.origin, hawkeye_store::UnlockOrigin::Leader);
+}
+
+/// (k9) The same at `unlockThreshold = 2`: the silent leader's unlock carries its own and a
+/// co-signer's signature; whichever member takes over — the co-signer re-sending its row, or
+/// the third adopting it from a peer — sends those bytes re-funded and builds nothing new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k9_takeover_at_unlock_threshold_two_resends_the_cosigned_unlock() {
+    let Some(env) = setup_with(views(2, 1)).await else {
+        return;
+    };
+    let (mut engines, _urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x49; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    env.mock
+        .state()
+        .inject_error("vault_send", -26, "16: mock refusal");
+    engines[leader].tick().await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "the send failed");
+    let first = engines[leader]
+        .ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap()
+        .unwrap()
+        .prevout;
+    let builds = env.mock.state().calls_to("vault_buildunlock").len();
+    // the leader falls silent; the others take the burn over after TAKEOVER blocks
+    for _ in 0..TAKEOVER + 1 {
+        env.mine(1);
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+    }
+    // the takeover leader sent it, and it is mined: every watching attestor links the burn to
+    // an intent of the previous leader's vault
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert!(
+            matches!(
+                b.state,
+                BurnState::IntentPending | BurnState::IntentConfirmed
+            ),
+            "attestor {i}: {:?}",
+            b.state
+        );
+        let intent = e
+            .ctx()
+            .db(|t| t.intent(&b.intent.unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intent.origin_vault,
+            Some(first),
+            "the previous leader's vault"
+        );
+    }
+    assert_eq!(
+        env.mock.state().calls_to("vault_buildunlock").len(),
+        builds,
+        "no new unlock was built"
+    );
+    let next = (0..3)
+        .find(|i| {
+            *i != leader
+                && engines[*i]
+                    .ctx()
+                    .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+                    .unwrap()
+                    .is_some()
+        })
+        .expect("the takeover leader recorded it");
+    let row = engines[next]
+        .ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.prevout, first);
+    assert!(
+        matches!(
+            row.origin,
+            hawkeye_store::UnlockOrigin::Leader | hawkeye_store::UnlockOrigin::Cosign
+        ),
+        "its own co-signed row re-sent, or the previous unlock adopted: {:?}",
+        row.origin
+    );
+}
+
+/// (k10) A co-signer asked again for the **same** unlock re-funded (other fee inputs, 01/V-2)
+/// adds the signature it already made over that sighash — no new signature, no sign-once
+/// conflict; another unlock of the vault is still refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k10_cosigner_merges_its_signature_into_a_refunded_unlock() {
+    use hawkeye::peers::UnlockSignRequest;
+    use hawkeye_core::memo::HawkeyeMemo;
+    let Some(env) = setup_with(views(2, 1)).await else {
+        return;
+    };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x4a; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let peer = (leader + 1) % 3;
+    engines[peer].tick().await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let b = engines[peer].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    let memo = HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
+    let vault = vaults(&env)[0];
+    let hex = unlock_hex(&env, &vault, &r, 300_000_000, Some(&memo)).await;
+    let as_leader = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[leader]));
+    let first = as_leader
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: hex.clone() })
+        .await
+        .unwrap();
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    // the same unlock, re-funded: other fee inputs, same template input and outputs
+    let refunded = env
+        .mock
+        .client()
+        .vault_refee(&hex.parse().unwrap())
+        .await
+        .unwrap()
+        .hex
+        .to_string();
+    assert_ne!(refunded, hex);
+    let again = as_leader
+        .unlock_sign(
+            &urls[peer],
+            &UnlockSignRequest {
+                hex: refunded.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        env.mock.state().calls_to("set_signunlock").len(),
+        signs,
+        "no new signature"
+    );
+    let ours = Transaction::decode_hex(&again.body.hex).unwrap();
+    let base = Transaction::decode_hex(&refunded).unwrap();
+    assert_eq!(ours.outputs, base.outputs);
+    assert_eq!(
+        ours.inputs.iter().map(|i| i.prevout).collect::<Vec<_>>(),
+        base.inputs.iter().map(|i| i.prevout).collect::<Vec<_>>(),
+        "the re-funded inputs"
+    );
+    assert_eq!(
+        hawkeye::engine::burn::unlock_signatures(&again.body.hex).unwrap(),
+        1
+    );
+    let had = Transaction::decode_hex(&first.body.hex).unwrap();
+    let sig = |t: &Transaction| {
+        let i = t.inputs.iter().position(|i| i.prevout == vault).unwrap();
+        t.inputs[i].script_sig.clone()
+    };
+    assert_eq!(
+        sig(&ours),
+        sig(&had),
+        "the signature it made the first time"
+    );
+    // another unlock of the vault (other outputs) is still refused
+    let other = unlock_hex(&env, &vault, &r, 200_000_000, Some(&memo)).await;
+    let e = as_leader
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: other })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("403"), "{e}");
 }
 
 /// (k3b) A leader's own unlock that never left (vault_send failed) and whose fee input was then

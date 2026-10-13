@@ -242,8 +242,8 @@ within a working day.
 | `slash-case-<id>` | page | a slash case waits for this operator (`auto_slash = false`, the mainnet default) | verify the evidence (section 10a) and vote |
 | `burn-over-cap` | ticket | a burn larger than the set's whole per-window unlock cap is parked out of the FIFO; later burns are served | governance: a `SET_PARAMS` raising `ratelimitbps`, or a decision to leave it parked |
 | `node-sign-restored` | page | `"wallet"` mode: the node wallet refuses every set signature (`set-sign-restored`, 07/F-5): it imported the member key (enrolment) or was restored from a seed, and its restore marker is set; no unlock or cancel is signed | if no other copy of the key can have signed: `hawkeye acknowledge-restore` (section 4 step 7, section 5 step 5); otherwise do not acknowledge, leave with the key |
-| `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet (takeover moves the burn on) | check the node's mempool and fee coins |
-| `unlock-dead` | ticket | a signed unlock can no longer confirm (its vault was spent by another transaction, or — for an unlock this attestor co-signed but did not lead — a fee input was spent); another vault may be signed | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
+| `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet: its vault is spent in the mempool, or by another transaction not yet `C_Y` deep, or it is a drill's (takeover moves the burn on) | check the node's mempool |
+| `unlock-dead` | ticket | a signed unlock can no longer confirm: its **vault** was spent by another transaction at least `C_Y` deep (a fee-input spend never makes it dead: it can be re-funded, 01/V-2); one more vault may now be signed for the burn | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
 | `roll-overdue` | ticket | vaults past half their `ROLL_MARGIN` without a roll (HK-6) | check the roll leader and the rate limit |
 | `roll-waiting-cap` | ticket | rolls wait for rate-limit room | expected under load; governance if it persists |
 | `fee-coins-low` | ticket | fewer than 8 confirmed fee coins in the node wallet: a flood of intents can outrun the cancels | fund the wallet; `hawkeye split-coins --count 16` |
@@ -286,7 +286,26 @@ when `vault_send` answers `bad-txns-inputs-spent`, `Missing inputs` or `txn-memp
 calls `vault_refee`, checks that only the fee inputs changed (log `refee`; a refusal is
 `refee_refused` / `refee_failed`) and sends the re-funded spend, with no new signature. A leader's
 unlock whose fee input is gone is therefore re-sent, never declared dead: anyone holding its bytes
-could re-fund it, so signing another vault for the burn could pay it twice. By hand: `ycash-cli
+could re-fund it, so signing another vault for the burn could pay it twice.
+
+**One revivable unlock per burn (01/V-2 on 05/N-1).** The rule every attestor follows: it never
+signs a second unlock for a burn while an unlock it signed for that burn could still confirm, and
+an unlock stops being revivable only when its **vault** is spent by another transaction at least
+`C_Y` deep (log `unlock_dead`) or the burn is paid. In practice:
+
+- an unlock this attestor co-signed (`unlockThreshold > 1`) and now leads after a takeover is
+  re-sent re-funded (`vault_refee` replaces every fee input: they are the old leader's), with no
+  new signature — log `unlock_resend` with `refund=true`;
+- a takeover leader that holds nothing for the burn first asks every peer's `GET /burns/<nonce>`
+  (field `unlock`: the signed unlock that peer holds for it) and adopts a valid one — log
+  `unlock_prior_found` / `unlock_adopted`, then `refee` — instead of building a new unlock; only
+  when no peer has one does it sign a fresh vault (the silent old leader's bytes, should they ever
+  be revived, are a second intent for a consumed burn: the watchers cancel it as a benign race);
+- a co-signer asked again for the same unlock re-funded adds the signature it already made (log
+  `unlock_cosign_merged`), and still refuses any other unlock of the vault.
+
+Keep the peer API reachable to the other attestors: a takeover depends on reading the old
+leader's `/burns/<nonce>`. By hand: `ycash-cli
 vault_refee <signed hex>`, then `vault_send` of the result. Re-funding needs a coin of exactly the
 missing value (within 1,000 zatoshi) or makes one with a self-send the spend chains on; keep fee
 coins confirmed (`fee-coins-low`). The node also remembers one build per vault and intent
