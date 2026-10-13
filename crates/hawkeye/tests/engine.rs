@@ -3978,12 +3978,19 @@ async fn u_minted_on_reorged_lock_pauses_own_mints() {
     e[0].ctx()
         .db(|t| t.ack_exposure(&l1, "set paused the bridge; supply reconciled"))
         .unwrap();
-    for _ in 0..3 {
+    let mut rounds = 0;
+    while lock_state(&e[0], &l2) != LockState::Minted {
+        rounds += 1;
+        assert!(
+            rounds <= 20,
+            "not minted after the ack: {:?}",
+            lock_state(&e[0], &l2)
+        );
+        env.mine(1); // the leader may be another member: takeover after TAKEOVER blocks
         tick_all(&mut e).await;
         env.eth_mine(3).await;
     }
     assert!(!e[0].alarms().iter().any(|a| a.name == "exposure"));
-    assert_eq!(lock_state(&e[0], &l2), LockState::Minted);
 }
 
 /// A proposed, not yet executed lock whose Ycash block reorgs away: its own proposer withdraws

@@ -1293,7 +1293,11 @@ format = "text"
                 &format!("secret_hex = \"{}\"", "01".repeat(32)),
                 "keystore = \"k.json\"",
             )
-            .replace("drills = true", "drills = false");
+            .replace("drills = true", "drills = false")
+            .replace(
+                "finality = \"finalized\"\n",
+                "finality = \"finalized\"\nsender_keystore = \"s.json\"\n",
+            );
         Config::parse(&text).unwrap().settings(d.path()).unwrap();
         let late = text.replace(
             "rpc_password = \"p\"\n",
