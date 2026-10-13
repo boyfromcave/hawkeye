@@ -119,6 +119,8 @@ struct Opts {
     mode: MintMode,
     min_owner_age: u32,
     roll_margin: u32,
+    /// The set's `ratelimitbps` (0: no rate limit).
+    ratelimitbps: u32,
 }
 
 impl Default for Opts {
@@ -127,6 +129,7 @@ impl Default for Opts {
             mode: MintMode::Threshold { k: 1 },
             min_owner_age: 400,
             roll_margin: 50,
+            ratelimitbps: 0,
         }
     }
 }
@@ -216,7 +219,7 @@ async fn setup_with(opts: Opts) -> Option<Env> {
         cancelthreshold: 1,
         slashthreshold: 2,
         open: false,
-        ratelimitbps: 0,
+        ratelimitbps: opts.ratelimitbps,
         ratewindow: 20,
         livenesswindow: 1000,
         bondmin: Amount(100_000_000),
@@ -1995,4 +1998,125 @@ async fn j2_threshold_mode_watchers_still_challenge_proposals() {
     env.warp(WINDOW).await;
     tick_all(&mut engines).await;
     assert_eq!(rogue.total_supply().await.unwrap(), U256::ZERO);
+}
+
+/// GET `/burns/<nonce>` from `e`'s API.
+async fn burn_view(e: &Engine, nonce: u64) -> hawkeye::peers::BurnView {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = hawkeye::api::router(e.ctx().clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    reqwest::get(format!("http://{addr}/burns/{nonce}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// (p) Audit 05/M-2: a burn above the set's whole per-window cap never stalls later nonces. With
+/// `ratelimitbps` 5000 over 10 YEC locked (cap 5 YEC), burns of 8, 1 and 1 YEC: the 8 is parked
+/// `WAITING_CAP` (reason `over-cap`, alarm `burn-over-cap`, `/status`, `/metrics`, `/burns`) on
+/// every attestor while the two 1-YEC burns are unlocked; raising the set's rate limit releases it
+/// without a restart and clears the alarm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p_over_cap_burn_does_not_block_later_burns() {
+    let Some(env) = setup_with(Opts {
+        ratelimitbps: 5_000,
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let mut engines = vec![
+        env.engine(0).await,
+        env.engine(1).await,
+        env.engine(2).await,
+    ];
+    lock_and_mint(&env, &mut engines).await;
+    // into the next rate-limit epoch: its basis is the 10 YEC locked
+    env.mine(20);
+    tick_all(&mut engines).await;
+    let r = YcashRecipient::p2pkh([0x77; 20]);
+    let big = env.burn(800_000_000, &r).await;
+    let small = [
+        env.burn(100_000_000, &r).await,
+        env.burn(100_000_000, &r).await,
+    ];
+    env.eth_mine(3).await;
+    tick_all(&mut engines).await;
+    let dep = dep_of(&engines[0]);
+    let kb = BurnKey::new(dep, big);
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&kb)).unwrap().unwrap();
+        assert!(b.over_cap(), "parked over cap on every ledger: {b:?}");
+        assert!(
+            e.alarms().iter().any(|a| a.name == "burn-over-cap"),
+            "{:?}",
+            e.alarms()
+        );
+    }
+    // the later burns go on
+    for _ in 0..6 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    for n in small {
+        let k = BurnKey::new(dep, n);
+        for e in &engines {
+            let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+            assert!(
+                matches!(b.state, BurnState::IntentConfirmed | BurnState::Released),
+                "burn {n} is served past the over-cap one: {:?}",
+                b.state
+            );
+        }
+    }
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&kb)).unwrap().unwrap();
+        assert!(b.over_cap(), "still parked: {b:?}");
+        let st = e.ctx().status.read().unwrap().clone();
+        assert_eq!(st.burns_over_cap, 1);
+        let m = hawkeye::status::render_metrics(&st);
+        assert!(m.contains("hawkeye_burn_over_cap 1"), "{m}");
+        assert!(m.contains("hawkeye_alarm{name=\"burn-over-cap\"} 1"), "{m}");
+    }
+    let view = burn_view(&engines[0], big).await;
+    assert_eq!(view.state, "WAITING_CAP");
+    assert_eq!(view.reason.as_deref(), Some("over-cap"));
+    // governance raises the rate limit: released at the next tick, no restart
+    env.mock
+        .state()
+        .sets
+        .get_mut(&env.set)
+        .unwrap()
+        .set
+        .params
+        .ratelimitbps = 10_000;
+    tick_all(&mut engines).await;
+    for e in &engines {
+        assert!(
+            !e.alarms().iter().any(|a| a.name == "burn-over-cap"),
+            "the alarm clears: {:?}",
+            e.alarms()
+        );
+    }
+    for _ in 0..3 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&kb)).unwrap().unwrap();
+        assert!(
+            matches!(
+                b.state,
+                BurnState::IntentPending | BurnState::IntentConfirmed | BurnState::Released
+            ),
+            "released after the cap raise: {:?}",
+            b.state
+        );
+        assert_eq!(e.ctx().status.read().unwrap().burns_over_cap, 0);
+    }
+    assert_eq!(burn_view(&engines[0], big).await.reason, None);
 }

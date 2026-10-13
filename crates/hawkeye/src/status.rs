@@ -69,6 +69,9 @@ pub struct Status {
     pub locks: BTreeMap<String, u64>,
     /// Burn counts by state.
     pub burns: BTreeMap<String, u64>,
+    /// Burns parked `WAITING_CAP` because they exceed the set's full-window cap (audit 05/M-2,
+    /// alarm `burn-over-cap`); counted in `burns["WAITING_CAP"]` too.
+    pub burns_over_cap: u64,
     /// Intent counts by state.
     pub intents: BTreeMap<String, u64>,
     /// Vault counts by state.
@@ -161,6 +164,11 @@ pub fn render_metrics(s: &Status) -> String {
         gauge(name, help, &rows);
     }
     gauge(
+        "hawkeye_burn_over_cap",
+        "Burns parked because they exceed the set's full-window rate-limit cap",
+        &[(String::new(), s.burns_over_cap as f64)],
+    );
+    gauge(
         "hawkeye_live_members",
         "Live members of the attestor set",
         &[(String::new(), s.live_members as f64)],
@@ -207,8 +215,10 @@ mod tests {
             detail: "x".into(),
             since: 1,
         });
+        s.burns_over_cap = 1;
         let m = render_metrics(&s);
         assert!(m.contains("hawkeye_locks{state=\"MINTED\"} 2"));
+        assert!(m.contains("hawkeye_burn_over_cap 1"));
         assert!(m.contains("hawkeye_alarm{name=\"supply\"} 1"));
         assert!(m.contains("# TYPE hawkeye_supply_ok gauge"));
     }

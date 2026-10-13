@@ -47,7 +47,7 @@ pub mod state;
 pub mod vaults;
 
 pub use accounts::{Account, Guardian};
-pub use burns::{BurnKey, BurnRecord, NewBurn};
+pub use burns::{BurnKey, BurnRecord, NewBurn, OVER_CAP_EPOCH};
 pub use chain::{Cursor, RewindReport};
 pub use error::{Result, SignerError, StoreError};
 pub use events::Event;

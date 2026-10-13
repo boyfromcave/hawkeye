@@ -109,6 +109,12 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
             }
         );
     }
+    if st.burns_over_cap > 0 {
+        println!(
+            "burns over cap: {} (WAITING_CAP, reason over-cap: they wait for the set's cap to rise)",
+            st.burns_over_cap
+        );
+    }
     println!(
         "supply: wYEC {} vs locked {} → {}",
         st.supply.wyec_total_supply,
@@ -312,6 +318,7 @@ pub async fn burn(
     recipient: &str,
     eth_key: Option<&str>,
     near_key: Option<&std::path::Path>,
+    allow_over_cap: bool,
 ) -> Result<()> {
     let r = decode_address(recipient, s.network).map_err(|e| anyhow!("--recipient: {e}"))?;
     if let Some(w) = recipient_warning(&r) {
@@ -319,6 +326,22 @@ pub async fn burn(
         eprintln!("warning: {w}");
     }
     let value = zat(amount)?;
+    if !allow_over_cap {
+        // a courtesy for honest holders (05/M-2): a deliberate over-cap burn is harmless anyway
+        match ycash(s)?.set_getinfo(&s.params.set_hash(), None).await {
+            Ok(info) => over_cap_check(
+                u64::try_from(value)?,
+                crate::engine::burn::full_window_cap(&info.set),
+            )?,
+            Err(e) => {
+                warn!(event = "burn_cap_unchecked", error = %e);
+                eprintln!(
+                    "warning: the set's rate limit could not be read ({e}); the burn is sent \
+                     unchecked against the per-window cap"
+                );
+            }
+        }
+    }
     let chain = match s.foreign {
         BridgeKind::Ethereum => {
             ensure!(near_key.is_none(), "--near-key is for a NEAR bridge");
@@ -351,6 +374,21 @@ pub async fn burn(
         "recipient_kind": r.kind().name(),
         "recipienthash": hex::encode(r.recipient_hash()),
     }))
+}
+
+/// `hawkeye burn`'s pre-check (audit 05/M-2): refuse a burn of `amount` zat above the set's
+/// full-window cap `full` (`None`: no rate limit). Such a burn is not released until the set raises
+/// its rate limit; `--allow-over-cap` sends it anyway.
+pub fn over_cap_check(amount: u64, full: Option<u64>) -> Result<()> {
+    if let Some(cap) = full {
+        ensure!(
+            amount <= cap,
+            "this burn exceeds the attestor set's per-window cap ({} YEC): it would not be \
+             released until the set raises its rate limit; pass --allow-over-cap to burn anyway",
+            Amount::from_zat(i64::try_from(cap).unwrap_or(i64::MAX))
+        );
+    }
+    Ok(())
 }
 
 /// The warning `hawkeye burn` prints for a recipient the contract accepts but the node may not
@@ -871,6 +909,20 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// 05/M-2 (d): `hawkeye burn` refuses a burn above the set's per-window cap, names the cap
+    /// and the override; within the cap, or with no rate limit, it passes.
+    #[test]
+    fn burn_pre_check_refuses_an_over_cap_amount() {
+        let e = over_cap_check(800_000_000, Some(500_000_000)).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "this burn exceeds the attestor set's per-window cap (5.00000000 YEC): it would not \
+             be released until the set raises its rate limit; pass --allow-over-cap to burn anyway"
+        );
+        assert!(over_cap_check(500_000_000, Some(500_000_000)).is_ok());
+        assert!(over_cap_check(u64::MAX, None).is_ok());
     }
 
     #[test]
