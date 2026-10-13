@@ -129,6 +129,15 @@ two files would be from different instants. Take one before every upgrade (secti
    *ledger is behind the chain: records for vault X missing*, and the command exits non-zero;
 4. if anything is missing, or you are in any doubt, **do not sign from this ledger**: leave with
    the key (section 7) and rejoin with a fresh one.
+5. in `"wallet"` mode the node keeps its own sign-once records in `wallet.dat` (07/F-5): a wallet
+   restored from its seed, or one that imported the member key, carries a **restore marker** and
+   refuses to sign (`set-sign-restored`, which Hawkeye logs and retries, signing nothing) until the
+   old wallet's history is imported and acknowledged: `set_listsigned` on the old wallet (or the
+   `vaultsetsig=` lines of its `dumpwallet`), `set_importsigned` on the new one, check with
+   `set_listsigned`, then `set_acknowledgerestore` — only when no other copy of the key can have
+   signed since. A `wallet.dat` restored by copying the file has no marker: the single-instance
+   rule (section 2) is the only defence. In `"self"` mode the node holds no member key and
+   `hawkeye.db` is the record.
 
 `hawkeye run` performs the same audit at start and **refuses to start** when a record is missing;
 `--i-accept-equivocation-risk` overrides it, for the case where you know the original copy can never
@@ -227,7 +236,7 @@ within a working day.
 | `slash-case-<id>` | page | a slash case waits for this operator (`auto_slash = false`, the mainnet default) | verify the evidence (section 10a) and vote |
 | `burn-over-cap` | ticket | a burn larger than the set's whole per-window unlock cap is parked out of the FIFO; later burns are served | governance: a `SET_PARAMS` raising `ratelimitbps`, or a decision to leave it parked |
 | `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet (takeover moves the burn on) | check the node's mempool and fee coins |
-| `unlock-dead` | ticket | a signed unlock can no longer confirm (its vault or inputs were spent); another vault may be signed | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
+| `unlock-dead` | ticket | a signed unlock can no longer confirm (its vault was spent by another transaction, or — for an unlock this attestor co-signed but did not lead — a fee input was spent); another vault may be signed | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
 | `roll-overdue` | ticket | vaults past half their `ROLL_MARGIN` without a roll (HK-6) | check the roll leader and the rate limit |
 | `roll-waiting-cap` | ticket | rolls wait for rate-limit room | expected under load; governance if it persists |
 | `fee-coins-low` | ticket | fewer than 8 confirmed fee coins in the node wallet: a flood of intents can outrun the cancels | fund the wallet; `hawkeye split-coins --count 16` |
@@ -262,6 +271,20 @@ bridge vault's owner branch opens (plan §1.4): a dormant set protects nobody. A
 - alert: HawkeyeFeeCoins
   expr: hawkeye_fee_coins < 8
 ```
+
+**A signed spend whose fee input is gone** (audit 01/V-2). Set signatures cover the template input
+and every output (`SIGHASH_ALL|SIGHASH_ANYONECANPAY`), not the fee inputs, so a signed UNLOCK,
+CANCEL or roll stays valid when its fee coin is spent elsewhere. Hawkeye re-funds it by itself:
+when `vault_send` answers `bad-txns-inputs-spent`, `Missing inputs` or `txn-mempool-conflict`, it
+calls `vault_refee`, checks that only the fee inputs changed (log `refee`; a refusal is
+`refee_refused` / `refee_failed`) and sends the re-funded spend, with no new signature. A leader's
+unlock whose fee input is gone is therefore re-sent, never declared dead: anyone holding its bytes
+could re-fund it, so signing another vault for the burn could pay it twice. By hand: `ycash-cli
+vault_refee <signed hex>`, then `vault_send` of the result. Re-funding needs a coin of exactly the
+missing value (within 1,000 zatoshi) or makes one with a self-send the spend chains on; keep fee
+coins confirmed (`fee-coins-low`). The node also remembers one build per vault and intent
+(`vault_buildunlock` / `vault_buildcancel` return it again, `build` `reused`); Hawkeye rebuilds
+(`rebuild`) only a build it holds no signature of (log `unlock_rebuild`).
 
 ## 10. Incident response
 
