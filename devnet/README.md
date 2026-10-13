@@ -318,8 +318,9 @@ attestor4, signed with the contract's current threshold by attestor1..k from the
 `hawkeye leave` at once. Attestor3 leaves in the **inverse** order: `hawkeye leave` first, the
 governance round after. Pass: in each order every remaining attestor's `/status` shows
 `guardian-drift` between the two halves and not after; the final guardians are exactly the set's
-current members; a second lock (3) mints; attestor4's `hawkeye withdraw-bond` succeeds after
-`maturity`. Regtest asserts the alarm only (drift pauses signing on mainnet, not here). Operators:
+current members; a second lock (3) mints; after `maturity` attestor4's `hawkeye withdraw-bond`
+is held only by the devnet bond script's own CLTV (`BOND_LOCK` = 5,000 blocks), which the scenario
+checks it names. Regtest asserts the alarm only (drift pauses signing on mainnet, not here). Operators:
 read [`docs/operations.md`](../docs/operations.md) before running an attestor for real.
 
 ## `scenario pq-recipient`: a post-quantum burn recipient (plan §9.1 R5, NEAR plan NH-R5)

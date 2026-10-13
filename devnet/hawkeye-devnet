@@ -2683,12 +2683,20 @@ format = "text"
 
         self.step("the rotated bridge still works: lock 3 YEC and wait for its mint")
         self.lock_mint("3", 13 * COIN, timeout)
-        self.step("attestor%d withdraws its bond after the exit delay (maturity %d)"
-                  % (n, self.s["set"]["params"]["maturity"]))
+        self.step("attestor%d's bond after the exit delay (maturity %d): the primitive releases it; the devnet's "
+                  "bond script also carries a CLTV of BOND_LOCK = %d blocks, so `withdraw-bond` must name that"
+                  % (n, self.s["set"]["params"]["maturity"], BOND_LOCK))
         self.mine(self.s["set"]["params"]["maturity"] + 2)
         a = self.attestor(n)
-        out = self.hawkeye(a["config"], "withdraw-bond", timeout=180).stdout.strip()
-        self.say("  attestor%d: hawkeye withdraw-bond -> %s" % (n, out.splitlines()[-1][:220] if out else "ok"))
+        p = self.hawkeye(a["config"], "withdraw-bond", timeout=180, check=False)
+        out = (p.stdout + p.stderr).strip()
+        if p.returncode == 0:
+            self.say("  attestor%d: hawkeye withdraw-bond -> %s" % (n, out.splitlines()[-1][:220] if out else "ok"))
+        elif "CLTV holds it until height" in out:
+            self.say("  attestor%d: hawkeye withdraw-bond refused as expected on this devnet: %s"
+                     % (n, out.splitlines()[-1][:220]))
+        else:
+            die("withdraw-bond: %s" % out[-800:])
         bridge = self.s["eth"]["bridge"]
         count = int(self.eth_call(bridge, "guardianCount()(uint256)"))
         member = [i for i in range(1, n + 1)
@@ -2698,7 +2706,8 @@ format = "text"
                 % (",".join(map(str, member)), count, ",".join(map(str, watch))))
         return ("rotation in the documented order raised guardian-drift between the governance round and the leave "
                 "and cleared it after; the inverse order raised it until the round; final guardians attestor%s = the "
-                "set's current members, no drift, mints work, the leaver's bond withdrawn" % ",".join(map(str, watch)))
+                "set's current members, no drift, mints work; the leaver's bond past its exit delay (held only by "
+                "the devnet's CLTV)" % ",".join(map(str, watch)))
 
     def drill_takeover(self, timeout):
         p = self.bridge()

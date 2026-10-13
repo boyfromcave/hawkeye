@@ -1,0 +1,64 @@
+00:54:31 removed /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet
+00:54:31 === hawkeye-devnet scenario rotation (docs/operations.md §7: guardian rotation order and guardian-drift (audit 05/M-3)), 2026-10-13 07:54:31 UTC
+00:54:31 ycashd: /Users/boy/projects/yellowback-workspace/ycash-dd/src/ycashd (node line ycash-dd v4.5.0): Ycash Daemon version v4.5.0-db4683a2e-dirty
+00:54:31 hawkeye: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/target/debug/hawkeye (hawkeye 0.1.0)
+00:54:31 --- step 1: up (4 attestors)
+00:54:31 hawkeye-devnet up: 5 regtest ycashd nodes (node0 user/miner, node1..4 attestors), vault upgrade 6d5b7a31 at height 110, bridge on ethereum (tag WYEC), dir /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet
+00:54:31   node line ycash-dd v4.5.0 (Ycash Daemon version v4.5.0-db4683a2e-dirty); extra start-up args: none
+00:54:39   nodes up: rpc ports 2501, 2503, 2505, 2507, 2509
+00:54:39   mining 211 blocks on node0 (activation 110 + coinbase maturity 100)
+00:54:45   height 211: vault upgrade active (branch 6d5b7a31, activation 110), node0 balance 659.06250000 YEC
+00:54:45   attestor1: member key 031125f1aba3edb6836bc9bb9419c5c69121c0cee451724cd8e368ae0a114b9233, eth address 0xa73e13E033FdED1bd8fB42D8bd8Ee5c8Bc4Bc2B0
+00:54:45   attestor2: member key 03de30870781ea4bf749ed0ef0e9e43558ce100392ac51049bd76a5186d2d9bf44, eth address 0x860F6Fe56a6080420e6FeFD8a778A6cbfbBD9196
+00:54:45   attestor3: member key 0254a2c0eba1731e11f3545670dfcd05953f3fd36f19d21f5ac6f64b392d4d88a9, eth address 0x41cdA855CF899d7d6Ce1401B5B57C50c12C1123f
+00:54:45   attestor4: member key 0316e96ed5dee8e1aed776aa656328ccfb06e9180a86ba75944ee169daebb33b4c, eth address 0xc211Ff344D77DD99C224cd274e5E9747c24335c0
+00:54:45   holder (node0's Ethereum persona): 0xFeE28085eD29cC1985aeb02568230F277bC3aA1d
+00:54:50   funded attestor wallets: 8 coins x 2.5 YEC each (tx 8bfeccfbb1edd7e3f8674eb8e6c51d2b32dda7770f750b49168d27037fc85d16)
+00:54:51   set_create on node0: setid 899c419a1347dc42c910283e0d6e4be9e2100dd77c9d768a936e5b476f42fea7 (seats 4, unlock 1, cancel 1, slash 3, rate 5000 bps / 20, liveness 60, maturity 2, bondmin 1)
+00:54:51   anvil up on http://127.0.0.1:2520 (block time 1s, --slots-in-an-epoch 1: finalized = latest - 2)
+00:54:51   forge script script/Deploy.s.sol: guardians 0xa73e13E033FdED1bd8fB42D8bd8Ee5c8Bc4Bc2B0,0x860F6Fe56a6080420e6FeFD8a778A6cbfbBD9196,0x41cdA855CF899d7d6Ce1401B5B57C50c12C1123f,0xc211Ff344D77DD99C224cd274e5E9747c24335c0, threshold 2, challenge window 12s, mint mode optimistic
+00:54:53   wYEC deployed: bridge 0x5FbDB2315678afecb367f032d93F642f64180aa3, token 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 (deploy block 1, threshold 2, challengeWindow 12s, mintMode optimistic) -> /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet/deployments/31337.json
+00:54:53   funded 9 Ethereum accounts with 1000 ETH each (anvil_setBalance; 4 gas accounts)
+00:54:53   attestor1 enrolled in node1's wallet (hawkeye enroll: {"eth_address":"0xa73e13E033FdED1bd8fB42D8bd8Ee5c8Bc4Bc2B0","memberkey":"031125f1aba3edb6836bc9bb9419c5c69121c0cee451724cd8e368ae0a114b9233","near_guardian":"1125f1aba3edb6836bc9bb9419c5c69121c0cee451724cd8e368ae0a114b9233b7e2f6f26a6de59301526df4d188bbba65b8d2d9a0986ea44e80b3ea7956d5ed"})
+00:54:53   attestor2 enrolled in node2's wallet (hawkeye enroll: {"eth_address":"0x860F6Fe56a6080420e6FeFD8a778A6cbfbBD9196","memberkey":"03de30870781ea4bf749ed0ef0e9e43558ce100392ac51049bd76a5186d2d9bf44","near_guardian":"de30870781ea4bf749ed0ef0e9e43558ce100392ac51049bd76a5186d2d9bf4454cc1e20bc853aca9e157158f327e991f99fccf31eeb514b1dab713109ef0f29"})
+00:54:54   attestor3 enrolled in node3's wallet (hawkeye enroll: {"eth_address":"0x41cdA855CF899d7d6Ce1401B5B57C50c12C1123f","memberkey":"0254a2c0eba1731e11f3545670dfcd05953f3fd36f19d21f5ac6f64b392d4d88a9","near_guardian":"54a2c0eba1731e11f3545670dfcd05953f3fd36f19d21f5ac6f64b392d4d88a95c17c7796fc5914a1c2b3b89c03349296aaaeb3e0f770866e30da98de8ce4334"})
+00:54:54   attestor4 enrolled in node4's wallet (hawkeye enroll: {"eth_address":"0xc211Ff344D77DD99C224cd274e5E9747c24335c0","memberkey":"0316e96ed5dee8e1aed776aa656328ccfb06e9180a86ba75944ee169daebb33b4c","near_guardian":"16e96ed5dee8e1aed776aa656328ccfb06e9180a86ba75944ee169daebb33b4c28ea8840f14a7782d3e19287cf475ea042c3eccfc2ca6ba78c17db45ea08543d"})
+00:54:54   attestor1 SET_JOIN d1b53663ed438c90938d99761b9b28bd1ed0dc1f360d823ff0eea932d873affc (bond 1 YEC at 0accc8146b8277dacc65c63580424d85584ed165f50798fec42fee92e453a19d:0, bond lock 5214)
+00:54:54   attestor2 SET_JOIN 8fbb57e21a49c1ae12178f93a9a7ece860032abe6146b9e7a753b7ecb421ec3f (bond 1 YEC at 76ec1581a51bb545ba3be5be133e2d1f61648e5918b865b8c2ec548239f4dc3a:0, bond lock 5214)
+00:54:54   attestor3 SET_JOIN 17484a27c37a2d1ebc422fc4031c6761e2da837ff180dec6a0eba01b8e554cb3 (bond 1 YEC at 5a19df91381bdd3c4509e71be66b3d81e85e2ab97274c5dfbf65e357272b05d8:0, bond lock 5214)
+00:54:54   attestor4 SET_JOIN 4754c5a8a0cada03172a13b7b36c22a05ad851fa70e5a38c63813f29b1ab11f2 (bond 1 YEC at 92b32fcca5d8794c76083fed658eab9053cdc93e1c30e3b1c715b0bfcfdab44b:0, bond lock 5214)
+00:54:54   4 members current at height 216; lockedvalue 0E-8
+00:54:55   hawkeye1 running (pid 91420) beside node1: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet/attestor1.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet/attestor1/hawkeye.log
+00:54:55   hawkeye2 running (pid 91428) beside node2: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet/attestor2.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet/attestor2/hawkeye.log
+00:54:56   hawkeye3 running (pid 91441) beside node3: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet/attestor3.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet/attestor3/hawkeye.log
+00:54:56   hawkeye4 running (pid 91455) beside node4: /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet/attestor4.toml run, log /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet/attestor4/hawkeye.log
+00:54:56   background miner: node0 mines 1 block every 2.0s (pid 91479; `pause` / `resume`)
+00:54:56 devnet up at height 216; `hawkeye-devnet status`, `hawkeye-devnet down`
+00:54:56 --- step 2: lock 10 YEC and wait for its mint: a working bridge before the rotation
+00:54:57 hawkeye lock 10 --dest 0xFeE28085eD29cC1985aeb02568230F277bC3aA1d: {"amount_zat":1000000000,"lockid":"0xe01b5a9009eb3ca984598a2fed27d255be3f2c9b618dffebd8c81f2fbd9268a2","owner":"01979177ddc3c41e2285e72e99d3095d23ef82d878c7415ddce862bd0ad5be952d","owner_address":"yr2TjcjeVtmGQaKEATz44N2rXjgcTZR1XprV9Zd7DcmxqP9J4k8Y8","owner_height":677,"to":"0xFeE28085eD29cC1985aeb02568230F277bC3aA1d","txid":"102dd6ba5235ab40362788a4ce6c51c70c8dad83b1a56d3314b3dfd29232f25a","vout":0}
+00:55:00   ok: lock 102dd6ba5235ab40 confirmed (3s, height 218)
+00:55:15   ok: holder holds 10 wYEC (16s, height 225)
+00:55:15 --- step 3: the documented order (docs/operations.md §7) for attestor4: governance round first
+00:55:17   setGuardians([0x41cdA855CF899d7d6Ce1401B5B57C50c12C1123f, 0x860F6Fe56a6080420e6FeFD8a778A6cbfbBD9196, 0xa73e13E033FdED1bd8fB42D8bd8Ee5c8Bc4Bc2B0], 2) at adminNonce 0, signed by attestor1,2
+00:55:20   ok: guardian-drift raised on attestor1,2 (the contract dropped attestor4, the set still has it) (3s, height 227)
+00:55:20 --- step 4: then at once: attestor4 `hawkeye leave`
+00:55:20 attestor4's hawkeye stopped
+00:55:20   attestor4: hawkeye leave -> {"bondoutpoint":"4754c5a8a0cada03172a13b7b36c22a05ad851fa70e5a38c63813f29b1ab11f2:0","bondspendableat":230,"exitheight":228,"maturity":2,"memberkey":"0316e96ed5dee8e1aed776aa656328ccfb06e9180a86ba75944ee169daebb33b4c","t
+00:55:21   ok: attestor4's SET_REMOVE mined (no longer current) (1s, height 228)
+00:55:57   ok: guardian-drift cleared on attestor1,2 (the periodic guardian check, <= 60 ticks) (36s, height 245)
+00:55:57 --- step 5: the inverse order for attestor3: leave first (wrong: drift until the governance round; on mainnet it pauses every attestor's signing)
+00:55:57 attestor3's hawkeye stopped
+00:55:57   attestor3: hawkeye leave -> {"bondoutpoint":"17484a27c37a2d1ebc422fc4031c6761e2da837ff180dec6a0eba01b8e554cb3:0","bondspendableat":248,"exitheight":246,"maturity":2,"memberkey":"0254a2c0eba1731e11f3545670dfcd05953f3fd36f19d21f5ac6f64b392d4d88a9","t
+00:55:59   ok: attestor3's SET_REMOVE mined (no longer current) (2s, height 246)
+00:56:59   ok: guardian-drift raised on attestor1,2 (60s, height 273)
+00:57:00   setGuardians([0x860F6Fe56a6080420e6FeFD8a778A6cbfbBD9196, 0xa73e13E033FdED1bd8fB42D8bd8Ee5c8Bc4Bc2B0], 2) at adminNonce 1, signed by attestor1,2
+00:57:03   ok: guardian-drift cleared on attestor1,2 (GuardiansChanged triggers the check) (3s, height 275)
+00:57:03 --- step 6: the rotated bridge still works: lock 3 YEC and wait for its mint
+00:57:03 hawkeye lock 3 --dest 0xFeE28085eD29cC1985aeb02568230F277bC3aA1d: {"amount_zat":300000000,"lockid":"0x81f162a3d79f4bc1d66be46017bf85e2b4ddf50985bece494aaadaf041aed1a8","owner":"0103a1378876e658089a34b9ff94ea148048cc61a24722a110b0c94ed7fcb9250d","owner_address":"yr2ScTr2gAkiGh7j79CfehmH1Kue1PDEaZmqirwCnVePyjugmfUsL","owner_height":736,"to":"0xFeE28085eD29cC1985aeb02568230F277bC3aA1d","txid":"5fde4cf7dd04d38a25b052a8196d76fa87b6d82a34645803eaa64150257ea5ee","vout":0}
+00:57:04   ok: lock 5fde4cf7dd04d38a confirmed (1s, height 276)
+00:57:21   ok: holder holds 13 wYEC (17s, height 284)
+00:57:21 --- step 7: attestor4's bond after the exit delay (maturity 2): the primitive releases it; the devnet's bond script also carries a CLTV of BOND_LOCK = 5000 blocks, so `withdraw-bond` must name that
+00:57:22   attestor4: hawkeye withdraw-bond refused as expected on this devnet: Error: the bond script's CLTV holds it until height 5215 (tip 288)
+00:57:22 === PASS: rotation in the documented order raised guardian-drift between the governance round and the leave and cleared it after; the inverse order raised it until the round; final guardians attestor1,2 = the set's current members, no drift, mints work; the leaver's bond past its exit delay (held only by the devnet's CLTV)
+00:57:22 --- down
+00:57:27 devnet down (stopped: miner, hawkeye1, hawkeye2, anvil, ycashd0, ycashd1, ycashd2, ycashd3, ycashd4); the directory /Users/boy/projects/yellowback-workspace/wt/scratch/fx-bridge-runbook/devnet is kept (`up` resumes, `clean` removes it)
