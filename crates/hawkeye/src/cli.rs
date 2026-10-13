@@ -95,20 +95,36 @@ pub fn acknowledge_ledger_restore(s: &Settings) -> Result<()> {
 /// `hawkeye declare-leader-gone <member> [--reason]` (the owner's override, 2026-10-13): sign
 /// the declaration, record it in this ledger through the same checks a peer's goes through, and
 /// send it to every peer. Prints how many declarations each ledger now holds against the quorum.
-pub async fn declare_leader_gone(s: &Settings, member: &str, reason: &str) -> Result<()> {
+pub async fn declare_leader_gone(
+    s: &Settings,
+    member: &str,
+    reason: &str,
+    expires_in: Option<u32>,
+) -> Result<()> {
     let key = s.load_key()?;
     let ctx = crate::daemon::connect(s, key.clone(), Arc::new(CoreAttributor)).await?;
     let mut mk = [0u8; 33];
     hex::decode_to_slice(member.trim_start_matches("0x"), &mut mk)
         .map_err(|_| anyhow!("member must be 66 hex"))?;
+    let set = ctx.ycash.set_getinfo(&ctx.set_hash(), None).await?;
+    let seq = set
+        .memberlist
+        .iter()
+        .find(|m| m.key.0 == mk)
+        .map(|m| m.joinheight)
+        .ok_or_else(|| anyhow!("{member} is not in the set's member list"))?;
+    let tip = ctx.ycash.getblockcount().await?;
+    let expiry = tip.saturating_add(expires_in.unwrap_or(2 * s.params.takeover.max(1)));
     let sig = hawkeye_core::peerauth::sign(
         &key,
-        &hawkeye_core::peerauth::gone_msg(&s.params.set_id, &mk),
+        &hawkeye_core::peerauth::gone_msg(&s.params.set_id, &mk, seq, expiry),
     )
     .map_err(|e| anyhow!("{e}"))?;
     let decl = crate::peers::GoneDeclaration {
         member: hex::encode(mk),
         declarer: hex::encode(key.public_key()),
+        seq,
+        expiry,
         sig: hex::encode(sig),
         reason: reason.to_owned(),
     };

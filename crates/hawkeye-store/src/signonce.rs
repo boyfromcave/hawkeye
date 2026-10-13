@@ -1006,6 +1006,14 @@ impl Tx<'_> {
         )
     }
 
+    /// Delete every metadata entry whose key starts with `prefix`; returns how many.
+    pub fn delete_meta_prefix(&self, prefix: &str) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM meta WHERE substr(key, 1, length(?1)) = ?1",
+            [prefix],
+        )?)
+    }
+
     /// Set a metadata value.
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.conn().execute(

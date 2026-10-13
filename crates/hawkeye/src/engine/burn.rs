@@ -702,9 +702,11 @@ impl Engine {
         required.retain(|k| current.contains(k));
         // the owner's override (2026-10-13): a member declared permanently gone by a quorum —
         // applied only after the peers were asked, and never to a member that answers
+        let members_now = self.mem.members.clone();
+        let tip = self.mem.tip;
         let declared = self
             .ctx
-            .db(|t| declared_gone(t, &self.ctx.params.set_id, &current, self.unlock_quorum()))?;
+            .db(|t| declared_gone(t, &members_now, self.unlock_quorum(), tip))?;
         if !gone_now.is_empty() {
             info!(event = "unlock_prior_excluded", nonce = b.key.nonce,
                   not_current = %gone_now.iter().map(hex::encode).collect::<Vec<_>>().join(","),
@@ -728,6 +730,15 @@ impl Engine {
                 warn!(event = "unlock_prior_unsigned", nonce = b.key.nonce, peer = %peer);
                 continue;
             };
+            // review R-2: a member that answers, signed, is not gone: its declarations go
+            if self
+                .ctx
+                .db(|t| t.delete_meta_prefix(&format!("{GONE_PREFIX}{}/", hex::encode(who))))?
+                > 0
+            {
+                warn!(event = "gone_declarations_cleared", member = %hex::encode(who),
+                      "a member declared gone answered: its declarations are dropped");
+            }
             if signed.body.held || signed.body.unlock.is_some() {
                 held_from.insert(who);
             }
@@ -1045,17 +1056,42 @@ pub fn gone_quorum(k: u32, n_current: u32) -> u32 {
 
 /// The members declared permanently gone in this ledger by at least [`gone_quorum`] distinct
 /// members that are current **now** (a declarer that left stops counting) and are not the member.
+/// A declaration counts only for the membership it names (`seq` = the member's join height now)
+/// and only up to its `expiry` height, and not once the member has acted (`lastact`, a heartbeat)
+/// after it was recorded (review R-2).
 pub(crate) fn declared_gone(
     t: &hawkeye_store::Tx<'_>,
-    _set_id: &hawkeye_core::bytes::Hash32,
-    current: &[PubKey33],
+    members: &[hawkeye_ycash::types::Member],
     k: u32,
+    tip: u32,
 ) -> Result<Vec<PubKey33>, hawkeye_store::StoreError> {
-    let quorum = gone_quorum(k, u32::try_from(current.len()).unwrap_or(u32::MAX));
+    let current = members.iter().filter(|m| m.current).count();
+    let quorum = gone_quorum(k, u32::try_from(current).unwrap_or(u32::MAX));
+    Ok(gone_counts(t, members, tip)?
+        .into_iter()
+        .filter(|(_, ds)| ds.len() >= quorum as usize)
+        .map(|(m, _)| m)
+        .collect())
+}
+
+/// The valid declarations held here, by declared member: the distinct current declarers.
+fn gone_counts(
+    t: &hawkeye_store::Tx<'_>,
+    members: &[hawkeye_ycash::types::Member],
+    tip: u32,
+) -> Result<
+    std::collections::BTreeMap<PubKey33, std::collections::BTreeSet<PubKey33>>,
+    hawkeye_store::StoreError,
+> {
+    let current: Vec<PubKey33> = members
+        .iter()
+        .filter(|m| m.current)
+        .map(|m| m.key.0)
+        .collect();
     let mut by: std::collections::BTreeMap<PubKey33, std::collections::BTreeSet<PubKey33>> =
         Default::default();
-    for (k, _) in t.meta_prefix(GONE_PREFIX)? {
-        let mut parts = k[GONE_PREFIX.len()..].split('/');
+    for (key, v) in t.meta_prefix(GONE_PREFIX)? {
+        let mut parts = key[GONE_PREFIX.len()..].split('/');
         let (Some(m), Some(d)) = (parts.next(), parts.next()) else {
             continue;
         };
@@ -1063,21 +1099,39 @@ pub(crate) fn declared_gone(
         if hex::decode_to_slice(m, &mut mk).is_err() || hex::decode_to_slice(d, &mut dk).is_err() {
             continue;
         }
+        let Some(member) = members.iter().find(|x| x.key.0 == mk) else {
+            continue;
+        };
+        let Ok(j) = serde_json::from_str::<serde_json::Value>(&v) else {
+            continue;
+        };
+        let (seq, expiry, height) = (
+            j["seq"].as_u64().unwrap_or(u64::MAX),
+            j["expiry"].as_u64().unwrap_or(0),
+            j["height"].as_u64().unwrap_or(0),
+        );
+        if seq != u64::from(member.joinheight)
+            || expiry < u64::from(tip)
+            || u64::from(member.lastact) > height
+        {
+            continue;
+        }
         if dk != mk && current.contains(&dk) {
             by.entry(mk).or_default().insert(dk);
         }
     }
-    Ok(by
-        .into_iter()
-        .filter(|(_, ds)| ds.len() >= quorum as usize)
-        .map(|(m, _)| m)
-        .collect())
+    Ok(by)
 }
 
+/// The longest a gone declaration may run, in `TAKEOVER` periods past the current tip.
+pub const GONE_MAX_TAKEOVERS: u32 = 10;
+
 /// Verify a declaration that `member` is gone and record it in the ledger (the CLI for its own,
-/// `POST /members/gone` for a peer's): the signature over [`hawkeye_core::peerauth::gone_msg`]
-/// recovers to the declarer, a current member other than `member` (and, from a peer, the
-/// requester). Returns the declarations now held and the quorum.
+/// `POST /members/gone` for a peer's): `member` is in the set's member list (R-3) with join height
+/// `seq`; `expiry` is in the future and at most [`GONE_MAX_TAKEOVERS`] × `TAKEOVER` blocks ahead
+/// (R-2); the signature over [`hawkeye_core::peerauth::gone_msg`] recovers to the declarer, a
+/// current member other than `member` (and, from a peer, the requester). Returns the
+/// declarations now counting and the quorum.
 pub async fn record_gone(
     ctx: &super::Ctx,
     requester: Option<PubKey33>,
@@ -1097,45 +1151,50 @@ pub async fn record_gone(
     let sig = hawkeye_core::peerauth::parse_sig(&req.sig).map_err(|e| anyhow!("sig: {e}"))?;
     hawkeye_core::peerauth::verify(
         &declarer,
-        &hawkeye_core::peerauth::gone_msg(&ctx.params.set_id, &member),
+        &hawkeye_core::peerauth::gone_msg(&ctx.params.set_id, &member, req.seq, req.expiry),
         &sig,
     )
     .map_err(|e| anyhow!("declaration signature: {e}"))?;
-    let set = set_snapshot(ctx).await?;
-    let current: Vec<PubKey33> = set
+    let set = ctx.ycash.set_getinfo(&ctx.set_hash(), None).await?;
+    let m = set
         .memberlist
         .iter()
-        .filter(|m| m.current)
-        .map(|m| m.key.0)
-        .collect();
+        .find(|m| m.key.0 == member)
+        .ok_or_else(|| anyhow!("{} is not in the set's member list", req.member))?;
     anyhow::ensure!(
-        current.contains(&declarer),
+        m.joinheight == req.seq,
+        "the declaration names membership {} of the member, its current one joined at {}",
+        req.seq,
+        m.joinheight
+    );
+    let tip = ctx.ycash.getblockcount().await?;
+    let horizon = GONE_MAX_TAKEOVERS.saturating_mul(ctx.params.takeover.max(1));
+    anyhow::ensure!(
+        req.expiry >= tip && req.expiry <= tip.saturating_add(horizon),
+        "the declaration expires at {}: it must lie in {tip}..={}",
+        req.expiry,
+        tip.saturating_add(horizon)
+    );
+    anyhow::ensure!(
+        set.memberlist
+            .iter()
+            .any(|m| m.key.0 == declarer && m.current),
         "the declarer is not a current member"
     );
-    let quorum = gone_quorum(
-        set.set.params.unlockthreshold,
-        u32::try_from(current.len()).unwrap_or(u32::MAX),
-    );
+    let k = set.set.params.unlockthreshold;
+    let current = set.memberlist.iter().filter(|m| m.current).count();
+    let quorum = gone_quorum(k, u32::try_from(current).unwrap_or(u32::MAX));
     let n = ctx.db(|t| {
         let key = format!("{GONE_PREFIX}{}/{}", req.member, req.declarer);
-        let v = serde_json::json!({"sig": req.sig, "reason": req.reason,
-                                   "at": t.now()});
+        let v = serde_json::json!({"sig": req.sig, "reason": req.reason, "seq": req.seq,
+                                   "expiry": req.expiry, "height": tip, "at": t.now()});
         t.set_meta(&key, &v.to_string())?;
-        let mut n = 0u32;
-        for (k, _) in t.meta_prefix(&format!("{GONE_PREFIX}{}/", req.member))? {
-            let mut d = [0u8; 33];
-            if let Some(h) = k.rsplit('/').next()
-                && hex::decode_to_slice(h, &mut d).is_ok()
-                && current.contains(&d)
-                && d != member
-            {
-                n += 1;
-            }
-        }
-        Ok(n)
+        Ok(gone_counts(t, &set.memberlist, tip)?
+            .get(&member)
+            .map_or(0, |d| u32::try_from(d.len()).unwrap_or(u32::MAX)))
     })?;
     warn!(event = "member_declared_gone", member = %req.member, declarer = %req.declarer,
-          reason = %req.reason, declarations = n, quorum,
+          seq = req.seq, expiry = req.expiry, reason = %req.reason, declarations = n, quorum,
           "operator override: the holds this member causes are released once the quorum is reached");
     Ok(crate::peers::GoneAnswer {
         declarations: n,

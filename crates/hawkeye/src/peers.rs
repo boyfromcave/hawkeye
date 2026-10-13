@@ -113,6 +113,13 @@ pub struct OrphanRequest {
     /// this vault it has no record of (the burn is unknown): roll it so those bytes die.
     #[serde(default)]
     pub restored: bool,
+    /// With `restored`: how many vaults this restore event reports in all (review R-1: the
+    /// receiver accepts no more than that, and never more than `MAX_RESTORE_REPORT`).
+    #[serde(default)]
+    pub count: u32,
+    /// With `restored`: the restore event (hex), scoping `count`.
+    #[serde(default)]
+    pub event: String,
 }
 
 /// `POST /members/gone` request (authenticated): the requester's signed declaration that
@@ -123,7 +130,11 @@ pub struct GoneDeclaration {
     pub member: String,
     /// The declaring member (66 hex): the requester.
     pub declarer: String,
-    /// `sign_compact(declarer, gone_msg(set, member))`, 130 hex.
+    /// The member's join height (the membership declared gone, review R-2).
+    pub seq: u32,
+    /// The last Ycash height the declaration counts at (review R-2).
+    pub expiry: u32,
+    /// `sign_compact(declarer, gone_msg(set, member, seq, expiry))`, 130 hex.
     pub sig: String,
     /// Why (kept with the record).
     pub reason: String,

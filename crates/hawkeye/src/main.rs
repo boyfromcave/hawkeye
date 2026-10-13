@@ -86,6 +86,10 @@ enum Cmd {
         /// Why (kept with the declaration).
         #[arg(long, default_value = "permanently unreachable")]
         reason: String,
+        /// Blocks the declaration counts for (default 2 × TAKEOVER; at most 10 × TAKEOVER). It
+        /// covers this membership only, and lapses as soon as the member answers or heartbeats.
+        #[arg(long)]
+        expires_in: Option<u32>,
     },
     /// Key helpers.
     Keys {
@@ -329,9 +333,11 @@ async fn main() -> Result<()> {
         Cmd::Enroll => cli::enroll(&s).await,
         Cmd::AcknowledgeRestore => cli::acknowledge_restore(&s).await,
         Cmd::AcknowledgeLedgerRestore => cli::acknowledge_ledger_restore(&s),
-        Cmd::DeclareLeaderGone { member, reason } => {
-            cli::declare_leader_gone(&s, member, reason).await
-        }
+        Cmd::DeclareLeaderGone {
+            member,
+            reason,
+            expires_in,
+        } => cli::declare_leader_gone(&s, member, reason, *expires_in).await,
         Cmd::Lock {
             amount,
             amount_pos,
