@@ -182,6 +182,10 @@ pub struct BridgeSection {
     /// `k` for `threshold` (default: the deployment's threshold). Also the floor the contract's
     /// threshold is held to: on mainnet it must be ≥ 2 in every mode (plan §3.3).
     pub mint_threshold: Option<u8>,
+    /// Optimistic mode: once every live member is barred from a lock (`vetoed`, or a recorded
+    /// griefer of it), gather the contract's threshold of `Mint` signatures and `mint` at once
+    /// (plan §5.3, HK-15; audit 05/L-4). Default true; always on on mainnet.
+    pub fallback_to_threshold: Option<bool>,
 }
 
 /// `[keys]`.
@@ -386,6 +390,9 @@ pub struct Params {
     pub auto_slash: bool,
     /// Drills allowed.
     pub drills: bool,
+    /// Optimistic mode: fall back to the threshold path when every live member is barred from a
+    /// lock (`[bridge] fallback_to_threshold`, always true on mainnet; HK-15).
+    pub fallback_to_threshold: bool,
     /// The first Ycash height to follow (default: the upgrade's activation height).
     pub ycash_start_height: Option<u32>,
 }
@@ -462,6 +469,7 @@ pub(crate) fn sample_params(drills: bool, mainnet: bool) -> Params {
         mint_mode: MintMode::Threshold { k: 1 },
         auto_slash: true,
         drills,
+        fallback_to_threshold: true,
         ycash_start_height: None,
     }
 }
@@ -718,6 +726,7 @@ impl Config {
             mint_mode,
             auto_slash: self.policy.auto_slash.unwrap_or(!mainnet),
             drills: self.devnet.drills,
+            fallback_to_threshold: mainnet || self.bridge.fallback_to_threshold.unwrap_or(true),
             ycash_start_height: self.ycash.start_height,
         };
         Ok(Settings {
