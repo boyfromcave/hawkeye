@@ -73,34 +73,152 @@ pub(crate) fn orphan_of(
 /// no record here (review N-2): `restore_orphan/<txid:vout>`.
 pub const RESTORE_ORPHAN_PREFIX: &str = "restore_orphan/";
 
-/// The most vaults one restore event may report (review R-1).
+/// The most vaults one restore report may say its event covers (a sanity bound, review R-1).
 pub const MAX_RESTORE_REPORT: u32 = 64;
-/// `restore_report/<reporter>/<event>/<vault>`: the vaults a restore event reported here.
+/// The rolling window of the per-reporter restore-report caps, Ycash blocks (~7 days).
+pub const RESTORE_WINDOW: u32 = 4_032;
+/// Corroborated restored reports accepted per reporter per window (this ledger saw the reporter
+/// set-sign a spend of the vault), across all its restore events.
+pub const RESTORE_CORROBORATED_CAP: usize = 64;
+/// Uncorroborated restored reports accepted per reporter per window, across all its events.
+pub const RESTORE_UNCORROBORATED_CAP: usize = 4;
+/// `restore_report/<reporter>/<height:010>/<vault>` → `c` | `u`: the restored reports accepted
+/// here, by the height they were accepted at (the rolling window).
 pub const RESTORE_REPORT_PREFIX: &str = "restore_report/";
-/// `restore_rolled/<vault>`: vaults a restored report caused to roll (never re-marked, nor the
-/// vault their roll created).
+/// `restore_rolled/<vault>`: vaults a restored report marked to roll — never marked again.
 pub const RESTORE_ROLLED_PREFIX: &str = "restore_rolled/";
-/// `restore_flood/<reporter>`: a reporter whose restore reports were refused for volume (alarm
-/// `restore-report-flood`).
+/// `restore_lineage/<vault>`: a vault created by the release of the roll of a restore-rolled
+/// vault (or of one of its successors) — never marked for a restored report either.
+pub const RESTORE_LINEAGE_PREFIX: &str = "restore_lineage/";
+/// `restore_flood/<reporter>` → the height of the last refusal for volume (alarm
+/// `restore-report-flood`, cleared once the window passes).
 pub const RESTORE_FLOOD_PREFIX: &str = "restore_flood/";
 
-/// Whether `member`'s own signed `POST /burns/unlock` answer shows its ledger restored.
-async fn reporter_is_restored(ctx: &super::Ctx, member: &hawkeye_core::PubKey33) -> bool {
-    for peer in ctx.peers.urls().to_vec() {
+/// Whether `member`, asked once per restore event (cached), answered — signed — that its ledger
+/// is restored. Only the reporter is asked: its URL is learnt from its signed answers and cached.
+/// (A malicious member can lie here; the evidence rule and the caps are what bound it.)
+async fn reporter_says_restored(
+    ctx: &super::Ctx,
+    member: &hawkeye_core::PubKey33,
+    event: &str,
+) -> bool {
+    let key = (*member, event.to_owned());
+    if let Some(v) = ctx
+        .auth
+        .restore_answers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return *v;
+    }
+    let known = ctx
+        .auth
+        .peer_url
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(member)
+        .cloned();
+    let urls: Vec<String> = match known {
+        Some(u) => vec![u],
+        None => ctx.peers.urls().to_vec(),
+    };
+    let mut answer = None;
+    for peer in urls {
         if let Ok(a) = ctx.peers.burn_unlock(&peer, 0).await
-            && a.responder.as_ref() == Some(member)
+            && let Some(who) = a.responder
         {
-            return a.body.restored;
+            ctx.auth
+                .peer_url
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(who, peer.clone());
+            if who == *member {
+                answer = Some(a.body.restored);
+                break;
+            }
         }
     }
-    false
+    let v = answer.unwrap_or(false);
+    if answer.is_some() {
+        ctx.auth
+            .restore_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, v);
+    }
+    v
 }
 
-/// `POST /vaults/orphaned` with `restored` (review N-2, hardened by R-1): the reporter's restored
-/// ledger lacks an unlock its node wallet signed of `vault`. Accepted only if the reporter's own
-/// signed `/burns/unlock` answer shows it restored, within the count it stated for the restore
-/// event (≤ [`MAX_RESTORE_REPORT`]), never for a vault a restored report already rolled nor the
-/// vault such a roll created; a refusal for volume is recorded (alarm `restore-report-flood`).
+/// Whether `vault` descends, through the release of a roll, from a vault a restored report
+/// marked (review R-1): the roll's intent has the marked vault as origin and its release creates
+/// the successor. Records every successor found (`restore_lineage/`), generation by generation.
+pub(crate) fn restore_lineage_contains(
+    t: &hawkeye_store::Tx<'_>,
+    vault: &hawkeye_core::OutPoint,
+) -> Result<bool, hawkeye_store::StoreError> {
+    let roots: Vec<String> = t
+        .meta_prefix(RESTORE_ROLLED_PREFIX)?
+        .into_iter()
+        .map(|(k, _)| k[RESTORE_ROLLED_PREFIX.len()..].to_owned())
+        .chain(
+            t.meta_prefix(RESTORE_LINEAGE_PREFIX)?
+                .into_iter()
+                .map(|(k, _)| k[RESTORE_LINEAGE_PREFIX.len()..].to_owned()),
+        )
+        .collect();
+    if roots.iter().any(|r| *r == vault.to_string()) {
+        return Ok(true);
+    }
+    let mut frontier: Vec<hawkeye_core::OutPoint> = roots
+        .iter()
+        .filter_map(|r| super::slash::parse_outpoint(r).ok())
+        .collect();
+    let mut found = false;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(x) = frontier.pop() {
+        if !seen.insert(x) {
+            continue;
+        }
+        let mut released = vec![];
+        for st in [IntentState::Released, IntentState::Matched] {
+            for i in t.intents_in_state(st)? {
+                if i.origin_vault == Some(x)
+                    && i.classification.as_deref() == Some("matched-roll")
+                    && let Some(r) = i.released_txid
+                {
+                    released.push(r);
+                }
+            }
+        }
+        for r in released {
+            for v in t
+                .vaults_in_state(VaultState::Live)?
+                .into_iter()
+                .chain(t.vaults_in_state(VaultState::RollDue)?)
+            {
+                if v.outpoint.txid == r {
+                    let key = format!("{RESTORE_LINEAGE_PREFIX}{}", v.outpoint);
+                    if t.meta(&key)?.is_none() {
+                        t.set_meta(&key, &x.to_string())?;
+                    }
+                    found |= v.outpoint == *vault;
+                    frontier.push(v.outpoint);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// `POST /vaults/orphaned` with `restored` (review N-2; R-1 as decided 2026-10-13): acted on only
+/// with **evidence** — this ledger saw the reporter set-sign a spend of the vault — within
+/// [`RESTORE_CORROBORATED_CAP`] per reporter per [`RESTORE_WINDOW`] blocks; without evidence
+/// only [`RESTORE_UNCORROBORATED_CAP`] per reporter per window, counted across all its events
+/// (a fresh event id resets nothing). Never for a vault a restored report already marked, nor any
+/// successor of one (the vault its roll's release created, and so on). The reporter must also
+/// say, signed, that it is restored (asked once per event). Refusals for volume are recorded and
+/// alarmed (`restore-report-flood`).
 async fn verify_restore_report(
     ctx: &super::Ctx,
     requester: hawkeye_core::PubKey33,
@@ -108,8 +226,9 @@ async fn verify_restore_report(
     req: &crate::peers::OrphanRequest,
 ) -> Result<crate::peers::OrphanResponse> {
     let rep = hex::encode(requester);
+    let tip = ctx.ycash.getblockcount().await?;
     let flood = |why: String| -> anyhow::Error {
-        let _ = ctx.db(|t| t.set_meta(&format!("{RESTORE_FLOOD_PREFIX}{rep}"), &why));
+        let _ = ctx.db(|t| t.set_meta(&format!("{RESTORE_FLOOD_PREFIX}{rep}"), &tip.to_string()));
         warn!(event = "restore_report_flood", reporter = %rep, reason = %why);
         anyhow!("{why}")
     };
@@ -126,36 +245,48 @@ async fn verify_restore_report(
         )));
     }
     ensure!(
-        reporter_is_restored(ctx, &requester).await,
+        reporter_says_restored(ctx, &requester, &req.event).await,
         "the reporter's own signed /burns/unlock answer does not show its ledger restored"
     );
-    let prefix = format!("{RESTORE_REPORT_PREFIX}{rep}/{}/", req.event);
-    let key = format!("{prefix}{vault}");
-    let (seen, already, from_roll) = ctx.db(|t| {
-        let seen = t.meta_prefix(&prefix)?;
+    let (already, corroborated, window) = ctx.db(|t| {
         let already = t
             .meta(&format!("{RESTORE_ROLLED_PREFIX}{vault}"))?
-            .is_some();
-        let mut from_roll = false;
-        for (k, _) in t.meta_prefix(RESTORE_ROLLED_PREFIX)? {
-            if let Ok(x) = super::slash::parse_outpoint(&k[RESTORE_ROLLED_PREFIX.len()..])
-                && t.vault(&x)?.and_then(|v| v.spent_txid) == Some(vault.txid)
-            {
-                from_roll = true;
-            }
-        }
-        Ok((seen, already, from_roll))
+            .is_some()
+            || restore_lineage_contains(t, vault)?;
+        let corroborated = t.seen_set_sig_by(&ctx.params.set_id, vault, &requester)?;
+        let from = tip.saturating_sub(RESTORE_WINDOW);
+        let window: Vec<(String, String)> = t
+            .meta_prefix(&format!("{RESTORE_REPORT_PREFIX}{rep}/"))?
+            .into_iter()
+            .filter(|(k, _)| {
+                k.split('/')
+                    .nth(2)
+                    .and_then(|h| h.parse::<u32>().ok())
+                    .is_some_and(|h| h > from)
+            })
+            .collect();
+        Ok((already, corroborated, window))
     })?;
     ensure!(
-        !already && !from_roll,
-        "vault {vault} was already rolled for a restored report (or created by such a roll)"
+        !already,
+        "vault {vault} was already rolled for a restored report (or descends from such a roll)"
     );
-    if !seen.iter().any(|(k, _)| *k == key) && seen.len() >= req.count as usize {
+    let kind = if corroborated { "c" } else { "u" };
+    let used = window.iter().filter(|(_, v)| v == kind).count();
+    let cap = if corroborated {
+        RESTORE_CORROBORATED_CAP
+    } else {
+        RESTORE_UNCORROBORATED_CAP
+    };
+    if used >= cap {
         return Err(flood(format!(
-            "restore event {} of {rep} stated {} vaults and already reported {}",
-            req.event,
-            req.count,
-            seen.len()
+            "{rep} already made {used} {} restored reports in the last {RESTORE_WINDOW} blocks \
+             (cap {cap})",
+            if corroborated {
+                "corroborated"
+            } else {
+                "uncorroborated"
+            }
         )));
     }
     let op = op_rpc(vault);
@@ -163,19 +294,17 @@ async fn verify_restore_report(
         ctx.ycash.gettxout(&op.txid, op.vout, true).await?.is_some(),
         "vault {vault} is spent"
     );
-    // where this ledger saw the reporter sign a spend of the vault, the report is corroborated
-    let attributed = ctx.db(|t| t.seen_set_sig_by(&ctx.params.set_id, vault, &requester))?;
-    let tip = ctx.ycash.getblockcount().await?;
     let marked = ctx.db(|t| {
-        t.set_meta(&key, "1")?;
+        t.set_meta(
+            &format!("{RESTORE_REPORT_PREFIX}{rep}/{tip:010}/{vault}"),
+            kind,
+        )?;
         let m = mark_orphan(t, vault, 0, tip)?;
-        if m {
-            t.set_meta(&format!("{RESTORE_ROLLED_PREFIX}{vault}"), &rep)?;
-        }
+        t.set_meta(&format!("{RESTORE_ROLLED_PREFIX}{vault}"), &rep)?;
         Ok(m)
     })?;
     warn!(event = "orphan_marked_restored", vault = %vault, reporter = %rep,
-          restore_event = %req.event, count = req.count, attributed, marked);
+          restore_event = %req.event, corroborated, marked);
     Ok(crate::peers::OrphanResponse { marked })
 }
 
@@ -291,8 +420,19 @@ impl Engine {
     pub(crate) async fn orphans(&mut self) -> Result<()> {
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
-        // review R-1: a reporter refused for volume
-        let floods = self.ctx.db(|t| t.meta_prefix(RESTORE_FLOOD_PREFIX))?;
+        // review R-1: a reporter refused for volume, within the window (older refusals expire);
+        // and the lineage of restore-rolled vaults, followed as their rolls are released
+        let floods = self.ctx.db(|t| {
+            for (k, v) in t.meta_prefix(RESTORE_FLOOD_PREFIX)? {
+                if v.parse::<u32>()
+                    .map_or(true, |h| tip.saturating_sub(h) > RESTORE_WINDOW)
+                {
+                    t.delete_meta_prefix(&k)?;
+                }
+            }
+            let _ = restore_lineage_contains(t, &hawkeye_core::OutPoint::new([0; 32], 0))?;
+            t.meta_prefix(RESTORE_FLOOD_PREFIX)
+        })?;
         if floods.is_empty() {
             self.clear_alarm("restore-report-flood");
         } else {

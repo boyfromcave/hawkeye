@@ -75,6 +75,10 @@ pub struct AuthState {
     pub set: RwLock<Option<SetInfo>>,
     /// `(member, nonce) → expiry` (unix seconds) of the requests already admitted.
     replay: Mutex<HashMap<(PubKey33, [u8; 16]), u64>>,
+    /// Peer API URLs by the member key their signed answers recovered to (learnt, review R-1).
+    pub peer_url: Mutex<HashMap<PubKey33, String>>,
+    /// `(reporter, restore event) → restored`, as the reporter itself answered once (R-1).
+    pub restore_answers: Mutex<HashMap<(PubKey33, String), bool>>,
 }
 
 impl AuthState {

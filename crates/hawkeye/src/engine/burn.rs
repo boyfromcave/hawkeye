@@ -1185,7 +1185,12 @@ pub async fn record_gone(
     let current = set.memberlist.iter().filter(|m| m.current).count();
     let quorum = gone_quorum(k, u32::try_from(current).unwrap_or(u32::MAX));
     let n = ctx.db(|t| {
-        let key = format!("{GONE_PREFIX}{}/{}", req.member, req.declarer);
+        // keys normalised to lowercase hex: the delete on an answer matches them (R-2)
+        let key = format!(
+            "{GONE_PREFIX}{}/{}",
+            hex::encode(member),
+            hex::encode(declarer)
+        );
         let v = serde_json::json!({"sig": req.sig, "reason": req.reason, "seq": req.seq,
                                    "expiry": req.expiry, "height": tip, "at": t.now()});
         t.set_meta(&key, &v.to_string())?;
