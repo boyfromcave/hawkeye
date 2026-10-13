@@ -17,8 +17,10 @@ import {IWrappedYcash, WyecBridge} from "wyec/WyecBridge.sol";
 ///   GUARDIANS          comma-separated guardian addresses (required)
 ///   THRESHOLD          k of the threshold mint and every admin act (required; >= 2 on mainnet in
 ///                      every mode: at k = 1 one key mints through `mint` and skips the window)
-///   CHALLENGE_WINDOW   optimistic-mint challenge window in seconds (required, > 0; immutable)
-///   MINT_CAP           mint rate limit in wYEC base units per CAP_WINDOW (default 0 = no limit)
+///   CHALLENGE_WINDOW   optimistic-mint challenge window in seconds (required, > 0; immutable;
+///                      >= 2 hours on mainnet)
+///   MINT_CAP           mint rate limit in wYEC base units per CAP_WINDOW (default 0 = no limit;
+///                      not on mainnet, where it is required)
 ///   CAP_WINDOW         rate-limit window in seconds (default 0; > 0 when MINT_CAP > 0)
 ///   MINT_MODE          "optimistic" (default: proposeMint + window, the Foundation's model) or
 ///                      "threshold" (k-of-n mint), recorded as mintMode
@@ -68,6 +70,12 @@ contract Deploy is Script {
         // (wyec-contract-design.md §4.5.2, plan §3.3): never on mainnet, whatever the mode.
         require(block.chainid != 1 || c.threshold >= 2, "THRESHOLD must be >= 2 on mainnet");
         require(c.challengeWindow > 0 && c.challengeWindow <= type(uint64).max, "bad CHALLENGE_WINDOW");
+        // wyec's constructor floors on mainnet (audit 05/H-2), checked before broadcasting
+        require(
+            block.chainid != 1 || c.challengeWindow >= 2 hours,
+            "CHALLENGE_WINDOW must be >= 2 hours on mainnet"
+        );
+        require(block.chainid != 1 || c.mintCap > 0, "MINT_CAP is required on mainnet");
         require(c.mintCap == 0 || c.capWindow > 0, "CAP_WINDOW must be > 0 when MINT_CAP > 0");
         bytes32 mode = keccak256(bytes(c.mintMode));
         require(

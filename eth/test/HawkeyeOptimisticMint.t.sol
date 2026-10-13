@@ -96,7 +96,7 @@ contract HawkeyeOptimisticMintTest is BridgeTestBase {
         bridge.proposeMint(LOCK, 0, alice, sig);
         // a signature over other fields recovers to someone else
         sig = sign(g(0), mintDigest(address(bridge), LOCK, AMOUNT, alice));
-        vm.expectRevert();
+        expectNotGuardian(mintDigest(address(bridge), LOCK, AMOUNT + 1, alice), sig);
         bridge.proposeMint(LOCK, AMOUNT + 1, alice, sig);
         mintTo(alice, AMOUNT, LOCK);
         vm.expectRevert(abi.encodeWithSelector(WyecBridge.LockConsumed.selector, LOCK));
@@ -152,7 +152,7 @@ contract HawkeyeOptimisticMintTest is BridgeTestBase {
         bridge.challengeMint(none, 1, sig);
         // a signature for another proposal id recovers to someone else
         sig = sign(g(1), challengeDigest(address(bridge), LOCK, id + 1));
-        vm.expectRevert();
+        expectNotGuardian(challengeDigest(address(bridge), LOCK, id), sig);
         bridge.challengeMint(LOCK, id, sig);
         assertEq(uint8(status(LOCK)), uint8(WyecBridge.ProposalStatus.Pending));
     }

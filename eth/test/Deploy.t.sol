@@ -91,6 +91,32 @@ contract HawkeyeDeployScriptTest is Test {
         vm.removeFile(file);
     }
 
+    /// wyec's mainnet constructor floors (audit 05/H-2), refused by the script before
+    /// broadcasting; a config meeting them deploys on chain id 1.
+    function test_Deploy_MainnetWindowAndCapFloors() public {
+        Deploy d = new Deploy();
+        vm.chainId(1);
+        Deploy.Config memory c = config("mainnet-floors");
+        c.challengeWindow = 2 hours - 1;
+        vm.expectRevert(bytes("CHALLENGE_WINDOW must be >= 2 hours on mainnet"));
+        d.deploy(c);
+
+        c = config("mainnet-floors");
+        c.challengeWindow = 2 hours;
+        c.mintCap = 0;
+        c.capWindow = 0;
+        vm.expectRevert(bytes("MINT_CAP is required on mainnet"));
+        d.deploy(c);
+
+        c = config("mainnet-floors");
+        c.challengeWindow = 2 hours;
+        string memory file = c.file;
+        Deploy.Result memory r = d.deploy(c);
+        assertEq(WyecBridge(r.bridge).challengeWindow(), 2 hours);
+        assertEq(WyecBridge(r.bridge).MIN_MAINNET_CHALLENGE_WINDOW(), 2 hours);
+        vm.removeFile(file);
+    }
+
     function test_Deploy_BadConfigRejected() public {
         Deploy d = new Deploy();
         Deploy.Config memory c = config("bad");
