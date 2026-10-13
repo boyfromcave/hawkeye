@@ -321,6 +321,51 @@ its intent was then cancelled `C_Y` deep (log `unlock_dead`). In practice:
 - **Evicted unlocks (M-3).** A burn whose unlock left the mempool unmined goes back to its leader
   after `max(TAKEOVER, C_Y)` blocks (log `burn_intent_evicted`), which re-sends it.
 
+- **Who must answer (review N-1, N-3).** The members asked are the burn's previous leaders in
+  this ledger plus every set signer attributed on an unlock of the burn this ledger observed on
+  Ycash; only those still **current** in the set are required — the node accepts an unlock only
+  with `unlockThreshold` signatures of members current at the spend height
+  (`SetSnapshot::CheckSetSigs`), so a removed or departed member's bytes can never confirm. An
+  unlock of the burn this ledger observed (mempool or block) whose vault is unspent is adopted
+  first, whoever led it, without asking anyone.
+- **A restored ledger never says "none" (N-2).** While `ledger-restored` is raised, this
+  attestor's `POST /burns/unlock` answers `held: true, restored: true`; in `"wallet"` mode every
+  vault its node wallet signed an unlock of with no ledger record is marked `ROLL_DUE` and reported
+  (`restore_orphan`, `orphan_marked_restored`) until it is spent.
+
+**A permanently gone member (owner's decision, 2026-10-13).** An unreachable previous leader
+holds its burns (`unlock-prior-unknown`); double-payment protection stays the default. Two ways
+out:
+
+1. **On chain (preferred):** remove the member from the set (`SET_REMOVE`, plan §2.3). It is no
+   longer current, its signatures can never confirm, and its answer stops being required at once.
+2. **Off chain, the operator override:** each attestor that agrees runs
+   `hawkeye declare-leader-gone <member key> --reason "<why>"`. It signs a declaration
+   (`sha256d("HawkeyeMemberGone" ‖ setId ‖ member)` with its member key), records it in its
+   ledger and sends it to every peer (`POST /members/gone`, authenticated); each ledger records it
+   after checking the signature and that the declarer is a current member other than the gone one
+   (logs `member_declared_gone`, `declare_leader_gone`, then `unlock_prior_excluded`). **Quorum: at
+   least `unlockThreshold` (k) distinct current members other than the gone one** — as many as can
+   release an unlock — after which no ledger waits for that member's answer. Only declare a member
+   gone when you are sure its signed unlocks are lost with it; if it comes back with them, the
+   watchers' benign-race cancel and the orphan roll are the remaining net.
+
+**Backups (N-2).** The restore check compares the ledger with `hawkeye.db.hwm`. A backup of the
+whole directory restores the mark with the ledger and defeats the check: back the two up
+separately (or not the mark at all), or rely on the `"wallet"`-mode check against the node
+wallet's `set_listsigned`.
+
+**Upgrading to this release (N-4).** Earlier releases built unlocks, rolls and cancels with a
+change output; this one refuses to co-sign, adopt or re-fund one (H-1). Before upgrading, let
+every in-flight burn and cancel settle (no burn `ASSIGNED`/`INTENT_PENDING` with a live signed
+unlock of the old shape), then upgrade every member of the set together. A remaining old-shape row
+is held: re-send it with the old release, or let its vault be spent. Each exactly-funded build
+releases the node wallet's locks on the fee coins of the discarded build (`lockunspent`); if that
+fails (`lockunspent_failed`), a node restart clears them. Members mark a vault `ROLL_DUE` at
+slightly different heights (when each sees the orphan), so the roll leader of an early-due vault
+can briefly differ between ledgers; at `unlockThreshold = 1` this only delays the roll by up to
+one `TAKEOVER`, above it a co-signer may refuse until its own takeover window agrees.
+
 Keep the peer API reachable to the other attestors: a takeover, and any fresh unlock of a burn
 someone else led, depends on their signed answers. By hand: `ycash-cli
 vault_refee <signed hex>`, then `vault_send` of the result. Re-funding needs a coin of exactly the

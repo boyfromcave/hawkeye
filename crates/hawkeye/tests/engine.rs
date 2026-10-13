@@ -5389,3 +5389,232 @@ async fn r10_ledger_restore_is_detected() {
     hawkeye::restore::write_hwm(&hwm, 2).unwrap();
     assert_eq!(hawkeye::restore::read_hwm(&hwm), 5);
 }
+
+// ------------------------------------------------------------------------------------------
+// (s) re-review of fix/unlock-revival: N-1 non-current members, the owner's override, N-2 a
+// restored ledger never says "none", N-3 observed unlocks adopted
+
+/// Three engines whose APIs are served except the `down` one's (its port is closed). Returns
+/// the engines and the down member's address (to serve it later).
+async fn with_one_down(env: &Env, down: usize) -> (Vec<Engine>, std::net::SocketAddr) {
+    let mut listeners = vec![];
+    let mut urls = vec![];
+    for _ in 0..3 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", l.local_addr().unwrap()));
+        listeners.push(Some(l));
+    }
+    let addr = listeners[down].as_ref().unwrap().local_addr().unwrap();
+    listeners[down] = None;
+    let mut engines = vec![];
+    for i in 0..3 {
+        let peers = (0..3)
+            .filter(|j| *j != i)
+            .map(|j| urls[j].clone())
+            .collect();
+        engines.push(env.engine_with_peers(i, peers).await);
+    }
+    for (i, l) in listeners.into_iter().enumerate() {
+        if let Some(l) = l {
+            let ctx = engines[i].ctx().clone();
+            tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+        }
+    }
+    (engines, addr)
+}
+
+/// Lock, mint and burn; the burn's leader never ticks and its API is down; the others tick past
+/// the takeover: the burn is held (r6). Returns `(engines, leader, nonce)`.
+async fn held_takeover(env: &Env) -> (Vec<Engine>, usize, u64) {
+    let mut engines = three(env).await;
+    lock_and_mint(env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x71; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(env, nonce);
+    drop(engines);
+    let (mut engines, _) = with_one_down(env, leader).await;
+    for _ in 0..TAKEOVER + 2 {
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+        env.mine(1);
+    }
+    assert!(unlocks_for(env, nonce).is_empty(), "held");
+    (engines, leader, nonce)
+}
+
+/// (s1) N-1: once the unreachable previous leader is no longer a current member (here it left
+/// the set), its answer is not needed — a non-current member's set signature can never confirm
+/// (`CheckSetSigs`) — and the takeover signs a fresh vault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s1_a_member_no_longer_current_is_not_required() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, leader, nonce) = held_takeover(&env).await;
+    {
+        let mut st = env.mock.state();
+        let h = st.tip_height();
+        st.leave_member(&env.set, &PubKey(env.key_of_index(leader)), h);
+    }
+    env.mine(1);
+    for _ in 0..2 {
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+    }
+    assert_eq!(unlocks_for(&env, nonce).len(), 1, "no longer held");
+}
+
+/// (s2) The owner's override: a quorum (`unlockThreshold` = 1 here) of other current members
+/// declares the unreachable leader gone; the hold is released. A self-declaration, a forged
+/// signature and a non-member's declaration are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2_declared_gone_by_a_quorum_releases_the_hold() {
+    use hawkeye::peers::GoneDeclaration;
+    let Some(env) = setup().await else { return };
+    let (mut engines, leader, nonce) = held_takeover(&env).await;
+    let mk = env.key_of_index(leader);
+    let decl = |by: &SecretKey, member: [u8; 33]| GoneDeclaration {
+        member: hex::encode(member),
+        declarer: hex::encode(by.public_key()),
+        sig: hex::encode(
+            hawkeye_core::peerauth::sign(
+                by,
+                &hawkeye_core::peerauth::gone_msg(&env.set.0, &member),
+            )
+            .unwrap(),
+        ),
+        reason: "test".into(),
+    };
+    // refusals, on every ledger
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let me = env.keys[i].clone();
+        assert!(
+            hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.keys[leader], mk))
+                .await
+                .is_err(),
+            "self-declaration"
+        );
+        let mut forged = decl(&me, mk);
+        forged.sig = decl(&env.keys[leader], mk).sig;
+        assert!(
+            hawkeye::engine::burn::record_gone(e.ctx(), None, &forged)
+                .await
+                .is_err(),
+            "forged"
+        );
+        assert!(
+            hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.holder, mk))
+                .await
+                .is_err(),
+            "not a member"
+        );
+    }
+    // one other member declares it gone to everyone (as `hawkeye declare-leader-gone` does)
+    let declarer = (leader + 2) % 3;
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let a = hawkeye::engine::burn::record_gone(e.ctx(), None, &decl(&env.keys[declarer], mk))
+            .await
+            .unwrap();
+        assert_eq!((a.declarations, a.quorum), (1, 1));
+    }
+    for _ in 0..2 {
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+    }
+    assert_eq!(
+        unlocks_for(&env, nonce).len(),
+        1,
+        "released by the override"
+    );
+}
+
+/// (s3) N-2: a restored ledger never answers "none" (it cannot know what it signed before the
+/// backup).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_a_restored_ledger_answers_unknown() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let ask = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[1]));
+    let a = ask.burn_unlock(&urls[0], 5).await.unwrap();
+    assert!(!a.body.held && !a.body.restored, "an ordinary ledger: none");
+    engines[0]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    let a = ask.burn_unlock(&urls[0], 5).await.unwrap();
+    assert!(a.body.restored);
+    assert!(a.body.held, "restored: never 'none'");
+    assert_eq!(a.body.unlock, None);
+}
+
+/// (s4) N-3: the leader's unlock was observed in the mempool by the others, then evicted, and
+/// the leader is gone (API down). The re-finalized burn's takeover adopts the observed bytes
+/// (the same spend, re-funded) without the leader's answer and without building anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_a_divergent_leaders_evicted_unlock_is_adopted_not_rebuilt() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x72; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    drop(engines);
+    let (mut engines, _) = with_one_down(&env, leader).await;
+    // the leader posts; everyone observes it
+    tick_all(&mut engines).await;
+    tick_all(&mut engines).await;
+    let posted = unlocks_for(&env, nonce);
+    assert_eq!(posted.len(), 1);
+    let (tx, vault) = posted[0].clone();
+    // evicted, and the leader is gone for good
+    {
+        let mut st = env.mock.state();
+        let txid = tx.txid();
+        st.mempool.retain(|t| *t != txid);
+        st.txs.remove(&txid);
+    }
+    let builds = env.mock.state().calls_to("vault_buildunlock").len();
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    let mut back = false;
+    for _ in 0..3 * TAKEOVER + 4 {
+        env.mine(1);
+        for (i, e) in engines.iter_mut().enumerate() {
+            if i != leader {
+                e.tick().await;
+            }
+        }
+        if !unlocks_for(&env, nonce).is_empty() {
+            back = true;
+            break;
+        }
+    }
+    assert!(back, "the observed unlock was re-sent");
+    assert_eq!(unlocks_for(&env, nonce)[0].1, vault, "on its own vault");
+    assert_eq!(
+        env.mock.state().calls_to("vault_buildunlock").len(),
+        builds,
+        "nothing rebuilt"
+    );
+    assert!(
+        env.mock.state().calls_to("set_signunlock").len() <= signs + 1,
+        "no fresh signature beyond the adopter's no-op pass"
+    );
+}
