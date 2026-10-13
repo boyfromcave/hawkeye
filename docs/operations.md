@@ -333,11 +333,14 @@ its intent was then cancelled `C_Y` deep (log `unlock_dead`). In practice:
 - **A restored ledger never says "none" (N-2).** While `ledger-restored` is raised, this
   attestor's `POST /burns/unlock` answers `held: true, restored: true`; in `"wallet"` mode every
   vault its node wallet signed an unlock of with no ledger record is marked `ROLL_DUE` and reported
-  (`restore_orphan`, `orphan_marked_restored`) until it is spent. A receiver accepts such a report
-  only if the reporter's own signed `POST /burns/unlock` answer shows it restored, at most as many
-  vaults per restore event as the reporter stated up front (never more than 64; more is refused and
-  alarmed `restore-report-flood`), and never for a vault a restored report already rolled nor the
-  vault that roll created (review R-1).
+  (`restore_orphan`, `orphan_marked_restored`) until it is spent. A receiver acts on such a report
+  only with **evidence** — its own ledger saw the reporter set-sign a spend of that vault — within
+  64 such reports per reporter per 4,032 blocks (~7 days); without evidence a reporter gets only 4
+  per window, counted across all its restore events (a new event id resets nothing). Past either
+  cap the report is refused and `restore-report-flood` raised; it clears once the window passes.
+  The reporter must also say, signed, that its ledger is restored (asked once per event). A vault a
+  restored report already marked is never marked again, nor any successor of it: the vault the
+  release of its roll created, and so on (review R-1).
 - **Observed unlocks are pruned** once their burn is released `C_Y` deep (review R-3).
 
 **A permanently gone member (owner's decision, 2026-10-13).** An unreachable previous leader
@@ -367,6 +370,10 @@ out:
    the override itself logs `unlock_prior_overridden`). Only declare a member
    gone when you are sure its signed unlocks are lost with it; if it comes back with them, the
    watchers' benign-race cancel and the orphan roll are the remaining net.
+
+A member that answers `held: true` (or `restored: true`) without serving bytes can never be
+overridden, by design: the declarations about it are dropped the moment it answers. Only removing
+it from the set (`SET_REMOVE`) releases the burns it holds up.
 
 **Backups (N-2).** The restore check compares the ledger with `hawkeye.db.hwm`. A backup of the
 whole directory restores the mark with the ledger and defeats the check: back the two up

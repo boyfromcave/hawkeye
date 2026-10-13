@@ -5811,19 +5811,20 @@ fn restore_report(vault: &OutPoint, count: u32, event: &str) -> hawkeye::peers::
     }
 }
 
-/// (t1) R-1: a restored report is refused from a reporter whose own signed `/burns/unlock` does
-/// not show its ledger restored; from a restored one, a restore event marks at most the count it
-/// stated (≤ 64) — more is a flood, alarmed — and a vault already rolled for a restored report
-/// is never marked again.
+/// (t1) R-1: a restored report is refused from a reporter that does not say it is restored;
+/// without evidence (this ledger never saw the reporter sign a spend of the vault) a reporter gets
+/// 4 reports per 4,032-block window, across all its events — a fresh event id resets nothing; past
+/// that, refused and alarmed `restore-report-flood`, which clears once the window has passed; a
+/// vault already marked is never marked again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t1_restored_reports_are_verified_and_capped() {
+async fn t1_restored_reports_need_evidence_and_are_rate_limited() {
     let Some(env) = setup().await else { return };
     let (mut engines, urls) = networked(&env).await;
-    for _ in 0..3 {
+    for _ in 0..5 {
         lock_and_mint(&env, &mut engines).await;
     }
     let vs = free_vaults(&env).await;
-    assert!(vs.len() >= 3);
+    assert!(vs.len() >= 5);
     let reporter = Peers::new(vec![])
         .unwrap()
         .with_signer(env.signer(&env.keys[1]));
@@ -5838,30 +5839,24 @@ async fn t1_restored_reports_are_verified_and_capped() {
         .ctx()
         .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
         .unwrap();
-    // an absurd count is a flood
-    let e = reporter
-        .orphaned(&urls[0], &restore_report(&vs[0], 65, "ab"))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("1..=64"), "{e}");
-    // two stated: two marked, a third refused
-    for v in &vs[..2] {
+    // four uncorroborated, each under a new event id
+    for (n, v) in vs[..4].iter().enumerate() {
         let a = reporter
-            .orphaned(&urls[0], &restore_report(v, 2, "ab"))
+            .orphaned(&urls[0], &restore_report(v, 1, &format!("e{n}")))
             .await
             .unwrap();
         assert!(a.body.marked);
     }
+    // a fifth, under yet another event: refused, the window counts across events
     let e = reporter
-        .orphaned(&urls[0], &restore_report(&vs[2], 2, "ab"))
+        .orphaned(&urls[0], &restore_report(&vs[4], 1, "ff"))
         .await
         .unwrap_err()
         .to_string();
-    assert!(e.contains("stated 2 vaults"), "{e}");
-    // a vault already rolled for a restored report is never marked again, whatever the event
+    assert!(e.contains("uncorroborated") && e.contains("cap 4"), "{e}");
+    // a vault already marked: never again
     let e = reporter
-        .orphaned(&urls[0], &restore_report(&vs[0], 1, "cd"))
+        .orphaned(&urls[0], &restore_report(&vs[0], 1, "aa"))
         .await
         .unwrap_err()
         .to_string();
@@ -5871,10 +5866,92 @@ async fn t1_restored_reports_are_verified_and_capped() {
         engines[0]
             .alarms()
             .iter()
+            .any(|a| a.name == "restore-report-flood")
+    );
+    // the window passes: the alarm clears
+    env.mine(hawkeye::engine::roll::RESTORE_WINDOW + 2);
+    engines[0].tick().await;
+    assert!(
+        !engines[0]
+            .alarms()
+            .iter()
             .any(|a| a.name == "restore-report-flood"),
         "{:?}",
         engines[0].alarms()
     );
+}
+
+/// (t5) R-1 lineage: a vault rolled for a restored report is rolled for real (roll intent, then
+/// its release into a new vault); that successor is never marked for a restored report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t5_the_successor_of_a_restore_rolled_vault_is_never_marked() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let v = free_vaults(&env).await[0];
+    let vc = CoreOutPoint::new(v.txid.0, v.vout);
+    engines[1]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    let reporter = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[1]));
+    for i in [0usize, 2] {
+        let a = reporter
+            .orphaned(&urls[i], &restore_report(&v, 1, "ab"))
+            .await
+            .unwrap();
+        assert!(a.body.marked);
+    }
+    // the reporter's own ledger marks it too (as its restore check does)
+    engines[1]
+        .ctx()
+        .db(|t| {
+            t.transition_vault(
+                &vc,
+                VaultState::RollDue,
+                None,
+                Some("restore orphan (test)"),
+            )
+        })
+        .unwrap();
+    // the roll, its window, its release
+    let mut successor = None;
+    for _ in 0..4 * TAKEOVER + u32::from(DELAY) + 10 {
+        tick_all(&mut engines).await;
+        env.mine(1);
+        successor = engines[0]
+            .ctx()
+            .db(|t| {
+                let mut out = None;
+                for i in t.intents_in_state(IntentState::Released)? {
+                    if i.origin_vault == Some(vc)
+                        && let Some(r) = i.released_txid
+                    {
+                        for x in t.vaults_in_state(VaultState::Live)? {
+                            if x.outpoint.txid == r {
+                                out = Some(x.outpoint);
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .unwrap();
+        if successor.is_some() {
+            break;
+        }
+    }
+    let succ = successor.expect("the roll was released into a new vault");
+    let so = OutPoint::new(Hash256(succ.txid), succ.vout);
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&so, 1, "cd"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("descends"), "{e}");
 }
 
 /// (t2) R-2: an expired declaration does not count; a declaration naming another membership
@@ -5987,14 +6064,25 @@ async fn t3_a_declared_member_that_answers_keeps_its_hold() {
     let others: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
     for &d in &others {
         for &i in &others {
-            hawkeye::engine::burn::record_gone(
-                engines[i].ctx(),
-                None,
-                &gone_decl(&env, &env.keys[d], mk, 3 * TAKEOVER),
-            )
+            hawkeye::engine::burn::record_gone(engines[i].ctx(), None, &{
+                // uppercase keys: stored and deleted normalised (R-2 nit)
+                let mut g = gone_decl(&env, &env.keys[d], mk, 3 * TAKEOVER);
+                g.member = g.member.to_uppercase();
+                g.declarer = g.declarer.to_uppercase();
+                g
+            })
             .await
             .unwrap();
         }
+    }
+    // stored under the lowercase keys whatever the declarations' case
+    for &i in &others {
+        let n = engines[i]
+            .ctx()
+            .db(|t| t.meta_prefix(&format!("gone/{}/", hex::encode(mk))))
+            .unwrap()
+            .len();
+        assert_eq!(n, 2, "normalised keys");
     }
     // the member comes back before anyone acts: restored, it answers "held"
     engines[leader]
