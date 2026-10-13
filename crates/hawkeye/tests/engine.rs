@@ -5477,22 +5477,10 @@ async fn s1_a_member_no_longer_current_is_not_required() {
 /// signature and a non-member's declaration are refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2_declared_gone_by_a_quorum_releases_the_hold() {
-    use hawkeye::peers::GoneDeclaration;
     let Some(env) = setup().await else { return };
     let (mut engines, leader, nonce) = held_takeover(&env).await;
     let mk = env.key_of_index(leader);
-    let decl = |by: &SecretKey, member: [u8; 33]| GoneDeclaration {
-        member: hex::encode(member),
-        declarer: hex::encode(by.public_key()),
-        sig: hex::encode(
-            hawkeye_core::peerauth::sign(
-                by,
-                &hawkeye_core::peerauth::gone_msg(&env.set.0, &member),
-            )
-            .unwrap(),
-        ),
-        reason: "test".into(),
-    };
+    let decl = |by: &SecretKey, member: [u8; 33]| gone_decl(&env, by, member, 2 * TAKEOVER);
     // refusals, on every ledger
     for (i, e) in engines.iter().enumerate() {
         if i == leader {
@@ -5647,7 +5635,6 @@ async fn s4_a_divergent_leaders_evicted_unlock_is_adopted_not_rebuilt() {
 /// still current: the majority of the three current members) the hold is released.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2b_one_declaration_is_not_a_quorum_at_k1_n4() {
-    use hawkeye::peers::GoneDeclaration;
     let Some(env) = setup_with(Opts {
         members: 4,
         ..Opts::default()
@@ -5703,15 +5690,7 @@ async fn s2b_one_declaration_is_not_a_quorum_at_k1_n4() {
     }
     assert!(unlocks_for(&env, nonce).is_empty(), "held");
     let mk = env.key_of_index(leader);
-    let decl = |by: &SecretKey| GoneDeclaration {
-        member: hex::encode(mk),
-        declarer: hex::encode(by.public_key()),
-        sig: hex::encode(
-            hawkeye_core::peerauth::sign(by, &hawkeye_core::peerauth::gone_msg(&env.set.0, &mk))
-                .unwrap(),
-        ),
-        reason: "test".into(),
-    };
+    let decl = |by: &SecretKey| gone_decl(&env, by, mk, 2 * TAKEOVER);
     let others: Vec<usize> = (0..4).filter(|i| *i != leader).collect();
     let declare = |by: usize, engines: &Vec<Engine>| {
         let d = decl(&env.keys[by]);
@@ -5774,5 +5753,308 @@ async fn tick_except(engines: &mut [Engine], skip: usize) {
         if i != skip {
             e.tick().await;
         }
+    }
+}
+
+/// A declaration by `by` that `member` (its current membership) is gone, expiring `blocks` ahead.
+fn gone_decl(
+    env: &Env,
+    by: &SecretKey,
+    member: [u8; 33],
+    blocks: u32,
+) -> hawkeye::peers::GoneDeclaration {
+    let (seq, tip) = {
+        let st = env.mock.state();
+        let seq = st.sets[&env.set]
+            .memberlist
+            .iter()
+            .find(|m| m.key.0 == member)
+            .map_or(0, |m| m.joinheight);
+        (seq, st.tip_height())
+    };
+    gone_decl_at(env, by, member, seq, tip + blocks)
+}
+
+fn gone_decl_at(
+    env: &Env,
+    by: &SecretKey,
+    member: [u8; 33],
+    seq: u32,
+    expiry: u32,
+) -> hawkeye::peers::GoneDeclaration {
+    hawkeye::peers::GoneDeclaration {
+        member: hex::encode(member),
+        declarer: hex::encode(by.public_key()),
+        seq,
+        expiry,
+        sig: hex::encode(
+            hawkeye_core::peerauth::sign(
+                by,
+                &hawkeye_core::peerauth::gone_msg(&env.set.0, &member, seq, expiry),
+            )
+            .unwrap(),
+        ),
+        reason: "test".into(),
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// (t) final re-review: R-1 restored reports, R-2 scoped declarations, R-3 bounded growth
+
+fn restore_report(vault: &OutPoint, count: u32, event: &str) -> hawkeye::peers::OrphanRequest {
+    hawkeye::peers::OrphanRequest {
+        nonce: 0,
+        vault: format!("{}:{}", vault.txid, vault.vout),
+        restored: true,
+        count,
+        event: event.into(),
+    }
+}
+
+/// (t1) R-1: a restored report is refused from a reporter whose own signed `/burns/unlock` does
+/// not show its ledger restored; from a restored one, a restore event marks at most the count it
+/// stated (≤ 64) — more is a flood, alarmed — and a vault already rolled for a restored report
+/// is never marked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t1_restored_reports_are_verified_and_capped() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    for _ in 0..3 {
+        lock_and_mint(&env, &mut engines).await;
+    }
+    let vs = free_vaults(&env).await;
+    assert!(vs.len() >= 3);
+    let reporter = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[1]));
+    // not restored: refused
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&vs[0], 2, "ab"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("does not show its ledger restored"), "{e}");
+    engines[1]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    // an absurd count is a flood
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&vs[0], 65, "ab"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("1..=64"), "{e}");
+    // two stated: two marked, a third refused
+    for v in &vs[..2] {
+        let a = reporter
+            .orphaned(&urls[0], &restore_report(v, 2, "ab"))
+            .await
+            .unwrap();
+        assert!(a.body.marked);
+    }
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&vs[2], 2, "ab"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("stated 2 vaults"), "{e}");
+    // a vault already rolled for a restored report is never marked again, whatever the event
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&vs[0], 1, "cd"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("already rolled"), "{e}");
+    engines[0].tick().await;
+    assert!(
+        engines[0]
+            .alarms()
+            .iter()
+            .any(|a| a.name == "restore-report-flood"),
+        "{:?}",
+        engines[0].alarms()
+    );
+}
+
+/// (t2) R-2: an expired declaration does not count; a declaration naming another membership
+/// (seq) of the member is refused; a declaration about a member that is not in the set is
+/// refused (R-3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t2_declarations_are_scoped_and_expire() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, leader, nonce) = held_takeover(&env).await;
+    let mk = env.key_of_index(leader);
+    let others: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+    // a quorum (2 of the 2 others), but expiring in one block
+    for &d in &others {
+        for &i in &others {
+            hawkeye::engine::burn::record_gone(
+                engines[i].ctx(),
+                None,
+                &gone_decl(&env, &env.keys[d], mk, 1),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    env.mine(2); // past their expiry
+    for _ in 0..3 {
+        tick_except(&mut engines, leader).await;
+        env.mine(1);
+    }
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "expired declarations release nothing"
+    );
+    // the positive control: the same quorum, not expired, releases
+    for &d in &others {
+        for &i in &others {
+            hawkeye::engine::burn::record_gone(
+                engines[i].ctx(),
+                None,
+                &gone_decl(&env, &env.keys[d], mk, 4),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    tick_except(&mut engines, leader).await;
+    tick_except(&mut engines, leader).await;
+    assert_eq!(unlocks_for(&env, nonce).len(), 1, "a live quorum releases");
+    // another membership of the member
+    let seq = {
+        let st = env.mock.state();
+        st.sets[&env.set]
+            .memberlist
+            .iter()
+            .find(|m| m.key.0 == mk)
+            .unwrap()
+            .joinheight
+    };
+    let tip = env.mock.state().tip_height();
+    let e = hawkeye::engine::burn::record_gone(
+        engines[others[0]].ctx(),
+        None,
+        &gone_decl_at(&env, &env.keys[others[1]], mk, seq + 1, tip + 4),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("membership"), "{e}");
+    // too far ahead
+    let e = hawkeye::engine::burn::record_gone(
+        engines[others[0]].ctx(),
+        None,
+        &gone_decl_at(&env, &env.keys[others[1]], mk, seq, tip + 100 * TAKEOVER),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("expires"), "{e}");
+    // not a member of the set at all
+    let stranger = secret(50).public_key();
+    let e = hawkeye::engine::burn::record_gone(
+        engines[others[0]].ctx(),
+        None,
+        &gone_decl_at(&env, &env.keys[others[1]], stranger, 0, tip + 4),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("not in the set's member list"), "{e}");
+}
+
+/// (t3) R-2 and the `gone-member-answered` path: a member declared gone by a quorum answers
+/// (here: its ledger is restored, so it answers "held"); its declarations are dropped, the alarm
+/// is raised, and its hold stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t3_a_declared_member_that_answers_keeps_its_hold() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x74; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    drop(engines);
+    let (mut engines, addr) = with_one_down(&env, leader).await;
+    for _ in 0..TAKEOVER + 2 {
+        tick_except(&mut engines, leader).await;
+        env.mine(1);
+    }
+    let mk = env.key_of_index(leader);
+    let others: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+    for &d in &others {
+        for &i in &others {
+            hawkeye::engine::burn::record_gone(
+                engines[i].ctx(),
+                None,
+                &gone_decl(&env, &env.keys[d], mk, 3 * TAKEOVER),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    // the member comes back before anyone acts: restored, it answers "held"
+    engines[leader]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    let l = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let ctx = engines[leader].ctx().clone();
+    tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+    tick_except(&mut engines, leader).await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "its hold stands");
+    assert!(
+        engines.iter().enumerate().any(
+            |(i, e)| i != leader && e.alarms().iter().any(|a| a.name == "gone-member-answered")
+        ),
+        "alarmed"
+    );
+    let left = engines[others[0]]
+        .ctx()
+        .db(|t| t.meta_prefix(&format!("gone/{}/", hex::encode(mk))))
+        .unwrap();
+    let left1 = engines[others[1]]
+        .ctx()
+        .db(|t| t.meta_prefix(&format!("gone/{}/", hex::encode(mk))))
+        .unwrap();
+    assert!(
+        left.is_empty() || left1.is_empty(),
+        "the taking-over ledger dropped the declarations once the member answered"
+    );
+}
+
+/// (t4) R-3: the observed unlocks of a burn released `C_Y` deep are pruned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t4_observed_unlocks_are_pruned_after_release() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x75; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    tick_all(&mut engines).await;
+    tick_all(&mut engines).await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let prefix = format!("observed_unlock/{k}/");
+    assert!(
+        engines
+            .iter()
+            .any(|e| !e.ctx().db(|t| t.meta_prefix(&prefix)).unwrap().is_empty()),
+        "observed while pending"
+    );
+    for _ in 0..u32::from(DELAY) + C_Y + 4 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert_eq!(b.state, BurnState::Released);
+        assert!(
+            e.ctx().db(|t| t.meta_prefix(&prefix)).unwrap().is_empty(),
+            "pruned"
+        );
     }
 }
