@@ -101,8 +101,23 @@ async fn lock(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
 
 async fn burn(State(ctx): State<Ctx>, Path(nonce): Path<u64>) -> Response {
     let k = BurnKey::new(ctx.params.deployment, nonce);
+    let held = ctx.db(|t| {
+        let Some(row) = t.live_unlock_for_burn(&ctx.params.set_id, &k)? else {
+            return Ok(None);
+        };
+        if row.origin == hawkeye_store::UnlockOrigin::Drill {
+            return Ok(None);
+        }
+        Ok(t.ycash_signature(&hawkeye_store::YcashSignKey {
+            domain: hawkeye_store::SignDomain::YcashUnlock,
+            set_id: ctx.params.set_id,
+            prevout: row.prevout,
+        })?
+        .map(|r| r.signed_hex))
+    });
     match ctx.db(|t| t.burn(&k)) {
         Ok(Some(b)) => Json(BurnView {
+            unlock: held.ok().flatten(),
             nonce,
             tx_hash: format!("0x{}", hex::encode(b.tx_hash)),
             amount: b.amount,

@@ -69,6 +69,12 @@ pub struct BurnView {
     pub leader: Option<String>,
     /// The intent paying it.
     pub intent: Option<String>,
+    /// The signed unlock (hex) this attestor holds for the burn and that may still confirm — as
+    /// its leader or co-signer, never a drill's. Not a secret: it pays the burn's own recipient,
+    /// and a takeover leader re-sends it (re-funded) instead of signing another vault for the
+    /// burn (audit 01/V-2: a signed unlock stays revivable while its vault is unspent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock: Option<String>,
 }
 
 /// `POST /slash/sign` request.
@@ -191,6 +197,19 @@ impl Peers {
         let r = self
             .http
             .get(format!("{peer}/locks/{lock_id_hex}"))
+            .send()
+            .await?;
+        if !r.status().is_success() {
+            return Err(anyhow!("{peer}: HTTP {}", r.status()));
+        }
+        Ok(r.json().await?)
+    }
+
+    /// `GET <peer>/burns/<nonce>` (read-only, unsigned).
+    pub async fn burn(&self, peer: &str, nonce: u64) -> Result<BurnView> {
+        let r = self
+            .http
+            .get(format!("{peer}/burns/{nonce}"))
             .send()
             .await?;
         if !r.status().is_success() {

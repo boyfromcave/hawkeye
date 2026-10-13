@@ -184,16 +184,20 @@ impl Engine {
     }
 
     /// Judge the live unlock that pays a burn here (remedial report 05/H-1 §4.4, finding
-    /// 05/N-1): re-sent only if this attestor signed it **as the burn's leader** and every fee
-    /// input still unspent is this wallet's; dead only when it can no longer confirm — the vault
-    /// spent by another transaction at least `C_Y` deep, or, for a row this attestor did not
-    /// sign as leader, a fee input spent so deep while the vault is unspent.
+    /// 05/N-1; audit 01/V-2).
     ///
-    /// A leader's unlock whose fee input is gone is **not** dead (audit 01/V-2): the set
-    /// signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, so anyone holding the signed
-    /// bytes can re-fund it (`vault_refee`) and it would still pay the burn. Signing another
-    /// vault for the burn would then risk a double payment; it is re-sent instead, and
-    /// [`super::sign::send_set_signed`] re-funds it.
+    /// **An unlock this member signed stays revivable while its vault is unspent.** The set
+    /// signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, so anyone holding the signed bytes
+    /// can re-fund them (`vault_refee`, or by hand) whatever happened to their fee inputs; a
+    /// second unlock signed for the burn meanwhile would let the burn be paid twice. So:
+    ///
+    /// - vault unspent: the bytes are re-sent — re-funded when a fee input is gone or is not this
+    ///   wallet's (a co-signed row adopted as the burn's new leader, takeover) — never replaced.
+    ///   A fee-input spend no longer makes a row dead. Only a drill row is held, never sent;
+    /// - vault spent by this unlock (any funding of it: the ledger links an intent of the vault
+    ///   to this burn, or the stored transaction is known): it is out;
+    /// - vault spent by **another** transaction at least `C_Y` deep: the bytes can no longer
+    ///   confirm — dead, and one more vault may be signed for the burn; shallower: held.
     async fn judge_live_unlock(
         &mut self,
         row: &UnlockBurnRecord,
@@ -205,13 +209,23 @@ impl Engine {
         let vault = row.prevout;
         let ycash = self.ctx.ycash.clone();
         let rpc = |op: &CoreOutPoint| op_rpc(op);
-        // the vault: unspent, spent by this unlock (it is out), or by another transaction
         if ycash
             .gettxout(&rpc(&vault).txid, vault.vout, true)
             .await?
             .is_none()
         {
-            if ycash.getrawtransaction(&tx.txid()).await.is_ok() {
+            let ours_seen = self.ctx.db(|t| {
+                for st in <IntentState as hawkeye_store::Machine>::ALL {
+                    if t.intents_in_state(*st)?
+                        .iter()
+                        .any(|i| i.origin_vault == Some(vault) && i.matched_burn == Some(row.key))
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })?;
+            if ours_seen || ycash.getrawtransaction(&tx.txid()).await.is_ok() {
                 return Ok(LiveUnlock::Out);
             }
             if ycash
@@ -234,78 +248,46 @@ impl Engine {
                 "vault {vault} spent by another transaction {depth} < C_Y {cy} blocks deep"
             )));
         }
-        let mut foreign = vec![];
-        let mut lost = vec![];
+        if row.origin == UnlockOrigin::Drill {
+            return Ok(LiveUnlock::Hold(format!(
+                "a drill unlock of vault {vault} pays this burn here; it is never re-sent"
+            )));
+        }
+        // every input but the vault: still unspent and this wallet's, else re-funded
+        let mut refund = row.origin != UnlockOrigin::Leader;
         for i in &tx.inputs {
             let op = op_core(&i.prevout);
             if op == vault {
                 continue;
             }
-            match ycash
+            let mine = match ycash
                 .gettxout(&i.prevout.txid, i.prevout.vout, true)
                 .await?
             {
-                Some(info) => {
-                    let mine = match info
-                        .script_pub_key
-                        .addresses
-                        .as_ref()
-                        .and_then(|a| a.first())
-                    {
-                        Some(a) => ycash
-                            .validateaddress(a)
-                            .await
-                            .is_ok_and(|v| v.ismine == Some(true)),
-                        None => false,
-                    };
-                    if !mine {
-                        foreign.push(op.to_string());
-                    }
-                }
-                None if row.origin == UnlockOrigin::Leader => {
-                    // re-fundable (01/V-2): resent below, `send_set_signed` re-funds it
-                    lost.push(op.to_string());
-                }
-                None => {
-                    if ycash
-                        .gettxout(&i.prevout.txid, i.prevout.vout, false)
-                        .await?
-                        .is_some()
-                    {
-                        return Ok(LiveUnlock::Hold(format!(
-                            "fee input {op} is spent in the mempool by another transaction"
-                        )));
-                    }
-                    let since = *self.mem.conflict_seen.entry(op).or_insert(tip);
-                    let depth = tip + 1 - since.min(tip + 1);
-                    if depth >= cy {
-                        return Ok(LiveUnlock::Dead(format!(
-                            "fee input {op} spent at least {depth} blocks deep (seen spent since height {since}) while vault {vault} is unspent"
-                        )));
-                    }
-                    return Ok(LiveUnlock::Hold(format!(
-                        "fee input {op} spent {depth} < C_Y {cy} blocks deep"
-                    )));
-                }
-            }
+                Some(info) => match info
+                    .script_pub_key
+                    .addresses
+                    .as_ref()
+                    .and_then(|a| a.first())
+                {
+                    Some(a) => ycash
+                        .validateaddress(a)
+                        .await
+                        .is_ok_and(|v| v.ismine == Some(true)),
+                    None => false,
+                },
+                None => false,
+            };
+            refund |= !mine;
         }
-        if row.origin != UnlockOrigin::Leader {
-            return Ok(LiveUnlock::Hold(format!(
-                "a {} unlock of vault {vault} pays this burn here; it is never re-sent",
-                row.origin
-            )));
+        if refund {
+            info!(event = "unlock_refund_due", vault = %vault, origin = %row.origin,
+                  "fee inputs gone or not this wallet's: the signed unlock is re-sent re-funded (01/V-2)");
         }
-        if !foreign.is_empty() {
-            return Ok(LiveUnlock::Hold(format!(
-                "the unlock of vault {vault} has fee inputs this wallet does not hold: {}",
-                foreign.join(", ")
-            )));
-        }
-        if !lost.is_empty() {
-            info!(event = "unlock_refund_due", vault = %vault, lost = %lost.join(", "),
-                  "fee input(s) gone: the leader's unlock is re-sent re-funded (01/V-2)");
-        }
-        Ok(LiveUnlock::Resend(signed_hex.to_owned()))
+        Ok(LiveUnlock::Resend {
+            hex: signed_hex.to_owned(),
+            refund,
+        })
     }
 
     /// vault_buildunlock → memo → set_signunlock (sign-once, per vault **and** per burn) →
@@ -316,7 +298,10 @@ impl Engine {
         let nonce = b.key.nonce;
         let recipient =
             YcashRecipient::from_bytes(&b.recipient).map_err(|e| anyhow!("recipient: {e}"))?;
-        let (signed, template) = match self.ctx.db(|t| t.live_unlock_for_burn(&p.set_id, &b.key))? {
+        let (signed, template, refund) = match self
+            .ctx
+            .db(|t| t.live_unlock_for_burn(&p.set_id, &b.key))?
+        {
             Some(row) => {
                 let key = self.unlock_key_of(&row.prevout);
                 let rec = self.ctx.db(|t| t.ycash_signature(&key))?.ok_or_else(|| {
@@ -356,13 +341,36 @@ impl Engine {
                         );
                         return Ok(());
                     }
-                    LiveUnlock::Resend(h) => {
-                        info!(event = "unlock_resend", nonce);
+                    LiveUnlock::Resend { hex: h, refund } => {
+                        info!(event = "unlock_resend", nonce, origin = %row.origin, refund);
                         match self.complete_unlock(&h).await? {
-                            Some(h) => (h, row.prevout),
+                            Some(h) => (h, row.prevout, refund),
                             None => return Ok(()),
                         }
                     }
+                }
+            }
+            None if let Some((hex, vault)) = self.prior_unlock(b).await? => {
+                // takeover (01/V-2): another member already signed an unlock for this burn,
+                // revivable while its vault is unspent; it is adopted, never doubled
+                let key = self.unlock_key_of(&vault);
+                let signer = SetSigning::prepare(&self.ctx, &hex, Role::Unlock, vault).await?;
+                let burn = UnlockBurn {
+                    key: b.key,
+                    origin: UnlockOrigin::Leader,
+                    allow_double: false,
+                };
+                let rec = self.ctx.db(|t| {
+                    t.sign_once_unlock(&key, Some(&burn), &hex, |h| {
+                        let o = signer.sign(h)?;
+                        Ok::<_, String>((o.hex, o.sighash))
+                    })
+                })?;
+                warn!(event = "unlock_adopted", nonce, vault = %vault,
+                      "takeover: the previous signed unlock of the burn is re-sent re-funded, no new vault is signed");
+                match self.complete_unlock(&rec.signed_hex).await? {
+                    Some(h) => (h, vault, true),
+                    None => return Ok(()),
                 }
             }
             None => {
@@ -425,13 +433,18 @@ impl Engine {
                       recipient = %encode_address(&recipient, p.network), complete = complete.get());
                 super::drill_crash_point(&p, "unlock_signed");
                 match self.complete_unlock(&rec.signed_hex).await? {
-                    Some(h) => (h, vault.outpoint),
+                    Some(h) => (h, vault.outpoint, false),
                     None => return Ok(()),
                 }
             }
         };
         let hex: HexBytes = signed.parse().map_err(|e| anyhow!("{e}"))?;
-        let txid = match super::sign::send_set_signed(&self.ctx.ycash, &hex, &template).await {
+        let sent = if refund {
+            super::sign::send_refunded(&self.ctx.ycash, &hex, &template).await
+        } else {
+            super::sign::send_set_signed(&self.ctx.ycash, &hex, &template).await
+        };
+        let txid = match sent {
             Ok(t) => t,
             Err(e) if e.rpc().is_some_and(|r| r.is_already_known()) => {
                 // already broadcast; the watcher observes it from the mempool or a block
@@ -574,6 +587,77 @@ impl Engine {
         Ok(script)
     }
 
+    /// A signed unlock another member holds for burn `b` that may still confirm (`GET
+    /// /burns/<nonce>` of every peer): the first that spends an unspent vault of the set into
+    /// one intent matching this burn here and carries only valid signatures of set members.
+    async fn prior_unlock(&mut self, b: &BurnRecord) -> Result<Option<(String, CoreOutPoint)>> {
+        let members = self.slashable_member_keys();
+        for peer in self.ctx.peers.urls().to_vec() {
+            let Ok(view) = self.ctx.peers.burn(&peer, b.key.nonce).await else {
+                continue;
+            };
+            let Some(hex) = view.unlock else { continue };
+            match self.check_prior_unlock(b, &hex, &members).await {
+                Ok(vault) => {
+                    info!(event = "unlock_prior_found", nonce = b.key.nonce, peer = %peer,
+                          vault = %vault);
+                    return Ok(Some((hex, vault)));
+                }
+                Err(e) => warn!(event = "unlock_prior_rejected", nonce = b.key.nonce,
+                                peer = %peer, error = %format!("{e:#}")),
+            }
+        }
+        Ok(None)
+    }
+
+    async fn check_prior_unlock(
+        &mut self,
+        b: &BurnRecord,
+        hex: &str,
+        members: &[PubKey33],
+    ) -> Result<CoreOutPoint> {
+        use hawkeye_core::matcher::Classification;
+        let tx = Transaction::decode_hex(hex).map_err(|e| anyhow!("decode: {e}"))?;
+        let f = classify_unlock(&self.ctx, &tx).await?;
+        anyhow::ensure!(
+            f.classification == Classification::MatchedBurn { nonce: b.key.nonce },
+            "it does not pay burn {} here: {}",
+            b.key.nonce,
+            hawkeye_store::classification_code(&f.classification)
+        );
+        let idx =
+            super::sign::input_index(&tx, &f.origin).ok_or_else(|| anyhow!("no vault input"))?;
+        let a = self
+            .ctx
+            .attributor
+            .attribute(
+                &tx.encode(),
+                idx,
+                &f.coin.0,
+                f.coin.1,
+                hawkeye_core::VAULT_BRANCH_ID,
+            )
+            .map_err(|e| anyhow!("signatures: {e}"))?;
+        anyhow::ensure!(!a.signers.is_empty(), "unsigned");
+        anyhow::ensure!(
+            a.signers.iter().all(|s| members.contains(&s.pubkey)),
+            "a signer is not a member of the set"
+        );
+        let mine = self.unlock_key_of(&f.origin);
+        if let Some(r) = self.ctx.db(|t| t.ycash_signature(&mine))? {
+            anyhow::ensure!(
+                Transaction::decode_hex(&r.signed_hex)
+                    .ok()
+                    .is_some_and(|o| {
+                        super::sign::same_spend_any_signatures(&o, &tx, &f.origin).is_ok()
+                    }),
+                "this attestor already signed another spend of vault {}",
+                f.origin
+            );
+        }
+        Ok(f.origin)
+    }
+
     /// The sign-once key of a vault's unlock.
     pub(crate) fn unlock_key_of(&self, vault: &CoreOutPoint) -> YcashSignKey {
         YcashSignKey {
@@ -684,11 +768,18 @@ impl Engine {
 /// What a burn's live unlock here allows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LiveUnlock {
-    /// This attestor's own unlock as leader, sendable: re-send these bytes.
-    Resend(String),
+    /// The signed unlock may still confirm and this attestor leads the burn: re-send these
+    /// bytes (`refund`: re-fund every fee input first — gone, or not this wallet's).
+    Resend {
+        /// The signed bytes.
+        hex: String,
+        /// Re-fund before sending.
+        refund: bool,
+    },
     /// Not re-sent and not dead (yet): wait, alarm; takeover moves the burn on.
     Hold(String),
-    /// It can no longer confirm: mark it dead (one more vault may then be signed).
+    /// Its vault was spent by another transaction `C_Y` deep: it can no longer confirm; mark it
+    /// dead (one more vault may then be signed).
     Dead(String),
     /// It is broadcast or mined: the watcher follows it.
     Out,
@@ -811,80 +902,13 @@ pub async fn verify_and_sign_unlock(
         anyhow!("unauthenticated request: unlock co-signing answers member-signed requests only")
     })?;
     let tx = Transaction::decode_hex(&req.hex).map_err(|e| anyhow!("unlock: {e}"))?;
-    // the vault input: unspent on this node (N-3)
-    let mut vault = None;
-    for input in &tx.inputs {
-        // unsigned, or carrying UNLOCK signatures already
-        if !input.script_sig.is_empty()
-            && parse_selector(TemplateKind::Vault, &input.script_sig)
-                .map(|s| s.selector)
-                .ok()
-                != Some(1)
-        {
-            continue;
-        }
-        let Ok(Some(o)) = ctx
-            .ycash
-            .gettxout(&input.prevout.txid, input.prevout.vout, true)
-            .await
-        else {
-            continue;
-        };
-        if let Ok(v) = parse_vault(&o.script_pub_key.hex.0)
-            && v.tag == p.tag()
-            && v.set_id == p.set_id
-        {
-            vault = Some((op_core(&input.prevout), v));
-            break;
-        }
-    }
-    let (origin, vp) = vault.ok_or_else(|| {
-        anyhow!(
-            "the transaction unlocks no unspent {} vault of this set",
-            p.tag_text()
-        )
-    })?;
-    // its intents (one, HK-8)
-    let mut intents = vec![];
-    for (n, o) in tx.outputs.iter().enumerate() {
-        let ip = match hawkeye_core::template::parse_intent(&o.script_pubkey) {
-            Ok(ip) => ip,
-            Err(_) => match ctx
-                .ycash
-                .vault_decodescript(&HexBytes(o.script_pubkey.clone()))
-                .await
-            {
-                Ok(hawkeye_ycash::types::DecodedScript::Intent(f)) => {
-                    crate::convert::intent_params(&f)?
-                }
-                _ => continue,
-            },
-        };
-        intents.push((n, ip, u64::try_from(o.value).unwrap_or(0)));
-    }
-    let [(_, ip, value)] = intents.as_slice() else {
-        anyhow::bail!(
-            "the unlock creates {} intents, not one (HK-8)",
-            intents.len()
-        );
-    };
-    let tip = ctx.ycash.getblockcount().await?;
-    let outs = crate::convert::outputs(&tx);
-    let c = ctx.db(|t| {
-        Ok(super::ycash::classify(
-            t,
-            p,
-            &super::ycash::IntentFacts {
-                txid: tx.txid().0,
-                first_seen: tip,
-                intent: ip,
-                value: *value,
-                outputs: &outs,
-                spent_vault: Some(&vp),
-                origin: Some(&origin),
-            },
-        ))
-    })?;
+    let UnlockFacts {
+        origin,
+        vault: vp,
+        coin,
+        classification: c,
+        tip,
+    } = classify_unlock(ctx, &tx).await?;
     let (matched, burn) = match c {
         Classification::MatchedBurn { nonce } => {
             let k = BurnKey::new(p.deployment, nonce);
@@ -943,6 +967,29 @@ pub async fn verify_and_sign_unlock(
         set_id: p.set_id,
         prevout: origin,
     };
+    // the same unlock asked again with other signatures or other fee inputs (a takeover
+    // leader re-sending the previous leader's bytes, 01/V-2): this attestor's signature is
+    // already made over that sighash; it is added to the request, never made again
+    if let Some(rec) = ctx.db(|t| t.ycash_signature(&key))?
+        && rec.built_hex != req.hex
+        && let Some(merged) = merge_own_signature(ctx, &rec.signed_hex, &req.hex, &origin, &coin)?
+    {
+        if let Some(b) = &burn {
+            anyhow::ensure!(
+                ctx.db(|t| t.unlock_burn_rows(&p.set_id, &b.key))?
+                    .iter()
+                    .any(|r| r.prevout == origin && r.is_live()),
+                "vault {origin} was signed here for another purpose"
+            );
+        }
+        info!(event = "unlock_cosign_merged", vault = %origin, matched = %matched,
+              requester = %hex::encode(requester));
+        return Ok(crate::peers::UnlockSignResponse {
+            complete: unlock_signatures(&merged)? >= need as usize,
+            hex: merged,
+            matched,
+        });
+    }
     let signer = SetSigning::prepare(ctx, &req.hex, Role::Unlock, origin).await?;
     let complete = std::cell::Cell::new(None);
     let rec = ctx.db(|t| {
@@ -961,6 +1008,166 @@ pub async fn verify_and_sign_unlock(
         hex: rec.signed_hex,
         matched,
     })
+}
+
+/// What [`classify_unlock`] established about an unlock transaction.
+pub(crate) struct UnlockFacts {
+    /// The vault it spends.
+    pub origin: CoreOutPoint,
+    /// That vault's parameters.
+    pub vault: hawkeye_core::VaultParams,
+    /// That vault's script and value (from this node: it is unspent).
+    pub coin: (Vec<u8>, u64),
+    /// Its one intent's classification against this ledger.
+    pub classification: hawkeye_core::matcher::Classification,
+    /// This node's tip.
+    pub tip: u32,
+}
+
+/// Classify an unlock on this attestor's own node and ledger: it must spend one **unspent**
+/// vault of the bridge's tag of the set (`gettxout`, N-3) into exactly one intent (HK-8).
+pub(crate) async fn classify_unlock(ctx: &super::Ctx, tx: &Transaction) -> Result<UnlockFacts> {
+    let p = &ctx.params;
+    let mut vault = None;
+    for input in &tx.inputs {
+        // unsigned, or carrying UNLOCK signatures already
+        if !input.script_sig.is_empty()
+            && parse_selector(TemplateKind::Vault, &input.script_sig)
+                .map(|s| s.selector)
+                .ok()
+                != Some(1)
+        {
+            continue;
+        }
+        let Ok(Some(o)) = ctx
+            .ycash
+            .gettxout(&input.prevout.txid, input.prevout.vout, true)
+            .await
+        else {
+            continue;
+        };
+        if let Ok(v) = parse_vault(&o.script_pub_key.hex.0)
+            && v.tag == p.tag()
+            && v.set_id == p.set_id
+        {
+            let coin = (
+                o.script_pub_key.hex.0.clone(),
+                u64::try_from(o.value.zat()).unwrap_or(0),
+            );
+            vault = Some((op_core(&input.prevout), v, coin));
+            break;
+        }
+    }
+    let (origin, vp, coin) = vault.ok_or_else(|| {
+        anyhow!(
+            "the transaction unlocks no unspent {} vault of this set",
+            p.tag_text()
+        )
+    })?;
+    let mut intents = vec![];
+    for (n, o) in tx.outputs.iter().enumerate() {
+        let ip = match hawkeye_core::template::parse_intent(&o.script_pubkey) {
+            Ok(ip) => ip,
+            Err(_) => match ctx
+                .ycash
+                .vault_decodescript(&HexBytes(o.script_pubkey.clone()))
+                .await
+            {
+                Ok(hawkeye_ycash::types::DecodedScript::Intent(f)) => {
+                    crate::convert::intent_params(&f)?
+                }
+                _ => continue,
+            },
+        };
+        intents.push((n, ip, u64::try_from(o.value).unwrap_or(0)));
+    }
+    let [(_, ip, value)] = intents.as_slice() else {
+        anyhow::bail!(
+            "the unlock creates {} intents, not one (HK-8)",
+            intents.len()
+        );
+    };
+    let tip = ctx.ycash.getblockcount().await?;
+    let outs = crate::convert::outputs(tx);
+    let classification = ctx.db(|t| {
+        Ok(super::ycash::classify(
+            t,
+            p,
+            &super::ycash::IntentFacts {
+                txid: tx.txid().0,
+                first_seen: tip,
+                intent: ip,
+                value: *value,
+                outputs: &outs,
+                spent_vault: Some(&vp),
+                origin: Some(&origin),
+            },
+        ))
+    })?;
+    Ok(UnlockFacts {
+        origin,
+        vault: vp,
+        coin,
+        classification,
+        tip,
+    })
+}
+
+/// This attestor's own UNLOCK signature on `stored` (the bytes it signed), added to `request`
+/// when `request` is the same unlock (only the fee inputs or the other signatures differ:
+/// under `SIGHASH_ALL|SIGHASH_ANYONECANPAY` the signature covers it, 01/V-2). `None` when it is
+/// another unlock (the per-vault sign-once refuses it) or holds no signature of this key.
+pub(crate) fn merge_own_signature(
+    ctx: &super::Ctx,
+    stored: &str,
+    request: &str,
+    vault: &CoreOutPoint,
+    coin: &(Vec<u8>, u64),
+) -> Result<Option<String>> {
+    let old = Transaction::decode_hex(stored).map_err(|e| anyhow!("{e}"))?;
+    let mut new = Transaction::decode_hex(request).map_err(|e| anyhow!("{e}"))?;
+    if super::sign::same_spend_any_signatures(&old, &new, vault).is_err() {
+        return Ok(None);
+    }
+    let (Some(oi), Some(ni)) = (
+        super::sign::input_index(&old, vault),
+        super::sign::input_index(&new, vault),
+    ) else {
+        return Ok(None);
+    };
+    let attribute = |t: &Transaction, i: usize| {
+        ctx.attributor.attribute(
+            &t.encode(),
+            i,
+            &coin.0,
+            coin.1,
+            hawkeye_core::VAULT_BRANCH_ID,
+        )
+    };
+    let Some(mine) = attribute(&old, oi)
+        .ok()
+        .and_then(|a| a.signers.into_iter().find(|s| s.pubkey == ctx.me))
+    else {
+        return Ok(None);
+    };
+    let mut args = super::sign::role_args(&new, ni, Role::Unlock)?;
+    let have: Vec<PubKey33> = if args.is_empty() {
+        vec![]
+    } else {
+        attribute(&new, ni)
+            .map_err(|e| anyhow!("the request's signatures: {e}"))?
+            .signers
+            .into_iter()
+            .map(|s| s.pubkey)
+            .collect()
+    };
+    if !have.contains(&ctx.me) {
+        args.push(mine.signature.to_vec());
+    }
+    let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+    new.inputs[ni].script_sig =
+        hawkeye_core::template::selector_script_sig(&refs, 1).map_err(|e| anyhow!("{e}"))?;
+    Ok(Some(new.encode_hex()))
 }
 
 #[cfg(test)]

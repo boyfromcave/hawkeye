@@ -468,6 +468,24 @@ pub fn same_set_signed_spend(
     Ok(())
 }
 
+/// [`same_set_signed_spend`] whatever set signatures either carries: the same unlock or cancel
+/// (one sighash under `SIGHASH_ALL|SIGHASH_ANYONECANPAY`), only the fee inputs and the template
+/// input's signatures may differ.
+pub fn same_spend_any_signatures(
+    old: &Transaction,
+    new: &Transaction,
+    template: &CoreOutPoint,
+) -> Result<()> {
+    let clear = |t: &Transaction| {
+        let mut t = t.clone();
+        if let Some(i) = input_index(&t, template) {
+            t.inputs[i].script_sig.clear();
+        }
+        t
+    };
+    same_set_signed_spend(&clear(old), &clear(new), template)
+}
+
 /// Whether a send failed because a fee input is gone: spent in a block (`-26 "18:
 /// bad-txns-inputs-spent"` while its transaction has unspent outputs, `-25 Missing inputs` once
 /// it has none: both node lines, regtest_self_signing.rs) or by a mempool transaction
@@ -518,6 +536,29 @@ pub async fn send_set_signed(
     }
     tracing::info!(event = "refee", template = %template, replaced = refunded.replaced.len(),
                    fee = %refunded.fee, sighash = %hex::encode(refunded.sighash.0));
+    ycash.vault_send(&refunded.hex).await
+}
+
+/// `vault_send` of set-signed bytes after re-funding **every** fee input with `vault_refee`
+/// (01/V-2): for bytes this wallet did not fund — a co-signed unlock adopted as the burn's new
+/// leader, a previous leader's unlock fetched at takeover — or whose fee input is gone. Only the
+/// fee inputs may change ([`same_set_signed_spend`]).
+pub async fn send_refunded(
+    ycash: &YcashRpc,
+    hex: &HexBytes,
+    template: &CoreOutPoint,
+) -> core::result::Result<hawkeye_ycash::primitives::Txid, hawkeye_ycash::Error> {
+    let refunded = ycash.vault_refee(hex).await?;
+    let old = Transaction::decode(&hex.0);
+    let new = Transaction::decode(&refunded.hex.0);
+    if let (Ok(old), Ok(new)) = (old, new)
+        && let Err(why) = same_set_signed_spend(&old, &new, template)
+    {
+        tracing::warn!(event = "refee_refused", template = %template, reason = %format!("{why:#}"));
+        return ycash.vault_send(hex).await;
+    }
+    tracing::info!(event = "refee", template = %template, replaced = refunded.replaced.len(),
+                   fee = %refunded.fee);
     ycash.vault_send(&refunded.hex).await
 }
 
