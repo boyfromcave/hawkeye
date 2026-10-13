@@ -1,7 +1,8 @@
 # Hawkeye beside a real node, on both node lines (ycash-dd v4.5.0, ycash6 6.2x) and on both
 # bridges (foreign = ethereum: anvil + wYEC; foreign = near: a NEAR sandbox node + wyec-near, NEAR
-# plan NH5): build the node from the line's post-quantum branch upgrade/quantum-vaults (this
-# Hawkeye reads only the PQ owner slot, quantum spec §1; `node_ref` overrides), start the devnet
+# plan NH5): build the node from the line's upgrade/vault (the post-quantum line merged into it, and
+# the remedial merges: set signatures over SIGHASH_ALL|SIGHASH_ANYONECANPAY, the wallet's restore
+# marker; this Hawkeye reads only the PQ owner slot and signs 0x81; `node_ref` overrides), start the devnet
 # (regtest nodes + the bridge + one Hawkeye per attestor) and run `scenario demo`, the
 # optimistic-mint drill `scenario rogue-mint` (lock -> mint, burn -> HKB1/HKN1 intent -> release,
 # rogue -> cancel -> slash, supply invariant) and the post-quantum recipient drill
@@ -19,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       node_ref:
-        description: node branch, tag or commit to build (both lines; empty = upgrade/quantum-vaults)
+        description: node branch, tag or commit to build (both lines; empty = upgrade/vault)
         default: ""
   push:
     branches: [main, upgrade/vault, upgrade/quantum-vaults, "claude/**"]
@@ -35,9 +36,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   FOUNDRY_VERSION: v1.7.1
-  # This Hawkeye needs the PQ-owner node (vault_getnewowner, the PQ owner slot): the quantum line
-  # on every branch of it (an upgrade/vault node has no template this Hawkeye parses).
-  NODE_REF: ${{ inputs.node_ref || 'upgrade/quantum-vaults' }}
+  # This Hawkeye needs the PQ-owner node (vault_getnewowner, the PQ owner slot) with the 0x81 set
+  # signatures (audit 01/V-2), vault_refee and the restore marker (07/F-5): upgrade/vault (ycash-dd
+  # 8af82551b / ycash6 047b561ac or later). upgrade/quantum-vaults predates the set-signature change.
+  NODE_REF: ${{ inputs.node_ref || 'upgrade/vault' }}
 
 jobs:
   # The node binaries per line, built on ubuntu-22.04 (the depends toolchain needs libtinfo5) and
