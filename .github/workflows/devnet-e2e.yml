@@ -42,11 +42,32 @@ env:
   NODE_REF: ${{ inputs.node_ref || 'upgrade/vault' }}
 
 jobs:
+  # Resolve NODE_REF to one commit per node line, once: the node job builds that commit and the demo
+  # jobs restore exactly that build. Resolving the branch twice raced with node-line pushes (a demo
+  # asked for the cache of a newer commit than the node job built).
+  refs:
+    name: node commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      dd: ${{ steps.r.outputs.dd }}
+      y6: ${{ steps.r.outputs.y6 }}
+    steps:
+      - id: r
+        run: |
+          dd=$(git ls-remote "https://github.com/boyfromcave/ycash-dd.git" "refs/heads/$NODE_REF" | cut -f1)
+          y6=$(git ls-remote "https://github.com/boyfromcave/ycash6.git" "refs/heads/$NODE_REF" | cut -f1)
+          if [ -z "$dd" ]; then dd=$NODE_REF; fi
+          if [ -z "$y6" ]; then y6=$NODE_REF; fi
+          echo "dd=$dd" >> "$GITHUB_OUTPUT"; echo "y6=$y6" >> "$GITHUB_OUTPUT"
+          echo "ycash-dd $dd, ycash6 $y6"
+
   # The node binaries per line, built on ubuntu-22.04 (the depends toolchain needs libtinfo5) and
   # cached per line + node commit; the demo jobs restore them from that cache. They link only libc,
   # libm and libgcc_s, so the NEAR jobs run them on ubuntu-24.04 (the sandbox needs glibc 2.39).
   node:
     name: node ${{ matrix.line }}
+    needs: refs
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     strategy:
@@ -55,10 +76,12 @@ jobs:
         include:
           - line: ycash-dd
             repo: boyfromcave/ycash-dd
+            refout: dd
             daemon: src/ycashd
             cli: src/ycash-cli
           - line: ycash6
             repo: boyfromcave/ycash6
+            refout: y6
             daemon: src/ycashd
             cli: src/ycash-cli
     steps:
@@ -67,7 +90,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ matrix.repo }}
-          ref: ${{ env.NODE_REF }}
+          ref: ${{ needs.refs.outputs[matrix.refout] }}
           path: node
           persist-credentials: false
       - name: node commit
@@ -119,7 +142,7 @@ jobs:
 
   demo:
     name: demo on ${{ matrix.line }} (${{ matrix.foreign }})
-    needs: node
+    needs: [refs, node]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     # Hawkeye and the node are checked out side by side, never one inside the other (see `node`).
@@ -134,10 +157,12 @@ jobs:
         include:
           - line: ycash-dd
             repo: boyfromcave/ycash-dd
+            refout: dd
             daemon: src/ycashd
             cli: src/ycash-cli
           - line: ycash6
             repo: boyfromcave/ycash6
+            refout: y6
             daemon: src/ycashd
             cli: src/ycash-cli
           - foreign: ethereum
@@ -153,7 +178,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ matrix.repo }}
-          ref: ${{ env.NODE_REF }}
+          ref: ${{ needs.refs.outputs[matrix.refout] }}
           path: node
           persist-credentials: false
       - name: node commit
