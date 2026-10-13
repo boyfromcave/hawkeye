@@ -26,6 +26,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Result, anyhow};
+use hawkeye_core::PubKey33;
 use hawkeye_core::bytes::Hash32;
 use hawkeye_core::leader::mint_leader_for;
 use hawkeye_core::policy::LockFacts;
@@ -266,7 +267,7 @@ impl Engine {
                         info!(event = "mint_challenge_observed", lock_id = %lock_hex(lock_id),
                               proposal_id, challenger = %challenger,
                               lock_state = ?l.as_ref().map(|l| l.state.to_string()));
-                        if l.is_some_and(|l| l.state == LockState::Proposed) {
+                        if let Some(l) = l.filter(|l| l.state == LockState::Proposed) {
                             // the lock's own (matching) proposal was challenged: re-proposed by
                             // the next eligible attestor; the challenge is attributable
                             t.transition_lock(
@@ -275,7 +276,15 @@ impl Engine {
                                 None,
                                 Some(&format!("proposal {proposal_id} challenged by {challenger}")),
                             )?;
-                            griefed.push((*lock_id, *proposal_id, *challenger));
+                            griefed.push(Griefed {
+                                lock_id: *lock_id,
+                                proposal_id: *proposal_id,
+                                challenger: *challenger,
+                                challenge_tx: m.tx.0,
+                                block: m.height,
+                                amount: l.value_zat,
+                                to: l.destination.clone(),
+                            });
                         }
                     }
                     ForeignEvent::GuardiansChanged { count, threshold } => {
@@ -299,14 +308,17 @@ impl Engine {
         if rotated {
             self.mem.guardian_check_due = true;
         }
-        for (lock_id, id, by) in griefed {
+        for g in griefed {
             self.alarm(
                 "matching-proposal-challenged",
                 format!(
-                    "proposal {id} of policy-OK lock {} was challenged by {by}; it is re-proposed",
-                    lock_hex(&lock_id)
+                    "proposal {} of policy-OK lock {} was challenged by {}; it is re-proposed",
+                    g.proposal_id,
+                    lock_hex(&g.lock_id),
+                    g.challenger
                 ),
             );
+            self.griefing_case(&g)?;
         }
         for (pm, why) in frauds {
             self.fraudulent_mint(&pm, &why).await?;
@@ -745,40 +757,186 @@ impl Engine {
             if self.consumed(&l.lock_id).await? {
                 continue;
             }
-            let digest = self
-                .ctx
-                .foreign
-                .mint_digest(&l.lock_id, l.value_zat, &to)
-                .map_err(|e| anyhow!("{e}"))?;
-            let sigs = self.collect_mint_sigs(&l.lock_id, &digest).await?;
-            let need = p.mint_mode.signatures_needed();
-            if sigs.len() < need {
-                info!(event = "mint_waiting_signatures", lock_id = %lock_hex(&l.lock_id),
-                      have = sigs.len(), need);
-                continue;
+            self.threshold_mint_for(&l, &to, k, p.mint_mode.signatures_needed())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Gather `need` distinct current guardians' `Mint` signatures for `l` (this attestor's own,
+    /// then peers' over `GET /locks/<id>`) and `mint` at once with threshold `k`. `true` once
+    /// submitted.
+    async fn threshold_mint_for(
+        &mut self,
+        l: &LockRecord,
+        to: &Account,
+        k: u8,
+        need: usize,
+    ) -> Result<bool> {
+        let tip = self.mem.tip;
+        let digest = self
+            .ctx
+            .foreign
+            .mint_digest(&l.lock_id, l.value_zat, to)
+            .map_err(|e| anyhow!("{e}"))?;
+        let sigs = self.collect_mint_sigs(&l.lock_id, &digest, need).await?;
+        if sigs.len() < need {
+            info!(event = "mint_waiting_signatures", lock_id = %lock_hex(&l.lock_id),
+                  have = sigs.len(), need);
+            return Ok(false);
+        }
+        self.mem.submitted.insert(l.lock_id, tip);
+        let n = sigs.len();
+        let res = self
+            .ctx
+            .foreign
+            .threshold_mint(k, l.lock_id, l.value_zat, to.clone(), sigs)
+            .await;
+        match res {
+            Ok(m) => {
+                info!(event = "mint_submitted", lock_id = %lock_hex(&l.lock_id),
+                      amount = l.value_zat, to = %to, tx = %m.tx,
+                      block = m.height, signatures = n);
+                if l.state == LockState::Signed {
+                    self.ctx.db(|t| {
+                        t.transition_lock(&l.lock_id, LockState::MintSubmitted, Some(tip), None)
+                    })?;
+                }
+                Ok(true)
             }
-            self.mem.submitted.insert(l.lock_id, tip);
-            let n = sigs.len();
-            let res = self
+            Err(e) => {
+                warn!(event = "mint_submit_failed", lock_id = %lock_hex(&l.lock_id), error = %e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// HK-15 (audit 05/L-4): every live member is barred from `l` — `vetoed` by the contract, or a
+    /// recorded griefer of it — so the optimistic path cannot mint it. The mint leader over **all**
+    /// live members but the griefers (takeover covers a silent one) gathers the contract's
+    /// threshold of `Mint` signatures and calls `mint`, which overrides at once. Each signature was
+    /// made only after its signer's own policy check (sign-once), so this is the design's
+    /// "quorum, immediate" path, not a weaker one. Gated by `signing_paused` like every submission.
+    async fn threshold_fallback(
+        &mut self,
+        l: &LockRecord,
+        to: &Account,
+        griefers: &[PubKey33],
+    ) -> Result<()> {
+        if self.signing_paused() || self.recently_submitted(&l.lock_id) {
+            return Ok(());
+        }
+        let p = self.ctx.params.clone();
+        let since = self
+            .mem
+            .tip
+            .saturating_sub(l.block_height + p.confirmations - 1);
+        let submitters: Vec<PubKey33> = self
+            .live()
+            .iter()
+            .copied()
+            .filter(|k| !griefers.contains(k))
+            .collect();
+        if mint_leader_for(&l.lock_id, &submitters, since, p.takeover) != Some(&self.ctx.me) {
+            return Ok(());
+        }
+        let k = self
+            .ctx
+            .foreign
+            .threshold()
+            .await
+            .map_err(|e| anyhow!("threshold: {e}"))?;
+        let mut barred = vec![];
+        for m in self.live().to_vec() {
+            let g = self
                 .ctx
                 .foreign
-                .threshold_mint(k, l.lock_id, l.value_zat, to.clone(), sigs)
-                .await;
-            match res {
-                Ok(m) => {
-                    info!(event = "mint_submitted", lock_id = %lock_hex(&l.lock_id),
-                          amount = l.value_zat, to = %to, tx = %m.tx,
-                          block = m.height, signatures = n);
-                    if l.state == LockState::Signed {
-                        self.ctx.db(|t| {
-                            t.transition_lock(&l.lock_id, LockState::MintSubmitted, Some(tip), None)
-                        })?;
+                .guardian_of(&m)
+                .map_err(|e| anyhow!("{e}"))?;
+            if griefers.contains(&m) {
+                barred.push(format!("{g} (griefer)"));
+            } else if self
+                .ctx
+                .foreign
+                .vetoed(l.lock_id, g)
+                .await
+                .map_err(|e| anyhow!("vetoed: {e}"))?
+            {
+                barred.push(g.to_string());
+            }
+        }
+        warn!(event = "mint_threshold_fallback", lock_id = %lock_hex(&l.lock_id), threshold = k,
+              barred = %barred.join(", "), "every live proposer is barred: minting by threshold");
+        self.threshold_mint_for(l, to, k, usize::from(k)).await?;
+        Ok(())
+    }
+
+    /// The members with a `GRIEFING` case for `lock_id` in this ledger (any state).
+    fn griefers_of(&self, lock_id: &Hash32) -> Result<Vec<PubKey33>> {
+        self.ctx.db(|t| {
+            let mut v = vec![];
+            for s in <hawkeye_store::SlashState as hawkeye_store::Machine>::ALL {
+                for c in t.slash_cases_in_state(*s)? {
+                    if c.fault == FaultKind::Griefing
+                        && c.subject.get(..32) == Some(lock_id.as_slice())
+                        && !v.contains(&c.target_key)
+                    {
+                        v.push(c.target_key);
                     }
                 }
-                Err(e) => {
-                    warn!(event = "mint_submit_failed", lock_id = %lock_hex(&l.lock_id), error = %e)
-                }
             }
+            Ok(v)
+        })
+    }
+
+    /// A matching proposal of a policy-OK lock was challenged (audit 05/L-4): open a `GRIEFING`
+    /// case (`SET_REMOVE burn=0`, plan §2.3) against the challenger when it is a member a slash
+    /// still reaches and not this attestor. One case per `(challenger, lock, proposal)`.
+    fn griefing_case(&mut self, g: &Griefed) -> Result<()> {
+        let foreign = self.ctx.foreign.clone();
+        let members = self.slashable_member_keys();
+        let Some(key) = members
+            .iter()
+            .find(|k| foreign.guardian_of(k).ok() == Some(g.challenger))
+            .copied()
+        else {
+            return Ok(());
+        };
+        if key == self.ctx.me {
+            warn!(event = "own_griefing_challenge", lock_id = %lock_hex(&g.lock_id),
+                  proposal_id = g.proposal_id);
+            return Ok(());
+        }
+        let mut subject = g.lock_id.to_vec();
+        subject.extend_from_slice(&g.proposal_id.to_be_bytes());
+        let evidence = serde_json::json!({
+            "fault": "GRIEFING",
+            "set_id": hawkeye_core::bytes::txid_to_display(&self.ctx.params.set_id),
+            "target": hex::encode(key),
+            "subject": hex::encode(&subject),
+            "lock_id": lock_hex(&g.lock_id),
+            "proposal_id": g.proposal_id.to_string(),
+            "challenger": g.challenger.to_string(),
+            "challenge_tx": format!("0x{}", hex::encode(g.challenge_tx)),
+            "challenge_block": g.block,
+            "lock_state": LockState::Proposed.to_string(),
+            "amount": g.amount,
+            "to": g.to.as_ref().map(ToString::to_string),
+        });
+        let tip = self.mem.tip;
+        let (case, new) = self.ctx.db(|t| {
+            t.open_slash_case(&NewSlashCase {
+                target_key: key,
+                fault: FaultKind::Griefing,
+                subject,
+                evidence_json: evidence.to_string(),
+                opened_height: Some(tip),
+            })
+        })?;
+        if new {
+            warn!(event = "slash_case_opened", case = case.id, fault = "GRIEFING",
+                  target = %hex::encode(key), lock_id = %lock_hex(&g.lock_id),
+                  proposal_id = g.proposal_id);
         }
         Ok(())
     }
@@ -855,8 +1013,14 @@ impl Engine {
         if self.recently_submitted(&l.lock_id) {
             return Ok(());
         }
+        // a member that challenged a matching proposal of this lock (an open GRIEFING case here)
+        // is not waited for as its proposer: it would hold the lock by never proposing
+        let griefers = self.griefers_of(&l.lock_id)?;
         let mut eligible = Vec::with_capacity(self.live().len());
         for k in self.live().to_vec() {
+            if griefers.contains(&k) {
+                continue;
+            }
             let a = self
                 .ctx
                 .foreign
@@ -876,7 +1040,11 @@ impl Engine {
         let Some(leader) = mint_leader_for(&l.lock_id, &eligible, since, p.takeover) else {
             if self.mem.squat_logged.insert((l.lock_id, 0)) {
                 warn!(event = "mint_no_eligible_proposer", lock_id = %lock_hex(&l.lock_id),
+                      fallback = p.fallback_to_threshold,
                       "every live member is barred from this lock: a threshold mint is needed");
+            }
+            if p.fallback_to_threshold {
+                return self.threshold_fallback(l, to, &griefers).await;
             }
             return Ok(());
         };
@@ -969,8 +1137,12 @@ impl Engine {
 
     /// Own signature plus peers' (`GET /locks/<id>`), each recovered to a current member's
     /// guardian, distinct.
-    async fn collect_mint_sigs(&self, lock_id: &Hash32, digest: &Hash32) -> Result<Vec<[u8; 65]>> {
-        let need = self.ctx.params.mint_mode.signatures_needed();
+    async fn collect_mint_sigs(
+        &self,
+        lock_id: &Hash32,
+        digest: &Hash32,
+        need: usize,
+    ) -> Result<Vec<[u8; 65]>> {
         let own = self
             .ctx
             .db(|t| t.mint_signature(lock_id))?
@@ -1012,6 +1184,17 @@ impl Engine {
         }
         Ok(sigs)
     }
+}
+
+/// A final `MintChallenged` of a proposal that matched a policy-OK lock here (griefing, §2.3).
+struct Griefed {
+    lock_id: Hash32,
+    proposal_id: u128,
+    challenger: Guardian,
+    challenge_tx: Hash32,
+    block: u64,
+    amount: u64,
+    to: Option<Account>,
 }
 
 /// Keys of `(lockId, proposalId)` pairs the engine remembers in memory.

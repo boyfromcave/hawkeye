@@ -62,6 +62,13 @@ pub struct NewBurn {
     pub finalized: bool,
 }
 
+/// The `waiting_epoch` sentinel of an **over-cap** burn (plan §5.5, audit 05/M-2): its amount
+/// exceeds the set's whole per-window cap (`RateCap(basis, ratelimitbps)`), so no epoch turn can
+/// release it. It is parked out of the FIFO (later nonces are served) and released only when the
+/// set's cap rises to its amount. `i64::MAX`, the largest value the `INTEGER` column holds; no
+/// rate-limit epoch reaches it (an epoch is a height divided by `ratewindow ≥ 1`). No schema change.
+pub const OVER_CAP_EPOCH: u64 = i64::MAX as u64;
+
 /// A burn row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BurnRecord {
@@ -86,7 +93,8 @@ pub struct BurnRecord {
     pub leader: Option<PubKey33>,
     /// The Ycash height of the (latest) assignment: the takeover deadline counts from here.
     pub assigned_height: Option<u32>,
-    /// The rate-limit epoch it waits for (`WAITING_CAP`).
+    /// The rate-limit epoch it waits for (`WAITING_CAP`); [`OVER_CAP_EPOCH`] when it exceeds the
+    /// set's full-window cap and waits for the set's parameters to change, not for an epoch.
     pub waiting_epoch: Option<u64>,
     /// The intent output paying it (`INTENT_*`, `RELEASED`).
     pub intent: Option<OutPoint>,
@@ -94,6 +102,23 @@ pub struct BurnRecord {
     pub created_at: i64,
     /// Unix seconds.
     pub updated_at: i64,
+}
+
+impl BurnRecord {
+    /// `WAITING_CAP` because it exceeds the set's full-window cap ([`OVER_CAP_EPOCH`]).
+    pub fn over_cap(&self) -> bool {
+        self.state == BurnState::WaitingCap && self.waiting_epoch == Some(OVER_CAP_EPOCH)
+    }
+
+    /// Why a `WAITING_CAP` burn waits: `"over-cap"` (for a cap raise) or `"epoch"` (for the next
+    /// rate-limit epoch); `None` in any other state.
+    pub fn waiting_reason(&self) -> Option<&'static str> {
+        (self.state == BurnState::WaitingCap).then_some(if self.over_cap() {
+            "over-cap"
+        } else {
+            "epoch"
+        })
+    }
 }
 
 const COLS: &str = "chain_id, bridge, nonce, tx_hash, block_number, block_hash, sender, amount, \
@@ -364,9 +389,14 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// `FINALIZED | ASSIGNED → WAITING_CAP(epoch)` (§5.5).
+    /// `FINALIZED | ASSIGNED → WAITING_CAP(epoch)` (§5.5); `epoch` = [`OVER_CAP_EPOCH`] parks an
+    /// over-cap burn (logged with reason `over-cap`).
     pub fn burn_wait_cap(&self, k: &BurnKey, epoch: u64, height: Option<u32>) -> Result<()> {
-        let detail = format!("epoch {epoch}");
+        let detail = if epoch == OVER_CAP_EPOCH {
+            "over-cap: exceeds the set's full-window cap".to_owned()
+        } else {
+            format!("epoch {epoch}")
+        };
         self.burn_edge(
             k,
             BurnState::WaitingCap,

@@ -8,10 +8,11 @@ use hawkeye_core::memo::{HawkeyeMemo, parse_memo_script_for};
 use hawkeye_core::recipient::YcashRecipient;
 use hawkeye_core::template::{TemplateKind, parse_selector, parse_vault};
 use hawkeye_store::{
-    BurnRecord, BurnState, IntentState, SignDomain, VaultRecord, VaultState, YcashSignKey,
+    BurnRecord, BurnState, IntentState, OVER_CAP_EPOCH, SignDomain, VaultRecord, VaultState,
+    YcashSignKey,
 };
 use hawkeye_ycash::tx::{Transaction, insert_op_return};
-use hawkeye_ycash::types::Recipient;
+use hawkeye_ycash::types::{Recipient, Set};
 use hawkeye_ycash::{Amount, ErrorReason, HexBytes};
 use tracing::{debug, info, warn};
 
@@ -20,18 +21,36 @@ use crate::convert::{op_core, op_rpc};
 
 impl Engine {
     /// Assign, take over, wait for the cap, and (as leader) post the unlock of every finalized
-    /// burn, FIFO by nonce.
+    /// burn, FIFO by nonce. A burn larger than the set's whole per-window cap (audit 05/M-2) is
+    /// parked out of the FIFO on every attestor's ledger with alarm `burn-over-cap`, so later
+    /// nonces are served; it is released when the set's cap rises to its amount.
     pub(crate) async fn burns(&mut self) -> Result<()> {
         let p = self.ctx.params.clone();
         let dep = p.deployment;
         let tip = self.mem.tip;
         let epoch = self.mem.set.as_ref().map_or(0, |s| s.set.epoch);
         let epoch_u = u64::try_from(epoch).unwrap_or(0);
+        // `None`: the set is unknown (nothing is judged over cap, nothing over cap is released);
+        // `Some(None)`: no rate limit; `Some(Some(cap))`: the full-window cap
+        let full = self.mem.set.as_ref().map(|s| full_window_cap(&s.set));
+        let over = |amount: u64| matches!(full, Some(Some(cap)) if amount > cap);
         let live = self.live().to_vec();
-        // the epoch turned: waiting burns are up again
         self.ctx.db(|t| {
             for b in t.burns_in_state(&dep, BurnState::WaitingCap)? {
-                if b.waiting_epoch != Some(epoch_u) {
+                if b.over_cap() {
+                    // over cap: released only by a cap change, never by an epoch turn
+                    if full.is_some() && !over(b.amount) {
+                        t.transition_burn(
+                            &b.key,
+                            BurnState::Finalized,
+                            Some(tip.into()),
+                            Some("cap raised: within the set's full-window cap"),
+                        )?;
+                        info!(event = "burn_over_cap_released", nonce = b.key.nonce,
+                              amount = b.amount, cap = ?full.flatten());
+                    }
+                } else if b.waiting_epoch != Some(epoch_u) {
+                    // the epoch turned: waiting burns are up again
                     t.transition_burn(
                         &b.key,
                         BurnState::Finalized,
@@ -39,6 +58,15 @@ impl Engine {
                         Some("new epoch"),
                     )?;
                     info!(event = "burn_cap_released", nonce = b.key.nonce, epoch);
+                }
+            }
+            for s in [BurnState::Finalized, BurnState::Assigned] {
+                for b in t.burns_in_state(&dep, s)? {
+                    if over(b.amount) {
+                        t.burn_wait_cap(&b.key, OVER_CAP_EPOCH, Some(tip))?;
+                        warn!(event = "burn_over_cap", nonce = b.key.nonce, amount = b.amount,
+                              cap = ?full.flatten(), "parked out of the FIFO until the set's cap rises");
+                    }
                 }
             }
             for b in t.burns_in_state(&dep, BurnState::Finalized)? {
@@ -65,41 +93,88 @@ impl Engine {
             }
             Ok(())
         })?;
+        self.over_cap_alarm()?;
         if !self.is_current_member() {
             return Ok(());
         }
-        let assigned = self
+        let assigned: Vec<BurnRecord> = self
             .ctx
-            .db(|t| t.burns_in_state(&dep, BurnState::Assigned))?;
-        let mut available = self
+            .db(|t| t.burns_in_state(&dep, BurnState::Assigned))?
+            .into_iter()
+            .filter(|b| b.leader == Some(self.ctx.me))
+            .collect();
+        let available = self
             .mem
             .set
             .as_ref()
             .and_then(|s| s.set.unlockavailable)
             .map(|a| u64::try_from(a.zat()).unwrap_or(0));
-        for b in assigned {
-            if b.leader != Some(self.ctx.me) {
-                continue;
-            }
-            if let Some(av) = available {
-                if b.amount > av {
+        let amounts: Vec<u64> = assigned.iter().map(|b| b.amount).collect();
+        let plan = cap_plan(&amounts, available, full.flatten());
+        for (b, step) in assigned.iter().zip(plan) {
+            match step {
+                CapStep::Post => {
+                    if let Err(e) = self.post_unlock(b).await {
+                        warn!(event = "unlock_failed", nonce = b.key.nonce, error = %format!("{e:#}"));
+                    }
+                }
+                CapStep::OverCap => {
+                    // parked above already; kept for a cap read between the two steps
+                    self.ctx
+                        .db(|t| t.burn_wait_cap(&b.key, OVER_CAP_EPOCH, Some(tip)))?;
+                }
+                CapStep::WaitEpoch => {
                     self.ctx
                         .db(|t| t.burn_wait_cap(&b.key, epoch_u, Some(tip)))?;
                     info!(
                         event = "burn_waiting_cap",
                         nonce = b.key.nonce,
                         amount = b.amount,
-                        available = av,
+                        available = ?available,
                         epoch
                     );
-                    break; // FIFO: later burns wait behind it
                 }
-                available = Some(av - b.amount);
-            }
-            if let Err(e) = self.post_unlock(&b).await {
-                warn!(event = "unlock_failed", nonce = b.key.nonce, error = %format!("{e:#}"));
+                CapStep::Behind => {} // FIFO: later burns wait behind it
             }
         }
+        Ok(())
+    }
+
+    /// Raise `burn-over-cap` while any burn of this deployment is parked over cap; clear it once
+    /// none is.
+    fn over_cap_alarm(&mut self) -> Result<()> {
+        let dep = self.ctx.params.deployment;
+        let parked: Vec<BurnRecord> = self
+            .ctx
+            .db(|t| t.burns_in_state(&dep, BurnState::WaitingCap))?
+            .into_iter()
+            .filter(BurnRecord::over_cap)
+            .collect();
+        if parked.is_empty() {
+            self.clear_alarm("burn-over-cap");
+            return Ok(());
+        }
+        let (bps, basis, cap) = self.mem.set.as_ref().map_or((0, 0, None), |s| {
+            (
+                s.set.params.ratelimitbps,
+                cap_basis(&s.set),
+                full_window_cap(&s.set),
+            )
+        });
+        let list: Vec<String> = parked
+            .iter()
+            .map(|b| format!("{} ({} zat)", b.key.nonce, b.amount))
+            .collect();
+        self.alarm(
+            "burn-over-cap",
+            format!(
+                "burn(s) {} exceed the set's full-window cap {} zat (ratelimitbps {bps}, basis \
+                 {basis} zat); they wait for a governance change (SET_PARAMS raising \
+                 ratelimitbps) while later burns are served",
+                list.join(", "),
+                cap.map_or_else(|| "none".to_owned(), |c| c.to_string()),
+            ),
+        );
         Ok(())
     }
 
@@ -218,18 +293,29 @@ impl Engine {
             Err(e) if matches!(e.reason(), Some(ErrorReason::Rejected { ref reason, .. }) if reason.contains("vault-rate")) =>
             {
                 let epoch = self.mem.set.as_ref().map_or(0, |s| s.set.epoch);
-                self.ctx.db(|t| {
-                    t.burn_wait_cap(
-                        &b.key,
-                        u64::try_from(epoch).unwrap_or(0),
-                        Some(self.mem.tip),
-                    )
-                })?;
+                // over the cap even for an empty epoch: out of the FIFO (05/M-2)
+                let over = self
+                    .mem
+                    .set
+                    .as_ref()
+                    .and_then(|s| full_window_cap(&s.set))
+                    .is_some_and(|cap| b.amount > cap);
+                let wait = if over {
+                    OVER_CAP_EPOCH
+                } else {
+                    u64::try_from(epoch).unwrap_or(0)
+                };
+                self.ctx
+                    .db(|t| t.burn_wait_cap(&b.key, wait, Some(self.mem.tip)))?;
                 info!(
                     event = "burn_waiting_cap",
                     nonce,
-                    reason = "bad-txns-vault-rate"
+                    reason = "bad-txns-vault-rate",
+                    over_cap = over
                 );
+                if over {
+                    self.over_cap_alarm()?;
+                }
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
@@ -387,6 +473,67 @@ impl Engine {
     }
 }
 
+/// The node's `RateCap(basis, bps)` (`ycash-dd/src/vault/state.cpp`), bit for bit: the most an
+/// epoch with basis `basis` zat lets the set unlock.
+pub fn rate_cap(basis: u64, bps: u32) -> u64 {
+    let bps = u64::from(bps);
+    (basis / 10_000) * bps + ((basis % 10_000) * bps) / 10_000
+}
+
+/// The basis a fresh epoch would have: the larger of the current epoch's `epochbasis` and the
+/// set's `lockedvalue` (the next epoch's basis, U-20), so a burn that fits either is not judged
+/// over cap.
+pub fn cap_basis(set: &Set) -> u64 {
+    let z = |a: hawkeye_ycash::Amount| u64::try_from(a.zat()).unwrap_or(0);
+    z(set.epochbasis).max(z(set.lockedvalue))
+}
+
+/// The set's full-window cap in zat (`None`: `ratelimitbps == 0`, no limit). A burn above it
+/// fits no epoch under the current parameters: it is **over cap** (audit 05/M-2).
+pub fn full_window_cap(set: &Set) -> Option<u64> {
+    (set.params.ratelimitbps != 0).then(|| rate_cap(cap_basis(set), set.params.ratelimitbps))
+}
+
+/// What the leader does with one of its assigned burns (plan §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapStep {
+    /// Within the epoch's remainder: unlock it.
+    Post,
+    /// Above the full-window cap: parked out of the FIFO (05/M-2); later burns go on.
+    OverCap,
+    /// Fits a full window but not this epoch's remainder: `WAITING_CAP` for the next epoch.
+    WaitEpoch,
+    /// Behind a `WaitEpoch` burn: left `ASSIGNED` (FIFO by nonce, never splitting, HK-8).
+    Behind,
+}
+
+/// The leader's FIFO walk over its burns' `amounts` (nonce order) given the epoch's remaining
+/// `available` and the `full` window cap (`None`: unlimited). An over-cap burn is skipped and
+/// never blocks; the first burn that does not fit the remainder blocks every later one.
+pub fn cap_plan(amounts: &[u64], available: Option<u64>, full: Option<u64>) -> Vec<CapStep> {
+    let mut left = available;
+    let mut blocked = false;
+    amounts
+        .iter()
+        .map(|&a| {
+            if full.is_some_and(|f| a > f) {
+                return CapStep::OverCap;
+            }
+            if blocked {
+                return CapStep::Behind;
+            }
+            if let Some(av) = left {
+                if a > av {
+                    blocked = true;
+                    return CapStep::WaitEpoch;
+                }
+                left = Some(av - a);
+            }
+            CapStep::Post
+        })
+        .collect()
+}
+
 /// The number of set signatures on the UNLOCK (selector 1) input of an unlock transaction.
 pub fn unlock_signatures(hex: &str) -> Result<usize> {
     let tx = Transaction::decode_hex(hex).map_err(|e| anyhow!("{e}"))?;
@@ -528,4 +675,51 @@ pub async fn verify_and_sign_unlock(
         hex: rec.signed_hex,
         matched,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CapStep::*, cap_plan, rate_cap};
+
+    #[test]
+    fn rate_cap_is_the_nodes() {
+        // RateCap(basis, bps) = (basis / 10000) * bps + ((basis % 10000) * bps) / 10000
+        assert_eq!(rate_cap(1_000_000_000, 5_000), 500_000_000);
+        assert_eq!(rate_cap(9_999, 9_999), 9_998);
+        assert_eq!(rate_cap(12_345, 1), 1);
+        assert_eq!(rate_cap(0, 10_000), 0);
+        assert_eq!(rate_cap(u64::MAX / 2, 10_000), u64::MAX / 2);
+    }
+
+    /// 05/M-2: cap 5, burns 8, 1, 1 — the over-cap burn is skipped, the others go.
+    #[test]
+    fn an_over_cap_burn_does_not_block_later_ones() {
+        assert_eq!(
+            cap_plan(&[8, 1, 1], Some(5), Some(5)),
+            [OverCap, Post, Post]
+        );
+        assert_eq!(
+            cap_plan(&[1, 8, 4, 1], Some(5), Some(5)),
+            [Post, OverCap, Post, WaitEpoch]
+        );
+        // no rate limit: everything goes, nothing is over cap
+        assert_eq!(cap_plan(&[8, 1], None, None), [Post, Post]);
+    }
+
+    /// FIFO for burns that fit a full window is the old behaviour: cap 5, burns 4, 3, 1 — 4 goes,
+    /// 3 waits for the next epoch, 1 waits behind it (never served out of order).
+    #[test]
+    fn fifo_is_kept_for_burns_that_fit() {
+        assert_eq!(
+            cap_plan(&[4, 3, 1], Some(5), Some(5)),
+            [Post, WaitEpoch, Behind]
+        );
+        assert_eq!(cap_plan(&[3, 1], Some(5), Some(5)), [Post, Post]);
+        assert_eq!(cap_plan(&[5, 5], Some(5), Some(5)), [Post, WaitEpoch]);
+        // the cap unknown (pre-fix shape): the remainder alone decides
+        assert_eq!(
+            cap_plan(&[4, 3, 1], Some(5), None),
+            [Post, WaitEpoch, Behind]
+        );
+    }
 }

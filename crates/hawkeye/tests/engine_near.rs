@@ -207,6 +207,7 @@ impl Env {
             mint_mode: self.mode,
             auto_slash: true,
             drills: true,
+            fallback_to_threshold: true,
             ycash_start_height: Some(1),
         }
     }

@@ -18,6 +18,7 @@ pub mod json;
 #[cfg(feature = "mock")]
 pub mod mock;
 pub mod primitives;
+pub mod redacted;
 pub mod stock;
 pub mod tx;
 pub mod types;
@@ -26,3 +27,4 @@ pub use amount::Amount;
 pub use client::{Auth, YcashRpc};
 pub use error::{Error, ErrorReason, RpcError};
 pub use primitives::{Bytes32, Hash256, HexBytes, OutPoint, PqKeyId, PubKey};
+pub use redacted::Redacted;

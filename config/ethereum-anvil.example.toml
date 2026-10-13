@@ -34,6 +34,7 @@ heartbeat_blocks = 10
 min_lock = "0.1"
 max_lock = "1000"
 mint_mode = "optimistic"
+# fallback_to_threshold = true  # optimistic: once every live member is barred from a lock, mint by threshold (always on mainnet)
 
 [keys]
 secret_hex = "0101010101010101010101010101010101010101010101010101010101010101"   # dev only

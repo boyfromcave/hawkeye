@@ -424,7 +424,7 @@ impl Engine {
 
     fn compute_status(&self, report: &TickReport) -> Result<Status> {
         let dep = self.ctx.params.deployment;
-        let (counts, ycur, ecur) = self.ctx.db(|t| {
+        let (counts, over_cap, ycur, ecur) = self.ctx.db(|t| {
             let mut c: [BTreeMap<String, u64>; 5] = Default::default();
             for s in LockState::ALL {
                 c[0].insert(s.to_string(), t.locks_in_state(*s)?.len() as u64);
@@ -441,8 +441,14 @@ impl Engine {
             for s in SlashState::ALL {
                 c[4].insert(s.to_string(), t.slash_cases_in_state(*s)?.len() as u64);
             }
+            let over_cap = t
+                .burns_in_state(&dep, BurnState::WaitingCap)?
+                .iter()
+                .filter(|b| b.over_cap())
+                .count() as u64;
             Ok((
                 c,
+                over_cap,
                 t.cursor(hawkeye_store::Chain::Ycash)?,
                 t.cursor(hawkeye_store::Chain::Foreign)?,
             ))
@@ -475,6 +481,7 @@ impl Engine {
             foreign,
             locks,
             burns,
+            burns_over_cap: over_cap,
             intents,
             vaults,
             slash_cases,
