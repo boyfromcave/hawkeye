@@ -101,8 +101,48 @@ pub async fn detect(ctx: &Ctx, hwm: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// At start-up: flag the ledger when it looks restored.
+/// In `"wallet"` mode: the vaults the node wallet signed an unlock of (`set_listsigned`, role 1)
+/// with no record in the ledger (review N-2).
+pub async fn unrecorded_unlocks(ctx: &Ctx) -> Result<Vec<hawkeye_core::OutPoint>> {
+    if ctx.params.ycash_signing != crate::config::YcashSigning::Wallet {
+        return Ok(vec![]);
+    }
+    let Ok(listed) = ctx.ycash.set_listsigned().await else {
+        return Ok(vec![]);
+    };
+    let mut out = vec![];
+    for r in listed
+        .records
+        .iter()
+        .filter(|r| r.setid.0 == ctx.params.set_id && r.role == 1)
+    {
+        let op = crate::convert::op_core(&r.prevout);
+        let key = hawkeye_store::YcashSignKey {
+            domain: SignDomain::YcashUnlock,
+            set_id: ctx.params.set_id,
+            prevout: op,
+        };
+        if ctx.db(|t| t.ycash_signature(&key))?.is_none() {
+            out.push(op);
+        }
+    }
+    Ok(out)
+}
+
+/// At start-up: flag the ledger when it looks restored, and (wallet mode) record every vault the
+/// node wallet signed an unlock of with no ledger record as an orphan candidate: it is marked
+/// `ROLL_DUE` and reported until spent, so those forgotten bytes die (review N-2).
 pub async fn check_restore(ctx: &Ctx, hwm: &Path) -> Result<()> {
+    for op in unrecorded_unlocks(ctx).await? {
+        error!(event = "restore_orphan", vault = %op,
+               "the node wallet signed an unlock of this vault the ledger has no record of: rolling it");
+        ctx.db(|t| {
+            t.set_meta(
+                &format!("{}{op}", crate::engine::roll::RESTORE_ORPHAN_PREFIX),
+                "wallet",
+            )
+        })?;
+    }
     if let Some(why) = detect(ctx, hwm).await? {
         error!(event = "ledger_restored", reason = %why,
                "fresh unlocks wait for every member's signed answer until `hawkeye acknowledge-ledger-restore`");

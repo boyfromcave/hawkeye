@@ -1447,6 +1447,8 @@ impl MockState {
                 to_json(&rows)
             }
             "sendmany" => self.sendmany(p),
+            // the mock locks no coins: releasing is always fine
+            "lockunspent" => Ok(Value::Bool(true)),
             "gettxout" => self.gettxout(p),
             "generate" => {
                 let n: u32 = arg(p, 0, "numblocks")?;

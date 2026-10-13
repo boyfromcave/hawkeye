@@ -86,6 +86,10 @@ pub struct BurnUnlockResponse {
     pub nonce: u64,
     /// The burn's state in the peer's ledger (`unknown` when it has none).
     pub state: String,
+    /// The peer's ledger is flagged restored (review N-2): `held` is then `true` whatever it
+    /// finds — it cannot know what it signed before the backup.
+    #[serde(default)]
+    pub restored: bool,
     /// The peer holds a live (non-drill) signed unlock for the burn: it, or a co-signer, signed
     /// one that may still confirm (01/V-2). `false` is the peer's signed statement that it holds
     /// none (review M-1).
@@ -105,6 +109,33 @@ pub struct OrphanRequest {
     pub nonce: u64,
     /// The orphaned vault (`txid:vout`).
     pub vault: String,
+    /// Review N-2: the reporter's ledger was restored and its node wallet signed an unlock of
+    /// this vault it has no record of (the burn is unknown): roll it so those bytes die.
+    #[serde(default)]
+    pub restored: bool,
+}
+
+/// `POST /members/gone` request (authenticated): the requester's signed declaration that
+/// `member` is permanently gone (the owner's override, 2026-10-13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoneDeclaration {
+    /// The member declared gone (66 hex).
+    pub member: String,
+    /// The declaring member (66 hex): the requester.
+    pub declarer: String,
+    /// `sign_compact(declarer, gone_msg(set, member))`, 130 hex.
+    pub sig: String,
+    /// Why (kept with the record).
+    pub reason: String,
+}
+
+/// `POST /members/gone` answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoneAnswer {
+    /// Declarations of the member this ledger now holds, from distinct current members.
+    pub declarations: u32,
+    /// The quorum (the set's `unlockThreshold`).
+    pub quorum: u32,
 }
 
 /// `POST /vaults/orphaned` answer.
@@ -240,6 +271,15 @@ impl Peers {
             return Err(anyhow!("{peer}: HTTP {}", r.status()));
         }
         Ok(r.json().await?)
+    }
+
+    /// `POST <peer>/members/gone` (authenticated).
+    pub async fn declare_gone(
+        &self,
+        peer: &str,
+        req: &GoneDeclaration,
+    ) -> Result<Signed<GoneAnswer>> {
+        self.post_signed(peer, "/members/gone", req).await
     }
 
     /// `POST <peer>/vaults/orphaned` (authenticated).

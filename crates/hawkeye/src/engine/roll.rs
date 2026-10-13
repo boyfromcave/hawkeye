@@ -69,6 +69,10 @@ pub(crate) fn orphan_of(
     Ok(live.then_some(op))
 }
 
+/// The `meta` key prefix of the vaults a restored ledger's node wallet signed an unlock of with
+/// no record here (review N-2): `restore_orphan/<txid:vout>`.
+pub const RESTORE_ORPHAN_PREFIX: &str = "restore_orphan/";
+
 /// Mark an orphaned vault `ROLL_DUE` (from `LIVE`): its roll leader — never a member that signed
 /// it — rolls it now, which spends it, so the orphaned signed unlock dies (review H-2).
 pub(crate) fn mark_orphan(
@@ -214,6 +218,7 @@ impl Engine {
             let req = crate::peers::OrphanRequest {
                 nonce: r.key.nonce,
                 vault: r.prevout.to_string(),
+                restored: false,
             };
             for peer in self.ctx.peers.urls().to_vec() {
                 match self.ctx.peers.orphaned(&peer, &req).await {
@@ -221,6 +226,38 @@ impl Engine {
                                    marked = a.body.marked),
                     Err(e) => info!(event = "orphan_report_failed", peer = %peer, error = %e),
                 }
+            }
+        }
+        // review N-2: vaults the node wallet signed an unlock of that a restored ledger has no
+        // record of (restore::check_restore): rolled, whatever burn those bytes pay, until spent
+        let restore_orphans = self.ctx.db(|t| t.meta_prefix(RESTORE_ORPHAN_PREFIX))?;
+        for (k, _) in restore_orphans {
+            let Ok(vault) = super::slash::parse_outpoint(&k[RESTORE_ORPHAN_PREFIX.len()..]) else {
+                continue;
+            };
+            let op = op_rpc(&vault);
+            if self
+                .ctx
+                .ycash
+                .gettxout(&op.txid, op.vout, true)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
+            self.ctx.db(|t| mark_orphan(t, &vault, 0, tip))?;
+            let last = self.mem.orphan_reported.get(&vault).copied();
+            if last.is_some_and(|t| self.mem.ticks < t + 20) {
+                continue;
+            }
+            self.mem.orphan_reported.insert(vault, self.mem.ticks);
+            let req = crate::peers::OrphanRequest {
+                nonce: 0,
+                vault: vault.to_string(),
+                restored: true,
+            };
+            for peer in self.ctx.peers.urls().to_vec() {
+                let _ = self.ctx.peers.orphaned(&peer, &req).await;
             }
         }
         Ok(())
@@ -434,6 +471,21 @@ pub async fn verify_orphan(
 ) -> Result<crate::peers::OrphanResponse> {
     let requester = requester.ok_or_else(|| anyhow!("member-signed requests only"))?;
     let vault = super::slash::parse_outpoint(&req.vault)?;
+    if req.restored {
+        // review N-2: the reporter's restored ledger lacks an unlock its node wallet signed of
+        // this vault; the burn is unknown, so it cannot be checked here. Rolling a live vault is
+        // harmless (the same owner, a later ownerHeight), so a current member's report is enough.
+        let tip = ctx.ycash.getblockcount().await?;
+        let op = op_rpc(&vault);
+        ensure!(
+            ctx.ycash.gettxout(&op.txid, op.vout, true).await?.is_some(),
+            "vault {vault} is spent"
+        );
+        let marked = ctx.db(|t| mark_orphan(t, &vault, 0, tip))?;
+        warn!(event = "orphan_marked_restored", vault = %vault,
+              requester = %hex::encode(requester), marked);
+        return Ok(crate::peers::OrphanResponse { marked });
+    }
     let k = hawkeye_store::BurnKey::new(ctx.params.deployment, req.nonce);
     let tip = ctx.ycash.getblockcount().await?;
     let conf = ctx.params.confirmations;

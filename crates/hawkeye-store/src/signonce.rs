@@ -997,6 +997,15 @@ impl Tx<'_> {
         self.one("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
     }
 
+    /// Every metadata entry whose key starts with `prefix`, ordered by key.
+    pub fn meta_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        self.all(
+            "SELECT key, value FROM meta WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
+            [prefix],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    }
+
     /// Set a metadata value.
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.conn().execute(

@@ -645,6 +645,24 @@ pub async fn fund_exactly(
         .await
         .map_err(|e| anyhow!("funding the unlock exactly: {e}"))?;
     let funded = Transaction::decode(&h.0).map_err(|e| anyhow!("{e}"))?;
+    // the build's own fee coins were locked by the node's Fund and are now unused: release them
+    // (review N-4; a node restart clears the in-memory locks too)
+    let mut kept = std::collections::HashSet::new();
+    for i in &funded.inputs {
+        kept.insert(i.prevout);
+    }
+    let released: Vec<hawkeye_ycash::OutPoint> = tx
+        .inputs
+        .iter()
+        .map(|i| i.prevout)
+        .filter(|o| !kept.contains(o))
+        .collect();
+    if !released.is_empty()
+        && let Err(e) = ycash.unlockunspent(&released).await
+    {
+        tracing::warn!(event = "lockunspent_failed", error = %e, coins = released.len(),
+                       "the build's unused fee coins stay locked until the node restarts");
+    }
     unlock_value_bounded(&funded, vault_value)?;
     Ok(funded.encode_hex())
 }

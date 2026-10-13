@@ -106,6 +106,21 @@ pub fn response_msg(request_msg: &Hash32, response_body: &[u8]) -> Hash32 {
     sha256d(&m)
 }
 
+/// The domain of a declaration that a member is permanently gone (the owner's override,
+/// 2026-10-13), 17 ASCII bytes.
+pub const GONE_DOMAIN: &[u8; 17] = b"HawkeyeMemberGone";
+
+/// `sha256d("HawkeyeMemberGone" ‖ set_id ‖ member)`: what an attestor signs to declare `member`
+/// permanently gone (it holds no signed unlock that could ever be revived, as far as the set
+/// knows). A quorum of such declarations releases the holds that member causes.
+pub fn gone_msg(set_id: &Hash32, member: &PubKey33) -> Hash32 {
+    let mut m = Vec::with_capacity(17 + 32 + 33);
+    m.extend_from_slice(GONE_DOMAIN);
+    m.extend_from_slice(set_id);
+    m.extend_from_slice(member);
+    sha256d(&m)
+}
+
 /// Sign a request message with the member key.
 pub fn sign(key: &SecretKey, msg: &Hash32) -> Result<[u8; 65]> {
     sign_compact(key, msg)

@@ -631,6 +631,18 @@ impl YcashRpc {
         self.call(m, vec!["".into(), Value::Object(o)]).await
     }
 
+    /// `lockunspent true [{"txid","vout"}, …]`: release the wallet's in-memory locks on these
+    /// coins (a vault build this wallet funded and then discarded, review N-4).
+    pub async fn unlockunspent(&self, outpoints: &[OutPoint]) -> Result<bool, Error> {
+        let m = "lockunspent";
+        let list: Vec<Value> = outpoints
+            .iter()
+            .map(|o| json!({"txid": o.txid.to_string(), "vout": o.vout}))
+            .collect();
+        self.call(m, vec![Value::from(true), Value::Array(list)])
+            .await
+    }
+
     /// Regtest only: mine `n` blocks to the wallet.
     pub async fn generate(&self, n: u32) -> Result<Vec<BlockHash>, Error> {
         self.call("generate", vec![n.into()]).await

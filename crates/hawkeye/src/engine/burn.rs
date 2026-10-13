@@ -666,16 +666,59 @@ impl Engine {
     async fn prior_unlock(&mut self, b: &BurnRecord) -> Result<Prior> {
         let me = self.ctx.me;
         let restored = self.ledger_restored()?;
+        let current = self.current_member_keys();
+        let members = self.slashable_member_keys();
+        // review N-3: an unlock of this burn this ledger observed on Ycash (mempool or block)
+        // whose vault is still unspent is the burn's own spend: adopt it, whoever led it
+        if let Some((hex, vault)) = self.observed_unlock_for(b, &members).await? {
+            return Ok(Prior::Found(hex, vault));
+        }
         let mut required: Vec<PubKey33> = if restored {
-            self.current_member_keys()
+            current.clone()
         } else {
             self.ctx.db(|t| t.burn_leaders(&b.key))?
         };
+        // review N-3: every signer attributed on an unlock this ledger observed for the burn,
+        // even if this ledger never recorded it as the burn's leader (ledgers diverge)
+        for s in self.observed_signers(b)? {
+            if !required.contains(&s) {
+                required.push(s);
+            }
+        }
         required.retain(|k| *k != me);
+        // review N-1: only a CURRENT member's set signature can ever confirm an unlock — the
+        // node's SetSnapshot::CheckSetSigs (ycash-dd src/vault/state.cpp:289-306) requires
+        // exactly k signatures, each recovering to a member current at the spend's height — so
+        // an unlock held by a member that is no longer current (removed, left) can never
+        // confirm, and that member need not answer. (A key that later rejoins is current again:
+        // it is then required again for every burn not yet freshly signed; for one already
+        // signed meanwhile, the watchers cancel a second intent as a benign race, and the
+        // orphan roll spends its vault.)
+        let gone_now: Vec<PubKey33> = required
+            .iter()
+            .filter(|k| !current.contains(*k))
+            .copied()
+            .collect();
+        required.retain(|k| current.contains(k));
+        // the owner's override (2026-10-13): a member declared permanently gone by a quorum
+        let declared = self
+            .ctx
+            .db(|t| declared_gone(t, &self.ctx.params.set_id, &current, self.unlock_quorum()))?;
+        let overridden: Vec<PubKey33> = required
+            .iter()
+            .filter(|k| declared.contains(*k))
+            .copied()
+            .collect();
+        required.retain(|k| !declared.contains(k));
+        if !gone_now.is_empty() || !overridden.is_empty() {
+            info!(event = "unlock_prior_excluded", nonce = b.key.nonce,
+                  not_current = %gone_now.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                  declared_gone = %overridden.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                  "members whose answer is not needed: not current (their signatures cannot confirm) or declared gone by a quorum");
+        }
         if required.is_empty() {
             return Ok(Prior::NoneConfirmed);
         }
-        let members = self.slashable_member_keys();
         let mut none_from = std::collections::HashSet::new();
         for peer in self.ctx.peers.urls().to_vec() {
             let signed = match self.ctx.peers.burn_unlock(&peer, b.key.nonce).await {
@@ -726,6 +769,68 @@ impl Engine {
                 }
             )))
         }
+    }
+
+    /// The unlock quorum `k` (the set's `unlockThreshold`; 1 before the set is read).
+    pub(crate) fn unlock_quorum(&self) -> u32 {
+        self.mem
+            .set
+            .as_ref()
+            .map_or(1, |s| s.set.params.unlockthreshold)
+            .max(1)
+    }
+
+    /// Every set signer attributed on an unlock of `b` this ledger observed (review N-3).
+    fn observed_signers(&self, b: &BurnRecord) -> Result<Vec<PubKey33>> {
+        let rows = self
+            .ctx
+            .db(|t| t.meta_prefix(&super::ycash::observed_unlock_prefix(&b.key)))?;
+        let mut out = vec![];
+        for (_, v) in rows {
+            let Ok(j) = serde_json::from_str::<serde_json::Value>(&v) else {
+                continue;
+            };
+            for s in j["signers"].as_array().into_iter().flatten() {
+                let mut k = [0u8; 33];
+                if let Some(h) = s.as_str()
+                    && hex::decode_to_slice(h, &mut k).is_ok()
+                    && !out.contains(&k)
+                {
+                    out.push(k);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// An unlock of `b` this ledger observed whose vault is still unspent and which passes the
+    /// adoption checks (review N-3): the burn's own spend, re-sent rather than rebuilt.
+    async fn observed_unlock_for(
+        &mut self,
+        b: &BurnRecord,
+        members: &[PubKey33],
+    ) -> Result<Option<(String, CoreOutPoint)>> {
+        let rows = self
+            .ctx
+            .db(|t| t.meta_prefix(&super::ycash::observed_unlock_prefix(&b.key)))?;
+        for (key, v) in rows {
+            let Some(raw) = serde_json::from_str::<serde_json::Value>(&v)
+                .ok()
+                .and_then(|j| j["raw"].as_str().map(str::to_owned))
+            else {
+                continue;
+            };
+            match self.check_prior_unlock(b, &raw, members).await {
+                Ok(vault) => {
+                    info!(event = "unlock_observed_found", nonce = b.key.nonce, vault = %vault,
+                          record = %key, "re-sending the burn's observed unlock");
+                    return Ok(Some((raw, vault)));
+                }
+                Err(e) => debug!(event = "unlock_observed_skipped", nonce = b.key.nonce,
+                                 record = %key, error = %format!("{e:#}")),
+            }
+        }
+        Ok(None)
     }
 
     /// The ledger was found restored from a backup (review L-2) and not yet acknowledged.
@@ -891,6 +996,106 @@ impl Engine {
         );
         Ok(None)
     }
+}
+
+/// The `meta` key prefix of the declarations that a member is permanently gone:
+/// `gone/<member hex>/<declarer hex>` → `{sig, reason, at}` (the owner's override, 2026-10-13).
+pub const GONE_PREFIX: &str = "gone/";
+
+/// The members declared permanently gone in this ledger by at least `quorum` (the set's
+/// `unlockThreshold`) distinct members that are current now and are not the member itself.
+pub(crate) fn declared_gone(
+    t: &hawkeye_store::Tx<'_>,
+    _set_id: &hawkeye_core::bytes::Hash32,
+    current: &[PubKey33],
+    quorum: u32,
+) -> Result<Vec<PubKey33>, hawkeye_store::StoreError> {
+    let mut by: std::collections::BTreeMap<PubKey33, std::collections::BTreeSet<PubKey33>> =
+        Default::default();
+    for (k, _) in t.meta_prefix(GONE_PREFIX)? {
+        let mut parts = k[GONE_PREFIX.len()..].split('/');
+        let (Some(m), Some(d)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (mut mk, mut dk) = ([0u8; 33], [0u8; 33]);
+        if hex::decode_to_slice(m, &mut mk).is_err() || hex::decode_to_slice(d, &mut dk).is_err() {
+            continue;
+        }
+        if dk != mk && current.contains(&dk) {
+            by.entry(mk).or_default().insert(dk);
+        }
+    }
+    Ok(by
+        .into_iter()
+        .filter(|(_, ds)| ds.len() >= quorum as usize)
+        .map(|(m, _)| m)
+        .collect())
+}
+
+/// Verify a declaration that `member` is gone and record it in the ledger (the CLI for its own,
+/// `POST /members/gone` for a peer's): the signature over [`hawkeye_core::peerauth::gone_msg`]
+/// recovers to the declarer, a current member other than `member` (and, from a peer, the
+/// requester). Returns the declarations now held and the quorum.
+pub async fn record_gone(
+    ctx: &super::Ctx,
+    requester: Option<PubKey33>,
+    req: &crate::peers::GoneDeclaration,
+) -> Result<crate::peers::GoneAnswer> {
+    let parse = |h: &str, what: &str| -> Result<PubKey33> {
+        let mut k = [0u8; 33];
+        hex::decode_to_slice(h, &mut k).map_err(|_| anyhow!("{what} is not 66 hex"))?;
+        Ok(k)
+    };
+    let member = parse(&req.member, "member")?;
+    let declarer = parse(&req.declarer, "declarer")?;
+    if let Some(r) = requester {
+        anyhow::ensure!(r == declarer, "a declaration is sent by its own declarer");
+    }
+    anyhow::ensure!(declarer != member, "a member cannot declare itself gone");
+    let sig = hawkeye_core::peerauth::parse_sig(&req.sig).map_err(|e| anyhow!("sig: {e}"))?;
+    hawkeye_core::peerauth::verify(
+        &declarer,
+        &hawkeye_core::peerauth::gone_msg(&ctx.params.set_id, &member),
+        &sig,
+    )
+    .map_err(|e| anyhow!("declaration signature: {e}"))?;
+    let set = set_snapshot(ctx).await?;
+    let current: Vec<PubKey33> = set
+        .memberlist
+        .iter()
+        .filter(|m| m.current)
+        .map(|m| m.key.0)
+        .collect();
+    anyhow::ensure!(
+        current.contains(&declarer),
+        "the declarer is not a current member"
+    );
+    let quorum = set.set.params.unlockthreshold.max(1);
+    let n = ctx.db(|t| {
+        let key = format!("{GONE_PREFIX}{}/{}", req.member, req.declarer);
+        let v = serde_json::json!({"sig": req.sig, "reason": req.reason,
+                                   "at": t.now()});
+        t.set_meta(&key, &v.to_string())?;
+        let mut n = 0u32;
+        for (k, _) in t.meta_prefix(&format!("{GONE_PREFIX}{}/", req.member))? {
+            let mut d = [0u8; 33];
+            if let Some(h) = k.rsplit('/').next()
+                && hex::decode_to_slice(h, &mut d).is_ok()
+                && current.contains(&d)
+                && d != member
+            {
+                n += 1;
+            }
+        }
+        Ok(n)
+    })?;
+    warn!(event = "member_declared_gone", member = %req.member, declarer = %req.declarer,
+          reason = %req.reason, declarations = n, quorum,
+          "operator override: the holds this member causes are released once the quorum is reached");
+    Ok(crate::peers::GoneAnswer {
+        declarations: n,
+        quorum,
+    })
 }
 
 /// The `meta` key set when the ledger is found restored from a backup (review L-2): its value
