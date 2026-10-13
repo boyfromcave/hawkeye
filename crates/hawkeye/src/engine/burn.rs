@@ -184,8 +184,15 @@ impl Engine {
 
     /// Judge the live unlock that pays a burn here (remedial report 05/H-1 §4.4, finding
     /// 05/N-1): re-sent only if this attestor signed it **as the burn's leader** and every fee
-    /// input is this wallet's; dead only when it can no longer confirm — a fee input (or the
-    /// vault) spent by another transaction at least `C_Y` deep while the vault is unspent.
+    /// input still unspent is this wallet's; dead only when it can no longer confirm — the vault
+    /// spent by another transaction at least `C_Y` deep, or, for a row this attestor did not
+    /// sign as leader, a fee input spent so deep while the vault is unspent.
+    ///
+    /// A leader's unlock whose fee input is gone is **not** dead (audit 01/V-2): the set
+    /// signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, so anyone holding the signed
+    /// bytes can re-fund it (`vault_refee`) and it would still pay the burn. Signing another
+    /// vault for the burn would then risk a double payment; it is re-sent instead, and
+    /// [`super::sign::send_set_signed`] re-funds it.
     async fn judge_live_unlock(
         &mut self,
         row: &UnlockBurnRecord,
@@ -227,6 +234,7 @@ impl Engine {
             )));
         }
         let mut foreign = vec![];
+        let mut lost = vec![];
         for i in &tx.inputs {
             let op = op_core(&i.prevout);
             if op == vault {
@@ -252,6 +260,10 @@ impl Engine {
                     if !mine {
                         foreign.push(op.to_string());
                     }
+                }
+                None if row.origin == UnlockOrigin::Leader => {
+                    // re-fundable (01/V-2): resent below, `send_set_signed` re-funds it
+                    lost.push(op.to_string());
                 }
                 None => {
                     if ycash
@@ -288,6 +300,10 @@ impl Engine {
                 foreign.join(", ")
             )));
         }
+        if !lost.is_empty() {
+            info!(event = "unlock_refund_due", vault = %vault, lost = %lost.join(", "),
+                  "fee input(s) gone: the leader's unlock is re-sent re-funded (01/V-2)");
+        }
         Ok(LiveUnlock::Resend(signed_hex.to_owned()))
     }
 
@@ -299,7 +315,7 @@ impl Engine {
         let nonce = b.key.nonce;
         let recipient =
             YcashRecipient::from_bytes(&b.recipient).map_err(|e| anyhow!("recipient: {e}"))?;
-        let signed = match self.ctx.db(|t| t.live_unlock_for_burn(&p.set_id, &b.key))? {
+        let (signed, template) = match self.ctx.db(|t| t.live_unlock_for_burn(&p.set_id, &b.key))? {
             Some(row) => {
                 let key = self.unlock_key_of(&row.prevout);
                 let rec = self.ctx.db(|t| t.ycash_signature(&key))?.ok_or_else(|| {
@@ -342,7 +358,7 @@ impl Engine {
                     LiveUnlock::Resend(h) => {
                         info!(event = "unlock_resend", nonce);
                         match self.complete_unlock(&h).await? {
-                            Some(h) => h,
+                            Some(h) => (h, row.prevout),
                             None => return Ok(()),
                         }
                     }
@@ -373,17 +389,17 @@ impl Engine {
                     }
                     return Ok(());
                 };
-                let built = self
-                    .ctx
-                    .ycash
-                    .vault_buildunlock(
-                        &op_rpc(&vault.outpoint),
-                        &[Recipient::script(
-                            recipient.script(),
-                            Amount::from_zat(i64::try_from(b.amount)?),
-                        )],
-                    )
-                    .await?;
+                // no record of this vault here (checked above): a stale node build may go
+                let built = super::sign::build_unlock(
+                    &self.ctx.ycash,
+                    &op_rpc(&vault.outpoint),
+                    &[Recipient::script(
+                        recipient.script(),
+                        Amount::from_zat(i64::try_from(b.amount)?),
+                    )],
+                    true,
+                )
+                .await?;
                 let memo =
                     HawkeyeMemo::burn_release_for(p.bridge_kind, p.deployment, nonce, b.tx_hash);
                 let with_memo = insert_op_return(&built.hex.to_string(), &memo.encode())
@@ -408,13 +424,13 @@ impl Engine {
                       recipient = %encode_address(&recipient, p.network), complete = complete.get());
                 super::drill_crash_point(&p, "unlock_signed");
                 match self.complete_unlock(&rec.signed_hex).await? {
-                    Some(h) => h,
+                    Some(h) => (h, vault.outpoint),
                     None => return Ok(()),
                 }
             }
         };
         let hex: HexBytes = signed.parse().map_err(|e| anyhow!("{e}"))?;
-        let txid = match self.ctx.ycash.vault_send(&hex).await {
+        let txid = match super::sign::send_set_signed(&self.ctx.ycash, &hex, &template).await {
             Ok(t) => t,
             Err(e) if e.rpc().is_some_and(|r| r.is_already_known()) => {
                 // already broadcast; the watcher observes it from the mempool or a block

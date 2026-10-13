@@ -113,6 +113,10 @@ fn through(method: &str, text: &str) -> Result<Value, String> {
         "vault_buildcancel" => rt::<BuildCancelResult>(text),
         "vault_ownerspend" => rt::<OwnerSpendResult>(text),
         "vault_app" => rt::<AppResult>(text),
+        "vault_refee" => rt::<RefeeResult>(text),
+        "set_listsigned" => rt::<SignedRecords>(text),
+        "set_importsigned" => rt::<ImportSignedResult>(text),
+        "set_acknowledgerestore" => rt::<AckRestoreResult>(text),
         other => panic!("no Rust type for {other}"),
     }
 }
@@ -124,9 +128,9 @@ fn contract_is_the_node_copy() {
     assert_eq!(c["branchid"], "6d5b7a31");
     assert_eq!(
         c["source"]["sha256"],
-        "d7783c8e22061759d07686d2ef8569568160ce0d0ae2d79b323d851460b2a033"
+        "e7af3077b0be37ddc716a012139575e2063b34ff9063c3ddba505885ab80d19a"
     );
-    assert_eq!(c["methods"].as_object().unwrap().len(), 23);
+    assert_eq!(c["methods"].as_object().unwrap().len(), 27);
     assert_eq!(c["types"]["pqkeyid"]["json"], "string");
 }
 
@@ -420,5 +424,18 @@ fn parameters_match_the_contract() {
         .params()
         .unwrap()["burn"],
         true
+    );
+    // set_importsigned takes the records set_listsigned prints
+    let rec = SignedRecord {
+        setid: h,
+        prevout: OutPoint::new(h, 1),
+        role: 2,
+        sighash: HASH.parse().unwrap(),
+    };
+    check_value(
+        &c,
+        &c["methods"]["set_importsigned"]["params"][0]["type"],
+        &serde_json::to_value([&rec]).unwrap(),
+        "set_importsigned.records",
     );
 }

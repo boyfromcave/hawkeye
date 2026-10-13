@@ -12,6 +12,11 @@
 //!   accepted and mined; `set_signunlock` on the same transaction verifies the signature and
 //!   reports the **same sighash** (parity), signing nothing (and recording nothing: no
 //!   equivocation);
+//! - the hash type is `SIGHASH_ALL|SIGHASH_ANYONECANPAY` (audit 01/V-2): the builds report the
+//!   sighash Hawkeye signs, the remembered build is returned again (`reused`), the mined UNLOCK
+//!   attributes to the member key (`attribute_template_input`), and the self-signed CANCEL is
+//!   re-funded by `vault_refee` (only its fee inputs change, same sighash) and the re-funded
+//!   spend is mined with Hawkeye's signature;
 //! - a CANCEL of the intent, self-signed, mined;
 //! - a `SET_HEARTBEAT` self-signed, mined (the member's `lastact` moves);
 //! - `dumpprivkey` of the member key's address fails: the wallet never held it.
@@ -23,13 +28,16 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hawkeye::engine::sign::{next_branch_id, self_sign_act, self_sign_template};
+use hawkeye::engine::sign::{
+    next_branch_id, same_set_signed_spend, self_sign_act, self_sign_template,
+};
 use hawkeye_core::address::{Network, encode_address};
+use hawkeye_core::attribution::{VAULT_BRANCH_ID, attribute_template_input};
 use hawkeye_core::bytes::hash160;
 use hawkeye_core::recipient::YcashRecipient;
 use hawkeye_core::setsig::Role;
 use hawkeye_core::{OutPoint as CoreOutPoint, SecretKey};
-use hawkeye_ycash::types::{BuildAct, Recipient};
+use hawkeye_ycash::types::{BuildAct, BuildKind, Recipient};
 use hawkeye_ycash::{Amount, Auth, Hash256, HexBytes, OutPoint, PubKey, YcashRpc};
 use serde_json::{Value, json};
 
@@ -105,6 +113,27 @@ async fn start(bin: &str, dir: &std::path::Path, port: u16) -> Node {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Node { child, rpc }
+}
+
+/// Wait until the wallet has seen `txid` confirmed: Zcash notifies the wallet of blocks on a
+/// separate thread, so right after `generate` a build can still fund from a coin the block
+/// spent.
+async fn wallet_sees_confirmed(rpc: &YcashRpc, txid: &Hash256) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(t) = rpc
+            .call_value("gettransaction", vec![json!(txid.to_string())])
+            .await
+            && t["confirmations"].as_i64().unwrap_or(0) >= 1
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the wallet never saw {txid} confirmed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn call(rpc: &YcashRpc, m: &str, p: Vec<Value>) -> Value {
@@ -189,6 +218,7 @@ async fn self_signed_set_and_act_signatures_on_a_real_node() {
     let vtxid: Hash256 = locked["txid"].as_str().unwrap().parse().unwrap();
     let vault = OutPoint::new(vtxid, locked["vout"].as_u64().unwrap() as u32);
     rpc.generate(1).await.unwrap();
+    wallet_sees_confirmed(rpc, &vtxid).await;
     let core = |op: &OutPoint| CoreOutPoint::new(op.txid.0, op.vout);
     let coin_of = |op: OutPoint| async move {
         let o = rpc
@@ -211,18 +241,33 @@ async fn self_signed_set_and_act_signatures_on_a_real_node() {
         .await
         .unwrap();
     let branch = next_branch_id(rpc).await.unwrap();
+    let vault_coin = coin_of(vault).await;
     let out = self_sign_template(
         &member,
         &setid.0,
         Role::Unlock,
         &core(&vault),
-        &coin_of(vault).await,
+        &vault_coin,
         branch,
         1,
         &built.hex.to_string(),
     )
     .unwrap();
     assert!(out.complete);
+    assert_eq!(
+        built.sighash.0, out.sighash,
+        "vault_buildunlock reports the sighash Hawkeye signs (ALL|ANYONECANPAY)"
+    );
+    assert_eq!(built.build, BuildKind::New);
+    let again = rpc
+        .vault_buildunlock(
+            &vault,
+            &[Recipient::address(&to, Amount::from_zat(100_000_000))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.build, BuildKind::Reused);
+    assert_eq!(again.hex, built.hex);
     // parity: the node verifies our signature, reports the same sighash, adds none
     let parity = rpc
         .set_signunlock(&out.hex.parse::<HexBytes>().unwrap())
@@ -239,6 +284,25 @@ async fn self_signed_set_and_act_signatures_on_a_real_node() {
         .await
         .unwrap();
     rpc.generate(1).await.unwrap();
+    wallet_sees_confirmed(rpc, &utxid).await;
+    // the mined UNLOCK attributes to the member key (the node's 0x81 digest)
+    let raw = rpc.getrawtransaction(&utxid).await.unwrap();
+    let mined = hawkeye_ycash::tx::Transaction::decode(raw.as_slice()).unwrap();
+    let idx = hawkeye::engine::sign::input_index(&mined, &core(&vault)).unwrap();
+    let a = attribute_template_input(
+        raw.as_slice(),
+        idx,
+        &vault_coin.0,
+        vault_coin.1,
+        VAULT_BRANCH_ID,
+    )
+    .unwrap();
+    assert_eq!(a.signers.len(), 1);
+    assert_eq!(
+        a.signers[0].pubkey, me,
+        "the unlock attributes to the member"
+    );
+    assert_eq!(a.sighash, out.sighash);
     let intent = OutPoint::new(utxid, built.intents[0].vout);
     assert!(
         rpc.gettxout(&vault.txid, vault.vout, true)
@@ -250,26 +314,90 @@ async fn self_signed_set_and_act_signatures_on_a_real_node() {
     // CANCEL, self-signed
     let cancel = rpc.vault_buildcancel(&intent).await.unwrap();
     let branch = next_branch_id(rpc).await.unwrap();
+    let intent_coin = coin_of(intent).await;
     let c = self_sign_template(
         &member,
         &setid.0,
         Role::Cancel,
         &core(&intent),
-        &coin_of(intent).await,
+        &intent_coin,
         branch,
         1,
         &cancel.hex.to_string(),
     )
     .unwrap();
+    assert_eq!(cancel.sighash.0, c.sighash, "vault_buildcancel's sighash");
     let parity = rpc
         .set_signcancel(&c.hex.parse::<HexBytes>().unwrap())
         .await
         .unwrap();
     assert_eq!(parity.sighash.0, c.sighash);
-    rpc.vault_send(&c.hex.parse::<HexBytes>().unwrap())
+    // the cancel's fee input is spent elsewhere (a stock transaction of this wallet), so the
+    // signed cancel can no longer be sent as it is
+    let signed: HexBytes = c.hex.parse().unwrap();
+    let old = hawkeye_ycash::tx::Transaction::decode(&signed.0).unwrap();
+    let fee_in = old
+        .inputs
+        .iter()
+        .find(|i| core(&i.prevout) != core(&intent))
+        .unwrap()
+        .prevout;
+    let fee_coin = rpc
+        .gettxout(&fee_in.txid, fee_in.vout, true)
         .await
+        .unwrap()
+        .expect("the fee input is unspent");
+    let sink = rpc.getnewaddress().await.unwrap();
+    let raw = call(
+        rpc,
+        "createrawtransaction",
+        vec![
+            json!([{"txid": fee_in.txid.to_string(), "vout": fee_in.vout}]),
+            json!({ sink: (fee_coin.value.zat() - 10_000) as f64 / 1e8 }),
+        ],
+    )
+    .await;
+    let s = call(rpc, "signrawtransaction", vec![raw]).await;
+    let spend: Hash256 = call(rpc, "sendrawtransaction", vec![s["hex"].clone()])
+        .await
+        .as_str()
+        .unwrap()
+        .parse()
         .unwrap();
     rpc.generate(1).await.unwrap();
+    wallet_sees_confirmed(rpc, &spend).await;
+    let e = rpc.vault_send(&signed).await.unwrap_err();
+    eprintln!("the stale cancel: {e}");
+    // re-funded (01/V-2): the fee inputs replaced, Hawkeye's signature still valid
+    let refunded = rpc.vault_refee(&signed).await.unwrap();
+    assert_eq!(
+        refunded.sighash.0, c.sighash,
+        "vault_refee keeps the sighash"
+    );
+    assert_eq!(refunded.replaced, vec![fee_in]);
+    let new = hawkeye_ycash::tx::Transaction::decode(&refunded.hex.0).unwrap();
+    same_set_signed_spend(&old, &new, &core(&intent)).unwrap();
+    assert!(
+        new.inputs.iter().all(|i| i.prevout != fee_in),
+        "the spent coin is gone"
+    );
+    let ctxid = rpc.vault_send(&refunded.hex).await.unwrap();
+    rpc.generate(1).await.unwrap();
+    let raw = rpc.getrawtransaction(&ctxid).await.unwrap();
+    let mined = hawkeye_ycash::tx::Transaction::decode(raw.as_slice()).unwrap();
+    let idx = hawkeye::engine::sign::input_index(&mined, &core(&intent)).unwrap();
+    let a = attribute_template_input(
+        raw.as_slice(),
+        idx,
+        &intent_coin.0,
+        intent_coin.1,
+        VAULT_BRANCH_ID,
+    )
+    .unwrap();
+    assert_eq!(
+        a.signers[0].pubkey, me,
+        "the re-funded cancel attributes to the member"
+    );
     assert!(
         rpc.gettxout(&intent.txid, intent.vout, true)
             .await

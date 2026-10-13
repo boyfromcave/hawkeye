@@ -20,7 +20,7 @@ use anyhow::{Result, anyhow, ensure};
 use hawkeye_core::bytes::Hash32;
 use hawkeye_core::script::{push_to, push_values};
 use hawkeye_core::setsig::{Role, act_msg, recover_compact, set_sig_msg, sign_compact};
-use hawkeye_core::sighash::{SIGHASH_ALL, zip243};
+use hawkeye_core::sighash::{SET_SIG_HASH_TYPE, zip243};
 use hawkeye_core::template::{TemplateKind, parse_selector, selector_script_sig};
 use hawkeye_core::{OutPoint as CoreOutPoint, PubKey33, SecretKey};
 use hawkeye_ycash::tx::Transaction;
@@ -176,7 +176,7 @@ pub fn self_sign_template(
         .ok_or_else(|| anyhow!("the transaction spends no {template}"))?;
     let mut args = role_args(&tx, idx, role)?;
     let core = hawkeye_core::tx::Transaction::parse(&tx.encode()).map_err(|e| anyhow!("{e}"))?;
-    let sighash = zip243(&core, idx, &coin.0, coin.1, SIGHASH_ALL, branch_id)
+    let sighash = zip243(&core, idx, &coin.0, coin.1, SET_SIG_HASH_TYPE, branch_id)
         .map_err(|e| anyhow!("sighash: {e}"))?;
     let msg = set_sig_msg(set_id, role.byte(), template, &sighash);
     let me = key.public_key();
@@ -420,5 +420,201 @@ impl Adoption<'_> {
             }
         }
         Ok(signers)
+    }
+}
+
+/// Whether a re-funded spend is `old` with only its fee inputs replaced (01/V-2): the template
+/// input spending `template` — prevout, sequence and the scriptSig with the set signatures —
+/// once in each, every output, the version, lock time and expiry byte-identical, nothing
+/// shielded. Exactly what `SIGHASH_ALL|SIGHASH_ANYONECANPAY` binds, so the set signatures on
+/// the template input are valid on the re-funded spend too, and Hawkeye never broadcasts a
+/// spend that pays anyone else.
+pub fn same_set_signed_spend(
+    old: &Transaction,
+    new: &Transaction,
+    template: &CoreOutPoint,
+) -> Result<()> {
+    ensure!(
+        new.overwintered == old.overwintered
+            && new.version == old.version
+            && new.version_group_id == old.version_group_id
+            && new.lock_time == old.lock_time
+            && new.expiry_height == old.expiry_height,
+        "the version, lock time or expiry changed"
+    );
+    ensure!(new.outputs == old.outputs, "the outputs changed");
+    ensure!(
+        !new.has_shielded(),
+        "the re-funded spend has shielded parts"
+    );
+    let spends = |t: &Transaction| {
+        t.inputs
+            .iter()
+            .filter(|i| i.prevout.txid.0 == template.txid && i.prevout.vout == template.vout)
+            .count()
+    };
+    ensure!(
+        spends(old) == 1 && spends(new) == 1,
+        "the template input {template} is not spent exactly once"
+    );
+    let (a, b) = (
+        &old.inputs[input_index(old, template).expect("counted")],
+        &new.inputs[input_index(new, template).expect("counted")],
+    );
+    ensure!(
+        a.sequence == b.sequence && a.script_sig == b.script_sig,
+        "the template input's sequence or scriptSig changed"
+    );
+    Ok(())
+}
+
+/// Whether a send failed because a fee input is gone: spent in a block (`-26 "18:
+/// bad-txns-inputs-spent"` while its transaction has unspent outputs, `-25 Missing inputs` once
+/// it has none: both node lines, regtest_self_signing.rs) or by a mempool transaction
+/// (`txn-mempool-conflict`). The template input gone fails the same way; `vault_refee` then
+/// refuses and the original error stands.
+fn fee_input_lost(e: &hawkeye_ycash::Error) -> bool {
+    match e.reason() {
+        Some(hawkeye_ycash::ErrorReason::MissingInputs) => true,
+        Some(hawkeye_ycash::ErrorReason::Rejected { reason, .. }) => {
+            reason.contains("inputs-spent") || reason.contains("mempool-conflict")
+        }
+        _ => false,
+    }
+}
+
+/// `vault_send` of a set-signed UNLOCK or CANCEL spend of `template`; when a fee input is gone,
+/// re-fund it once with `vault_refee` (01/V-2: the set signatures are over
+/// `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, so they stay valid), check that only the fee inputs
+/// changed ([`same_set_signed_spend`]), and send that. The stored signed bytes are kept: a
+/// later retry re-funds again. Any refusal of the re-fund returns the original error.
+pub async fn send_set_signed(
+    ycash: &YcashRpc,
+    hex: &HexBytes,
+    template: &CoreOutPoint,
+) -> core::result::Result<hawkeye_ycash::primitives::Txid, hawkeye_ycash::Error> {
+    let err = match ycash.vault_send(hex).await {
+        Ok(t) => return Ok(t),
+        Err(e) if fee_input_lost(&e) => e,
+        Err(e) => return Err(e),
+    };
+    let refunded = match ycash.vault_refee(hex).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(event = "refee_failed", template = %template, error = %e,
+                           send_error = %err);
+            return Err(err);
+        }
+    };
+    let checked = Transaction::decode(&hex.0)
+        .map_err(|e| anyhow!("{e}"))
+        .and_then(|old| {
+            let new = Transaction::decode(&refunded.hex.0).map_err(|e| anyhow!("{e}"))?;
+            same_set_signed_spend(&old, &new, template)
+        });
+    if let Err(why) = checked {
+        tracing::warn!(event = "refee_refused", template = %template, reason = %format!("{why:#}"));
+        return Err(err);
+    }
+    tracing::info!(event = "refee", template = %template, replaced = refunded.replaced.len(),
+                   fee = %refunded.fee, sighash = %hex::encode(refunded.sighash.0));
+    ycash.vault_send(&refunded.hex).await
+}
+
+/// `vault_buildunlock` of `vault` to `recipients`. The node wallet remembers one build per vault
+/// (07/N-2) and refuses other recipients (`already built a different unlock`); `unsigned_here`
+/// (this attestor's ledger holds no unlock signature of the vault: it never handed one out —
+/// in self mode it signs only inside the ledger transaction, in wallet mode the node's own
+/// `set-sign-once` record still refuses a second spend) then discards it with `rebuild`, once.
+pub async fn build_unlock(
+    ycash: &YcashRpc,
+    vault: &hawkeye_ycash::OutPoint,
+    recipients: &[hawkeye_ycash::types::Recipient],
+    unsigned_here: bool,
+) -> core::result::Result<hawkeye_ycash::types::BuildUnlockResult, hawkeye_ycash::Error> {
+    match ycash.vault_buildunlock(vault, recipients).await {
+        Err(e)
+            if unsigned_here
+                && e.reason() == Some(hawkeye_ycash::ErrorReason::AlreadyBuiltDifferent) =>
+        {
+            tracing::warn!(event = "unlock_rebuild", vault = %vault,
+                           "the node wallet remembered another unlock of this vault, signed by no one here: rebuilding");
+            ycash.vault_buildunlock_with(vault, recipients, true).await
+        }
+        r => r,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hawkeye_ycash::tx::{TxIn, TxOut};
+    use hawkeye_ycash::{Hash256, OutPoint};
+
+    use super::*;
+
+    fn op(b: u8, n: u32) -> OutPoint {
+        OutPoint::new(Hash256([b; 32]), n)
+    }
+
+    fn signed() -> Transaction {
+        Transaction::new_v4(
+            vec![
+                TxIn {
+                    prevout: op(1, 0),
+                    script_sig: vec![0x41, 0x1f, 0x51],
+                    sequence: u32::MAX,
+                },
+                TxIn {
+                    prevout: op(2, 3),
+                    script_sig: vec![],
+                    sequence: u32::MAX,
+                },
+            ],
+            vec![
+                TxOut {
+                    value: 5,
+                    script_pubkey: vec![0x51],
+                },
+                TxOut {
+                    value: 7,
+                    script_pubkey: vec![0x52],
+                },
+            ],
+            0,
+            99,
+        )
+    }
+
+    #[test]
+    fn a_refunded_spend_changes_only_its_fee_inputs() {
+        let t = CoreOutPoint::new([1; 32], 0);
+        let old = signed();
+        // the node's re-fund: template input first, the fee input replaced by two coins
+        let mut new = old.clone();
+        new.inputs[1].prevout = op(9, 0);
+        new.inputs.push(TxIn {
+            prevout: op(9, 1),
+            script_sig: vec![],
+            sequence: u32::MAX,
+        });
+        same_set_signed_spend(&old, &new, &t).unwrap();
+        let bad: [fn(&mut Transaction); 7] = [
+            |x| x.outputs[1].value += 1,
+            |x| x.outputs.push(TxOut::op_return(b"x")),
+            |x| x.inputs[0].script_sig.push(0),
+            |x| x.inputs[0].sequence = 0,
+            |x| x.expiry_height += 1,
+            |x| x.lock_time = 5,
+            |x| x.inputs.push(x.inputs[0].clone()),
+        ];
+        for (n, f) in bad.iter().enumerate() {
+            let mut b = new.clone();
+            f(&mut b);
+            assert!(same_set_signed_spend(&old, &b, &t).is_err(), "case {n}");
+        }
+        let mut gone = new.clone();
+        gone.inputs.remove(0);
+        assert!(same_set_signed_spend(&old, &gone, &t).is_err());
+        assert!(same_set_signed_spend(&old, &new, &CoreOutPoint::new([3; 32], 0)).is_err());
     }
 }
