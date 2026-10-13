@@ -296,6 +296,15 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// ZIP-317 `MARGINAL_FEE` (zatoshi per logical action).
+pub const ZIP317_MARGINAL_FEE: i64 = 500;
+/// ZIP-317 `GRACE_ACTIONS`.
+pub const ZIP317_GRACE_ACTIONS: usize = 2;
+/// ZIP-317 `P2PKH_STANDARD_INPUT_SIZE`.
+pub const ZIP317_INPUT_SIZE: usize = 150;
+/// ZIP-317 `P2PKH_STANDARD_OUTPUT_SIZE`.
+pub const ZIP317_OUTPUT_SIZE: usize = 34;
+
 fn write_compact(out: &mut Vec<u8>, n: usize) {
     let n = n as u64;
     if n < 253 {
@@ -504,6 +513,41 @@ impl Transaction {
         hex::encode(self.encode())
     }
 
+    /// The ZIP-317 conventional fee of this transaction as serialized (ycash6 `src/zip317.cpp`
+    /// `CalculateConventionalFee`, ycash-dd `src/policy/policy.cpp` `Zip317ConventionalFee`):
+    /// `500 × max(2, max(⌈in_bytes / 150⌉, ⌈out_bytes / 34⌉) + 2 × joinsplits +
+    /// max(sapling spends, sapling outputs))`, `in_bytes` / `out_bytes` the serialized inputs /
+    /// outputs without their count. A post-quantum input's scriptSig (an SLH-DSA spend carries
+    /// ~7,938 bytes: 53 actions, 26,500 zat) dominates it; a ycash6 node started with
+    /// `-txunpaidactionlimit=0` refuses a transaction paying less, and its ZIP-401 limiter
+    /// evicts such a one first (audit 04/N-1).
+    pub fn zip317_conventional_fee(&self) -> i64 {
+        let mut in_bytes = 0usize;
+        for i in &self.inputs {
+            let mut b = vec![];
+            write_bytes(&mut b, &i.script_sig);
+            in_bytes += 36 + b.len() + 4;
+        }
+        let mut out_bytes = 0usize;
+        for o in &self.outputs {
+            let mut b = vec![];
+            write_bytes(&mut b, &o.script_pubkey);
+            out_bytes += 8 + b.len();
+        }
+        let transparent = in_bytes
+            .div_ceil(ZIP317_INPUT_SIZE)
+            .max(out_bytes.div_ceil(ZIP317_OUTPUT_SIZE));
+        let joinsplits = self.joinsplits.as_ref().map_or(0, |j| j.descriptions.len());
+        let sapling = self
+            .sapling
+            .as_ref()
+            .map_or(0, |s| s.spends.len().max(s.outputs.len()));
+        let actions = transparent + 2 * joinsplits + sapling;
+        ZIP317_MARGINAL_FEE
+            * i64::try_from(actions.max(ZIP317_GRACE_ACTIONS))
+                .unwrap_or(i64::MAX / ZIP317_MARGINAL_FEE)
+    }
+
     /// SHA256d of the serialization (internal order; `Display` prints it the RPC way).
     pub fn txid(&self) -> Txid {
         Txid::from_internal(sha256d(&self.encode()))
@@ -586,6 +630,32 @@ pub fn txid_of_hex(tx_hex: &str) -> Result<Txid, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zip317_conventional_fee() {
+        let p = OutPoint::new(Txid::from_internal([7; 32]), 1);
+        let input = |len: usize| TxIn {
+            prevout: p,
+            script_sig: vec![0; len],
+            sequence: u32::MAX,
+        };
+        let p2pkh = || TxOut {
+            value: 1,
+            script_pubkey: vec![0; 25],
+        };
+        // a P2PKH spend (148-byte input) to two P2PKH outputs (34 bytes each): the 2-action grace
+        let t = Transaction::new_v4(vec![input(107)], vec![p2pkh(), p2pkh()], 0, 0);
+        assert_eq!(t.zip317_conventional_fee(), 1_000);
+        // three outputs: 102 bytes, 3 actions
+        let t = Transaction::new_v4(vec![input(107)], vec![p2pkh(), p2pkh(), p2pkh()], 0, 0);
+        assert_eq!(t.zip317_conventional_fee(), 1_500);
+        // an SLH-DSA-sized scriptSig: 36 + 3 + 7,900 + 4 = 7,943 bytes, 53 actions (04/N-1)
+        let t = Transaction::new_v4(vec![input(7_900)], vec![p2pkh()], 0, 0);
+        assert_eq!(t.zip317_conventional_fee(), 26_500);
+        // 20 P2PKH inputs: 20 actions
+        let t = Transaction::new_v4(vec![input(107); 20], vec![p2pkh()], 0, 0);
+        assert_eq!(t.zip317_conventional_fee(), 10_000);
+    }
 
     fn tx() -> Transaction {
         let p = OutPoint::new(Txid::from_internal([7; 32]), 1);
