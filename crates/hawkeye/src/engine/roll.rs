@@ -94,23 +94,22 @@ pub const RESTORE_LINEAGE_PREFIX: &str = "restore_lineage/";
 /// `restore-report-flood`, cleared once the window passes).
 pub const RESTORE_FLOOD_PREFIX: &str = "restore_flood/";
 
-/// Whether `member`, asked once per restore event (cached), answered — signed — that its ledger
-/// is restored. Only the reporter is asked: its URL is learnt from its signed answers and cached.
-/// (A malicious member can lie here; the evidence rule and the caps are what bound it.)
-async fn reporter_says_restored(
-    ctx: &super::Ctx,
-    member: &hawkeye_core::PubKey33,
-    event: &str,
-) -> bool {
-    let key = (*member, event.to_owned());
-    if let Some(v) = ctx
-        .auth
-        .restore_answers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
+/// Whether `member` answered — signed — that its ledger is restored. Only the reporter is asked
+/// (its URL learnt from its signed answers and cached), and its answer is cached per reporter for
+/// [`crate::peer_auth::RESTORE_ANSWER_TTL`]: bounded by the member count, and a `true` lapses
+/// once the reporter has acknowledged its restore. (A malicious member can lie here; the evidence
+/// rule and the caps are what bound it.)
+async fn reporter_says_restored(ctx: &super::Ctx, member: &hawkeye_core::PubKey33) -> bool {
     {
-        return *v;
+        let mut cache = ctx
+            .auth
+            .restore_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.retain(|_, (_, at)| at.elapsed() < crate::peer_auth::RESTORE_ANSWER_TTL);
+        if let Some((v, _)) = cache.get(member) {
+            return *v;
+        }
     }
     let known = ctx
         .auth
@@ -145,7 +144,7 @@ async fn reporter_says_restored(
             .restore_answers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, v);
+            .insert(*member, (v, std::time::Instant::now()));
     }
     v
 }
@@ -244,10 +243,6 @@ async fn verify_restore_report(
             req.count
         )));
     }
-    ensure!(
-        reporter_says_restored(ctx, &requester, &req.event).await,
-        "the reporter's own signed /burns/unlock answer does not show its ledger restored"
-    );
     let (already, corroborated, window) = ctx.db(|t| {
         let already = t
             .meta(&format!("{RESTORE_ROLLED_PREFIX}{vault}"))?
@@ -289,6 +284,11 @@ async fn verify_restore_report(
             }
         )));
     }
+    // only now (a reporter over its cap triggers no outbound request): does it say it is restored?
+    ensure!(
+        reporter_says_restored(ctx, &requester).await,
+        "the reporter's own signed /burns/unlock answer does not show its ledger restored"
+    );
     let op = op_rpc(vault);
     ensure!(
         ctx.ycash.gettxout(&op.txid, op.vout, true).await?.is_some(),
@@ -426,6 +426,17 @@ impl Engine {
             for (k, v) in t.meta_prefix(RESTORE_FLOOD_PREFIX)? {
                 if v.parse::<u32>()
                     .map_or(true, |h| tip.saturating_sub(h) > RESTORE_WINDOW)
+                {
+                    t.delete_meta_prefix(&k)?;
+                }
+            }
+            // reports older than the window no longer count: drop them (review nit)
+            let from = tip.saturating_sub(RESTORE_WINDOW);
+            for (k, _) in t.meta_prefix(RESTORE_REPORT_PREFIX)? {
+                if k.split('/')
+                    .nth(2)
+                    .and_then(|h| h.parse::<u32>().ok())
+                    .is_none_or(|h| h <= from)
                 {
                     t.delete_meta_prefix(&k)?;
                 }

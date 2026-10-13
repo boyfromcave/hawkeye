@@ -5839,6 +5839,14 @@ async fn t1_restored_reports_need_evidence_and_are_rate_limited() {
         .ctx()
         .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
         .unwrap();
+    // the receiver cached the reporter's earlier `false` (TTL); let it lapse
+    engines[0]
+        .ctx()
+        .auth
+        .restore_answers
+        .lock()
+        .unwrap()
+        .clear();
     // four uncorroborated, each under a new event id
     for (n, v) in vs[..4].iter().enumerate() {
         let a = reporter
@@ -6145,4 +6153,146 @@ async fn t4_observed_unlocks_are_pruned_after_release() {
             "pruned"
         );
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// (v) nits after the final review: the restored-answer cache, the cap before any request, pruning
+
+/// (v1) The reporter's "restored" answer is cached per reporter with a TTL: a cached `true`
+/// lapses, so once the reporter acknowledged its restore its reports are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v1_a_cached_restored_answer_expires() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    for _ in 0..3 {
+        lock_and_mint(&env, &mut engines).await;
+    }
+    let vs = free_vaults(&env).await;
+    let reporter = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[1]));
+    engines[1]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    reporter
+        .orphaned(&urls[0], &restore_report(&vs[0], 1, "e1"))
+        .await
+        .unwrap();
+    let me1 = env.key_of_index(1);
+    assert_eq!(
+        engines[0].ctx().auth.restore_answers.lock().unwrap().len(),
+        1,
+        "one entry per reporter, whatever the event"
+    );
+    // the reporter acknowledges its restore; the cached `true` still holds within the TTL
+    engines[1]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "acknowledged"))
+        .unwrap();
+    reporter
+        .orphaned(&urls[0], &restore_report(&vs[1], 1, "e2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        engines[0].ctx().auth.restore_answers.lock().unwrap().len(),
+        1,
+        "still one entry: keyed by reporter"
+    );
+    // the TTL passes: asked again, the answer is now `false`
+    {
+        let mut c = engines[0].ctx().auth.restore_answers.lock().unwrap();
+        let old = std::time::Instant::now()
+            .checked_sub(hawkeye::peer_auth::RESTORE_ANSWER_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        c.insert(me1, (true, old));
+    }
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&vs[2], 1, "e3"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("does not show its ledger restored"), "{e}");
+}
+
+/// (v2) A reporter already over its cap is refused before anything is asked of it: no cached
+/// answer appears, and the refusal is the cap's (not "does not show restored").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_the_cap_is_checked_before_any_request() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    for _ in 0..5 {
+        lock_and_mint(&env, &mut engines).await;
+    }
+    let vs = free_vaults(&env).await;
+    let reporter = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[1]));
+    engines[1]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "test"))
+        .unwrap();
+    for (n, v) in vs[..4].iter().enumerate() {
+        reporter
+            .orphaned(&urls[0], &restore_report(v, 1, &format!("e{n}")))
+            .await
+            .unwrap();
+    }
+    // forget the cached answer and make the reporter no longer restored: were it asked, the
+    // refusal would be "does not show restored"
+    engines[0]
+        .ctx()
+        .auth
+        .restore_answers
+        .lock()
+        .unwrap()
+        .clear();
+    engines[1]
+        .ctx()
+        .db(|t| t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "acknowledged"))
+        .unwrap();
+    let e = reporter
+        .orphaned(&urls[0], &restore_report(&vs[4], 1, "e9"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("cap 4"), "{e}");
+    assert!(
+        engines[0]
+            .ctx()
+            .auth
+            .restore_answers
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "nothing was asked of the reporter"
+    );
+}
+
+/// (v3) `restore_report/` keys older than the window are pruned; recent ones stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3_old_restore_reports_are_pruned() {
+    let Some(env) = setup().await else { return };
+    let mut e = env.engine(0).await;
+    e.tick().await;
+    env.mine(hawkeye::engine::roll::RESTORE_WINDOW + 10);
+    let tip = env.mock.state().tip_height();
+    let rep = hex::encode(env.key_of_index(1));
+    let old = format!("restore_report/{rep}/{:010}/{}:0", 1, "aa".repeat(32));
+    let recent = format!("restore_report/{rep}/{:010}/{}:0", tip - 1, "bb".repeat(32));
+    e.ctx()
+        .db(|t| {
+            t.set_meta(&old, "u")?;
+            t.set_meta(&recent, "u")
+        })
+        .unwrap();
+    e.tick().await;
+    let left: Vec<String> = e
+        .ctx()
+        .db(|t| t.meta_prefix("restore_report/"))
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(left, vec![recent]);
 }
