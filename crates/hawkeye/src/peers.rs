@@ -134,7 +134,8 @@ pub struct GoneDeclaration {
 pub struct GoneAnswer {
     /// Declarations of the member this ledger now holds, from distinct current members.
     pub declarations: u32,
-    /// The quorum (the set's `unlockThreshold`).
+    /// The quorum: a strict majority of the current members other than the declared one, never
+    /// less than `unlockThreshold` ([`crate::engine::burn::gone_quorum`]).
     pub quorum: u32,
 }
 

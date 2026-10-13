@@ -700,26 +700,21 @@ impl Engine {
             .copied()
             .collect();
         required.retain(|k| current.contains(k));
-        // the owner's override (2026-10-13): a member declared permanently gone by a quorum
+        // the owner's override (2026-10-13): a member declared permanently gone by a quorum —
+        // applied only after the peers were asked, and never to a member that answers
         let declared = self
             .ctx
             .db(|t| declared_gone(t, &self.ctx.params.set_id, &current, self.unlock_quorum()))?;
-        let overridden: Vec<PubKey33> = required
-            .iter()
-            .filter(|k| declared.contains(*k))
-            .copied()
-            .collect();
-        required.retain(|k| !declared.contains(k));
-        if !gone_now.is_empty() || !overridden.is_empty() {
+        if !gone_now.is_empty() {
             info!(event = "unlock_prior_excluded", nonce = b.key.nonce,
                   not_current = %gone_now.iter().map(hex::encode).collect::<Vec<_>>().join(","),
-                  declared_gone = %overridden.iter().map(hex::encode).collect::<Vec<_>>().join(","),
-                  "members whose answer is not needed: not current (their signatures cannot confirm) or declared gone by a quorum");
+                  "members whose answer is not needed: not current (their signatures cannot confirm)");
         }
         if required.is_empty() {
             return Ok(Prior::NoneConfirmed);
         }
         let mut none_from = std::collections::HashSet::new();
+        let mut held_from = std::collections::HashSet::new();
         for peer in self.ctx.peers.urls().to_vec() {
             let signed = match self.ctx.peers.burn_unlock(&peer, b.key.nonce).await {
                 Ok(s) => s,
@@ -733,6 +728,9 @@ impl Engine {
                 warn!(event = "unlock_prior_unsigned", nonce = b.key.nonce, peer = %peer);
                 continue;
             };
+            if signed.body.held || signed.body.unlock.is_some() {
+                held_from.insert(who);
+            }
             match (signed.body.unlock, signed.body.held) {
                 (Some(hex), _) => match self.check_prior_unlock(b, &hex, &members).await {
                     Ok(vault) => {
@@ -751,9 +749,43 @@ impl Engine {
                                       "the peer holds an unlock it no longer serves (paid in its view)"),
             }
         }
+        // a member declared gone that nevertheless answered "held": the declaration was wrong
+        // (it is not gone, or not silent): its hold stands
+        let answered: Vec<PubKey33> = declared
+            .iter()
+            .filter(|k| held_from.contains(*k))
+            .copied()
+            .collect();
+        if !answered.is_empty() {
+            let who = answered
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>()
+                .join(",");
+            warn!(event = "gone_member_answered", nonce = b.key.nonce, members = %who,
+                  "a member declared gone answered that it holds a signed unlock for the burn: its hold stands");
+            self.alarm(
+                "gone-member-answered",
+                format!(
+                    "burn {}: member(s) {who} declared gone answered that they hold a signed \
+                     unlock: the override does not apply to them",
+                    b.key.nonce
+                ),
+            );
+        }
+        let overridden: Vec<PubKey33> = required
+            .iter()
+            .filter(|k| !none_from.contains(*k) && declared.contains(*k) && !held_from.contains(*k))
+            .copied()
+            .collect();
+        if !overridden.is_empty() {
+            warn!(event = "unlock_prior_overridden", nonce = b.key.nonce,
+                  declared_gone = %overridden.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                  "not waiting for member(s) declared gone by a quorum (owner's override)");
+        }
         let missing: Vec<String> = required
             .iter()
-            .filter(|k| !none_from.contains(*k))
+            .filter(|k| !none_from.contains(*k) && !overridden.contains(*k))
             .map(hex::encode)
             .collect();
         if missing.is_empty() {
@@ -1002,14 +1034,24 @@ impl Engine {
 /// `gone/<member hex>/<declarer hex>` → `{sig, reason, at}` (the owner's override, 2026-10-13).
 pub const GONE_PREFIX: &str = "gone/";
 
-/// The members declared permanently gone in this ledger by at least `quorum` (the set's
-/// `unlockThreshold`) distinct members that are current now and are not the member itself.
+/// The quorum of declarations that declares a member gone (coordinator decision, 2026-10-13): a
+/// strict majority of the current members other than the declared one, and never less than the
+/// unlock threshold `k`: `max(k, floor((n_current − 1) / 2) + 1)`, `n_current` counting the
+/// declared member. (A quorum of `k` alone would let one member at `k = 1` release an honest but
+/// slow leader's hold and double a burn.)
+pub fn gone_quorum(k: u32, n_current: u32) -> u32 {
+    k.max(1).max(n_current.saturating_sub(1) / 2 + 1)
+}
+
+/// The members declared permanently gone in this ledger by at least [`gone_quorum`] distinct
+/// members that are current **now** (a declarer that left stops counting) and are not the member.
 pub(crate) fn declared_gone(
     t: &hawkeye_store::Tx<'_>,
     _set_id: &hawkeye_core::bytes::Hash32,
     current: &[PubKey33],
-    quorum: u32,
+    k: u32,
 ) -> Result<Vec<PubKey33>, hawkeye_store::StoreError> {
+    let quorum = gone_quorum(k, u32::try_from(current.len()).unwrap_or(u32::MAX));
     let mut by: std::collections::BTreeMap<PubKey33, std::collections::BTreeSet<PubKey33>> =
         Default::default();
     for (k, _) in t.meta_prefix(GONE_PREFIX)? {
@@ -1070,7 +1112,10 @@ pub async fn record_gone(
         current.contains(&declarer),
         "the declarer is not a current member"
     );
-    let quorum = set.set.params.unlockthreshold.max(1);
+    let quorum = gone_quorum(
+        set.set.params.unlockthreshold,
+        u32::try_from(current.len()).unwrap_or(u32::MAX),
+    );
     let n = ctx.db(|t| {
         let key = format!("{GONE_PREFIX}{}/{}", req.member, req.declarer);
         let v = serde_json::json!({"sig": req.sig, "reason": req.reason,
