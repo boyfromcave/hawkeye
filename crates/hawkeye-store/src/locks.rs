@@ -249,12 +249,12 @@ impl Tx<'_> {
                     params![lock_id, reason],
                 )?;
             }
-            LockState::Signed if self.mint_signature(lock_id)?.is_none() => {
+            LockState::Signed if !self.has_mint_signature(lock_id)? => {
                 return Err(StoreError::Invalid(format!(
                     "lock {oid}: SIGNED without a sign-once record"
                 )));
             }
-            LockState::Reorged if self.mint_signature(lock_id)?.is_some() => {
+            LockState::Reorged if self.has_mint_signature(lock_id)? => {
                 self.conn().execute(
                     "UPDATE locks SET exposure = 1 WHERE lock_id = ?1",
                     [lock_id],

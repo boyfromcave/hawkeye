@@ -1,6 +1,7 @@
 //! Opening and migrating the ledger.
 
 mod common;
+use common::DEP;
 
 use hawkeye_store::schema::MIGRATIONS;
 use hawkeye_store::{Store, StoreError};
@@ -245,7 +246,12 @@ fn a_v3_ledger_migrates_to_v4_losslessly() {
             (Some(eth(dest)), LockState::Signed)
         );
         assert_eq!(t.lock(&[9; 32])?.unwrap().destination, None);
-        let m = t.mint_signature(&[1; 32])?.unwrap();
+        // pre-v9: the placeholder deployment until the start-up backfill (schema v9)
+        assert_eq!(t.mint_signatures_any(&[1; 32])?[0].deployment.chain_id, 0);
+        assert!(t.mint_signature(&DEP, &[1; 32])?.is_none());
+        assert_eq!(t.backfill_mint_deployment(&DEP)?, 1);
+        assert_eq!(t.backfill_mint_deployment(&DEP)?, 0);
+        let m = t.mint_signature(&DEP, &[1; 32])?.unwrap();
         assert_eq!(
             (m.amount, m.to, m.digest, m.signature, m.signed_at),
             (1000, eth(dest), [4; 32], [5; 65], 11)

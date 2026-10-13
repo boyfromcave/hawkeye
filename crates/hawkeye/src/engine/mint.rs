@@ -112,6 +112,17 @@ pub fn challenge_due(
     now.saturating_add(margin) >= eta || (lock_absent && caught_up && blocks_since >= confirmations)
 }
 
+/// The lock edges from `state` to `MINTED` (a `Minted` observed, or the lockId found consumed).
+fn minted_path(state: LockState) -> &'static [LockState] {
+    use LockState::*;
+    match state {
+        PolicyOk | Signed | MintSubmitted | Executed => &[Minted],
+        Proposed => &[Executed, Minted],
+        Challenged => &[Proposed, Executed, Minted],
+        _ => &[],
+    }
+}
+
 /// Judge a `Minted(lockId, to, amount)` against the ledger and, if it matches, move the lock to
 /// `MINTED`. A `provisional` (unfinalized, audit 05/H-2) proposal is judged the same way but
 /// never moves the lock: `PROPOSED` keeps meaning "a matching proposal is final", which the
@@ -158,12 +169,7 @@ fn judge_minted(
         }
         return Ok(MintVerdict::Ok);
     }
-    let path: &[LockState] = match l.state {
-        PolicyOk | Signed | MintSubmitted | Executed => &[Minted],
-        Proposed => &[Executed, Minted],
-        Challenged => &[Proposed, Executed, Minted],
-        _ => &[],
-    };
+    let path = minted_path(l.state);
     for s in path {
         t.transition_lock(lock_id, *s, h, Some("Minted observed (finalized)"))?;
     }
@@ -1021,16 +1027,58 @@ impl Engine {
         let foreign = self.ctx.foreign.clone();
         let key = self.ctx.key.clone();
         let signer = self.ctx.guardian()?;
-        let to_sign = self.ctx.db(|t| t.locks_in_state(LockState::PolicyOk))?;
+        let dep = p.deployment;
+        // POLICY_OK locks, and (after a migration to a successor bridge, wyec design §4.6) the
+        // unminted locks signed only for another deployment
+        let to_sign = self.ctx.db(|t| {
+            let mut v = t.locks_in_state(LockState::PolicyOk)?;
+            for s in [
+                LockState::Signed,
+                LockState::MintSubmitted,
+                LockState::Proposed,
+                LockState::Challenged,
+            ] {
+                for l in t.locks_in_state(s)? {
+                    if t.mint_signature(&dep, &l.lock_id)?.is_none() {
+                        v.push(l);
+                    }
+                }
+            }
+            Ok(v)
+        })?;
         for l in to_sign {
             let Some(to) = l.destination.clone() else {
                 continue;
             };
+            // a lockId the bridge (or any predecessor: `isConsumed`) has minted, finalized, is
+            // never signed again (audit 05/L-3): recorded as minted
+            let final_consumed = self
+                .ctx
+                .foreign
+                .consumed_final(l.lock_id)
+                .await
+                .map_err(|e| anyhow!("consumed (final): {e}"))?;
+            if final_consumed {
+                self.ctx.db(|t| {
+                    for s in minted_path(l.state) {
+                        t.transition_lock(
+                            &l.lock_id,
+                            *s,
+                            None,
+                            Some("consumed on the bridge (predecessor)"),
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                info!(event = "mint_already_consumed", lock_id = %lock_hex(&l.lock_id),
+                      state = %l.state, "consumed on the bridge or a predecessor: not signed");
+                continue;
+            }
             let digest = foreign
                 .mint_digest(&l.lock_id, l.value_zat, &to)
                 .map_err(|e| anyhow!("{e}"))?;
             self.ctx.db(|t| {
-                t.sign_once_mint(&l.lock_id, l.value_zat, &to, &digest, |d| {
+                t.sign_once_mint(&dep, &l.lock_id, l.value_zat, &to, &digest, |d| {
                     foreign.sign(&key, d)
                 })
             })?;
@@ -1363,7 +1411,7 @@ impl Engine {
         }
         let own = self
             .ctx
-            .db(|t| t.mint_signature(&l.lock_id))?
+            .db(|t| t.mint_signature(&self.ctx.params.deployment, &l.lock_id))?
             .ok_or_else(|| anyhow!("no own signature"))?;
         self.mem.submitted.insert(l.lock_id, tip);
         let res = self
@@ -1455,7 +1503,7 @@ impl Engine {
     ) -> Result<Vec<[u8; 65]>> {
         let own = self
             .ctx
-            .db(|t| t.mint_signature(lock_id))?
+            .db(|t| t.mint_signature(&self.ctx.params.deployment, lock_id))?
             .ok_or_else(|| anyhow!("no own signature"))?;
         let mut sigs = vec![own.signature];
         let mut signers = vec![self.ctx.guardian()?];

@@ -396,10 +396,17 @@ async fn a_lock_sign_threshold_mint_observed() {
     let c = env.client(&env.holder);
     assert_eq!(c.balance_of(&to).await.unwrap(), 1_000_000_000);
     assert!(c.is_consumed(&lock_id).await.unwrap());
+    let mut signed = 0;
     for e in &engines {
         let (l, sig) = e
             .ctx()
-            .db(|t| Ok((t.lock(&lock_id)?.unwrap(), t.mint_signature(&lock_id)?)))
+            .db(|t| {
+                Ok((
+                    t.lock(&lock_id)?.unwrap(),
+                    t.mint_signatures_any(&lock_id)
+                        .map(|v| v.into_iter().next())?,
+                ))
+            })
             .unwrap();
         assert_eq!(
             l.state,
@@ -410,7 +417,12 @@ async fn a_lock_sign_threshold_mint_observed() {
             l.destination,
             Some(hawkeye_core::Destination::Near(to.clone()))
         );
-        let sig = sig.expect("every attestor signed once");
+        // an attestor that finds the lock already consumed (final) records it minted without
+        // signing (audit 05/L-3); the leader signed
+        let Some(sig) = sig else {
+            continue;
+        };
+        signed += 1;
         // the stored signature is the NEAR attestation: Borsh-SHA256 digest, v ∈ {0, 1}
         let d = domain().digest(&BridgeMessage::Mint {
             lock_id,
@@ -421,6 +433,7 @@ async fn a_lock_sign_threshold_mint_observed() {
         assert!(sig.signature[64] <= 1);
         assert!(e.alarms().is_empty(), "{:?}", e.alarms());
     }
+    assert!(signed >= 1, "the leader signed");
     // exactly one mint transaction (the leader's), sent by a relayer, never by a member key
     let mints = sent_ok(&env, "mint");
     assert_eq!(mints.len(), 1);
@@ -535,17 +548,32 @@ async fn d_restart_mid_flow_signs_once() {
     let lock_id = hawkeye_core::lock::lock_id(&op);
     tick_all(&mut engines).await;
     env.mine(C_Y);
-    // one tick: every attestor signs; the leader mints
+    // one tick: the leader signs and mints; an attestor ticking after the (final) mint records
+    // it without signing (audit 05/L-3)
     tick_all(&mut engines).await;
     let before: Vec<_> = engines
         .iter()
-        .map(|e| e.ctx().db(|t| t.mint_signature(&lock_id)).unwrap().unwrap())
+        .map(|e| {
+            e.ctx()
+                .db(|t| {
+                    t.mint_signatures_any(&lock_id)
+                        .map(|v| v.into_iter().next())
+                })
+                .unwrap()
+        })
         .collect();
+    assert!(before.iter().any(Option::is_some), "the leader signed");
     drop(engines);
     let mut engines = env.three();
     near_rounds(&env, &mut engines, 3).await;
     for (e, b) in engines.iter().zip(&before) {
-        let after = e.ctx().db(|t| t.mint_signature(&lock_id)).unwrap().unwrap();
+        let after = e
+            .ctx()
+            .db(|t| {
+                t.mint_signatures_any(&lock_id)
+                    .map(|v| v.into_iter().next())
+            })
+            .unwrap();
         assert_eq!(&after, b, "the stored attestation is reused, not remade");
         assert_eq!(
             e.ctx().db(|t| t.lock(&lock_id)).unwrap().unwrap().state,

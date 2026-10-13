@@ -11,3 +11,4 @@ import {WyecBridgeTest} from "wyec-test/WyecBridge.t.sol";
 import {OptimisticMintTest} from "wyec-test/OptimisticMint.t.sol";
 import {RateLimitTest} from "wyec-test/RateLimit.t.sol";
 import {DeployScriptTest} from "wyec-test/Deploy.t.sol";
+import {SuccessorTest} from "wyec-test/Successor.t.sol";

@@ -21,8 +21,8 @@
 //! returned, so a signature never leaves the process unrecorded. If the signer fails nothing is
 //! recorded; if the commit fails the signature is dropped (and was never released).
 
-use hawkeye_core::OutPoint;
 use hawkeye_core::bytes::Hash32;
+use hawkeye_core::{Deployment, EthAddress, OutPoint};
 use rusqlite::params;
 
 use crate::accounts::{Account, Guardian, SqlAccount, SqlGuardian};
@@ -83,6 +83,9 @@ use crate::{Result, SignerError, StoreError, Tx, hx};
 pub struct MintSignRecord {
     /// The `lockId`.
     pub lock_id: Hash32,
+    /// The bridge deployment whose EIP-712 domain the digest is under (schema v9, audit 05/L-3;
+    /// `(0, 0x00…00)` for a pre-v9 row not yet backfilled).
+    pub deployment: Deployment,
     /// The signed amount (zatoshi = wYEC base units).
     pub amount: u64,
     /// The signed recipient.
@@ -122,21 +125,45 @@ pub struct YcashSignRecord {
     pub signed_at: i64,
 }
 
+const MINT_COLS: &str =
+    "lock_id, chain_id, bridge, amount, recipient, digest, signature, signed_at";
+
+fn mint_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MintSignRecord> {
+    Ok(MintSignRecord {
+        lock_id: r.get(0)?,
+        deployment: Deployment {
+            chain_id: r.get(1)?,
+            bridge: EthAddress(r.get(2)?),
+        },
+        amount: r.get(3)?,
+        to: r.get::<_, SqlAccount>(4)?.0,
+        digest: r.get(5)?,
+        signature: r.get(6)?,
+        signed_at: r.get(7)?,
+    })
+}
+
 fn key_id(k: &YcashSignKey) -> String {
     format!("{}/{}", hx(&k.set_id), k.prevout)
 }
 
 impl Tx<'_> {
-    /// Sign `Mint(lockId, amount, to)` at most once.
+    /// Sign `Mint(lockId, amount, to)` at most once **per deployment** (schema v9, audit 05/L-3).
     ///
-    /// - First call: the lock must be stored, `POLICY_OK`, with this `amount` (its value) and
-    ///   `to` (its destination); `sign(digest)` is called, the record stored and the lock moved
-    ///   `POLICY_OK → SIGNED`, all in this transaction.
-    /// - Identical later call (same `amount`, `to`, `digest`): the stored record, `sign` is not
-    ///   called.
-    /// - Any difference: [`StoreError::SignOnceConflict`], `sign` is not called.
+    /// - First call for the lock: it must be stored, `POLICY_OK`, with this `amount` (its value)
+    ///   and `to` (its destination); `sign(digest)` is called, the record stored and the lock
+    ///   moved `POLICY_OK → SIGNED`, all in this transaction.
+    /// - Identical later call for the same deployment (same `amount`, `to`, `digest`): the stored
+    ///   record, `sign` is not called. Any difference: [`StoreError::SignOnceConflict`].
+    /// - Another deployment (a successor bridge after a migration, wyec design §4.6): the lock
+    ///   must still be unminted (`POLICY_OK`, `SIGNED`, `MINT_SUBMITTED`, `PROPOSED`,
+    ///   `CHALLENGED`) and `(amount, to)` must equal every earlier record's (else
+    ///   [`StoreError::SignOnceConflict`]; SQLite enforces the same with a trigger); a new record
+    ///   is stored for this deployment, the lock state is left as it is (`POLICY_OK → SIGNED`
+    ///   aside).
     pub fn sign_once_mint<F, E>(
         &self,
+        deployment: &Deployment,
         lock_id: &Hash32,
         amount: u64,
         to: &Account,
@@ -147,7 +174,7 @@ impl Tx<'_> {
         F: FnOnce(&Hash32) -> core::result::Result<[u8; 65], E>,
         E: Into<SignerError>,
     {
-        if let Some(old) = self.mint_signature(lock_id)? {
+        if let Some(old) = self.mint_signature(deployment, lock_id)? {
             let mut diffs = Vec::new();
             if old.amount != amount {
                 diffs.push(format!("amount {} != stored {}", amount, old.amount));
@@ -173,7 +200,32 @@ impl Tx<'_> {
             };
         }
         let lock = self.require_lock(lock_id)?;
-        if lock.state != LockState::PolicyOk {
+        let earlier = self.mint_signatures_any(lock_id)?;
+        if let Some(e) = earlier.iter().find(|e| e.amount != amount || e.to != *to) {
+            return Err(StoreError::SignOnceConflict {
+                domain: SignDomain::Eip712Mint.as_str(),
+                key: hx(lock_id),
+                detail: format!(
+                    "Mint(amount {amount}, to {to}) for chain {} bridge {} differs from the \
+                     record for chain {} bridge {} (amount {}, to {}): one (amount, to) per lock",
+                    deployment.chain_id,
+                    hx(&deployment.bridge.0),
+                    e.deployment.chain_id,
+                    hx(&e.deployment.bridge.0),
+                    e.amount,
+                    e.to
+                ),
+            });
+        }
+        let resignable = !earlier.is_empty()
+            && matches!(
+                lock.state,
+                LockState::Signed
+                    | LockState::MintSubmitted
+                    | LockState::Proposed
+                    | LockState::Challenged
+            );
+        if lock.state != LockState::PolicyOk && !resignable {
             return Err(StoreError::Invalid(format!(
                 "lock {} is {}, not POLICY_OK: not signing",
                 hx(lock_id),
@@ -191,10 +243,13 @@ impl Tx<'_> {
         }
         let signature = sign(digest).map_err(|e| StoreError::Signer(e.into()))?;
         self.conn().execute(
-            "INSERT INTO sign_once_mint (lock_id, amount, recipient, digest, signature, signed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sign_once_mint (lock_id, chain_id, bridge, amount, recipient, digest,
+                                         signature, signed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 lock_id,
+                deployment.chain_id,
+                deployment.bridge.0,
                 amount,
                 SqlAccount(to.clone()),
                 digest,
@@ -202,13 +257,15 @@ impl Tx<'_> {
                 self.now()
             ],
         )?;
-        self.transition_lock(
-            lock_id,
-            LockState::Signed,
-            None,
-            Some(&format!("Mint(amount {amount}, to {to})")),
-        )?;
-        self.mint_signature(lock_id)?
+        if lock.state == LockState::PolicyOk {
+            self.transition_lock(
+                lock_id,
+                LockState::Signed,
+                None,
+                Some(&format!("Mint(amount {amount}, to {to})")),
+            )?;
+        }
+        self.mint_signature(deployment, lock_id)?
             .ok_or_else(|| StoreError::corrupt("sign-once record vanished"))
     }
 
@@ -364,7 +421,7 @@ impl Tx<'_> {
                 })
             };
         }
-        if self.lock(lock_id)?.is_some() || self.mint_signature(lock_id)?.is_some() {
+        if self.lock(lock_id)?.is_some() || self.has_mint_signature(lock_id)? {
             return Err(StoreError::Invalid(format!(
                 "lock {} is in this ledger: the rogue-mint drill signs only unknown lockIds",
                 hx(lock_id)
@@ -397,6 +454,11 @@ impl Tx<'_> {
             |r| {
                 Ok(MintSignRecord {
                     lock_id: r.get(0)?,
+                    // drill records are not per deployment (devnet only)
+                    deployment: Deployment {
+                        chain_id: 0,
+                        bridge: EthAddress([0; 20]),
+                    },
                     amount: r.get(1)?,
                     to: r.get::<_, SqlAccount>(2)?.0,
                     digest: r.get(3)?,
@@ -408,20 +470,62 @@ impl Tx<'_> {
     }
 
     /// The stored `Mint` signature for a `lockId`.
-    pub fn mint_signature(&self, lock_id: &Hash32) -> Result<Option<MintSignRecord>> {
+    pub fn mint_signature(
+        &self,
+        deployment: &Deployment,
+        lock_id: &Hash32,
+    ) -> Result<Option<MintSignRecord>> {
         self.one(
-            "SELECT lock_id, amount, recipient, digest, signature, signed_at
-             FROM sign_once_mint WHERE lock_id = ?1",
+            &format!("SELECT {MINT_COLS} FROM sign_once_mint WHERE lock_id = ?1 AND chain_id = ?2 AND bridge = ?3"),
+            params![lock_id, deployment.chain_id, deployment.bridge.0],
+            mint_row,
+        )
+    }
+
+    /// Every `Mint` sign-once record of `lock_id`, whatever the deployment (schema v9).
+    pub fn mint_signatures_any(&self, lock_id: &Hash32) -> Result<Vec<MintSignRecord>> {
+        self.all(
+            &format!("SELECT {MINT_COLS} FROM sign_once_mint WHERE lock_id = ?1 ORDER BY signed_at, chain_id, bridge"),
             [lock_id],
+            mint_row,
+        )
+    }
+
+    /// Whether this attestor ever signed a `Mint` for `lock_id`, on any deployment (a reorged
+    /// signed lock is an exposure; the `SIGNED` state needs a record).
+    pub fn has_mint_signature(&self, lock_id: &Hash32) -> Result<bool> {
+        Ok(!self.mint_signatures_any(lock_id)?.is_empty())
+    }
+
+    /// The schema-v9 backfill (audit 05/L-3): pre-v9 `Mint` records carry the placeholder
+    /// deployment; they were all made for the deployment configured then, which is the one
+    /// configured now unless the operator migrated in between (then they belong to the old
+    /// bridge: run once with the old deployment first). Returns the rows set.
+    pub fn backfill_mint_deployment(&self, deployment: &Deployment) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE sign_once_mint SET chain_id = ?1, bridge = ?2
+             WHERE chain_id = 0 AND bridge = zeroblob(20)",
+            params![deployment.chain_id, deployment.bridge.0],
+        )?)
+    }
+
+    /// `Mint` records per deployment other than `deployment` (start-up log after a migration).
+    pub fn mint_signatures_elsewhere(
+        &self,
+        deployment: &Deployment,
+    ) -> Result<Vec<(Deployment, u64)>> {
+        self.all(
+            "SELECT chain_id, bridge, count(*) FROM sign_once_mint
+             WHERE NOT (chain_id = ?1 AND bridge = ?2) GROUP BY chain_id, bridge",
+            params![deployment.chain_id, deployment.bridge.0],
             |r| {
-                Ok(MintSignRecord {
-                    lock_id: r.get(0)?,
-                    amount: r.get(1)?,
-                    to: r.get::<_, SqlAccount>(2)?.0,
-                    digest: r.get(3)?,
-                    signature: r.get(4)?,
-                    signed_at: r.get(5)?,
-                })
+                Ok((
+                    Deployment {
+                        chain_id: r.get(0)?,
+                        bridge: EthAddress(r.get(1)?),
+                    },
+                    r.get(2)?,
+                ))
             },
         )
     }

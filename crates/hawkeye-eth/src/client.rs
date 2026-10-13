@@ -258,8 +258,29 @@ impl EthClient {
         Ok(self.bridge().paused().call().await?)
     }
     /// Whether `lockId` has been minted (the contract's replay key).
+    /// [`consumed`](Self::consumed) as of the finalized block (see [`Finality`]):
+    /// what may be acted on without a reorg undoing it.
+    pub async fn consumed_final(&self, lock_id: B256) -> Result<bool> {
+        let n = self.finalized_block_number().await?;
+        let at = alloy::eips::BlockId::number(n);
+        match self.bridge().isConsumed(lock_id).block(at).call().await {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                // a bridge deployed after the finalized block has no code there: nothing is
+                // consumed in the final state yet
+                let code = self.provider.get_code_at(self.bridge).block_id(at).await?;
+                if code.is_empty() {
+                    Ok(false)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
     pub async fn consumed(&self, lock_id: B256) -> Result<bool> {
-        Ok(self.bridge().consumed(lock_id).call().await?)
+        // `isConsumed`: this bridge's own record or any predecessor's (wyec design §4.6, audit
+        // 05/L-3); `consumed(bytes32)` alone would miss a lock minted before a migration
+        Ok(self.bridge().isConsumed(lock_id).call().await?)
     }
     /// The nonce the next burn will get (= number of burns so far).
     pub async fn burn_nonce(&self) -> Result<U256> {

@@ -24,7 +24,7 @@ fn mint_identical_call_returns_stored_signature_without_signing() {
         fake_sig(d)
     };
     let first = s
-        .sign_once_mint(&id, amount, &DEST, &[7; 32], signer)
+        .sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], signer)
         .unwrap();
     assert_eq!(calls.get(), 1);
     assert_eq!(first.signature, fake_sig(&[7; 32]).unwrap());
@@ -35,6 +35,7 @@ fn mint_identical_call_returns_stored_signature_without_signing() {
 
     let again = s
         .sign_once_mint(
+            &DEP,
             &id,
             amount,
             &DEST,
@@ -63,7 +64,7 @@ fn mint_conflict_never_calls_the_signer() {
         .tx(|t| Ok::<_, StoreError>(policy_ok_lock(t, 2, 100)))
         .unwrap();
     let amount = new_lock(2, 100).value_zat;
-    s.sign_once_mint(&id, amount, &DEST, &[7; 32], fake_sig)
+    s.sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], fake_sig)
         .unwrap();
     let never =
         |_: &[u8; 32]| -> Result<[u8; 65], StoreError> { panic!("signer called on conflict") };
@@ -72,7 +73,7 @@ fn mint_conflict_never_calls_the_signer() {
         (amount, Account::Ethereum(EthAddress([0xee; 20])), [7; 32]),
         (amount, DEST, [8; 32]),
     ] {
-        match s.sign_once_mint(&id, a, &to, &d, never) {
+        match s.sign_once_mint(&DEP, &id, a, &to, &d, never) {
             Err(StoreError::SignOnceConflict { domain, key, .. }) => {
                 assert_eq!(domain, "eip712-mint");
                 assert_eq!(key, hex::encode(id));
@@ -81,7 +82,7 @@ fn mint_conflict_never_calls_the_signer() {
         }
     }
     // The stored record is unchanged.
-    let rec = s.tx(|t| t.mint_signature(&id)).unwrap().unwrap();
+    let rec = s.tx(|t| t.mint_signature(&DEP, &id)).unwrap().unwrap();
     assert_eq!((rec.amount, rec.to, rec.digest), (amount, DEST, [7; 32]));
 }
 
@@ -92,24 +93,25 @@ fn mint_refuses_locks_that_are_not_policy_ok_or_do_not_match() {
     s.tx(|t| {
         // Unknown lock.
         assert!(matches!(
-            t.sign_once_mint(&[1; 32], 1, &DEST, &[7; 32], never),
+            t.sign_once_mint(&DEP, &[1; 32], 1, &DEST, &[7; 32], never),
             Err(StoreError::NotFound { .. })
         ));
         // A SEEN lock.
         let rec = t.insert_lock(&new_lock(3, 100))?;
         assert!(matches!(
-            t.sign_once_mint(&rec.lock_id, rec.value_zat, &DEST, &[7; 32], never),
+            t.sign_once_mint(&DEP, &rec.lock_id, rec.value_zat, &DEST, &[7; 32], never),
             Err(StoreError::Invalid(_))
         ));
         // POLICY_OK but the wrong amount or recipient for the lock.
         let id = policy_ok_lock(t, 4, 100);
         let v = new_lock(4, 100).value_zat;
         assert!(matches!(
-            t.sign_once_mint(&id, v + 1, &DEST, &[7; 32], never),
+            t.sign_once_mint(&DEP, &id, v + 1, &DEST, &[7; 32], never),
             Err(StoreError::Invalid(_))
         ));
         assert!(matches!(
             t.sign_once_mint(
+                &DEP,
                 &id,
                 v,
                 &Account::Ethereum(EthAddress([1; 20])),
@@ -118,7 +120,7 @@ fn mint_refuses_locks_that_are_not_policy_ok_or_do_not_match() {
             ),
             Err(StoreError::Invalid(_))
         ));
-        assert!(t.mint_signature(&id)?.is_none());
+        assert!(t.mint_signature(&DEP, &id)?.is_none());
         Ok::<_, StoreError>(())
     })
     .unwrap();
@@ -131,18 +133,18 @@ fn signer_failure_records_nothing() {
         .tx(|t| Ok::<_, StoreError>(policy_ok_lock(t, 5, 100)))
         .unwrap();
     let amount = new_lock(5, 100).value_zat;
-    let r = s.sign_once_mint(&id, amount, &DEST, &[7; 32], |_: &[u8; 32]| {
+    let r = s.sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], |_: &[u8; 32]| {
         Err::<[u8; 65], _>(std::io::Error::other("keystore locked"))
     });
     assert!(matches!(r, Err(StoreError::Signer(_))));
     s.tx(|t| {
-        assert!(t.mint_signature(&id)?.is_none());
+        assert!(t.mint_signature(&DEP, &id)?.is_none());
         assert_eq!(t.lock(&id)?.unwrap().state, LockState::PolicyOk);
         Ok::<_, StoreError>(())
     })
     .unwrap();
     // A later attempt signs normally.
-    s.sign_once_mint(&id, amount, &DEST, &[7; 32], fake_sig)
+    s.sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], fake_sig)
         .unwrap();
 }
 
@@ -154,11 +156,11 @@ fn a_rolled_back_transaction_releases_no_signature() {
         .unwrap();
     let amount = new_lock(6, 100).value_zat;
     let r: Result<(), StoreError> = s.tx(|t| {
-        t.sign_once_mint(&id, amount, &DEST, &[7; 32], fake_sig)?;
+        t.sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], fake_sig)?;
         Err(StoreError::Invalid("caller aborts".into()))
     });
     assert!(r.is_err());
-    assert!(s.tx(|t| t.mint_signature(&id)).unwrap().is_none());
+    assert!(s.tx(|t| t.mint_signature(&DEP, &id)).unwrap().is_none());
 }
 
 #[test]
@@ -177,7 +179,7 @@ fn sign_once_persists_across_reopen() {
             .tx(|t| Ok::<_, StoreError>(policy_ok_lock(t, 7, 100)))
             .unwrap();
         let amount = new_lock(7, 100).value_zat;
-        s.sign_once_mint(&id, amount, &DEST, &[7; 32], fake_sig)
+        s.sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], fake_sig)
             .unwrap();
         s.sign_once_ycash(&ykey, "0400aa", |hex: &str| {
             Ok::<_, StoreError>((format!("{hex}ff"), [0x99; 32]))
@@ -188,11 +190,11 @@ fn sign_once_persists_across_reopen() {
     let mut s = Store::open(&path).unwrap();
     let never = |_: &[u8; 32]| -> Result<[u8; 65], StoreError> { panic!("re-signed after reopen") };
     let rec = s
-        .sign_once_mint(&id, amount, &DEST, &[7; 32], never)
+        .sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], never)
         .unwrap();
     assert_eq!(rec.signature, fake_sig(&[7; 32]).unwrap());
     assert!(matches!(
-        s.sign_once_mint(&id, amount, &DEST, &[8; 32], never),
+        s.sign_once_mint(&DEP, &id, amount, &DEST, &[8; 32], never),
         Err(StoreError::SignOnceConflict { .. })
     ));
     let y = s
@@ -287,8 +289,15 @@ fn sign_once_rows_are_immutable_in_sqlite() {
         let id = s
             .tx(|t| Ok::<_, StoreError>(policy_ok_lock(t, 8, 100)))
             .unwrap();
-        s.sign_once_mint(&id, new_lock(8, 100).value_zat, &DEST, &[7; 32], fake_sig)
-            .unwrap();
+        s.sign_once_mint(
+            &DEP,
+            &id,
+            new_lock(8, 100).value_zat,
+            &DEST,
+            &[7; 32],
+            fake_sig,
+        )
+        .unwrap();
     }
     let raw = rusqlite::Connection::open(&path).unwrap();
     assert!(raw.execute("DELETE FROM sign_once_mint", []).is_err());
@@ -388,7 +397,7 @@ fn a_matching_proposal_is_never_challenged() {
         .unwrap_err();
     assert!(e.to_string().contains("never challenged"), "{e}");
     // ... in every policy-OK state (here SIGNED)
-    s.sign_once_mint(&id, amount, &DEST, &[2; 32], fake_sig)
+    s.sign_once_mint(&DEP, &id, amount, &DEST, &[2; 32], fake_sig)
         .unwrap();
     assert!(
         s.tx(|t| t.sign_once_challenge(&proposal(id, 1, amount, DEST), "x", &[1; 32], never))
@@ -448,7 +457,7 @@ fn drill_mint_only_for_unknown_locks_and_once() {
     ));
     // and it never counts as the lock's real Mint signature
     s.tx(|t| {
-        assert!(t.mint_signature(&fake)?.is_none());
+        assert!(t.mint_signature(&DEP, &fake)?.is_none());
         Ok::<_, StoreError>(())
     })
     .unwrap();
@@ -566,4 +575,88 @@ fn unlock_sign_once_has_a_burn_dimension() {
         Ok::<_, StoreError>(())
     })
     .unwrap();
+}
+
+/// Schema v9 (audit 05/L-3): the `Mint` record is per deployment; a successor bridge gets its own
+/// signature for a lock signed but never minted, with the same `(amount, to)` only.
+#[test]
+fn mint_sign_once_per_deployment() {
+    let mut s = store();
+    let id = s
+        .tx(|t| Ok::<_, StoreError>(policy_ok_lock(t, 1, 100)))
+        .unwrap();
+    let amount = new_lock(1, 0).value_zat;
+    let succ = hawkeye_core::Deployment {
+        chain_id: DEP.chain_id,
+        bridge: hawkeye_core::EthAddress([0xc1; 20]),
+    };
+    let a = s
+        .sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], fake_sig)
+        .unwrap();
+    // the successor's digest differs (another domain): a second record, the lock stays SIGNED
+    let b = s
+        .sign_once_mint(&succ, &id, amount, &DEST, &[8; 32], fake_sig)
+        .unwrap();
+    assert_eq!((a.deployment, b.deployment), (DEP, succ));
+    assert_ne!(a.signature, b.signature);
+    let never = |_: &[u8; 32]| -> Result<[u8; 65], StoreError> { panic!("signer called") };
+    s.tx(|t| {
+        assert_eq!(t.lock(&id)?.unwrap().state, LockState::Signed);
+        assert_eq!(t.mint_signatures_any(&id)?.len(), 2);
+        // identical repeat on either deployment: the stored record, no signing
+        assert_eq!(
+            t.sign_once_mint(&succ, &id, amount, &DEST, &[8; 32], never)?,
+            b
+        );
+        // another (amount, to) on a third deployment: refused, by the code and by the trigger
+        let third = hawkeye_core::Deployment {
+            chain_id: 1,
+            bridge: hawkeye_core::EthAddress([0xd2; 20]),
+        };
+        assert!(matches!(
+            t.sign_once_mint(&third, &id, amount + 1, &DEST, &[9; 32], never),
+            Err(StoreError::SignOnceConflict { .. })
+        ));
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn mint_one_amount_per_lock_is_a_sqlite_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("l.sqlite");
+    let id = {
+        let mut s = Store::open(&path).unwrap();
+        let id = s
+            .tx(|t| Ok::<_, StoreError>(policy_ok_lock(t, 1, 100)))
+            .unwrap();
+        let amount = new_lock(1, 0).value_zat;
+        s.sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], fake_sig)
+            .unwrap();
+        id
+    };
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let insert = |amount: i64, bridge: u8| {
+        raw.execute(
+            "INSERT INTO sign_once_mint (lock_id, chain_id, bridge, amount, recipient, digest,
+                                         signature, signed_at)
+             SELECT lock_id, chain_id, ?2, ?1, recipient, digest, signature, signed_at
+             FROM sign_once_mint LIMIT 1",
+            (amount, vec![bridge; 20]),
+        )
+    };
+    let amount = i64::try_from(new_lock(1, 0).value_zat).unwrap();
+    let e = insert(amount + 1, 0xc1).unwrap_err().to_string();
+    assert!(e.contains("one (amount, recipient) per lock"), "{e}");
+    insert(amount, 0xc1).unwrap();
+    // a stored record is immutable, and only a placeholder row may take a deployment
+    assert!(
+        raw.execute(
+            "UPDATE sign_once_mint SET chain_id = 5 WHERE lock_id = ?1",
+            [id.to_vec()]
+        )
+        .is_err()
+    );
+    assert!(raw.execute("DELETE FROM sign_once_mint", []).is_err());
 }

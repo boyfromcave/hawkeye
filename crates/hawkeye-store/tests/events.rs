@@ -12,7 +12,7 @@ fn a_lock_lifecycle_is_logged_in_order() {
         .tx(|t| Ok::<_, StoreError>(policy_ok_lock(t, 1, 100)))
         .unwrap();
     let amount = new_lock(1, 100).value_zat;
-    s.sign_once_mint(&id, amount, &DEST, &[7; 32], fake_sig)
+    s.sign_once_mint(&DEP, &id, amount, &DEST, &[7; 32], fake_sig)
         .unwrap();
     s.tx(|t| {
         t.transition_lock(&id, LockState::MintSubmitted, None, Some("eth tx 0xab"))?;

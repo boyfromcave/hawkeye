@@ -53,6 +53,24 @@ pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributo
             rows = backfilled
         );
     }
+    // schema v9 (audit 05/L-3): pre-v9 Mint records were made for the deployment configured
+    // then; records of another deployment (a migrated bridge) are kept and logged
+    let dep = s.params.deployment;
+    let set = store
+        .tx(|t| t.backfill_mint_deployment(&dep))
+        .context("ledger v9 backfill")?;
+    if set > 0 {
+        info!(
+            event = "ledger_backfill",
+            table = "sign_once_mint",
+            rows = set
+        );
+    }
+    for (d, n) in store.tx(|t| t.mint_signatures_elsewhere(&dep))? {
+        info!(event = "ledger_has_other_deployment_rows", table = "sign_once_mint",
+              chain_id = d.chain_id, bridge = %format!("0x{}", hex::encode(d.bridge.0)), rows = n,
+              "Mint records of another bridge deployment (a migration): kept; this one is signed anew");
+    }
     let peers = Peers::new(s.peers.clone())?.with_signer(PeerSigner {
         key: key.clone(),
         set_id: s.params.set_id,

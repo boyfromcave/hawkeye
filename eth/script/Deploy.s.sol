@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Script, console} from "forge-std/Script.sol";
 import {WrappedYcash} from "wyec/WrappedYcash.sol";
-import {IWrappedYcash, WyecBridge} from "wyec/WyecBridge.sol";
+import {IWrappedYcash, IWyecBridgeConsumed, WyecBridge} from "wyec/WyecBridge.sol";
 
 /// Deploys wYEC in the order of wyec-contract-design.md §8: the bridge first, constructed with the
 /// token address predicted from the deployer's next nonce, then the token in the very next
@@ -96,7 +96,9 @@ contract Deploy is Script {
             uint8(c.threshold),
             uint64(c.challengeWindow),
             c.mintCap,
-            c.capWindow
+            c.capWindow,
+            // a first deployment; a successor is wyec's script with OLD_BRIDGE (design §4.6)
+            IWyecBridgeConsumed(address(0))
         );
         WrappedYcash token = new WrappedYcash(address(bridge));
         vm.stopBroadcast();

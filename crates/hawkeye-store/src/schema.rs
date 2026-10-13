@@ -12,7 +12,7 @@
 /// `pending_mints.provisional`). V7 touches only `pending_mints`, so it applies on top of V6.
 /// `V8` (audit 05/L-5, `exposure_acks`) and `V9` (audit 05/L-3, `sign_once_mint` keyed per
 /// deployment) are lane `bridge-wave2`'s.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
 
 /// Version 1: the H4 ledger.
 const V1: &str = r#"
@@ -504,6 +504,48 @@ ALTER TABLE sign_once_drill_mint_v4 RENAME TO sign_once_drill_mint;
 CREATE TRIGGER sign_once_drill_mint_immutable_update BEFORE UPDATE ON sign_once_drill_mint
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
 CREATE TRIGGER sign_once_drill_mint_immutable_delete BEFORE DELETE ON sign_once_drill_mint
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+"#;
+
+/// Version 9 (audit 05/L-3): the EIP-712 `Mint` sign-once record is per **deployment**
+/// (`chain_id`, `bridge`): a successor bridge (wyec design §4.6) is a new EIP-712 domain, and a
+/// lock signed but not minted before a migration must be signable for the successor. The
+/// invariant that matters stays at the SQLite level: one `(amount, recipient)` per lock, ever,
+/// across deployments (trigger `sign_once_mint_one_amount_per_lock`). Rows from before V9 carry
+/// the placeholder deployment `(0, 0x00…00)` until `Store::backfill_mint_deployment` (called at
+/// start-up with the configured deployment) sets it; the update trigger allows exactly that one
+/// change and nothing else.
+const V9: &str = r#"
+CREATE TABLE sign_once_mint_v9 (
+    lock_id    BLOB    NOT NULL CHECK (length(lock_id) = 32)
+                       REFERENCES locks (lock_id) ON DELETE RESTRICT,
+    chain_id   INTEGER NOT NULL CHECK (chain_id >= 0),
+    bridge     BLOB    NOT NULL CHECK (length(bridge) = 20),
+    amount     INTEGER NOT NULL CHECK (amount >= 0),
+    recipient  TEXT    NOT NULL CHECK ((recipient GLOB 'ethereum:0x*' AND length(recipient) = 51)
+                                       OR (recipient GLOB 'near:*' AND length(recipient) BETWEEN 7 AND 69)),
+    digest     BLOB    NOT NULL CHECK (length(digest) = 32),
+    signature  BLOB    NOT NULL CHECK (length(signature) = 65),
+    signed_at  INTEGER NOT NULL,
+    PRIMARY KEY (lock_id, chain_id, bridge)
+);
+INSERT INTO sign_once_mint_v9
+    SELECT lock_id, 0, zeroblob(20), amount, recipient, digest, signature, signed_at
+    FROM sign_once_mint;
+DROP TABLE sign_once_mint;
+ALTER TABLE sign_once_mint_v9 RENAME TO sign_once_mint;
+CREATE TRIGGER sign_once_mint_one_amount_per_lock BEFORE INSERT ON sign_once_mint
+WHEN EXISTS (SELECT 1 FROM sign_once_mint
+             WHERE lock_id = NEW.lock_id
+               AND (amount != NEW.amount OR recipient != NEW.recipient))
+BEGIN SELECT RAISE(ABORT, 'sign-once: one (amount, recipient) per lock across deployments'); END;
+CREATE TRIGGER sign_once_mint_immutable_update BEFORE UPDATE ON sign_once_mint
+WHEN NOT (OLD.chain_id = 0 AND OLD.bridge = zeroblob(20)
+          AND NEW.lock_id = OLD.lock_id AND NEW.amount = OLD.amount
+          AND NEW.recipient = OLD.recipient AND NEW.digest = OLD.digest
+          AND NEW.signature = OLD.signature AND NEW.signed_at = OLD.signed_at)
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_mint_immutable_delete BEFORE DELETE ON sign_once_mint
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
 "#;
 

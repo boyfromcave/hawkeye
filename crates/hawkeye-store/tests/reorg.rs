@@ -55,6 +55,7 @@ fn ycash_rewind_undoes_what_reorged_blocks_caused() {
         .unwrap();
     for (id, n) in [(deep_signed, 1), (signed, 3)] {
         s.sign_once_mint(
+            &DEP,
             &id,
             new_lock(n, 0).value_zat,
             &DEST,
@@ -138,7 +139,7 @@ fn ycash_rewind_undoes_what_reorged_blocks_caused() {
         let l = t.lock(&signed)?.unwrap();
         assert_eq!((l.state, l.exposure), (LockState::Reorged, true));
         assert!(
-            t.mint_signature(&signed)?.is_some(),
+            t.mint_signature(&DEP, &signed)?.is_some(),
             "sign-once records survive"
         );
         assert_eq!(t.lock(&deep_signed)?.unwrap().state, LockState::Signed);
@@ -362,6 +363,7 @@ fn exposures_until_acknowledged() {
         .unwrap();
     for (id, n) in [(a, 1), (b, 2)] {
         s.sign_once_mint(
+            &DEP,
             &id,
             new_lock(n, 0).value_zat,
             &DEST,
