@@ -196,7 +196,13 @@ fn eth_vectors() {
             .unwrap();
     let cases = root["cases"].as_array().expect("cases");
     let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
+    let mut refused = 0;
     for c in cases {
+        if !c["expectAccepted"].as_bool().expect("expectAccepted") {
+            eth_vector_refused(c);
+            refused += 1;
+            continue;
+        }
         let kind = c["kind"].as_str().unwrap();
         *kinds.entry(kind).or_default() += 1;
         let d = Domain::new(
@@ -267,6 +273,69 @@ fn eth_vectors() {
             ("SetPaused", 4),
         ]
     );
+    assert_eq!(refused, 7);
+}
+
+/// A refused case of `eip712.json` (audit 05/T-4): Hawkeye's own encoder and recovery refuse it
+/// for the reason the case names, as the contract did (the Foundry generator proved that).
+fn eth_vector_refused(c: &Value) {
+    let reject = c["reject"].as_str().unwrap();
+    let d = Domain::new(
+        c["chainId"].as_u64().unwrap(),
+        addr(c["verifyingContract"].as_str().unwrap()),
+    );
+    let h32 = |k: &'static str| -> [u8; 32] { from_hex_array(k, c[k].as_str().unwrap()).unwrap() };
+    let digest = d.mint_digest(
+        &h32("lockId"),
+        u64_of(&c["amount"]),
+        &addr(c["to"].as_str().unwrap()),
+    );
+    assert_eq!(digest, h32("digest"), "{c}");
+    let hexsig = |v: &Value| sig(v.as_str().unwrap().trim_start_matches("0x"));
+    match reject {
+        "wrong-chain-id" | "wrong-verifying-contract" | "wrong-struct" => {
+            let signed = if reject == "wrong-struct" {
+                d.challenge_digest(&h32("lockId"), u128_of(&c["signedProposalId"]))
+            } else {
+                Domain::new(
+                    c["signedChainId"].as_u64().unwrap(),
+                    addr(c["signedVerifyingContract"].as_str().unwrap()),
+                )
+                .mint_digest(
+                    &h32("lockId"),
+                    u64_of(&c["amount"]),
+                    &addr(c["to"].as_str().unwrap()),
+                )
+            };
+            assert_eq!(signed, h32("signedDigest"), "{c}");
+            let s = hexsig(&c["signature"]);
+            let signer = addr(c["signer"].as_str().unwrap());
+            assert_eq!(recover_address(&signed, &s).unwrap(), signer, "{c}");
+            let r = recover_address(&digest, &s).unwrap();
+            assert_eq!(r, addr(c["recovered"].as_str().unwrap()), "{c}");
+            assert_ne!(r, signer, "{c}");
+        }
+        "high-s" | "bad-v" => {
+            let s = hexsig(&c["signature"]);
+            assert!(recover_address(&digest, &s).is_err(), "{c}");
+            assert!(sort_signatures(&digest, &[s]).is_err(), "{c}");
+        }
+        "duplicate-signer" | "not-ascending" => {
+            let sigs: Vec<[u8; 65]> = c["signatures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(hexsig)
+                .collect();
+            let sorted = sort_signatures(&digest, &sigs);
+            if c["acceptedAfterSort"].as_bool().unwrap() {
+                assert_eq!(sorted.unwrap(), vec![sigs[1], sigs[0]], "{c}");
+            } else {
+                assert!(sorted.is_err(), "{c}");
+            }
+        }
+        other => panic!("unknown reject {other}"),
+    }
 }
 
 fn u64_of(v: &Value) -> u64 {

@@ -15,13 +15,18 @@
 //! attestor: the challenged proposer is barred from that lock.
 //!
 //! **The watcher runs in every mode**: the contract's optimistic path cannot be switched off, so a
-//! single key can propose whatever Hawkeye's own mode is. Every finalized `MintProposed` is judged
-//! against this ledger's policy-OK locks; one that does not match is challenged with a sign-once
+//! single key can propose whatever Hawkeye's own mode is. Every `MintProposed` is judged — at the
+//! chain's head first (`Engine::scan_proposals_latest`, audit 05/H-2: the contract runs the
+//! window at `latest`, so waiting for finality would cost two epochs of it, or all of it during a
+//! finality stall), then again once final — against this ledger's policy-OK locks; one that does
+//! not match is challenged with a sign-once
 //! EIP-712 `Challenge(lockId, proposalId)` signature (definite fraud at once; an undecided one when
 //! the lock is still absent `C_Y` blocks later, or at the latest when a quarter of the window is
 //! left). A proposal matching a policy-OK lock is never challenged (the ledger refuses to sign it).
 //! The proposer of a fraudulent proposal gets a `FRAUDULENT_MINT` slash case, as a fraudulent
-//! threshold mint's signers do.
+//! threshold mint's signers do — once the proposal is **final**: an unfinalized proposal is
+//! challenged (a challenge binds `(lockId, proposalId)` and is harmless if the proposal reorgs
+//! out), never the ground of a slash case or a `fraudulent-mint` alarm.
 
 use std::collections::HashSet;
 
@@ -40,7 +45,7 @@ use hawkeye_ycash::Hash256;
 use hawkeye_ycash::tx::Transaction;
 use tracing::{info, warn};
 
-use super::Engine;
+use super::{Engine, FinalityWatch};
 use crate::convert::outputs;
 use crate::foreign::{
     Account, ForeignError, ForeignEvent, ForeignResult, Guardian, Proposal, ProposalStatus, TxId,
@@ -55,6 +60,10 @@ enum MintVerdict {
     /// No policy-OK lock with this `(amount, to)` behind it.
     Fraud(String),
 }
+
+/// The head-of-chain proposal scan re-reads this many blocks below the last one it covered, so a
+/// proposal that reorgs out and back in within the unfinalized range is seen again: two epochs.
+pub const PROPOSAL_RESCAN_DEPTH: u64 = 64;
 
 fn lock_hex(id: &Hash32) -> String {
     format!("0x{}", hex::encode(id))
@@ -78,7 +87,9 @@ pub fn challenge_due(
 }
 
 /// Judge a `Minted(lockId, to, amount)` against the ledger and, if it matches, move the lock to
-/// `MINTED`.
+/// `MINTED`. A `provisional` (unfinalized, audit 05/H-2) proposal is judged the same way but
+/// never moves the lock: `PROPOSED` keeps meaning "a matching proposal is final", which the
+/// finalized scan's challenge classification (griefing vs an honest challenge) relies on.
 fn judge_minted(
     t: &Tx<'_>,
     lock_id: &Hash32,
@@ -86,6 +97,7 @@ fn judge_minted(
     amount: u64,
     block: u64,
     proposal: bool,
+    provisional: bool,
 ) -> Result<MintVerdict, StoreError> {
     let Some(l) = t.lock(lock_id)? else {
         return Ok(MintVerdict::Defer);
@@ -113,7 +125,7 @@ fn judge_minted(
     }
     let h = Some(u32::try_from(block).unwrap_or(u32::MAX));
     if proposal {
-        if l.state == Signed || l.state == Challenged {
+        if !provisional && (l.state == Signed || l.state == Challenged) {
             t.transition_lock(lock_id, Proposed, None, Some("proposal observed"))?;
         }
         return Ok(MintVerdict::Ok);
@@ -165,6 +177,7 @@ impl Engine {
         let mut frauds = vec![];
         let mut griefed = vec![];
         let mut rotated = false;
+        let mut cap_change = None;
         self.ctx.db(|t| {
             for ev in &events {
                 let m = &ev.meta;
@@ -233,7 +246,10 @@ impl Engine {
                             block: m.height,
                             since_height: tip,
                             proposal,
+                            provisional: false,
                         };
+                        // seen at `latest` first (audit 05/H-2): its deferred check is final now
+                        let had = t.finalize_pending_mint(&pm.lock_id, &pm.tx_hash, m.height)?;
                         if let ForeignEvent::MintProposed {
                             proposal_id,
                             proposer,
@@ -245,9 +261,13 @@ impl Engine {
                                   proposal_id, proposer = %proposer, amount, to = %pm.to,
                                   eta, block = m.height);
                         }
-                        match judge_minted(t, &pm.lock_id, &pm.to, amount, m.height, proposal)?
+                        match judge_minted(t, &pm.lock_id, &pm.to, amount, m.height, proposal, false)?
                         {
-                            MintVerdict::Ok => {}
+                            MintVerdict::Ok => {
+                                if had {
+                                    t.remove_pending_mint(&pm.lock_id, &pm.tx_hash)?;
+                                }
+                            }
                             MintVerdict::Defer => {
                                 // persisted with the cursor: a restart re-judges it
                                 if t.add_pending_mint(&pm)? {
@@ -255,7 +275,13 @@ impl Engine {
                                           proposal);
                                 }
                             }
-                            MintVerdict::Fraud(why) => frauds.push((pm, why)),
+                            MintVerdict::Fraud(why) => {
+                                // judged here, final: a provisional record of it is done with
+                                if had {
+                                    t.remove_pending_mint(&pm.lock_id, &pm.tx_hash)?;
+                                }
+                                frauds.push((pm, why));
+                            }
                         }
                     }
                     ForeignEvent::MintChallenged {
@@ -296,17 +322,26 @@ impl Engine {
                         cap_window,
                     } => {
                         info!(event = "mint_limit_changed", mint_cap = %mint_cap, cap_window = %cap_window);
+                        cap_change = Some(*mint_cap);
                     }
                     ForeignEvent::Paused { paused, by } => {
                         warn!(event = "bridge_paused", paused, by = %by);
                     }
                 }
             }
+            // a proposal seen at `latest` whose block is final now without it was reorged out
+            let dropped = t.drop_unfinalized_pending_mints(to)?;
+            if dropped > 0 {
+                info!(event = "unfinalized_proposals_dropped", count = dropped, finalized_to = to);
+            }
             t.advance_cursor(Chain::Foreign, to, &to_hash)?;
             Ok(())
         })?;
         if rotated {
             self.mem.guardian_check_due = true;
+        }
+        if let Some(cap) = cap_change {
+            self.mint_cap_changed(cap == 0);
         }
         for g in griefed {
             self.alarm(
@@ -343,7 +378,15 @@ impl Engine {
             .is_some_and(|c| c.height >= u64::from(tip));
         for pm in pending {
             let (v, absent) = self.ctx.db(|t| {
-                let v = judge_minted(t, &pm.lock_id, &pm.to, pm.amount, pm.block, pm.proposal)?;
+                let v = judge_minted(
+                    t,
+                    &pm.lock_id,
+                    &pm.to,
+                    pm.amount,
+                    pm.block,
+                    pm.proposal,
+                    pm.provisional,
+                )?;
                 if matches!(v, MintVerdict::Ok) {
                     t.remove_pending_mint(&pm.lock_id, &pm.tx_hash)?;
                 }
@@ -362,6 +405,21 @@ impl Engine {
                     continue;
                 }
             };
+            if pm.provisional {
+                // not final yet (audit 05/H-2): challenge it (the window runs at `latest`), but
+                // no slash case and no alarm; the finalized scan re-judges the row and opens the
+                // case then, or drops it if the proposal was reorged out
+                if self
+                    .mem
+                    .provisional_challenged
+                    .insert((pm.lock_id, pm.tx_hash))
+                {
+                    warn!(event = "unfinalized_proposal_challenge", lock_id = %lock_hex(&pm.lock_id),
+                          amount = pm.amount, to = %pm.to, reason = %why);
+                    self.challenge(&pm, &why).await;
+                }
+                continue;
+            }
             self.fraudulent_mint(&pm, &why).await?;
             self.ctx
                 .db(|t| t.remove_pending_mint(&pm.lock_id, &pm.tx_hash))?;
@@ -406,6 +464,176 @@ impl Engine {
             )
         };
         self.challenge(pm, &why).await;
+    }
+
+    /// The optimistic path's events at the chain's head, ahead of finality (audit 05/H-2): the
+    /// contract runs the window at `latest` (`eta = block.timestamp + challengeWindow`,
+    /// `executeMint` at `eta`, `challengeMint` at any time), so a watcher reading only finalized
+    /// blocks would lose two epochs of every window, and the whole window during a finality
+    /// stall. Each tick reads `MintProposed` / `MintChallenged` in `(finalized, latest]`,
+    /// re-reading [`PROPOSAL_RESCAN_DEPTH`] blocks below the last scan (no ledger cursor: the
+    /// range is not final). A proposal is judged as the finalized scan judges it: one matching a
+    /// policy-OK lock is left alone (the lock moves to `PROPOSED` once it is final); an undecided
+    /// one is recorded `provisional`
+    /// and challenged when [`challenge_due`]; a fraudulent one is challenged at once. None of it
+    /// opens a slash case or raises `fraudulent-mint`: the finalized scan does, once the
+    /// proposal is final. Also runs the finality watch.
+    pub(crate) async fn scan_proposals_latest(&mut self) -> Result<()> {
+        let foreign = self.ctx.foreign.clone();
+        let latest = foreign
+            .latest_height()
+            .await
+            .map_err(|e| anyhow!("latest block: {e}"))?;
+        self.mem.eth_latest = latest;
+        let fin = self.mem.eth_finalized;
+        self.watch_finality(fin, latest);
+        self.mem.provisional_seen.retain(|_, block| *block > fin);
+        let from = (fin + 1).max(self.ctx.params.eth_start_block).max(
+            self.mem
+                .latest_scanned
+                .saturating_sub(PROPOSAL_RESCAN_DEPTH),
+        );
+        if latest < from {
+            return Ok(());
+        }
+        let to = latest.min(from + foreign.max_scan_blocks().max(1) - 1);
+        let batch = foreign
+            .scan_proposals(from, to)
+            .await
+            .map_err(|e| anyhow!("scan proposals {from}..={to}: {e}"))?;
+        self.mem.latest_scanned = to;
+        let tip = self.mem.tip;
+        let mut fresh = vec![];
+        for ev in &batch.events {
+            let m = &ev.meta;
+            match &ev.event {
+                ForeignEvent::MintProposed {
+                    lock_id,
+                    proposal_id,
+                    proposer,
+                    to,
+                    amount,
+                    eta,
+                } if m.height > fin
+                    && !self.mem.provisional_seen.contains_key(&(*lock_id, m.tx.0)) =>
+                {
+                    info!(event = "mint_proposal_seen_unfinalized", lock_id = %lock_hex(lock_id),
+                          proposal_id, proposer = %proposer, amount = %amount, to = %to, eta,
+                          block = m.height, finalized = fin);
+                    fresh.push(PendingMintRecord {
+                        lock_id: *lock_id,
+                        to: to.clone(),
+                        amount: u64::try_from(*amount).unwrap_or(u64::MAX),
+                        tx_hash: m.tx.0,
+                        block: m.height,
+                        since_height: tip,
+                        proposal: true,
+                        provisional: true,
+                    });
+                }
+                ForeignEvent::MintChallenged {
+                    lock_id,
+                    proposal_id,
+                    ..
+                } => {
+                    self.mem.challenges_done.insert((*lock_id, *proposal_id));
+                }
+                _ => {}
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let frauds = self.ctx.db(|t| {
+            let mut frauds = vec![];
+            for pm in &fresh {
+                match judge_minted(t, &pm.lock_id, &pm.to, pm.amount, pm.block, true, true)? {
+                    MintVerdict::Ok => {}
+                    MintVerdict::Defer => {
+                        if t.add_pending_mint(pm)? {
+                            info!(event = "mint_check_deferred", lock_id = %lock_hex(&pm.lock_id),
+                                  proposal = true, provisional = true);
+                        }
+                    }
+                    MintVerdict::Fraud(why) => frauds.push((pm.clone(), why)),
+                }
+            }
+            Ok(frauds)
+        })?;
+        for pm in &fresh {
+            self.mem
+                .provisional_seen
+                .insert((pm.lock_id, pm.tx_hash), pm.block);
+        }
+        for (pm, why) in frauds {
+            warn!(event = "unfinalized_proposal_challenge", lock_id = %lock_hex(&pm.lock_id),
+                  amount = pm.amount, to = %pm.to, block = pm.block, reason = %why);
+            self.mem
+                .provisional_challenged
+                .insert((pm.lock_id, pm.tx_hash));
+            self.challenge(&pm, &why).await;
+        }
+        Ok(())
+    }
+
+    /// The finality watch (audit 05/H-2): `finalized` unchanged for
+    /// [`ETH_FINALITY_STALL_SECS`](hawkeye_eth::mode::ETH_FINALITY_STALL_SECS) while the head
+    /// advanced is a stall — alarm `eth-finality-stall`, and on mainnet this attestor's own
+    /// mint-side acts pause ([`Engine::mint_paused`]); cleared when `finalized` moves. A chain
+    /// whose head does not move either (an idle devnet) is not stalled: nothing can be proposed.
+    fn watch_finality(&mut self, fin: u64, latest: u64) {
+        let now = self.instant();
+        let w = match self.mem.finality_watch {
+            Some(w) if w.finalized == fin => w,
+            _ => {
+                self.mem.finality_watch = Some(FinalityWatch {
+                    finalized: fin,
+                    since: now,
+                    latest_then: latest,
+                });
+                if self.mem.finality_stalled {
+                    self.mem.finality_stalled = false;
+                    info!(event = "eth_finality_resumed", finalized = fin, latest);
+                }
+                self.clear_alarm("eth-finality-stall");
+                return;
+            }
+        };
+        let age = now.saturating_duration_since(w.since).as_secs();
+        if age >= hawkeye_eth::mode::ETH_FINALITY_STALL_SECS && latest > w.latest_then {
+            self.mem.finality_stalled = true;
+            let paused = if self.ctx.params.mainnet {
+                "; own proposals, executions and Mint signatures paused, challenges continue"
+            } else {
+                ""
+            };
+            self.alarm(
+                "eth-finality-stall",
+                format!("finalized {fin} unchanged for {age}s; latest {latest}{paused}"),
+            );
+        }
+    }
+
+    /// The rate limit seen unbounded or bounded (a finalized `MintLimitChanged`, or the
+    /// contract's state at start and every 60 ticks): on mainnet a cap of 0 (no limit) raises
+    /// `mint-cap-unbounded` and pauses this attestor's mint-side acts until a cap is set again
+    /// (audit 05/H-2); elsewhere it is only logged.
+    pub(crate) fn mint_cap_changed(&mut self, unbounded: bool) {
+        if !self.ctx.params.mainnet {
+            return;
+        }
+        if unbounded {
+            self.mem.mint_cap_unbounded = true;
+            self.alarm(
+                "mint-cap-unbounded",
+                "the bridge's mintCap was set to 0 (no rate limit): own proposals, executions and \
+                 Mint signatures paused until a quorum sets a cap"
+                    .into(),
+            );
+        } else {
+            self.mem.mint_cap_unbounded = false;
+            self.clear_alarm("mint-cap-unbounded");
+        }
     }
 
     /// The contract's challenge window (read once).
@@ -704,7 +932,7 @@ impl Engine {
         if self.is_current_member() {
             self.resubmit_challenges().await?;
         }
-        if self.signing_paused() || !self.is_current_member() {
+        if self.mint_paused() || !self.is_current_member() {
             return Ok(());
         }
         let p = self.ctx.params.clone();
@@ -816,14 +1044,14 @@ impl Engine {
     /// live members but the griefers (takeover covers a silent one) gathers the contract's
     /// threshold of `Mint` signatures and calls `mint`, which overrides at once. Each signature was
     /// made only after its signer's own policy check (sign-once), so this is the design's
-    /// "quorum, immediate" path, not a weaker one. Gated by `signing_paused` like every submission.
+    /// "quorum, immediate" path, not a weaker one. Gated by `mint_paused` like every mint-side submission.
     async fn threshold_fallback(
         &mut self,
         l: &LockRecord,
         to: &Account,
         griefers: &[PubKey33],
     ) -> Result<()> {
-        if self.signing_paused() || self.recently_submitted(&l.lock_id) {
+        if self.mint_paused() || self.recently_submitted(&l.lock_id) {
             return Ok(());
         }
         let p = self.ctx.params.clone();

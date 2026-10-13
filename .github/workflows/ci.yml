@@ -207,6 +207,25 @@ jobs:
       - run: forge fmt --check
       - run: forge build --sizes
       - run: forge test -vvv
+      # The vectors' provenance (audit 05/T-1): Vectors.t.sol stamps vectors/eip712.json with the
+      # fetched pin; this is the second, independent witness that stamp, fetch and pin agree.
+      - name: vector stamp matches the pin
+        run: |
+          pin=$(sed -n 's/^WYEC_COMMIT=//p' tools/fetch-wyec.sh)
+          test -n "$pin"
+          test "$pin" = "$(jq -r .wyecCommit vectors/eip712.json)"
+          test "$pin" = "$(cat vendor/wyec/.wyec-commit)"
+      # One copy of the contract tests (audit 05/T-4): wyec's suites run from vendor/wyec/test at
+      # the pin through test/Upstream.t.sol. Every test function declared upstream, and every one
+      # of Hawkeye's own, must be one forge actually lists.
+      - name: upstream and Hawkeye test counts
+        run: ./tools/check-test-counts.sh
+      - name: no bare vm.expectRevert()
+        run: |
+          if grep -rn "vm.expectRevert();" test/; then
+            echo "bare expectRevert is not allowed; assert the selector" >&2
+            exit 1
+          fi
       - name: committed ABIs match the build (crates/hawkeye-eth/abi)
         run: ./tools/export-abi.sh --check
       - name: deploy script against a local anvil

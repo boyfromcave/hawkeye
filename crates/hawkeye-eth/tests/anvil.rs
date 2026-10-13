@@ -43,7 +43,9 @@ async fn setup(n: usize, k: u8, mode: MintMode) -> Option<Env> {
             std::env::var("HAWKEYE_REQUIRE_ANVIL").as_deref() != Ok("1"),
             "HAWKEYE_REQUIRE_ANVIL=1 but `anvil` is not on PATH"
         );
-        eprintln!("skipping: `anvil` is not on PATH");
+        eprintln!(
+            "SKIPPED (anvil not on PATH): this test passed vacuously; `make test` or HAWKEYE_REQUIRE_ANVIL=1 turns a missing anvil into a failure"
+        );
         return None;
     }
     let anvil = Anvil::new()

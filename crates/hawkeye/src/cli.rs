@@ -61,6 +61,124 @@ pub async fn enroll(s: &Settings) -> Result<()> {
 }
 
 /// `hawkeye status [--json]`.
+/// `hawkeye status --params` (audit 05/M-4): the effective parameters, the set's live ones and the
+/// contract's, each against its mainnet floor. The floors are enforced on mainnet only (refused at
+/// start-up), a quarter of them warned on testnet; on regtest they are shown for information.
+pub async fn status_params(s: &Settings, as_json: bool) -> Result<()> {
+    use crate::floors::{Row, TESTNET_DIVISOR, live_rows, static_rows};
+    let key = s.load_key()?;
+    let ctx = crate::daemon::connect(s, key, Arc::new(CoreAttributor)).await?;
+    let p = &ctx.params;
+    let divisor = if s.network_name == "testnet" {
+        TESTNET_DIVISOR
+    } else {
+        1
+    };
+    let config = static_rows(p, divisor);
+    let set = ctx
+        .ycash
+        .set_getinfo(&ctx.set_hash(), None)
+        .await
+        .context("set_getinfo")?;
+    let locked = u64::try_from(set.set.lockedvalue.0).unwrap_or(0);
+    let live = live_rows(p, &set.set.params, locked);
+    let (other, total) = crate::daemon::vault_delay_mismatch(&ctx).await?;
+    // the contract's values, read without the mainnet refusal, then held to its floors
+    let b = ctx
+        .foreign
+        .check_bridge(false)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    let chain = hawkeye_eth::mode::MAINNET;
+    let contract = vec![
+        Row {
+            param: "contract.threshold",
+            value: b.threshold.into(),
+            rule: ">= 2 (MAINNET_MIN_THRESHOLD)".into(),
+            ok: hawkeye_eth::mode::check_contract_threshold(chain, b.threshold).is_ok(),
+            why: "plan §3.3: at 1 one key skips the challenge window",
+        },
+        Row {
+            param: "contract.challengeWindow",
+            value: b.challenge_window,
+            rule: format!(
+                ">= {} s (MAINNET_MIN_CHALLENGE_WINDOW_SECS)",
+                hawkeye_eth::mode::MAINNET_MIN_CHALLENGE_WINDOW_SECS
+            ),
+            ok: hawkeye_eth::mode::check_challenge_window(chain, b.challenge_window).is_ok(),
+            why: "audit 05/H-2: detection, Ethereum finality included, fits in the window",
+        },
+        Row {
+            param: "contract.mintCap",
+            value: u64::try_from(b.mint_cap).unwrap_or(u64::MAX),
+            rule: "> 0 (a bounded mint rate)".into(),
+            ok: hawkeye_eth::mode::check_mint_cap(chain, b.mint_cap).is_ok(),
+            why: "audit 05/H-2: what an unchallenged proposal can mint",
+        },
+    ];
+    let set_params = &set.set.params;
+    if as_json {
+        return print(&json!({
+            "network": s.network_name,
+            "enforced": s.network_name == "mainnet",
+            "config": config,
+            "set": {
+                "livenesswindow": set_params.livenesswindow,
+                "ratelimitbps": set_params.ratelimitbps,
+                "ratewindow": set_params.ratewindow,
+                "maturity": set_params.maturity,
+                "lockedvalue": locked,
+                "rows": live,
+                "vaults_with_other_delay": other,
+                "vaults": total,
+            },
+            "contract": {
+                "threshold": b.threshold,
+                "challengeWindow": b.challenge_window,
+                "mintCap": b.mint_cap.to_string(),
+                "capWindow": b.cap_window.to_string(),
+                "rows": contract,
+            },
+        }));
+    }
+    println!(
+        "parameters on {} ({}); floors: crates/hawkeye/src/floors.rs, hawkeye-eth mode.rs",
+        s.network_name,
+        match s.network_name.as_str() {
+            "mainnet" => "enforced: below a floor refuses to start",
+            "testnet" => "a quarter of the floors, warned",
+            _ => "not enforced, shown for information",
+        }
+    );
+    let show = |title: &str, rows: &[Row]| {
+        println!("{title}");
+        for r in rows {
+            println!(
+                "  {:<26} {:>12}  {:<11} {}",
+                r.param,
+                r.value,
+                if r.ok { "OK" } else { "BELOW FLOOR" },
+                r.rule
+            );
+        }
+    };
+    show("config:", &config);
+    println!(
+        "set: livenesswindow {}, ratelimitbps {} per {}, maturity {}, locked {locked} zat; {other} of {total} vaults with another delay",
+        set_params.livenesswindow,
+        set_params.ratelimitbps,
+        set_params.ratewindow,
+        set_params.maturity
+    );
+    show("  against the set:", &live);
+    println!(
+        "contract: threshold {}, challengeWindow {} s, mintCap {} per {} s",
+        b.threshold, b.challenge_window, b.mint_cap, b.cap_window
+    );
+    show("  against the mainnet rules:", &contract);
+    Ok(())
+}
+
 pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
     let key = s.load_key()?;
     let ctx = crate::daemon::connect(s, key, Arc::new(CoreAttributor)).await?;

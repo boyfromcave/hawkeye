@@ -21,6 +21,7 @@ remappings = [
     "@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
     "forge-std/=node_modules/forge-std/src/",
     "wyec/=vendor/wyec/contracts/",
+    "wyec-test/=vendor/wyec/test/",
 ]
 solc_version = "0.8.37"
 # As wyec's compile.js: optimizer on, 200 runs.
@@ -30,10 +31,12 @@ evm_version = "prague"
 bytecode_hash = "ipfs"
 # OpenZeppelin 5.6.1 names locals `error`, which solc 0.8.37 warns about.
 ignored_warnings_from = ["node_modules"]
-# Deploy.s.sol writes deployments/, Vectors.s.sol writes vectors/.
+# Deploy.s.sol writes deployments/, Vectors.t.sol writes vectors/ (and reads the pin stamp).
 fs_permissions = [
     { access = "read-write", path = "./deployments" },
     { access = "read-write", path = "./vectors" },
+    # Vectors.t.sol stamps the vectors with the fetched pin (audit 05/T-1).
+    { access = "read", path = "./vendor/wyec/.wyec-commit" },
 ]
 
 [fmt]

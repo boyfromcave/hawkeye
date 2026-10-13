@@ -57,8 +57,10 @@ pub async fn connect(s: &Settings, key: SecretKey, attributor: Arc<dyn Attributo
 /// The start-up checks: the node's network, the set exists with at least the network's minimum
 /// `maturity` (D-Q-31: 16,128 on mainnet/testnet, 2 on regtest), this key is a current member, the
 /// guardian set matches the members (refused on mainnet, warned elsewhere), and the live bridge's
-/// threshold is ≥ 2 on mainnet in every mint mode (plan §3.3; warned elsewhere when it is 1) —
-/// the bridge's own rules through [`ForeignChain::check_bridge`](foreign::ForeignChain::check_bridge).
+/// threshold is ≥ 2 on mainnet in every mint mode (plan §3.3; warned elsewhere when it is 1), and
+/// on mainnet its `challengeWindow` is at least two hours and its `mintCap` non-zero (audit
+/// 05/H-2; an unbounded cap is warned elsewhere) — the bridge's own rules through
+/// [`ForeignChain::check_bridge`](foreign::ForeignChain::check_bridge).
 pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
     let info = ctx.ycash.getblockchaininfo().await.context("ycashd")?;
     let want = match ctx.network_name.as_str() {
@@ -87,6 +89,27 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
             set.set.params.maturity
         );
     }
+    // the live floors (audit 05/M-4): the heartbeat against livenesswindow refuses on mainnet
+    let locked = u64::try_from(set.set.lockedvalue.0).unwrap_or(0);
+    for r in crate::floors::live_rows(&ctx.params, &set.set.params, locked) {
+        if r.ok {
+            continue;
+        }
+        if r.param == "bridge.heartbeat_blocks" && ctx.params.mainnet {
+            bail!("mainnet refuses {r}: every member would go DORMANT (audit 05/M-4)");
+        }
+        warn!(event = "startup_param_below_floor", detail = %r, why = r.why);
+    }
+    let (other, total) = vault_delay_mismatch(ctx).await?;
+    if other > 0 {
+        warn!(
+            event = "vault_delay_mismatch",
+            other,
+            total,
+            delay = ctx.params.delay,
+            "vaults of this tag and set carry another delay: the lock policy rejects every one of them"
+        );
+    }
     if !set
         .memberlist
         .iter()
@@ -110,6 +133,13 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
         .await
         .map_err(|e| anyhow!("{e}"))?;
     let (threshold, window) = (bridge.threshold, bridge.challenge_window);
+    if bridge.mint_cap == 0 {
+        // refused on mainnet by check_bridge (audit 05/H-2)
+        warn!(
+            event = "startup_bridge_mint_cap_unbounded",
+            "the bridge has no mint rate limit: a proposal nobody challenges mints without bound (development only)"
+        );
+    }
     if threshold < MAINNET_MIN_THRESHOLD {
         warn!(
             event = "startup_bridge_threshold_one",
@@ -121,12 +151,37 @@ pub async fn startup_checks(ctx: &Ctx) -> Result<()> {
           foreign = %ctx.foreign.kind(), tag = %ctx.params.tag_text(),
           eth = %ctx.guardian()?, chain = %info.chain, tip = info.blocks,
           mint_mode = %ctx.params.mint_mode, bridge_threshold = threshold,
-          challenge_window = window);
+          challenge_window = window, mint_cap = %bridge.mint_cap,
+          cap_window = %bridge.cap_window);
     Ok(())
+}
+
+/// How many of the bridge's live vaults (its tag, its set) carry a `delay` other than the
+/// configured one, of how many (audit 05/M-4: such a lock is rejected by the policy).
+pub async fn vault_delay_mismatch(ctx: &Ctx) -> Result<(usize, usize)> {
+    let rows = ctx
+        .ycash
+        .vault_list(Some(&hawkeye_ycash::types::VaultListFilter {
+            tag: Some(ctx.params.tag_text()),
+            setid: Some(ctx.set_hash()),
+            kind: Some(hawkeye_ycash::types::TemplateKind::Vault),
+            ..Default::default()
+        }))
+        .await
+        .context("vault_list")?;
+    let vaults: Vec<_> = rows.iter().filter_map(|r| r.as_vault()).collect();
+    let other = vaults
+        .iter()
+        .filter(|v| v.fields.delay != u32::from(ctx.params.delay))
+        .count();
+    Ok((other, vaults.len()))
 }
 
 /// Run the daemon until SIGINT/SIGTERM.
 pub async fn run(s: &Settings) -> Result<()> {
+    for w in &s.warnings {
+        warn!(event = "config_below_floor", detail = %w);
+    }
     let key = s.load_key()?;
     let ctx = connect(s, key, Arc::new(CoreAttributor)).await?;
     startup_checks(&ctx).await?;
