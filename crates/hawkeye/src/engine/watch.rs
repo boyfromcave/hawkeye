@@ -118,6 +118,7 @@ impl Engine {
         for i in unmatched {
             if let Err(e) = self.handle_unmatched(&i).await {
                 warn!(event = "cancel_failed", intent = %i.outpoint, error = %format!("{e:#}"));
+                self.note_sign_error(&e);
             }
         }
         // e. our cancels not yet mined: re-broadcast the stored bytes (never rebuilt)
@@ -309,7 +310,8 @@ impl Engine {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    warn!(event = "cancel_failed", intent = %i.outpoint, error = %format!("{e:#}"))
+                    warn!(event = "cancel_failed", intent = %i.outpoint, error = %format!("{e:#}"));
+                    self.note_sign_error(&e);
                 }
             }
         }

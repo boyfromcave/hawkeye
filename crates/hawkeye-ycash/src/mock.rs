@@ -15,7 +15,7 @@
 //!   unlimited mock wallet;
 //! - builds are remembered per wallet and vault (`vault_buildunlock`: `reused`, `already built a
 //!   different unlock`, `rebuild`; 07/N-2); the sign-once listing RPCs answer from
-//!   [`MockState::sign_once`] (no restore marker);
+//!   [`MockState::sign_once`] and [`MockState::restored`] (the restore marker, off by default);
 //! - a join is current as soon as it is mined (no maturity).
 //!
 //! The bond rules are modelled (owner 2026-10-11, quantum plan D-Q-29..D-Q-31): bonds are real
@@ -200,6 +200,10 @@ pub struct MockState {
     pub unspent: Vec<Unspent>,
     /// The `(setid, prevout)` → `(role, sighash)` sign-once record.
     pub sign_once: HashMap<(SetId, OutPoint), (u8, Bytes32)>,
+    /// The wallet's restore marker (07/F-5): while set, `set_signunlock` / `set_signcancel`
+    /// refuse a `(setid, prevout)` with no record (`set-sign-restored`) unless the call passes
+    /// `{"acknowledgerestore": true}`; `set_acknowledgerestore` clears it.
+    pub restored: bool,
     /// Recipient scripts by `recipienthash` (for `vault_release` without a recipient).
     pub recipients: HashMap<Bytes32, Vec<u8>>,
     /// `-rpcuser`/`-rpcpassword`, checked when set.
@@ -465,6 +469,7 @@ impl MockState {
             addresses: BTreeMap::new(),
             unspent: vec![],
             sign_once: HashMap::new(),
+            restored: false,
             recipients: HashMap::new(),
             auth: None,
             wallet_views: HashMap::new(),
@@ -1345,10 +1350,13 @@ impl MockState {
             "vault_refee" => self.vault_refee(p),
             "set_listsigned" => self.set_listsigned(),
             "set_importsigned" => self.set_importsigned(p),
-            "set_acknowledgerestore" => to_json(&AckRestoreResult {
-                restored: false,
-                pendingkeys: 0,
-            }),
+            "set_acknowledgerestore" => {
+                self.restored = false;
+                to_json(&AckRestoreResult {
+                    restored: false,
+                    pendingkeys: 0,
+                })
+            }
             "vault_release" => self.vault_release(p),
             "vault_ownerspend" => self.vault_ownerspend(p),
             // ---- stock
@@ -2349,6 +2357,21 @@ impl MockState {
                 }
             }
         }
+        let ack = p
+            .get(1)
+            .and_then(|o| o.get("acknowledgerestore"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if self.restored && !ack && !self.sign_once.contains_key(&(setid, prevout)) {
+            return err(
+                -4,
+                format!(
+                    "set-sign-restored: this wallet was restored or imported a member key and has no sign-once history; \
+                     import it with set_importsigned (or a wallet dump) and then set_acknowledgerestore, or pass \
+                     {{\"acknowledgerestore\": true}} if this key has never signed a set spend of {prevout}"
+                ),
+            );
+        }
         let mut recorded = false;
         if let Some((r, sh)) = self.sign_once.get(&(setid, prevout)) {
             if *r != role || *sh != sighash {
@@ -2537,7 +2560,7 @@ impl MockState {
             .collect();
         records.sort_by_key(|r| (r.setid.0, r.prevout.txid.0, r.prevout.vout));
         to_json(&SignedRecords {
-            restored: false,
+            restored: self.restored,
             records,
         })
     }

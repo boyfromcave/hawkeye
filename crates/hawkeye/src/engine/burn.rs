@@ -120,6 +120,7 @@ impl Engine {
                 CapStep::Post => {
                     if let Err(e) = self.post_unlock(b).await {
                         warn!(event = "unlock_failed", nonce = b.key.nonce, error = %format!("{e:#}"));
+                        self.note_sign_error(&e);
                     }
                 }
                 CapStep::OverCap => {

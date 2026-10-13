@@ -2643,6 +2643,48 @@ async fn k6_fee_coins_alarm() {
     assert!(st.fee_coins.unwrap() >= 16);
 }
 
+/// (k7) 07/F-5, `"wallet"` mode: a node wallet carrying the restore marker refuses every set
+/// signature (`set-sign-restored`); the daemon pages `node-sign-restored` and signs nothing, and
+/// once the operator acknowledges (`set_acknowledgerestore`, what `hawkeye acknowledge-restore`
+/// ends with) the burn is unlocked and the alarm clears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k7_restore_marker_pages_until_acknowledged() {
+    let Some(env) = setup().await else { return };
+    let mut engines = vec![
+        env.engine(0).await,
+        env.engine(1).await,
+        env.engine(2).await,
+    ];
+    lock_and_mint(&env, &mut engines).await;
+    env.mock.state().restored = true;
+    let nonce = burn_and_release(&env, &mut engines, &[0, 1, 2]).await;
+    tick_all(&mut engines).await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "nothing signed");
+    assert!(
+        engines
+            .iter()
+            .any(|e| e.alarms().iter().any(|a| a.name == "node-sign-restored")),
+        "{:?}",
+        engines.iter().map(|e| e.alarms()).collect::<Vec<_>>()
+    );
+    let ack = env.mock.client().set_acknowledgerestore().await.unwrap();
+    assert!(!ack.restored);
+    tick_all(&mut engines).await;
+    tick_all(&mut engines).await;
+    assert_eq!(
+        unlocks_for(&env, nonce).len(),
+        1,
+        "unlocked once acknowledged"
+    );
+    for e in &engines {
+        assert!(
+            !e.alarms().iter().any(|a| a.name == "node-sign-restored"),
+            "{:?}",
+            e.alarms()
+        );
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // optimistic mode (wyec @ cad126a, plan §3.3)
 

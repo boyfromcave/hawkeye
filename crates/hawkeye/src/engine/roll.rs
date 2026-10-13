@@ -188,6 +188,7 @@ impl Engine {
             }
             if let Err(e) = self.post_roll(&v).await {
                 warn!(event = "roll_failed", vault = %v.outpoint, error = %format!("{e:#}"));
+                self.note_sign_error(&e);
             }
         }
         if blocked.is_empty() {

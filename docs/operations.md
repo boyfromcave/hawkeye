@@ -95,7 +95,12 @@ Do this once per member key, on an **offline** machine, with two people.
    from that moment anyone who reads the wallet or the RPC credentials has it. An attestor moving
    from `"wallet"` to `"self"` should rotate (section 7): the old secret has been in `wallet.dat`.
 7. Join the Ycash set with your bond (`set_join`, plan §2.4) and fund the node wallet's fee coins
-   (`hawkeye split-coins --count 16`).
+   (`hawkeye split-coins --count 16`). In `"wallet"` mode, once the `SET_JOIN` is mined the node
+   wallet carries a **restore marker** (it imported a member key, 07/F-5) and signs nothing
+   (`set-sign-restored`, alarm `node-sign-restored`) until you run **`hawkeye acknowledge-restore`**:
+   it audits the ledger against the node, imports the ledger's sign-once records
+   (`set_importsigned`) and clears the marker (`set_acknowledgerestore`). For the fresh key of
+   this ceremony that is a true statement; never run it for a key another host may have used.
 8. Hand `eth_address` (or `near_guardian`) to the governance round (section 7).
 
 | Step | Done by | Signature |
@@ -104,7 +109,7 @@ Do this once per member key, on an **offline** machine, with two people.
 | 4 gas key generated and funded | | |
 | 5 escrow sealed (two custodians) | | |
 | 6 keystore on the host, `ycash_signing` set | | |
-| 7 `set_join` mined, fee coins split | | |
+| 7 `set_join` mined, fee coins split (`"wallet"` mode: `acknowledge-restore`) | | |
 | 8 guardian address handed over | | |
 
 ## 5. Backups and `audit-ledger`
@@ -135,7 +140,8 @@ two files would be from different instants. Take one before every upgrade (secti
    old wallet's history is imported and acknowledged: `set_listsigned` on the old wallet (or the
    `vaultsetsig=` lines of its `dumpwallet`), `set_importsigned` on the new one, check with
    `set_listsigned`, then `set_acknowledgerestore` — only when no other copy of the key can have
-   signed since. A `wallet.dat` restored by copying the file has no marker: the single-instance
+   signed since (`hawkeye acknowledge-restore` does all three from this ledger, after its audit).
+   A `wallet.dat` restored by copying the file has no marker: the single-instance
    rule (section 2) is the only defence. In `"self"` mode the node holds no member key and
    `hawkeye.db` is the record.
 
@@ -235,6 +241,7 @@ within a working day.
 | `matching-proposal-challenged` | ticket | someone challenged a proposal that matched a policy-OK lock (griefing, HK-15); the lock is re-proposed, a `GRIEFING` case is open against the challenger, and once every live proposer is barred the threshold fallback mints it (`mint_threshold_fallback` in the log; `[bridge] fallback_to_threshold`) | review the `GRIEFING` case and vote (`SET_REMOVE burn=0`); a second strike by the same challenger is grounds for removal |
 | `slash-case-<id>` | page | a slash case waits for this operator (`auto_slash = false`, the mainnet default) | verify the evidence (section 10a) and vote |
 | `burn-over-cap` | ticket | a burn larger than the set's whole per-window unlock cap is parked out of the FIFO; later burns are served | governance: a `SET_PARAMS` raising `ratelimitbps`, or a decision to leave it parked |
+| `node-sign-restored` | page | `"wallet"` mode: the node wallet refuses every set signature (`set-sign-restored`, 07/F-5): it imported the member key (enrolment) or was restored from a seed, and its restore marker is set; no unlock or cancel is signed | if no other copy of the key can have signed: `hawkeye acknowledge-restore` (section 4 step 7, section 5 step 5); otherwise do not acknowledge, leave with the key |
 | `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet (takeover moves the burn on) | check the node's mempool and fee coins |
 | `unlock-dead` | ticket | a signed unlock can no longer confirm (its vault was spent by another transaction, or — for an unlock this attestor co-signed but did not lead — a fee input was spent); another vault may be signed | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
 | `roll-overdue` | ticket | vaults past half their `ROLL_MARGIN` without a roll (HK-6) | check the roll leader and the rate limit |
@@ -334,6 +341,7 @@ accepts that slash and cancel gathering is unavailable until the last attestor h
 | `hawkeye enroll` | `"wallet"` mode: import the member key (nothing in `"self"` mode) |
 | `hawkeye keys derive --secret <hex>` / `keys encrypt --out <file>` | key ceremony (section 4) |
 | `hawkeye split-coins [--count N] [--amount YEC]` | fresh fee coins |
+| `hawkeye acknowledge-restore` | `"wallet"` mode: import the ledger's sign-once records into the node wallet and clear its restore marker (07/F-5) |
 | `hawkeye leave` / `hawkeye withdraw-bond [--to <addr>]` | leave the set; bond after `maturity` |
 
 | File | Mode | Backed up |

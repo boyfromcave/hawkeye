@@ -70,6 +70,93 @@ pub async fn enroll(s: &Settings) -> Result<()> {
     print(&serde_json::to_value(key_info(&key))?)
 }
 
+/// `hawkeye acknowledge-restore` (07/F-5, `"wallet"` mode): the node wallet carries a restore
+/// marker once the member key was imported and joined (or the wallet was restored from a seed),
+/// and refuses every set signature (`set-sign-restored`) until its sign-once history is imported
+/// and acknowledged. This ledger is that history for the bridge: the audit must pass (no unlock by
+/// this member on the chain or in the mempool without a record here), then its unlock and cancel
+/// records go to `set_importsigned` (a conflicting node record refuses the whole import:
+/// `set-sign-once`) and `set_acknowledgerestore` clears the marker. Never run by the daemon.
+pub async fn acknowledge_restore(s: &Settings) -> Result<()> {
+    if s.params.ycash_signing == crate::config::YcashSigning::SelfSigned {
+        return print(&json!({"restored": false, "note":
+            "ycash_signing = \"self\": the node wallet holds no member key; nothing to acknowledge"}));
+    }
+    let node = ycash(s)?;
+    let before = node.set_listsigned().await.context("set_listsigned")?;
+    if !before.restored {
+        return print(&json!({"restored": false, "records": before.records.len()}));
+    }
+    let key = s.load_key()?;
+    if !s.store_path.exists() {
+        // before the first `hawkeye run`: an empty ledger, as `run` would create it (the audit
+        // still checks the chain for unlocks signed by this member)
+        drop(
+            Store::open(&s.store_path)
+                .with_context(|| format!("ledger {}", s.store_path.display()))?,
+        );
+    }
+    let mut store = Store::open_readonly(&s.store_path)
+        .with_context(|| format!("ledger {}", s.store_path.display()))?;
+    let audit = crate::audit::audit_ledger(
+        &mut store,
+        &node,
+        &CoreAttributor,
+        &s.params,
+        &key.public_key(),
+    )
+    .await?;
+    if !audit.ok {
+        return Err(crate::audit::refuse(&audit));
+    }
+    let recs = store.read(|t| t.ycash_signatures(&s.params.set_id))?;
+    let records: Vec<hawkeye_ycash::types::SignedRecord> = recs
+        .iter()
+        .filter_map(|r| {
+            let role = match r.key.domain {
+                SignDomain::YcashUnlock => 1,
+                SignDomain::YcashCancel => 2,
+                _ => return None,
+            };
+            Some(hawkeye_ycash::types::SignedRecord {
+                setid: hawkeye_ycash::Hash256::from_internal(r.key.set_id),
+                prevout: hawkeye_ycash::OutPoint::new(
+                    hawkeye_ycash::Hash256::from_internal(r.key.prevout.txid),
+                    r.key.prevout.vout,
+                ),
+                role,
+                sighash: hawkeye_ycash::Bytes32(r.sighash),
+            })
+        })
+        .collect();
+    let imported = if records.is_empty() {
+        None
+    } else {
+        Some(
+            node.set_importsigned(&records)
+                .await
+                .context("set_importsigned")?,
+        )
+    };
+    let after = node
+        .set_acknowledgerestore()
+        .await
+        .context("set_acknowledgerestore")?;
+    info!(
+        event = "restore_acknowledged",
+        records = records.len(),
+        pending_keys = after.pendingkeys,
+        restored = after.restored
+    );
+    print(&json!({
+        "restored": after.restored,
+        "pendingkeys": after.pendingkeys,
+        "ledger_records": records.len(),
+        "imported": imported.as_ref().map(|i| i.imported),
+        "present": imported.as_ref().map(|i| i.present),
+    }))
+}
+
 /// `hawkeye audit-ledger [--json]` (docs/operations.md §5): the ledger, opened read-only and
 /// not migrated, against the node. Fails (non-zero exit) when a record is missing.
 pub async fn audit_ledger(s: &Settings, as_json: bool) -> Result<()> {
