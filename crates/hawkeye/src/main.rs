@@ -30,6 +30,19 @@ enum Cmd {
         /// opens fraud cases against) honest proposals for them (audit 05/L-5). Refused on mainnet.
         #[arg(long)]
         i_accept_blind_start: bool,
+        /// Start even though `audit-ledger` finds an unlock this member signed with no record in
+        /// this ledger (a restored or copied ledger): this attestor may then sign a second spend
+        /// of that vault, a provable equivocation (docs/operations.md §5).
+        #[arg(long)]
+        i_accept_equivocation_risk: bool,
+    },
+    /// Read-only: compare the ledger's sign-once records with the node (docs/operations.md §5).
+    /// Exits non-zero when an unlock this member signed has no record here. Opens the ledger
+    /// without migrating it; run it with the daemon stopped or running.
+    AuditLedger {
+        /// As JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Exposures (audit 05/L-5): signed locks that left the active chain, minted or not. While
     /// one is unacknowledged the daemon pauses its own mint-side acts (off regtest).
@@ -273,11 +286,13 @@ async fn main() -> Result<()> {
     match &args.cmd {
         Cmd::Run {
             i_accept_blind_start,
+            i_accept_equivocation_risk,
         } => {
             let mut s = s;
             s.params.accept_blind_start = *i_accept_blind_start;
-            daemon::run(&s).await
+            daemon::run(&s, *i_accept_equivocation_risk).await
         }
+        Cmd::AuditLedger { json } => cli::audit_ledger(&s, *json).await,
         Cmd::Exposure {
             cmd: ExposureCmd::List,
         } => cli::exposure_list(&s),

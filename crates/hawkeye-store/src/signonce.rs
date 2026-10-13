@@ -596,6 +596,29 @@ impl Tx<'_> {
         }
     }
 
+    /// Every stored Ycash signature of `set_id`, by domain and prevout (`hawkeye audit-ledger`).
+    pub fn ycash_signatures(&self, set_id: &Hash32) -> Result<Vec<YcashSignRecord>> {
+        self.all(
+            "SELECT domain, prevout_txid, prevout_vout, sighash, built_hex, signed_hex, signed_at
+             FROM sign_once_ycash WHERE set_id = ?1
+             ORDER BY domain, prevout_txid, prevout_vout",
+            params![set_id],
+            |r| {
+                Ok(YcashSignRecord {
+                    key: YcashSignKey {
+                        domain: r.get(0)?,
+                        set_id: *set_id,
+                        prevout: OutPoint::new(r.get(1)?, r.get(2)?),
+                    },
+                    sighash: r.get(3)?,
+                    built_hex: r.get(4)?,
+                    signed_hex: r.get(5)?,
+                    signed_at: r.get(6)?,
+                })
+            },
+        )
+    }
+
     /// The stored Ycash signature for `key`.
     pub fn ycash_signature(&self, key: &YcashSignKey) -> Result<Option<YcashSignRecord>> {
         self.one(

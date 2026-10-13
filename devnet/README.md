@@ -288,7 +288,7 @@ A passing run writes `devnet/transcripts/roll-<date>-<line>-<version>.txt`.
 ## The adversarial drills (plan §8)
 
 ```sh
-devnet/hawkeye-devnet scenario <dormancy|takeover|double|restart|reorg|rogue-mint> [--fresh] [--keep] [--timeout 180]
+devnet/hawkeye-devnet scenario <dormancy|takeover|double|restart|reorg|rogue-mint|rotation> [--fresh] [--keep] [--timeout 180]
 ```
 
 Each drill is self-contained like the demo: `up` with 3 attestors, act, assert every step with a
@@ -304,6 +304,24 @@ writes `<run>/transcripts/<drill>-…-FAILED.txt`. Leaders are computed with the
 | `restart` | D-16 | (A) pause the miner, lock 20, restart the mint leader with crash point `mint_signed` armed; (B) restart the next burn's leader with `unlock_signed` armed, burn 4; (C) burn 3 and `kill -9` its leader the moment it logs `unlock_signed` | (A) the leader aborts after recording its EIP-712 signature and before submitting; after the restart nothing is re-signed, minted once. (B) it aborts after recording the set signature, before broadcasting: no intent anywhere; restarted, it resends the stored bytes (`unlock_resend`), signs nothing again, one intent, released. (C) one intent, released, one `unlock_signed`. No `set-sign-once` refusal, no equivocation, no exposure; every ledger shows locks `MINTED` 1, burns and intents `RELEASED` 2, no slash case, no alarm |
 | `rogue-mint` | D-5 | lock 10 and wait for its mint (one unchallenged proposal); then attestor1 runs `hawkeye rogue-mint 5`: one `Mint` signature over an invented lockId with no lock behind it, `proposeMint` from its own account (12 s window). Attestor1's own Hawkeye leaves its deliberate proposal to the others (`own_fraudulent_proposal`) | another attestor's `MintChallenged(lockId, proposalId)` lands before `eta` (read from anvil's logs: challenger, block time); after `eta` the proposal is gone (`proposalStatus` None, `consumed` false, `executeMint` reverts `NoProposal`), `vetoed[lockId][attestor1]` is set, no wYEC was minted (supply 10, the rogue recipient holds 0); the others open `FRAUDULENT_MINT` cases and attestor1 is `removed`, `bondfrozen`; the supply invariant holds |
 | `reorg` | D-9, D-10 | anvil with `--slots-in-an-epoch 8` (finalized = latest − 16). (a) Pause the miner; lock 10 (the fallback builder, `nLockTime` = tip, sequence `0xfffffffe`), mine it at 1 confirmation (`C_Y` = 2); `invalidateblock` its *parent* on all nodes, so the lock is not final on the shorter chain and no mempool takes it back; mine a competing chain. Then re-broadcast the same lock. (b) Burn 4, then `anvil_reorg` it out before it is finalized; burn 4 again | (a) every Hawkeye logs `ycash_reorg … locks_deleted=1` and `GET /locks/<id>` is 404; no mint signature, no mint; after re-confirmation exactly one mint (`totalSupply` 10, every ledger `MINTED`). (b) the burn has no receipt, `burnNonce` is back; once finality passes the reorged blocks no ledger holds the nonce and no intent names it; the new burn reuses the nonce, its intent names the *new* tx hash, released once |
+
+## `scenario rotation`: the guardian rotation order (`docs/operations.md` §7, audit 05/M-3)
+
+```sh
+devnet/hawkeye-devnet scenario rotation [--fresh] [--keep] [--timeout 180]
+```
+
+`up` with **4** attestors (the scenario raises `--attestors` to 4), lock 10 and wait for its mint.
+Then attestor4 leaves in the documented order: the governance round first (`setGuardians` without
+attestor4, signed with the contract's current threshold by attestor1..k from their member keys,
+`cast wallet sign --no-hash` over the EIP-712 `SetGuardians` digest, submitted by the holder), then
+`hawkeye leave` at once. Attestor3 leaves in the **inverse** order: `hawkeye leave` first, the
+governance round after. Pass: in each order every remaining attestor's `/status` shows
+`guardian-drift` between the two halves and not after; the final guardians are exactly the set's
+current members; a second lock (3) mints; after `maturity` attestor4's `hawkeye withdraw-bond`
+is held only by the devnet bond script's own CLTV (`BOND_LOCK` = 5,000 blocks), which the scenario
+checks it names. Regtest asserts the alarm only (drift pauses signing on mainnet, not here). Operators:
+read [`docs/operations.md`](../docs/operations.md) before running an attestor for real.
 
 ## `scenario pq-recipient`: a post-quantum burn recipient (plan §9.1 R5, NEAR plan NH-R5)
 

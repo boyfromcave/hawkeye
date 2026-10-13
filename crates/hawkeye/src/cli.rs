@@ -69,6 +69,57 @@ pub async fn enroll(s: &Settings) -> Result<()> {
     print(&serde_json::to_value(key_info(&key))?)
 }
 
+/// `hawkeye audit-ledger [--json]` (docs/operations.md §5): the ledger, opened read-only and
+/// not migrated, against the node. Fails (non-zero exit) when a record is missing.
+pub async fn audit_ledger(s: &Settings, as_json: bool) -> Result<()> {
+    let key = s.load_key()?;
+    let mut store = Store::open_readonly(&s.store_path)
+        .with_context(|| format!("ledger {}", s.store_path.display()))?;
+    let r = crate::audit::audit_ledger(
+        &mut store,
+        &ycash(s)?,
+        &CoreAttributor,
+        &s.params,
+        &key.public_key(),
+    )
+    .await?;
+    if as_json {
+        print(&serde_json::to_value(&r)?)?;
+    } else {
+        println!(
+            "ledger schema v{}, cursor {}, node tip {}",
+            r.schema,
+            r.ledger_cursor
+                .map_or_else(|| "-".to_owned(), |c| c.to_string()),
+            r.node_tip
+        );
+        for rec in &r.records {
+            println!(
+                "{} {} {}",
+                rec.domain,
+                rec.prevout,
+                if rec.unspent {
+                    "live (unspent)"
+                } else {
+                    "spent"
+                }
+            );
+        }
+        for m in &r.missing {
+            println!(
+                "MISSING {}: signed on {} by this member (unlock {}), no record here",
+                m.vault, m.seen, m.txid
+            );
+        }
+        println!("{}", r.verdict());
+    }
+    if r.ok {
+        Ok(())
+    } else {
+        Err(crate::audit::refuse(&r))
+    }
+}
+
 /// `hawkeye status [--json]`.
 /// `hawkeye status --params` (audit 05/M-4): the effective parameters, the set's live ones and the
 /// contract's, each against its mainnet floor. The floors are enforced on mainnet only (refused at

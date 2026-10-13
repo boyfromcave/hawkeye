@@ -4254,3 +4254,139 @@ async fn s_migration_reproposes_pending_and_never_remints() {
     );
     assert_eq!(cb.proposal_count().await.unwrap(), 1);
 }
+
+/// (q) `hawkeye audit-ledger` (remedial report 05/M-3, docs/operations.md §5): the leader's ledger
+/// agrees with the node while its unlock is in the mempool and once it is mined; a copy of the
+/// ledger with that unlock's sign-once record deleted (a restored backup older than the
+/// signature) reports the vault as signed by this member with no record here (and not for a
+/// member that did not sign it), and opening it read-only neither migrates nor writes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn q_audit_ledger_detects_missing_record() {
+    let Some(env) = setup().await else { return };
+    let mut engines = vec![
+        env.engine(0).await,
+        env.engine(1).await,
+        env.engine(2).await,
+    ];
+    lock_and_mint(&env, &mut engines).await;
+    burn_and_release(&env, &mut engines, &[0, 1, 2]).await;
+    tick_all(&mut engines).await;
+    let attributor = MockAttributor { set: env.set.0 };
+    let node = env.mock.client();
+    // the burn's leader: the one ledger with an unlock record
+    let (i, vault) = (0..3)
+        .find_map(|i| {
+            let p = engines[i].ctx().params.clone();
+            let recs = engines[i]
+                .ctx()
+                .db(|t| t.ycash_signatures(&p.set_id))
+                .unwrap();
+            recs.iter()
+                .find(|r| r.key.domain == hawkeye_store::SignDomain::YcashUnlock)
+                .map(|r| (i, r.key.prevout))
+        })
+        .expect("an unlock record");
+    let params = engines[i].ctx().params.clone();
+    // the member whose set signature is on the unlock (the mock's wallet signs with one of its
+    // member keys): the audit asks about *its* signatures
+    let me: [u8; 33] = {
+        let st = env.mock.state();
+        let tx = st
+            .mempool
+            .iter()
+            .map(|t| Transaction::decode(&st.txs[t].0).unwrap())
+            .find(|t| t.inputs.iter().any(|i| i.prevout.txid.0 == vault.txid))
+            .expect("the unlock in the mempool");
+        let input = tx
+            .inputs
+            .iter()
+            .find(|i| i.prevout.txid.0 == vault.txid)
+            .unwrap();
+        let sel = hawkeye_core::template::parse_selector(
+            hawkeye_core::template::TemplateKind::Vault,
+            &input.script_sig,
+        )
+        .unwrap();
+        sel.args[0][1..34].try_into().unwrap()
+    };
+    for mined in [false, true] {
+        if mined {
+            env.mine(1);
+            tick_all(&mut engines).await;
+        }
+        let view = {
+            let mut st = engines[i].ctx().store.lock().unwrap();
+            hawkeye::audit::ledger_view(&mut st, &params).unwrap()
+        };
+        let r = hawkeye::audit::audit_view(view, &node, &attributor, &params, &me)
+            .await
+            .unwrap();
+        assert!(r.ok, "mined {mined}: {r:?}");
+        assert!(
+            r.records
+                .iter()
+                .any(|x| x.domain == "ycash-unlock" && x.prevout == vault.to_string()),
+            "{r:?}"
+        );
+    }
+    // an older copy: the record deleted behind the immutability trigger's back
+    let src = env.dir.path().join(format!("attestor{i}.db"));
+    let copy = env.dir.path().join("restored.db");
+    {
+        let c = rusqlite::Connection::open(&src).unwrap();
+        c.execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+            .unwrap();
+    }
+    {
+        let c = rusqlite::Connection::open(&copy).unwrap();
+        c.execute_batch("DROP TRIGGER sign_once_ycash_immutable_delete;")
+            .unwrap();
+        let n = c
+            .execute(
+                "DELETE FROM sign_once_ycash WHERE domain = 'ycash-unlock'",
+                [],
+            )
+            .unwrap();
+        assert!(n >= 1);
+    }
+    let before = std::fs::read(&copy).unwrap();
+    let mut restored = Store::open_readonly(&copy).unwrap();
+    let r = hawkeye::audit::audit_ledger(&mut restored, &node, &attributor, &params, &me)
+        .await
+        .unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert!(
+        r.missing.iter().any(|m| m.vault == vault.to_string()),
+        "{r:?}"
+    );
+    assert!(
+        r.verdict()
+            .contains("ledger is behind the chain: records for vault"),
+        "{}",
+        r.verdict()
+    );
+    assert_eq!(hawkeye::audit::refuse(&r).to_string(), r.verdict());
+    drop(restored);
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        before,
+        "read-only: not written"
+    );
+    // a member that did not sign it owes no record of it
+    let other = (0..3)
+        .map(|k| env.key_of_index(k))
+        .find(|k| *k != me)
+        .unwrap();
+    let mut restored = Store::open_readonly(&copy).unwrap();
+    let r = hawkeye::audit::audit_ledger(&mut restored, &node, &attributor, &params, &other)
+        .await
+        .unwrap();
+    assert!(r.ok, "{r:?}");
+    drop(restored);
+    // a ledger of another schema version is refused read-only (never migrated)
+    {
+        let c = rusqlite::Connection::open(&copy).unwrap();
+        c.execute_batch("PRAGMA user_version = 1;").unwrap();
+    }
+    assert!(Store::open_readonly(&copy).is_err());
+}

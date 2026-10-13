@@ -46,6 +46,11 @@ regtest); plain-YEC post-quantum addresses are `sq…` / `tq…` / `rq…`.
 
 ## Joining and leaving the signer set
 
+**Operating an attestor: read [`docs/operations.md`](docs/operations.md) before `hawkeye enroll`.**
+It is the runbook: the single-instance rule (one node, one Hawkeye, one ledger per key, ever), the
+key ceremony, backups and `hawkeye audit-ledger`, the rotation order, the parameter floors, every
+alarm with its action, incident playbooks and upgrades.
+
 An attestor posts a YEC bond to take a seat. The bond is locked for as long as the attestor is a
 member, and slashable.
 
@@ -62,7 +67,10 @@ leaving right after a fault does not escape it. A key cannot rejoin while its ol
 
 **Guardians are rotated off-chain.** Leaving the Ycash set does not touch the Ethereum or NEAR
 contract: rotate the member's guardian key out of the contract in the same governance round
-(`setGuardians` on Ethereum, `set_guardians` on NEAR). Until then Hawkeye's guardian-drift alarm reports the mismatch.
+(`setGuardians` on Ethereum, `set_guardians` on NEAR). Until then Hawkeye's guardian-drift alarm
+reports the mismatch, and on mainnet every attestor's mint-side acts pause: follow the order in
+[`docs/operations.md` §7](docs/operations.md#7-rotation-order-join--leave) (governance round, then
+`hawkeye leave` at once).
 
 ### Key custody
 
@@ -124,6 +132,7 @@ Keep at least 8 confirmed fee coins in the node wallet (`fee-coins-low` below th
 |---|---|---|
 | `hawkeye run` | attestor | the daemon: attest, watch, heartbeat, serve the API |
 | `hawkeye status [--json]` | anyone | the ledger, the node and the other chain at a glance |
+| `hawkeye audit-ledger [--json]` | attestor | read-only: is the ledger behind the chain (a restored backup)? `run` refuses to start if so |
 | `hawkeye enroll` | attestor | import the member key into the node wallet (no rescan; `ycash_signing = "self"`: nothing) |
 | `hawkeye keys derive --secret <hex>` | attestor | print the member key, its Ethereum address and NEAR guardian key |
 | `hawkeye keys encrypt --out <file>` | attestor | write a key (`HAWKEYE_SECRET`) as a keystore, owner-only |

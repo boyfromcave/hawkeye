@@ -2590,6 +2590,125 @@ format = "text"
                 "and the in-flight intent to the depositor (selector 3); 6 wYEC unbacked by design, supply alarm raised")
 
     # ================================================================ drill D-7: takeover
+    # ---------------------------------------------------------------- rotation (docs/operations.md §7)
+    def keccak(self, data_hex):
+        return self.cast("keccak", data_hex)
+
+    def guardians_digest(self, guardians, threshold, nonce):
+        """EIP-712 digest of SetGuardians(address[] guardians,uint8 threshold,uint256 adminNonce) on the devnet
+        bridge (domain WyecBridge / 1 / 31337 / bridge; abi.encodePacked(address[]) pads each to 32 bytes)."""
+        bridge = self.s["eth"]["bridge"]
+        dom_t = self.cast("keccak", "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+        ds = self.keccak(self.cast("abi-encode", "f(bytes32,bytes32,bytes32,uint256,address)", dom_t,
+                                   self.cast("keccak", "WyecBridge"), self.cast("keccak", "1"), "31337", bridge))
+        packed = "0x" + "".join("00" * 12 + g[2:].lower() for g in guardians)
+        st_t = self.cast("keccak", "SetGuardians(address[] guardians,uint8 threshold,uint256 adminNonce)")
+        sh = self.keccak(self.cast("abi-encode", "f(bytes32,bytes32,uint8,uint256)", st_t, self.keccak(packed),
+                                   str(threshold), str(nonce)))
+        return self.keccak("0x1901" + ds[2:] + sh[2:])
+
+    def set_guardians(self, keep, signers, threshold):
+        """The governance round: `signers` (attestor indices, the CURRENT guardians' threshold) sign
+        SetGuardians(guardians of `keep`, threshold, adminNonce); the holder's account submits it."""
+        bridge = self.s["eth"]["bridge"]
+        nonce = int(self.eth_call(bridge, "adminNonce()(uint256)"))
+        guardians = sorted((self.attestor(i)["eth_address"] for i in keep), key=lambda a: int(a, 16))
+        digest = self.guardians_digest(guardians, threshold, nonce)
+        sigs = []
+        for i in signers:
+            a = self.attestor(i)
+            sig = self.cast("wallet", "sign", "--no-hash", "--private-key", "0x" + a["secret_hex"], digest)
+            sigs.append((int(a["eth_address"], 16), sig))
+        sigs.sort()
+        self.cast("send", "--rpc-url", self.anvil_url(), "--private-key", "0x" + self.s["holder"]["secret_hex"],
+                  bridge, "setGuardians(address[],uint8,bytes[])", "[%s]" % ",".join(guardians), str(threshold),
+                  "[%s]" % ",".join(s for _, s in sigs), timeout=120)
+        self.say("  setGuardians([%s], %d) at adminNonce %d, signed by attestor%s"
+                 % (", ".join(guardians), threshold, nonce, ",".join(map(str, signers))))
+
+    def drift_on(self, indices):
+        """Every running attestor in `indices` reports guardian-drift (None while one does not)."""
+        out = {}
+        for i in indices:
+            code, st = self.api(self.attestor(i), "status")
+            if code != 200:
+                return None
+            out[i] = any(al["name"] == "guardian-drift" for al in st.get("alarms", []))
+        return out
+
+    def leave(self, i):
+        a = self.attestor(i)
+        self.silence(i, True)
+        out = self.hawkeye(a["config"], "leave", timeout=180).stdout.strip()
+        self.say("  attestor%d: hawkeye leave -> %s" % (i, out.splitlines()[-1][:220] if out else "ok"))
+        current = {m["key"]: m["current"] for m in self.node(0).set_getinfo(self.s["set"]["setid"])["memberlist"]}
+
+        def gone():
+            info = self.node(0).set_getinfo(self.s["set"]["setid"])
+            return not any(m["key"] == a["memberkey"] and m["current"] for m in info["memberlist"])
+        if current.get(a["memberkey"]):
+            self.wait_for("attestor%d's SET_REMOVE mined (no longer current)" % i, gone, 120)
+
+    def drill_rotation(self, timeout):
+        n = len(self.s["attestors"])
+        if n < 4:
+            die("scenario rotation needs --attestors 4 (it removes two)")
+        thr = int(self.eth_call(self.s["eth"]["bridge"], "threshold()(uint8)"))
+        self.step("lock 10 YEC and wait for its mint: a working bridge before the rotation")
+        self.lock_mint("10", 10 * COIN, timeout)
+        stay = [i for i in range(1, n - 1)]
+        watch = stay
+
+        self.step("the documented order (docs/operations.md §7) for attestor%d: governance round first" % n)
+        self.set_guardians([i for i in range(1, n)], list(range(1, thr + 1)), thr)
+        self.wait_for("guardian-drift raised on attestor%s (the contract dropped attestor%d, the set still has it)"
+                      % (",".join(map(str, watch)), n),
+                      lambda: (lambda d: d and all(d.values()))(self.drift_on(watch)), timeout)
+        self.step("then at once: attestor%d `hawkeye leave`" % n)
+        self.leave(n)
+        self.wait_for("guardian-drift cleared on attestor%s (the periodic guardian check, <= 60 ticks)"
+                      % ",".join(map(str, watch)),
+                      lambda: (lambda d: d and not any(d.values()))(self.drift_on(watch)), timeout + 120)
+
+        self.step("the inverse order for attestor%d: leave first (wrong: drift until the governance round; on "
+                  "mainnet it pauses every attestor's signing)" % (n - 1))
+        watch = [i for i in range(1, n - 1)]
+        self.leave(n - 1)
+        self.wait_for("guardian-drift raised on attestor%s" % ",".join(map(str, watch)),
+                      lambda: (lambda d: d and all(d.values()))(self.drift_on(watch)), timeout + 120)
+        self.set_guardians(watch, list(range(1, thr + 1)), min(thr, len(watch)))
+        self.wait_for("guardian-drift cleared on attestor%s (GuardiansChanged triggers the check)"
+                      % ",".join(map(str, watch)),
+                      lambda: (lambda d: d and not any(d.values()))(self.drift_on(watch)), timeout + 120)
+
+        self.step("the rotated bridge still works: lock 3 YEC and wait for its mint")
+        self.lock_mint("3", 13 * COIN, timeout)
+        self.step("attestor%d's bond after the exit delay (maturity %d): the primitive releases it; the devnet's "
+                  "bond script also carries a CLTV of BOND_LOCK = %d blocks, so `withdraw-bond` must name that"
+                  % (n, self.s["set"]["params"]["maturity"], BOND_LOCK))
+        self.mine(self.s["set"]["params"]["maturity"] + 2)
+        a = self.attestor(n)
+        p = self.hawkeye(a["config"], "withdraw-bond", timeout=180, check=False)
+        out = (p.stdout + p.stderr).strip()
+        if p.returncode == 0:
+            self.say("  attestor%d: hawkeye withdraw-bond -> %s" % (n, out.splitlines()[-1][:220] if out else "ok"))
+        elif "CLTV holds it until height" in out:
+            self.say("  attestor%d: hawkeye withdraw-bond refused as expected on this devnet: %s"
+                     % (n, out.splitlines()[-1][:220]))
+        else:
+            die("withdraw-bond: %s" % out[-800:])
+        bridge = self.s["eth"]["bridge"]
+        count = int(self.eth_call(bridge, "guardianCount()(uint256)"))
+        member = [i for i in range(1, n + 1)
+                  if self.eth_call(bridge, "isGuardian(address)(bool)", self.attestor(i)["eth_address"]) == "true"]
+        if member != watch or count != len(watch):
+            die("guardians after the rotation: attestor%s (count %d), expected attestor%s"
+                % (",".join(map(str, member)), count, ",".join(map(str, watch))))
+        return ("rotation in the documented order raised guardian-drift between the governance round and the leave "
+                "and cleared it after; the inverse order raised it until the round; final guardians attestor%s = the "
+                "set's current members, no drift, mints work; the leaver's bond past its exit delay (held only by "
+                "the devnet's CLTV)" % ",".join(map(str, watch)))
+
     def drill_takeover(self, timeout):
         p = self.bridge()
         self.step("lock 10 YEC and wait for its mint")
@@ -3504,6 +3623,7 @@ DRILLS = {
     "reorg": ("plan §8 D-9 + D-10: Ycash and Ethereum reorgs", "drill_reorg", {"slots": 8}),
     "rogue-mint": ("plan §8 D-5: rogue mint, an optimistic proposal with no lock", "drill_rogue_mint", {}),
     "pq-recipient": ("plan §9.1 R5: a burn to a plain-YEC post-quantum address, released and spent", "drill_pq_recipient", {}),
+    "rotation": ("docs/operations.md §7: guardian rotation order and guardian-drift (audit 05/M-3)", "drill_rotation", {}),
 }
 
 # The scenarios that run with --foreign near (NEAR plan NH5; pq-recipient: NH-R5).
@@ -3640,6 +3760,8 @@ def main():
                 dv.s = None
             if args.foreign == "near" and args.name not in NEAR_SCENARIOS:
                 die("scenario %s is Ethereum-only; on NEAR: %s" % (args.name, ", ".join(NEAR_SCENARIOS)))
+            if args.name == "rotation" and args.attestors < 4:
+                args.attestors = 4
             drill_args = (args.attestors, args.activation, args.base_port, args.anvil_port, args.interval,
                           args.block_time, args.keep, args.timeout)
             if args.name in DRILLS:

@@ -96,6 +96,42 @@ impl Store {
         Ok(s)
     }
 
+    /// Open an existing ledger **read-only**, without migrating it or touching its files
+    /// (`hawkeye audit-ledger`, remedial report 05/M-3): an older binary never rewrites a newer
+    /// ledger, a restored copy is inspected as it is. Refused unless its schema is exactly this
+    /// build's (a newer one: [`StoreError::SchemaTooNew`]; an older one would need the
+    /// migration a read-only open must not run).
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Err(StoreError::Invalid(format!(
+                "no ledger at {}",
+                path.display()
+            )));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let found: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let supported = u32::try_from(schema::MIGRATIONS.len()).expect("few migrations");
+        if found > supported {
+            return Err(StoreError::SchemaTooNew { found, supported });
+        }
+        if found < supported {
+            return Err(StoreError::Invalid(format!(
+                "the ledger is schema v{found}, this build reads v{supported}: a read-only open \
+                 does not migrate it (stop, back it up, and let `hawkeye run` migrate it first)"
+            )));
+        }
+        Ok(Self {
+            conn,
+            clock: system_clock,
+        })
+    }
+
     /// An in-memory ledger (tests, simulations).
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
@@ -160,6 +196,26 @@ impl Store {
         let v = f(&t)?;
         t.inner.commit().map_err(StoreError::from)?;
         Ok(v)
+    }
+
+    /// Run `f` in one deferred (read) transaction, always rolled back: the only way to read a
+    /// ledger opened with [`Store::open_readonly`].
+    pub fn read<T, E>(
+        &mut self,
+        f: impl FnOnce(&Tx<'_>) -> core::result::Result<T, E>,
+    ) -> core::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let now = (self.clock)();
+        let inner = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(StoreError::from)?;
+        let t = Tx { inner, now };
+        let v = f(&t);
+        t.inner.rollback().map_err(StoreError::from)?;
+        v
     }
 
     /// [`Tx::sign_once_mint`] in its own transaction.

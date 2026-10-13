@@ -248,12 +248,49 @@ pub async fn vault_delay_mismatch(ctx: &Ctx) -> Result<(usize, usize)> {
     Ok((other, vaults.len()))
 }
 
+/// The start-up ledger audit (remedial report 05/M-3, `docs/operations.md` §5): refuse to sign
+/// from a ledger that is behind the chain — an unlock this member signed, on the chain or in the
+/// mempool, with no sign-once record here (a restored backup, a copied ledger) — unless the
+/// operator passes `--i-accept-equivocation-risk`.
+async fn ledger_audit(ctx: &Ctx, accept: bool) -> Result<()> {
+    let view = {
+        let mut st = ctx.store.lock().unwrap_or_else(|e| e.into_inner());
+        crate::audit::ledger_view(&mut st, &ctx.params)?
+    };
+    let r = crate::audit::audit_view(
+        view,
+        &ctx.ycash,
+        ctx.attributor.as_ref(),
+        &ctx.params,
+        &ctx.me,
+    )
+    .await
+    .context("ledger audit")?;
+    if r.ok {
+        info!(event = "ledger_audit_ok", records = r.records.len());
+        return Ok(());
+    }
+    for m in &r.missing {
+        error!(event = "ledger_record_missing", vault = %m.vault, txid = %m.txid, seen = m.seen);
+    }
+    if accept {
+        error!(event = "ledger_audit_overridden", verdict = %r.verdict(),
+               "--i-accept-equivocation-risk: starting anyway");
+        return Ok(());
+    }
+    Err(crate::audit::refuse(&r)).context(
+        "refusing to start (hawkeye audit-ledger shows the detail; --i-accept-equivocation-risk \
+         overrides)",
+    )
+}
+
 /// Run the daemon until SIGINT/SIGTERM.
-pub async fn run(s: &Settings) -> Result<()> {
+pub async fn run(s: &Settings, accept_equivocation_risk: bool) -> Result<()> {
     // `s.warnings` (floors, transport) are logged by `main` for every command
     let key = s.load_key()?;
     let ctx = connect(s, key, Arc::new(CoreAttributor)).await?;
     startup_checks(&ctx).await?;
+    ledger_audit(&ctx, accept_equivocation_risk).await?;
     let listener = tokio::net::TcpListener::bind(s.listen)
         .await
         .with_context(|| format!("api listen {}", s.listen))?;
