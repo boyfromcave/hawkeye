@@ -188,6 +188,40 @@ pub async fn status_params(s: &Settings, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `hawkeye exposure list` (audit 05/L-5).
+pub fn exposure_list(s: &Settings) -> Result<()> {
+    let mut store = Store::open(&s.store_path)?;
+    let rows = store.tx(|t| t.unacked_exposures())?;
+    let v: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|l| {
+            json!({
+                "lock_id": format!("0x{}", hex::encode(l.lock_id)),
+                "state": l.state.to_string(),
+                "amount": l.value_zat,
+                "to": l.destination.as_ref().map(ToString::to_string),
+                "block_height": l.block_height,
+            })
+        })
+        .collect();
+    print(&serde_json::Value::Array(v))
+}
+
+/// `hawkeye exposure ack <lockId> --note …` (audit 05/L-5).
+pub fn exposure_ack(s: &Settings, lock_id: &str, note: &str) -> Result<()> {
+    ensure!(
+        !note.trim().is_empty(),
+        "--note: say what was done about the exposure"
+    );
+    let id: [u8; 32] = hex::decode(lock_id.trim_start_matches("0x"))
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow!("lockId {lock_id:?}: 32 bytes of hex"))?;
+    let mut store = Store::open(&s.store_path)?;
+    let new = store.tx(|t| t.ack_exposure(&id, note))?;
+    print(&json!({ "lock_id": format!("0x{}", hex::encode(id)), "acknowledged": true, "new": new }))
+}
+
 pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
     let key = s.load_key()?;
     let ctx = crate::daemon::connect(s, key, Arc::new(CoreAttributor)).await?;

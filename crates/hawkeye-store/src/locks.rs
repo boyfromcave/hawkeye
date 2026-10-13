@@ -191,6 +191,40 @@ impl Tx<'_> {
         )
     }
 
+    /// Exposures not yet acknowledged (audit 05/L-5): signed locks that left the active chain
+    /// (`REORGED`, the exposure flag set) or were minted after they did (`MINTED_UNBACKED`), with
+    /// no row in `exposure_acks`.
+    pub fn unacked_exposures(&self) -> Result<Vec<LockRecord>> {
+        self.all(
+            &format!(
+                "SELECT {COLS} FROM locks WHERE exposure = 1 AND state IN (?1, ?2)
+                 AND lock_id NOT IN (SELECT lock_id FROM exposure_acks)
+                 ORDER BY block_height, lock_id"
+            ),
+            [LockState::Reorged, LockState::MintedUnbacked],
+            row,
+        )
+    }
+
+    /// Acknowledge the exposure of `lock_id` with an operator's `note`. Errors if the lock is no
+    /// exposure; `false` if it was already acknowledged.
+    pub fn ack_exposure(&self, lock_id: &Hash32, note: &str) -> Result<bool> {
+        let l = self.require_lock(lock_id)?;
+        if !l.exposure || !matches!(l.state, LockState::Reorged | LockState::MintedUnbacked) {
+            return Err(StoreError::Invalid(format!(
+                "lock {} is not an exposure (state {}, exposure flag {})",
+                hex::encode(lock_id),
+                l.state,
+                l.exposure
+            )));
+        }
+        let n = self.conn().execute(
+            "INSERT OR IGNORE INTO exposure_acks (lock_id, note, acked_at) VALUES (?1, ?2, ?3)",
+            params![lock_id, note, self.now()],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Move a lock along a forward edge of the Lock machine; returns the state it left.
     ///
     /// `POLICY_REJECTED` takes `detail` as the rejection reason (required). `SIGNED` requires the
@@ -215,12 +249,12 @@ impl Tx<'_> {
                     params![lock_id, reason],
                 )?;
             }
-            LockState::Signed if self.mint_signature(lock_id)?.is_none() => {
+            LockState::Signed if !self.has_mint_signature(lock_id)? => {
                 return Err(StoreError::Invalid(format!(
                     "lock {oid}: SIGNED without a sign-once record"
                 )));
             }
-            LockState::Reorged if self.mint_signature(lock_id)?.is_some() => {
+            LockState::Reorged if self.has_mint_signature(lock_id)? => {
                 self.conn().execute(
                     "UPDATE locks SET exposure = 1 WHERE lock_id = ?1",
                     [lock_id],

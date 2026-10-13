@@ -617,7 +617,7 @@ contract Eip712VectorsTest is Test {
         g[0] = guardian;
         deployCodeTo(
             "WyecBridge.sol:WyecBridge",
-            abi.encode(t, g, uint8(1), uint64(60), uint256(0), uint256(0)),
+            abi.encode(t, g, uint8(1), uint64(60), uint256(0), uint256(0), address(0)),
             BRIDGE
         );
         return WyecBridge(BRIDGE);
@@ -633,7 +633,7 @@ contract Eip712VectorsTest is Test {
         }
         deployCodeTo(
             "WyecBridge.sol:WyecBridge",
-            abi.encode(t, g, uint8(2), uint64(60), uint256(0), uint256(0)),
+            abi.encode(t, g, uint8(2), uint64(60), uint256(0), uint256(0), address(0)),
             BRIDGE
         );
         return WyecBridge(BRIDGE);

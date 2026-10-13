@@ -29,7 +29,7 @@ pub use client::{
     Burned, EthClient, EthConfig, GuardianSet, Mined, MintSubmitted, Proposal, ProposalStatus,
     wallet_provider,
 };
-pub use deploy::{DeployParams, Deployment, deploy};
+pub use deploy::{DeployParams, Deployment, deploy, deploy_successor};
 pub use error::{Error, Result};
 pub use mode::MintMode;
 pub use scanner::{BridgeEvent, Finality, LogMeta, ScanBatch, ScannedEvent, Scanner};

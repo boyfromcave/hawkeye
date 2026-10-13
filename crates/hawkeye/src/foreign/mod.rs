@@ -411,6 +411,13 @@ pub trait ForeignChain: AttestationScheme + Send + Sync {
     /// Whether `lock_id` has been minted (the contract's replay key).
     fn consumed(&self, lock_id: Hash32) -> BoxFut<'_, bool>;
 
+    /// [`consumed`](Self::consumed) in the final state (Ethereum: at the finalized block; on a
+    /// successor bridge, through its predecessors, audit 05/L-3): the engine records a lock as
+    /// minted without signing only on this. Default: `consumed` (a chain whose reads are final).
+    fn consumed_final(&self, lock_id: Hash32) -> BoxFut<'_, bool> {
+        self.consumed(lock_id)
+    }
+
     /// The live or void proposal for `lock_id`, if any.
     fn proposal(&self, lock_id: Hash32) -> BoxFut<'_, Option<Proposal>>;
 

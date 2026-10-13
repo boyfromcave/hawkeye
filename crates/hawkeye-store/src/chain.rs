@@ -178,7 +178,7 @@ impl Tx<'_> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         for (id, state) in locks {
-            if self.mint_signature(&id)?.is_some() {
+            if self.has_mint_signature(&id)? {
                 self.transition_lock(
                     &id,
                     LockState::Reorged,

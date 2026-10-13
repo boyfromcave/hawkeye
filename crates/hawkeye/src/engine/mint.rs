@@ -59,6 +59,32 @@ enum MintVerdict {
     Defer,
     /// No policy-OK lock with this `(amount, to)` behind it.
     Fraud(String),
+    /// The matching lock left the active chain after this attestor signed it (audit 05/L-5): a
+    /// `Minted` is wYEC without YEC behind it (`MINTED_UNBACKED`, an exposure; no slash: the
+    /// fault is the reorg, not the signer), a proposal is withdrawn by challenge.
+    Exposure(String),
+}
+
+/// An `Exposure` verdict in the ledger: a `Minted` moves the lock `REORGED → MINTED_UNBACKED`
+/// (the exposure alarm and pause follow from the ledger, [`Engine::refresh_exposures`]); a
+/// proposal is returned to be withdrawn by challenge.
+fn exposure_mint(
+    t: &Tx<'_>,
+    pm: &PendingMintRecord,
+    why: &str,
+) -> Result<Option<(Hash32, String)>, StoreError> {
+    if pm.proposal {
+        return Ok(Some((pm.lock_id, why.to_owned())));
+    }
+    t.transition_lock(
+        &pm.lock_id,
+        LockState::MintedUnbacked,
+        None,
+        Some("Minted observed for a lock that left the active chain"),
+    )?;
+    warn!(event = "minted_unbacked", lock_id = %lock_hex(&pm.lock_id), amount = pm.amount,
+          to = %pm.to, tx = %format!("0x{}", hex::encode(pm.tx_hash)), reason = why);
+    Ok(None)
 }
 
 /// The head-of-chain proposal scan re-reads this many blocks below the last one it covered, so a
@@ -84,6 +110,17 @@ pub fn challenge_due(
 ) -> bool {
     let margin = (window / 4).max(1);
     now.saturating_add(margin) >= eta || (lock_absent && caught_up && blocks_since >= confirmations)
+}
+
+/// The lock edges from `state` to `MINTED` (a `Minted` observed, or the lockId found consumed).
+fn minted_path(state: LockState) -> &'static [LockState] {
+    use LockState::*;
+    match state {
+        PolicyOk | Signed | MintSubmitted | Executed => &[Minted],
+        Proposed => &[Executed, Minted],
+        Challenged => &[Proposed, Executed, Minted],
+        _ => &[],
+    }
 }
 
 /// Judge a `Minted(lockId, to, amount)` against the ledger and, if it matches, move the lock to
@@ -121,7 +158,9 @@ fn judge_minted(
         )));
     }
     if l.state == Reorged {
-        return Ok(MintVerdict::Ok);
+        return Ok(MintVerdict::Exposure(
+            "the lock left the active chain after signing".into(),
+        ));
     }
     let h = Some(u32::try_from(block).unwrap_or(u32::MAX));
     if proposal {
@@ -130,12 +169,7 @@ fn judge_minted(
         }
         return Ok(MintVerdict::Ok);
     }
-    let path: &[LockState] = match l.state {
-        PolicyOk | Signed | MintSubmitted | Executed => &[Minted],
-        Proposed => &[Executed, Minted],
-        Challenged => &[Proposed, Executed, Minted],
-        _ => &[],
-    };
+    let path = minted_path(l.state);
     for s in path {
         t.transition_lock(lock_id, *s, h, Some("Minted observed (finalized)"))?;
     }
@@ -175,6 +209,7 @@ impl Engine {
         let p = self.ctx.params.clone();
         let tip = self.mem.tip;
         let mut frauds = vec![];
+        let mut exposed = vec![];
         let mut griefed = vec![];
         let mut rotated = false;
         let mut cap_change = None;
@@ -282,6 +317,12 @@ impl Engine {
                                 }
                                 frauds.push((pm, why));
                             }
+                            MintVerdict::Exposure(why) => {
+                                if had {
+                                    t.remove_pending_mint(&pm.lock_id, &pm.tx_hash)?;
+                                }
+                                exposed.push(exposure_mint(t, &pm, &why)?);
+                            }
                         }
                     }
                     ForeignEvent::MintChallenged {
@@ -358,6 +399,9 @@ impl Engine {
         for (pm, why) in frauds {
             self.fraudulent_mint(&pm, &why).await?;
         }
+        for (lock_id, why) in exposed.into_iter().flatten() {
+            self.withdraw_reorged_proposal(lock_id, &why).await;
+        }
         self.mem.eth_fresh = to == fin;
         Ok(())
     }
@@ -377,7 +421,7 @@ impl Engine {
             .db(|t| t.cursor(Chain::Ycash))?
             .is_some_and(|c| c.height >= u64::from(tip));
         for pm in pending {
-            let (v, absent) = self.ctx.db(|t| {
+            let v = self.ctx.db(|t| {
                 let v = judge_minted(
                     t,
                     &pm.lock_id,
@@ -387,13 +431,25 @@ impl Engine {
                     pm.proposal,
                     pm.provisional,
                 )?;
-                if matches!(v, MintVerdict::Ok) {
+                let mut withdraw = None;
+                if let MintVerdict::Exposure(why) = &v {
+                    if pm.provisional {
+                        withdraw = Some((pm.lock_id, why.clone()));
+                    } else {
+                        withdraw = exposure_mint(t, &pm, why)?;
+                    }
+                }
+                if matches!(v, MintVerdict::Ok | MintVerdict::Exposure(_)) {
                     t.remove_pending_mint(&pm.lock_id, &pm.tx_hash)?;
                 }
-                Ok((v, t.lock(&pm.lock_id)?.is_none()))
+                Ok((v, t.lock(&pm.lock_id)?.is_none(), withdraw))
             })?;
+            let (v, absent, withdraw) = (v.0, v.1, v.2);
+            if let Some((lock_id, why)) = withdraw {
+                self.withdraw_reorged_proposal(lock_id, &why).await;
+            }
             let why = match v {
-                MintVerdict::Ok => continue,
+                MintVerdict::Ok | MintVerdict::Exposure(_) => continue,
                 MintVerdict::Fraud(why) => why,
                 MintVerdict::Defer if caught_up && tip >= pm.since_height + grace => {
                     "no policy-OK lock behind the lockId".to_owned()
@@ -544,11 +600,13 @@ impl Engine {
         if fresh.is_empty() {
             return Ok(());
         }
-        let frauds = self.ctx.db(|t| {
+        let (frauds, withdraw) = self.ctx.db(|t| {
             let mut frauds = vec![];
+            let mut withdraw = vec![];
             for pm in &fresh {
                 match judge_minted(t, &pm.lock_id, &pm.to, pm.amount, pm.block, true, true)? {
                     MintVerdict::Ok => {}
+                    MintVerdict::Exposure(why) => withdraw.push((pm.lock_id, why)),
                     MintVerdict::Defer => {
                         if t.add_pending_mint(pm)? {
                             info!(event = "mint_check_deferred", lock_id = %lock_hex(&pm.lock_id),
@@ -558,8 +616,11 @@ impl Engine {
                     MintVerdict::Fraud(why) => frauds.push((pm.clone(), why)),
                 }
             }
-            Ok(frauds)
+            Ok((frauds, withdraw))
         })?;
+        for (lock_id, why) in withdraw {
+            self.withdraw_reorged_proposal(lock_id, &why).await;
+        }
         for pm in &fresh {
             self.mem
                 .provisional_seen
@@ -634,6 +695,33 @@ impl Engine {
             self.mem.mint_cap_unbounded = false;
             self.clear_alarm("mint-cap-unbounded");
         }
+    }
+
+    /// A proposal for a lock that left the active chain after it was signed (audit 05/L-5):
+    /// withdrawn by challenge while the window runs, whoever proposed it (the proposer itself
+    /// included: `own_proposal_withdrawn`, not fraud). A `REORGED` lock is not mintable, so the
+    /// sign-once challenge record accepts it; a resubmission reuses the recorded bytes.
+    pub(crate) async fn withdraw_reorged_proposal(&mut self, lock_id: Hash32, why: &str) {
+        if !self.is_current_member() || self.mem.withdrawn.contains(&lock_id) {
+            return;
+        }
+        let live = match self.ctx.foreign.proposal(lock_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(event = "mint_challenge_failed", lock_id = %lock_hex(&lock_id), error = %e);
+                return;
+            }
+        };
+        if self.ctx.guardian().ok() == Some(live.proposer) {
+            info!(event = "own_proposal_withdrawn", lock_id = %lock_hex(&lock_id),
+                  proposal_id = live.id, reason = why);
+        } else {
+            warn!(event = "reorged_lock_proposal_challenge", lock_id = %lock_hex(&lock_id),
+                  proposal_id = live.id, proposer = %live.proposer, reason = why);
+        }
+        self.submit_challenge(lock_id, &live, why).await;
+        self.mem.withdrawn.insert(lock_id);
     }
 
     /// The contract's challenge window (read once).
@@ -939,16 +1027,58 @@ impl Engine {
         let foreign = self.ctx.foreign.clone();
         let key = self.ctx.key.clone();
         let signer = self.ctx.guardian()?;
-        let to_sign = self.ctx.db(|t| t.locks_in_state(LockState::PolicyOk))?;
+        let dep = p.deployment;
+        // POLICY_OK locks, and (after a migration to a successor bridge, wyec design §4.6) the
+        // unminted locks signed only for another deployment
+        let to_sign = self.ctx.db(|t| {
+            let mut v = t.locks_in_state(LockState::PolicyOk)?;
+            for s in [
+                LockState::Signed,
+                LockState::MintSubmitted,
+                LockState::Proposed,
+                LockState::Challenged,
+            ] {
+                for l in t.locks_in_state(s)? {
+                    if t.mint_signature(&dep, &l.lock_id)?.is_none() {
+                        v.push(l);
+                    }
+                }
+            }
+            Ok(v)
+        })?;
         for l in to_sign {
             let Some(to) = l.destination.clone() else {
                 continue;
             };
+            // a lockId the bridge (or any predecessor: `isConsumed`) has minted, finalized, is
+            // never signed again (audit 05/L-3): recorded as minted
+            let final_consumed = self
+                .ctx
+                .foreign
+                .consumed_final(l.lock_id)
+                .await
+                .map_err(|e| anyhow!("consumed (final): {e}"))?;
+            if final_consumed {
+                self.ctx.db(|t| {
+                    for s in minted_path(l.state) {
+                        t.transition_lock(
+                            &l.lock_id,
+                            *s,
+                            None,
+                            Some("consumed on the bridge (predecessor)"),
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                info!(event = "mint_already_consumed", lock_id = %lock_hex(&l.lock_id),
+                      state = %l.state, "consumed on the bridge or a predecessor: not signed");
+                continue;
+            }
             let digest = foreign
                 .mint_digest(&l.lock_id, l.value_zat, &to)
                 .map_err(|e| anyhow!("{e}"))?;
             self.ctx.db(|t| {
-                t.sign_once_mint(&l.lock_id, l.value_zat, &to, &digest, |d| {
+                t.sign_once_mint(&dep, &l.lock_id, l.value_zat, &to, &digest, |d| {
                     foreign.sign(&key, d)
                 })
             })?;
@@ -1281,7 +1411,7 @@ impl Engine {
         }
         let own = self
             .ctx
-            .db(|t| t.mint_signature(&l.lock_id))?
+            .db(|t| t.mint_signature(&self.ctx.params.deployment, &l.lock_id))?
             .ok_or_else(|| anyhow!("no own signature"))?;
         self.mem.submitted.insert(l.lock_id, tip);
         let res = self
@@ -1373,7 +1503,7 @@ impl Engine {
     ) -> Result<Vec<[u8; 65]>> {
         let own = self
             .ctx
-            .db(|t| t.mint_signature(lock_id))?
+            .db(|t| t.mint_signature(&self.ctx.params.deployment, lock_id))?
             .ok_or_else(|| anyhow!("no own signature"))?;
         let mut sigs = vec![own.signature];
         let mut signers = vec![self.ctx.guardian()?];

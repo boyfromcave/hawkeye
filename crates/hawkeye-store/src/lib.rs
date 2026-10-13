@@ -165,6 +165,7 @@ impl Store {
     /// [`Tx::sign_once_mint`] in its own transaction.
     pub fn sign_once_mint<F, E>(
         &mut self,
+        deployment: &hawkeye_core::Deployment,
         lock_id: &hawkeye_core::bytes::Hash32,
         amount: u64,
         to: &Account,
@@ -175,7 +176,7 @@ impl Store {
         F: FnOnce(&hawkeye_core::bytes::Hash32) -> core::result::Result<[u8; 65], E>,
         E: Into<SignerError>,
     {
-        self.tx(|t| t.sign_once_mint(lock_id, amount, to, digest, sign))
+        self.tx(|t| t.sign_once_mint(deployment, lock_id, amount, to, digest, sign))
     }
 
     /// The schema-v6 backfill of the per-burn unlock record (remedial report 05/H-1 §4.3): once

@@ -102,6 +102,9 @@ pub struct Status {
     pub finality_stalled: bool,
     /// Seconds since the finalized height last moved (0 before the first observation).
     pub eth_finalized_age_secs: u64,
+    /// Unacknowledged exposures (audit 05/L-5): lock ids (`0x…`) of signed locks that left the
+    /// active chain, minted or not.
+    pub exposure: Vec<String>,
 }
 
 fn esc(s: &str) -> String {
@@ -226,6 +229,11 @@ pub fn render_metrics(s: &Status) -> String {
         .map(|a| (format!("{{name=\"{}\"}}", esc(&a.name)), 1.0))
         .collect();
     gauge("hawkeye_alarm", "Raised alarms", &alarms);
+    gauge(
+        "hawkeye_exposure_unacked",
+        "Signed locks that left the active chain, not yet acknowledged",
+        &[(String::new(), s.exposure.len() as f64)],
+    );
     gauge(
         "hawkeye_eth_finalized_age_seconds",
         "Seconds since the foreign chain's finalized block last moved",

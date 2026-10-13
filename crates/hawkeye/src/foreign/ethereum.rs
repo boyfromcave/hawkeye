@@ -407,6 +407,10 @@ impl ForeignChain for EthereumChain {
         Box::pin(async move { self.client.consumed(b256(&lock_id)).await.map_err(fe) })
     }
 
+    fn consumed_final(&self, lock_id: Hash32) -> BoxFut<'_, bool> {
+        Box::pin(async move { self.client.consumed_final(b256(&lock_id)).await.map_err(fe) })
+    }
+
     fn proposal(&self, lock_id: Hash32) -> BoxFut<'_, Option<Proposal>> {
         Box::pin(async move {
             Ok(self

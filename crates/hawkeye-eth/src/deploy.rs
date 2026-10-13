@@ -36,6 +36,9 @@ pub struct Deployment {
     /// The rate-limit window, seconds.
     #[serde(default)]
     pub cap_window: u64,
+    /// The bridge this one succeeded (wyec design §4.6; `null` / absent for a first deployment).
+    #[serde(default)]
+    pub predecessor: Option<Address>,
 }
 
 /// What [`deploy`] deploys: the constructor's arguments and the mode recorded in the file.
@@ -51,6 +54,9 @@ pub struct DeployParams {
     pub cap_window: u64,
     /// Recorded as `mintMode`.
     pub mode: MintMode,
+    /// The bridge this one succeeds (its consumed lockIds stay consumed; wyec design §4.6); `None`
+    /// for a first deployment.
+    pub predecessor: Option<Address>,
 }
 
 impl DeployParams {
@@ -68,6 +74,7 @@ impl DeployParams {
             mint_cap: 0,
             cap_window: 0,
             mode,
+            predecessor: None,
         }
     }
 }
@@ -133,6 +140,7 @@ pub async fn deploy(
         p.challenge_window,
         U256::from(p.mint_cap),
         U256::from(p.cap_window),
+        Address::ZERO,
     )
     .await?
     .address();
@@ -157,6 +165,49 @@ pub async fn deploy(
         challenge_window: p.challenge_window,
         mint_cap: p.mint_cap,
         cap_window: p.cap_window,
+        predecessor: None,
+    })
+}
+
+/// A successor of `old` (wyec design §4.6): a new bridge over `old`'s token, with
+/// `p.predecessor` (default `old.bridge`) as its predecessor. The token is not touched: the
+/// hand-off is `old`'s threshold-signed `setBridge(new)`, the guardians' act.
+pub async fn deploy_successor(
+    provider: &DynProvider,
+    old: &Deployment,
+    p: &DeployParams,
+) -> Result<Deployment> {
+    let chain_id = provider.get_chain_id().await?;
+    crate::mode::check_contract_threshold(chain_id, p.threshold)?;
+    let predecessor = p.predecessor.unwrap_or(old.bridge);
+    let deploy_block = provider.get_block_number().await? + 1;
+    let bridge = *WyecBridge::deploy(
+        provider,
+        old.token,
+        p.guardians.clone(),
+        p.threshold,
+        p.challenge_window,
+        U256::from(p.mint_cap),
+        U256::from(p.cap_window),
+        predecessor,
+    )
+    .await?
+    .address();
+    Ok(Deployment {
+        chain_id,
+        bridge,
+        token: old.token,
+        deploy_block,
+        guardians: p.guardians.clone(),
+        threshold: p.threshold,
+        mint_mode: match p.mode {
+            MintMode::Optimistic => "optimistic".into(),
+            MintMode::Threshold { .. } => "threshold".into(),
+        },
+        challenge_window: p.challenge_window,
+        mint_cap: p.mint_cap,
+        cap_window: p.cap_window,
+        predecessor: Some(predecessor),
     })
 }
 

@@ -39,7 +39,7 @@ forge test -vvv                # wyec's suites too; fails if vectors/eip712.json
 **Restricted environments (opt-in).** Where the native solc download is blocked (this is how
 the H3 work was done), point Foundry at the solc-js shim from `package.json`. It is the same
 compiler version, so the bytecode is identical (the wYEC sizes match wyec-contract-design.md §4.5.5:
-10,035 bytes bridge at the pin, with the mainnet constructor floors, 4,683 bytes token). Every command above works with it:
+10,393 bytes bridge at the pin, with the §4.6 predecessor, 4,683 bytes token). Every command above works with it:
 
 ```sh
 export FOUNDRY_SOLC=./tools/solc FOUNDRY_OFFLINE=true

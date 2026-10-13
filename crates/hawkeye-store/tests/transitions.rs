@@ -34,9 +34,11 @@ fn lock_forward() -> Vec<(LockState, LockState)> {
         (Challenged, Proposed),
         (Executed, Minted),
         (Reorged, Seen),
+        // audit 05/L-5: a Minted observed for a lock that had left the active chain
+        (Reorged, MintedUnbacked),
     ];
     for &s in LockState::ALL {
-        if s != Reorged {
+        if s != Reorged && s != MintedUnbacked {
             v.push((s, Reorged));
         }
     }
@@ -316,7 +318,7 @@ fn every_lock_pair_through_the_api() {
                 match to {
                     LockState::Signed if from == LockState::PolicyOk => {
                         let l = t.lock(&id)?.unwrap();
-                        t.sign_once_mint(&id, l.value_zat, &DEST, &[7; 32], fake_sig)
+                        t.sign_once_mint(&DEP, &id, l.value_zat, &DEST, &[7; 32], fake_sig)
                             .map(drop)
                     }
                     LockState::PolicyRejected => t.reject_lock(&id, "value < MIN_LOCK", Some(140)),

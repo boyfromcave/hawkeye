@@ -1,7 +1,7 @@
 //! Following Ycash (plan §5.1, §5.4): blocks, reorgs, the set's vaults, new locks, and every
 //! unlock transaction (an intent's creation) observed in a block or the mempool.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use hawkeye_core::attribution::Attribution;
 use hawkeye_core::bytes::Hash32;
 use hawkeye_core::lock::Destination;
@@ -404,6 +404,29 @@ fn apply_outputs(
 impl Engine {
     async fn start_height(&self) -> Result<u32> {
         if let Some(h) = self.ctx.params.ycash_start_height {
+            // audit 05/L-5: an attestor that starts after the set's oldest vault of the bridge's
+            // tag never saw those locks; it would challenge (and open fraud cases against)
+            // honest proposals for them. Refused unless the operator says so (never on mainnet:
+            // the config refuses start_height there).
+            let oldest = self.oldest_bridge_vault().await?;
+            if let Some(min) = oldest
+                && min < h
+            {
+                if !self.ctx.params.accept_blind_start || self.ctx.params.mainnet {
+                    bail!(
+                        "ycash.start_height {h} is above the set's oldest {} vault at {min}: this \
+                         attestor would challenge and slash honest proposals for locks it never \
+                         saw (hawkeye run --i-accept-blind-start overrides off mainnet)",
+                        self.ctx.params.tag_text()
+                    );
+                }
+                warn!(
+                    event = "blind_start",
+                    start_height = h,
+                    oldest_vault = min,
+                    "starting after existing vaults: proposals for their locks will be challenged"
+                );
+            }
             return Ok(h);
         }
         let info = self.ctx.ycash.vault_getinfo().await?;
@@ -417,6 +440,26 @@ impl Engine {
         })
     }
 
+    /// The height of the set's oldest live vault of the bridge's tag, if any.
+    async fn oldest_bridge_vault(&self) -> Result<Option<u32>> {
+        let rows = self
+            .ctx
+            .ycash
+            .vault_list(Some(&hawkeye_ycash::types::VaultListFilter {
+                tag: Some(self.ctx.params.tag_text()),
+                setid: Some(self.ctx.set_hash()),
+                kind: Some(hawkeye_ycash::types::TemplateKind::Vault),
+                ..Default::default()
+            }))
+            .await
+            .context("vault_list")?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.as_vault())
+            .map(|v| v.height)
+            .min())
+    }
+
     /// Follow the active chain: rewind on a reorg, then process new blocks in order.
     pub(crate) async fn follow_ycash(&mut self) -> Result<()> {
         let tip = self.mem.tip;
@@ -424,6 +467,16 @@ impl Engine {
         let next = match cursor {
             None => self.start_height().await?,
             Some(c) => {
+                if let Some(h) = self.ctx.params.ycash_start_height
+                    && self.mem.ticks == 1
+                {
+                    info!(
+                        event = "start_height_ignored",
+                        start_height = h,
+                        cursor = c.height,
+                        "the ledger has a Ycash cursor: ycash.start_height applies to an empty ledger only"
+                    );
+                }
                 let h = u32::try_from(c.height).unwrap_or(u32::MAX);
                 let mut fork = h.min(tip);
                 loop {
@@ -448,12 +501,12 @@ impl Engine {
                         intents_unconfirmed = r.intents_unconfirmed.len()
                     );
                     self.mem.mempool_seen.clear();
-                    if !r.exposures.is_empty() {
-                        let ids: Vec<String> = r.exposures.iter().map(hex::encode).collect();
-                        self.alarm(
-                            "exposure",
-                            format!("signed locks left the active chain: {}", ids.join(", ")),
-                        );
+                    // the exposure alarm and pause come from the ledger (refresh_exposures); a
+                    // proposal still open for a reorged lock is withdrawn now, while the window
+                    // runs (audit 05/L-5)
+                    for id in &r.exposures {
+                        self.withdraw_reorged_proposal(*id, "the lock left the active chain")
+                            .await;
                     }
                 }
                 fork + 1

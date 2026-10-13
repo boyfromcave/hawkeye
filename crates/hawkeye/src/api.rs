@@ -79,7 +79,8 @@ async fn lock(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
     let Ok(lock_id): Result<[u8; 32], _> = bytes.as_slice().try_into() else {
         return err(StatusCode::BAD_REQUEST, "lockId is not 32 bytes");
     };
-    let r = ctx.db(|t| Ok((t.lock(&lock_id)?, t.mint_signature(&lock_id)?)));
+    let dep = ctx.params.deployment;
+    let r = ctx.db(|t| Ok((t.lock(&lock_id)?, t.mint_signature(&dep, &lock_id)?)));
     match r {
         Ok((Some(l), sig)) => Json(LockView {
             lock_id: format!("0x{}", hex::encode(l.lock_id)),

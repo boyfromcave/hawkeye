@@ -435,6 +435,9 @@ pub struct Params {
     pub auto_slash: bool,
     /// Drills allowed.
     pub drills: bool,
+    /// Start the follower at `ycash_start_height` although the set has older vaults of the
+    /// bridge's tag (`hawkeye run --i-accept-blind-start`; never on mainnet; audit 05/L-5).
+    pub accept_blind_start: bool,
     /// Optimistic mode: fall back to the threshold path when every live member is barred from a
     /// lock (`[bridge] fallback_to_threshold`, always true on mainnet; HK-15).
     pub fallback_to_threshold: bool,
@@ -532,6 +535,7 @@ pub(crate) fn sample_params(drills: bool, mainnet: bool) -> Params {
         auto_slash: true,
         drills,
         fallback_to_threshold: true,
+        accept_blind_start: false,
         ycash_start_height: None,
         ycash_signing: YcashSigning::Wallet,
         min_sender_balance_wei: 0,
@@ -800,6 +804,11 @@ impl Config {
         if mainnet {
             ensure!(!self.devnet.drills, "mainnet refuses [devnet] drills");
             ensure!(
+                self.ycash.start_height.is_none(),
+                "mainnet refuses ycash.start_height: the follower starts at the upgrade's \
+                 activation height (audit 05/L-5)"
+            );
+            ensure!(
                 !matches!(finality, Finality::Depth { .. }),
                 "mainnet refuses a depth-only Ethereum finality"
             );
@@ -876,6 +885,7 @@ impl Config {
             auto_slash: self.policy.auto_slash.unwrap_or(!mainnet),
             drills: self.devnet.drills,
             fallback_to_threshold: mainnet || self.bridge.fallback_to_threshold.unwrap_or(true),
+            accept_blind_start: false,
             ycash_start_height: self.ycash.start_height,
             ycash_signing,
             min_sender_balance_wei,
@@ -1266,6 +1276,48 @@ format = "text"
             .settings(d.path())
             .unwrap();
         assert!(s.warnings.is_empty());
+    }
+
+    /// Audit 05/L-5: `ycash.start_height` has no legitimate use on mainnet.
+    #[test]
+    fn mainnet_refuses_start_height() {
+        let d = dir();
+        std::fs::write(
+            d.path().join("31337.json"),
+            DEPLOYMENT.replace(r#""threshold":1"#, r#""threshold":2"#),
+        )
+        .unwrap();
+        let text = mainnet_values(&sample("mainnet", ""))
+            .replace("mint_threshold = 1\n", "mint_threshold = 2\n")
+            .replace(
+                &format!("secret_hex = \"{}\"", "01".repeat(32)),
+                "keystore = \"k.json\"",
+            )
+            .replace("drills = true", "drills = false")
+            .replace(
+                "finality = \"finalized\"\n",
+                "finality = \"finalized\"\nsender_keystore = \"s.json\"\n",
+            );
+        Config::parse(&text).unwrap().settings(d.path()).unwrap();
+        let late = text.replace(
+            "rpc_password = \"p\"\n",
+            "rpc_password = \"p\"\nstart_height = 100\n",
+        );
+        let e = format!(
+            "{:#}",
+            Config::parse(&late)
+                .unwrap()
+                .settings(d.path())
+                .unwrap_err()
+        );
+        assert!(e.contains("mainnet refuses ycash.start_height"), "{e}");
+        // elsewhere it parses (the engine checks it against the set's vaults)
+        let reg = sample("regtest", "").replace(
+            "rpc_password = \"p\"\n",
+            "rpc_password = \"p\"\nstart_height = 100\n",
+        );
+        let s = Config::parse(&reg).unwrap().settings(d.path()).unwrap();
+        assert_eq!(s.params.ycash_start_height, Some(100));
     }
 
     /// The mainnet example config passes the mainnet checks (its deployment file aside).
