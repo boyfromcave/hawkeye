@@ -39,6 +39,9 @@ use crate::peers::ApiError;
 /// few kilobytes, an evidence bundle tens).
 pub const MAX_BODY: usize = 1 << 20;
 
+/// How long a reporter's "restored" answer is cached.
+pub const RESTORE_ANSWER_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// The verified requester of a signing route, as a request extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerMember(pub PubKey33);
@@ -77,8 +80,10 @@ pub struct AuthState {
     replay: Mutex<HashMap<(PubKey33, [u8; 16]), u64>>,
     /// Peer API URLs by the member key their signed answers recovered to (learnt, review R-1).
     pub peer_url: Mutex<HashMap<PubKey33, String>>,
-    /// `(reporter, restore event) → restored`, as the reporter itself answered once (R-1).
-    pub restore_answers: Mutex<HashMap<(PubKey33, String), bool>>,
+    /// `reporter → (restored, when it answered)`: the reporter's own signed answer, cached for
+    /// [`RESTORE_ANSWER_TTL`] (one entry per member: bounded; a cached `true` lapses after the
+    /// restore is acknowledged, review nit).
+    pub restore_answers: Mutex<HashMap<PubKey33, (bool, std::time::Instant)>>,
 }
 
 impl AuthState {
