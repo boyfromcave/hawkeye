@@ -29,6 +29,7 @@ use hawkeye::attribution::Attributor;
 use hawkeye::config::Params;
 use hawkeye::engine::{Ctx, Engine};
 use hawkeye::keys::eth_signer;
+use hawkeye::peer_auth::PeerSigner;
 use hawkeye::peers::Peers;
 use hawkeye::status::Status;
 use hawkeye_core::address::Network;
@@ -119,6 +120,13 @@ struct Opts {
     mode: MintMode,
     min_owner_age: u32,
     roll_margin: u32,
+    /// The set's `unlockThreshold` (the §2 row: 1).
+    unlock_threshold: u32,
+    /// The set's `cancelThreshold` (the §2 row: 1).
+    cancel_threshold: u32,
+    /// Each attestor signs through its own wallet view of the shared mock (`a<i>`: its member
+    /// key only), as separate nodes would; needed for thresholds above 1.
+    wallet_views: bool,
     /// The set's `ratelimitbps` (0: no rate limit).
     ratelimitbps: u32,
     /// anvil's `--slots-in-an-epoch`: finalized = latest − 2 × slots (audit 05/T-3: 32 pins
@@ -136,6 +144,9 @@ impl Default for Opts {
             mode: MintMode::Threshold { k: 1 },
             min_owner_age: 400,
             roll_margin: 50,
+            unlock_threshold: 1,
+            cancel_threshold: 1,
+            wallet_views: false,
             ratelimitbps: 0,
             slots: 1,
             window: WINDOW,
@@ -230,8 +241,8 @@ async fn setup_with(opts: Opts) -> Option<Env> {
     let admit = st.new_wallet_key();
     let set = st.add_set(SetParams {
         seats: 3,
-        unlockthreshold: 1,
-        cancelthreshold: 1,
+        unlockthreshold: opts.unlock_threshold,
+        cancelthreshold: opts.cancel_threshold,
         slashthreshold: 2,
         open: false,
         ratelimitbps: opts.ratelimitbps,
@@ -242,9 +253,15 @@ async fn setup_with(opts: Opts) -> Option<Env> {
         maturity: 2,
         admitkey: admit,
     });
-    for k in &keys {
+    for (i, k) in keys.iter().enumerate() {
         st.add_member(&set, PubKey(k.public_key()), true);
+        if opts.wallet_views {
+            st.wallet_views
+                .insert(format!("a{i}"), [PubKey(k.public_key())].into());
+        }
     }
+    // fee coins (plan §5.5: at least 8, the fee-coins-low floor)
+    st.add_wallet_coins(10, 100_000_000);
     st.mine(1);
     let mock = MockYcashd::start_with(st).await.unwrap();
     Some(Env {
@@ -287,6 +304,8 @@ impl Env {
             fallback_to_threshold: true,
             accept_blind_start: false,
             ycash_start_height: Some(1),
+            ycash_signing: hawkeye::config::YcashSigning::Wallet,
+            min_sender_balance_wei: 0,
         }
     }
 
@@ -300,7 +319,7 @@ impl Env {
 
     /// Attestor `i`'s engine over the ledger file `attestor<i>.db`.
     async fn engine(&self, i: usize) -> Engine {
-        self.engine_with(i, vec![], |_| {}).await
+        self.engine_with_peers(i, vec![]).await
     }
 
     /// Attestor `i`'s engine with peer API URLs and adjusted parameters.
@@ -310,8 +329,45 @@ impl Env {
         peers: Vec<String>,
         adjust: impl FnOnce(&mut Params),
     ) -> Engine {
+        self.engine_full(i, peers, None, adjust).await
+    }
+
+    /// Attestor `i`'s node client: its own wallet view when the set needs per-member signing.
+    fn node(&self, i: usize) -> hawkeye_ycash::YcashRpc {
+        if self.opts.wallet_views {
+            self.mock.wallet_client(&format!("a{i}"))
+        } else {
+            self.mock.client()
+        }
+    }
+
+    /// A member-key request signer for `key` (the peer channel, HK-13).
+    fn signer(&self, key: &SecretKey) -> PeerSigner {
+        PeerSigner {
+            key: key.clone(),
+            set_id: self.set.0,
+            deployment: self.params().deployment,
+            require_auth: true,
+        }
+    }
+
+    /// Attestor `i`'s engine, asking `peers` (signed with its member key).
+    async fn engine_with_peers(&self, i: usize, peers: Vec<String>) -> Engine {
+        self.engine_full(i, peers, None, |_| {}).await
+    }
+
+    /// Attestor `i`'s engine whose Ethereum transactions are sent by `sender` (a gas account,
+    /// 05/M-1) instead of its member key.
+    async fn engine_full(
+        &self,
+        i: usize,
+        peers: Vec<String>,
+        sender: Option<SecretKey>,
+        adjust: impl FnOnce(&mut Params),
+    ) -> Engine {
+        let eth_key = sender.unwrap_or_else(|| self.keys[i].clone());
         let foreign = Arc::new(hawkeye::foreign::EthereumChain::new(
-            self.eth(&self.keys[i]).await,
+            self.eth(&eth_key).await,
         ));
         self.engine_on(i, peers, foreign, adjust)
     }
@@ -332,11 +388,12 @@ impl Env {
             params: Arc::new(params),
             me: key.public_key(),
             foreign,
-            key,
-            ycash: Arc::new(self.mock.client()),
+            ycash: Arc::new(self.node(i)),
             store: Arc::new(Mutex::new(store)),
             attributor: Arc::new(MockAttributor { set: self.set.0 }),
-            peers: Peers::new(peers).unwrap(),
+            peers: Peers::new(peers).unwrap().with_signer(self.signer(&key)),
+            key,
+            auth: Arc::new(hawkeye::peer_auth::AuthState::default()),
             status: Arc::new(RwLock::new(Status::default())),
             network_name: "regtest".into(),
         })
@@ -513,9 +570,11 @@ async fn a_lock_sign_mint_observed() {
     // the API: the lock with this attestor's signature; a slash vote it cannot verify is refused
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = hawkeye::api::router(engines[0].ctx().clone());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let peers = Peers::new(vec![format!("http://{addr}")]).unwrap();
+    let ctx0 = engines[0].ctx().clone();
+    tokio::spawn(async move { hawkeye::api::serve(listener, ctx0).await.unwrap() });
+    let peers = Peers::new(vec![format!("http://{addr}")])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[1]));
     let view = peers
         .lock(&peers.urls()[0], &format!("0x{}", hex::encode(lock_id)))
         .await
@@ -1035,6 +1094,31 @@ async fn e2_leader_back_after_the_release_adopts_it() {
 
 // ------------------------------------------------------------------------------------------
 // helpers for (f)–(k)
+
+/// Three engines, each serving its peer API on a loopback port and asking the other two
+/// (member-key signed, HK-13).
+async fn networked(env: &Env) -> (Vec<Engine>, Vec<String>) {
+    let mut listeners = vec![];
+    let mut urls = vec![];
+    for _ in 0..3 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", l.local_addr().unwrap()));
+        listeners.push(l);
+    }
+    let mut engines = vec![];
+    for i in 0..3 {
+        let peers = (0..3)
+            .filter(|j| *j != i)
+            .map(|j| urls[j].clone())
+            .collect();
+        engines.push(env.engine_with_peers(i, peers).await);
+    }
+    for (l, e) in listeners.into_iter().zip(&engines) {
+        let ctx = e.ctx().clone();
+        tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+    }
+    (engines, urls)
+}
 
 async fn three(env: &Env) -> Vec<Engine> {
     vec![
@@ -1730,78 +1814,764 @@ async fn j_optimistic_proposal_without_lock_challenged() {
     assert_eq!(c.total_supply().await.unwrap(), U256::ZERO);
 }
 
+// ------------------------------------------------------------------------------------------
+// (k) the peer channel (remedial report 05/H-1, HK-13): member-signed requests, `/unlock/sign`
+// inert at unlockThreshold 1 and leader-gated above it, one live vault per burn, reused unlocks
+// and co-signatures checked, cancel co-signing and fee-coin capacity
+
+fn views(unlock: u32, cancel: u32) -> Opts {
+    Opts {
+        unlock_threshold: unlock,
+        cancel_threshold: cancel,
+        wallet_views: true,
+        ..Opts::default()
+    }
+}
+
+/// An unlock of `vault` paying `amount` to `r`, unsigned, with burn `nonce`'s memo if given.
+async fn unlock_hex(
+    env: &Env,
+    vault: &OutPoint,
+    r: &YcashRecipient,
+    amount: i64,
+    memo: Option<&hawkeye_core::memo::HawkeyeMemo>,
+) -> String {
+    let built = env
+        .mock
+        .client()
+        .vault_buildunlock(
+            vault,
+            &[hawkeye_ycash::types::Recipient::script(
+                r.script(),
+                Amount(amount),
+            )],
+        )
+        .await
+        .unwrap()
+        .hex
+        .to_string();
+    match memo {
+        Some(m) => hawkeye_ycash::tx::insert_op_return(&built, &m.encode()).unwrap(),
+        None => built,
+    }
+}
+
+fn vaults(env: &Env) -> Vec<OutPoint> {
+    let st = env.mock.state();
+    st.templates
+        .iter()
+        .filter(|(_, t)| t.as_vault().is_some())
+        .map(|(op, _)| *op)
+        .collect()
+}
+
+/// The leader of burn `nonce` among the three (`nonce mod |live|` over the sorted keys).
+fn leader_index(env: &Env, nonce: u64) -> usize {
+    let mut live: Vec<[u8; 33]> = (0..3).map(|i| env.key_of_index(i)).collect();
+    hawkeye_core::keys::sort_members(&mut live);
+    index_of(env, &live[(nonce % 3) as usize])
+}
+
+/// The mempool transactions carrying burn `nonce`'s memo, and the vault each spends.
+fn unlocks_for(env: &Env, nonce: u64) -> Vec<(Transaction, OutPoint)> {
+    let vaults: Vec<OutPoint> = vaults(env);
+    mempool_txs(env)
+        .into_iter()
+        .filter(|t| {
+            t.outputs.iter().any(|o| {
+                matches!(parse_memo_script(&o.script_pubkey), Ok(Some(m)) if m.reference == nonce)
+            })
+        })
+        .filter_map(|t| {
+            let v = t
+                .inputs
+                .iter()
+                .map(|i| i.prevout)
+                .find(|p| vaults.contains(p))?;
+            Some((t, v))
+        })
+        .collect()
+}
+
+/// (k1) HK-1: at unlockThreshold 1 the endpoint is inert (and so is `/cancel/sign` at
+/// cancelThreshold 1); unsigned, stale, replayed and non-member requests never reach a
+/// signing closure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn k_unlock_cosign_endpoint() {
-    use hawkeye::engine::burn::verify_and_sign_unlock;
-    use hawkeye::peers::UnlockSignRequest;
-    use hawkeye_core::memo::HawkeyeMemo;
+async fn k1_signing_routes_authenticated_and_inert_at_threshold_one() {
+    use hawkeye::peers::{CancelSignRequest, SlashSignRequest, UnlockSignRequest};
     let Some(env) = setup().await else { return };
-    let mut engines = three(&env).await;
+    let (mut engines, urls) = networked(&env).await;
     lock_and_mint(&env, &mut engines).await;
     let r = YcashRecipient::p2pkh([0x44; 20]);
     let nonce = env.burn(300_000_000, &r).await;
     env.eth_mine(3).await;
-    let mut live: Vec<[u8; 33]> = (0..3).map(|i| env.key_of_index(i)).collect();
-    hawkeye_core::keys::sort_members(&mut live);
-    let leader = index_of(&env, &live[(nonce % 3) as usize]);
+    engines[1].tick().await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let b = engines[1].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    let memo = hawkeye_core::memo::HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
+    let hex = unlock_hex(&env, &vaults(&env)[0], &r, 300_000_000, Some(&memo)).await;
+    let req = UnlockSignRequest { hex: hex.clone() };
+    let signs = || env.mock.state().calls_to("set_signunlock").len();
+    let before = signs();
+    // unsigned: 401
+    let anon = Peers::new(vec![]).unwrap();
+    let e = anon
+        .unlock_sign(&urls[1], &req)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("401") && e.contains("missing"), "{e}");
+    // signed by a key that is no member: 403
+    let outsider = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.holder));
+    let e = outsider
+        .unlock_sign(&urls[1], &req)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("403") && e.contains("not a current member"),
+        "{e}"
+    );
+    let e = outsider
+        .slash_sign(
+            &urls[1],
+            &SlashSignRequest {
+                evidence: serde_json::json!({}),
+                act: "00".into(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not a current member"), "{e}");
+    // signed by the burn's leader, a current member: the endpoint is inert at threshold 1
+    let leader = leader_index(&env, nonce);
+    let member = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[leader]));
+    let e = member
+        .unlock_sign(&urls[1], &req)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("403") && e.contains("disabled"), "{e}");
+    let e = member
+        .cancel_sign(
+            &urls[1],
+            &CancelSignRequest {
+                hex: hex.clone(),
+                intent: format!("{}:0", "00".repeat(32)),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("disabled"), "{e}");
+    // a replayed request (same nonce) and a stale one are refused before the handler
+    let http = reqwest::Client::new();
+    let body = serde_json::to_vec(&req).unwrap();
+    let sr = env
+        .signer(&env.keys[leader])
+        .sign("/unlock/sign", &body)
+        .unwrap();
+    let send = |headers: Vec<(&'static str, String)>| {
+        let mut rb = http
+            .post(format!("{}/unlock/sign", urls[1]))
+            .header("content-type", "application/json");
+        for (n, v) in headers {
+            rb = rb.header(n, v);
+        }
+        rb.body(body.clone()).send()
+    };
+    assert_eq!(send(sr.headers.clone()).await.unwrap().status(), 403);
+    let replay = send(sr.headers.clone()).await.unwrap();
+    assert_eq!(replay.status(), 401);
+    assert!(replay.text().await.unwrap().contains("replayed"));
+    let old = 1_000_000u64;
+    let nonce16 = [7u8; 16];
+    let msg = hawkeye_core::peerauth::request_msg(&hawkeye_core::peerauth::PeerRequest {
+        set_id: &env.set.0,
+        deployment: &dep_of(&engines[0]),
+        method: "POST",
+        path: "/unlock/sign",
+        timestamp: old,
+        nonce: &nonce16,
+        body: &body,
+    })
+    .unwrap();
+    let sig = hawkeye_core::peerauth::sign(&env.keys[leader], &msg).unwrap();
+    let stale = send(vec![
+        ("x-hawkeye-member", hex::encode(env.key_of_index(leader))),
+        ("x-hawkeye-time", old.to_string()),
+        ("x-hawkeye-nonce", hex::encode(nonce16)),
+        ("x-hawkeye-sig", hex::encode(sig)),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(stale.status(), 401);
+    assert!(stale.text().await.unwrap().contains("stale"));
+    // a signature over another path (a /slash/sign body replayed to /unlock/sign) does not recover
+    let other = env
+        .signer(&env.keys[leader])
+        .sign("/slash/sign", &body)
+        .unwrap();
+    let r2 = send(other.headers).await.unwrap();
+    assert_eq!(r2.status(), 401);
+    assert_eq!(signs(), before, "no request reached a signing closure");
+    // the read-only routes stay public
+    let view = anon
+        .lock(&urls[1], &format!("0x{}", hex::encode([0u8; 32])))
+        .await;
+    assert!(view.unwrap_err().to_string().contains("404"));
+}
+
+/// (k) unlockThreshold 2: `POST /unlock/sign` co-signs only a member-signed request of the
+/// burn's leader here, only a burn ↔ memo match, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k_unlock_cosign_endpoint() {
+    use hawkeye::peers::UnlockSignRequest;
+    use hawkeye_core::memo::HawkeyeMemo;
+    let Some(env) = setup_with(views(2, 1)).await else {
+        return;
+    };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x44; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
     let peer = (leader + 1) % 3;
+    let third = (leader + 2) % 3;
     // only the peer ticks: it holds the finalized burn and posts nothing
     engines[peer].tick().await;
     let k = BurnKey::new(dep_of(&engines[0]), nonce);
     let b = engines[peer].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
     assert_eq!(b.state, BurnState::Assigned);
-    let vault = {
-        let st = env.mock.state();
-        *st.templates.keys().next().unwrap()
-    };
-    let client = env.mock.client();
-    let unlock = || async {
-        client
-            .vault_buildunlock(
-                &vault,
-                &[hawkeye_ycash::types::Recipient::script(
-                    r.script(),
-                    Amount(300_000_000),
-                )],
-            )
-            .await
-            .unwrap()
-            .hex
-            .to_string()
-    };
-    // no memo: refused
-    let e = verify_and_sign_unlock(
-        engines[peer].ctx(),
-        &UnlockSignRequest {
-            hex: unlock().await,
-        },
-    )
-    .await
-    .unwrap_err();
-    assert!(format!("{e:#}").contains("does not match"), "{e:#}");
-    // the burn's memo: co-signed, once
+    assert_eq!(b.leader, Some(env.key_of_index(leader)));
+    let vault = vaults(&env)[0];
     let memo = HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
-    let with = hawkeye_ycash::tx::insert_op_return(&unlock().await, &memo.encode()).unwrap();
-    let ok = verify_and_sign_unlock(
-        engines[peer].ctx(),
-        &UnlockSignRequest { hex: with.clone() },
-    )
-    .await
-    .unwrap();
-    assert_eq!(ok.matched, format!("burn {nonce}"));
-    assert!(ok.complete);
-    let signs = env.mock.state().calls_to("set_signunlock").len();
-    let again = verify_and_sign_unlock(engines[peer].ctx(), &UnlockSignRequest { hex: with })
+    let as_member = |i: usize| {
+        Peers::new(vec![])
+            .unwrap()
+            .with_signer(env.signer(&env.keys[i]))
+    };
+    let with = unlock_hex(&env, &vault, &r, 300_000_000, Some(&memo)).await;
+    let signs = || env.mock.state().calls_to("set_signunlock").len();
+    let before = signs();
+    // unsigned: 401; another member, not the leader: refused
+    let e = Peers::new(vec![])
+        .unwrap()
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: with.clone() })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("401"), "{e}");
+    let e = as_member(third)
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: with.clone() })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not the burn's leader"), "{e}");
+    // the leader, no memo: refused
+    let bare = unlock_hex(&env, &vault, &r, 300_000_000, None).await;
+    let e = as_member(leader)
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: bare })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("does not match"), "{e}");
+    assert_eq!(signs(), before);
+    // the leader, the burn's memo: co-signed once, the answer signed by the peer
+    let ok = as_member(leader)
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: with.clone() })
         .await
         .unwrap();
-    assert_eq!(again.hex, ok.hex);
-    assert_eq!(env.mock.state().calls_to("set_signunlock").len(), signs);
-    // another spend of the same vault is never co-signed
-    let other = hawkeye_ycash::tx::insert_op_return(&unlock().await, &memo.encode()).unwrap();
-    let e = verify_and_sign_unlock(engines[peer].ctx(), &UnlockSignRequest { hex: other })
+    assert_eq!(ok.responder, Some(env.key_of_index(peer)));
+    assert_eq!(ok.body.matched, format!("burn {nonce}"));
+    assert!(!ok.body.complete, "one of two signatures");
+    assert_eq!(signs(), before + 1);
+    let again = as_member(leader)
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: with })
         .await
-        .unwrap_err();
-    assert!(format!("{e:#}").contains("sign-once conflict"), "{e:#}");
+        .unwrap();
+    assert_eq!(again.body.hex, ok.body.hex);
+    assert_eq!(signs(), before + 1, "a repeat calls no node");
+    // another spend of the same vault is never co-signed
+    let other = unlock_hex(&env, &vault, &r, 300_000_000, Some(&memo)).await;
+    let e = as_member(leader)
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: other })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("sign-once conflict"), "{e}");
+    let rows = engines[peer]
+        .ctx()
+        .db(|t| t.unlock_burn_rows(&env.set.0, &k))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].origin, hawkeye_store::UnlockOrigin::Cosign);
+}
+
+/// (k2) The per-burn dimension: a burn the peer co-signed on V1 is never co-signed on V2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k2_per_burn_sign_once() {
+    use hawkeye::peers::UnlockSignRequest;
+    use hawkeye_core::memo::HawkeyeMemo;
+    let Some(env) = setup_with(views(2, 1)).await else {
+        return;
+    };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x45; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let peer = (leader + 1) % 3;
+    engines[peer].tick().await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let b = engines[peer].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    let memo = HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
+    let vs = vaults(&env);
+    assert!(vs.len() >= 2);
+    let leader_peers = Peers::new(vec![])
+        .unwrap()
+        .with_signer(env.signer(&env.keys[leader]));
+    let v1 = unlock_hex(&env, &vs[0], &r, 300_000_000, Some(&memo)).await;
+    leader_peers
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: v1 })
+        .await
+        .unwrap();
+    let before = env.mock.state().calls_to("set_signunlock").len();
+    let v2 = unlock_hex(&env, &vs[1], &r, 300_000_000, Some(&memo)).await;
+    let e = leader_peers
+        .unlock_sign(&urls[peer], &UnlockSignRequest { hex: v2 })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains(&format!("burn {k}")), "{e}");
+    assert_eq!(
+        env.mock.state().calls_to("set_signunlock").len(),
+        before,
+        "the second vault never reached the node"
+    );
+}
+
+/// (k3) Finding 05/N-1: a co-signed (not leader) unlock for the burn in the leader's ledger is
+/// never re-sent; it holds the burn until it is dead (its fee input spent `C_Y` deep), then
+/// the leader signs another vault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k3_attacker_prefilled_record_is_not_reused() {
+    use hawkeye_core::memo::HawkeyeMemo;
+    use hawkeye_store::{UnlockBurn, UnlockOrigin, YcashSignKey};
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x46; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    // the pre-fix attack: an unlock of V1 for the burn, signed and recorded as a co-signature in
+    // the leader's ledger, never broadcast
+    engines[leader].tick().await;
+    let mempool_before = unlocks_for(&env, nonce).len();
+    assert_eq!(mempool_before, 1, "the leader posted it");
+    // (set the stage again on a fresh env would be heavier: instead the attack is planted on the
+    // next burn, before the leader sees it)
+    let nonce2 = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader2 = leader_index(&env, nonce2);
+    let k2 = BurnKey::new(dep_of(&engines[0]), nonce2);
+    let _ = k;
+    let b2_hash = {
+        engines[(leader2 + 1) % 3].tick().await;
+        engines[(leader2 + 1) % 3]
+            .ctx()
+            .db(|t| t.burn(&k2))
+            .unwrap()
+            .unwrap()
+            .tx_hash
+    };
+    let spent_now: Vec<OutPoint> = unlocks_for(&env, nonce)
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    let free: Vec<OutPoint> = vaults(&env)
+        .into_iter()
+        .filter(|v| !spent_now.contains(v))
+        .collect();
+    let v1 = free[0];
+    let memo = HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce2, b2_hash);
+    let hex = unlock_hex(&env, &v1, &r, 300_000_000, Some(&memo)).await;
+    let signed = env
+        .mock
+        .client()
+        .set_signunlock(&hex.parse().unwrap())
+        .await
+        .unwrap();
+    let key = YcashSignKey {
+        domain: hawkeye_store::SignDomain::YcashUnlock,
+        set_id: env.set.0,
+        prevout: CoreOutPoint::new(v1.txid.0, v1.vout),
+    };
+    engines[leader2]
+        .ctx()
+        .db(|t| {
+            t.sign_once_unlock(
+                &key,
+                Some(&UnlockBurn {
+                    key: k2,
+                    origin: UnlockOrigin::Cosign,
+                    allow_double: false,
+                }),
+                &hex,
+                |_| Ok::<_, String>((signed.hex.to_string(), signed.sighash.0)),
+            )
+        })
+        .unwrap();
+    // the leader holds the burn: it neither re-sends the co-signed bytes nor signs another vault
+    let sends = env.mock.state().calls_to("vault_send").len();
+    tick_all(&mut engines).await;
+    assert!(
+        unlocks_for(&env, nonce2).is_empty(),
+        "nothing posted for the burn"
+    );
+    assert_eq!(env.mock.state().calls_to("vault_send").len(), sends);
+    assert!(
+        engines[leader2]
+            .alarms()
+            .iter()
+            .any(|a| a.name == "unlock-held"),
+        "{:?}",
+        engines[leader2].alarms()
+    );
+    // its fee input is spent by another transaction and buried C_Y deep: the row dies and the
+    // leader signs another vault for the burn
+    let tx = Transaction::decode(&signed.hex.0).unwrap();
+    let fee = tx.inputs.iter().find(|i| i.prevout != v1).unwrap().prevout;
+    let spend = Transaction::new_v4(
+        vec![TxIn {
+            prevout: fee,
+            script_sig: vec![0x51],
+            sequence: u32::MAX,
+        }],
+        vec![TxOut {
+            value: 1000,
+            script_pubkey: YcashRecipient::p2pkh([0x13; 20]).script(),
+        }],
+        0,
+        0,
+    );
+    env.mock.state().submit(spend.encode()).unwrap();
+    env.mine(1);
+    tick_all(&mut engines).await; // seen spent: 1 block deep
+    assert!(unlocks_for(&env, nonce2).is_empty());
+    env.mine(1);
+    tick_all(&mut engines).await; // C_Y deep: dead
+    tick_all(&mut engines).await; // another vault
+    let rows = engines[leader2]
+        .ctx()
+        .db(|t| t.unlock_burn_rows(&env.set.0, &k2))
+        .unwrap();
+    let dead = rows.iter().find(|r| r.prevout == key.prevout).unwrap();
+    assert!(
+        dead.dead_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("fee input")),
+        "{dead:?}"
+    );
+    let live: Vec<_> = rows.iter().filter(|r| r.is_live()).collect();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].origin, UnlockOrigin::Leader);
+    let posted = unlocks_for(&env, nonce2);
+    assert_eq!(posted.len(), 1, "one unlock for the burn");
+    assert_ne!(posted[0].1, v1, "on another vault");
+}
+
+/// (k3b) A leader's own unlock that never left (vault_send failed) and whose fee input was then
+/// spent `C_Y` deep is marked dead, and another vault is signed for the burn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k3b_unsendable_leader_unlock_dies_after_c_y() {
+    let Some(env) = setup().await else { return };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x47; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    env.mock
+        .state()
+        .inject_error("vault_send", -26, "16: mock refusal");
+    engines[leader].tick().await;
+    assert!(unlocks_for(&env, nonce).is_empty(), "the send failed");
+    let rows = engines[leader]
+        .ctx()
+        .db(|t| t.unlock_burn_rows(&env.set.0, &k))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let first = rows[0].prevout;
+    let rec = engines[leader]
+        .ctx()
+        .db(|t| {
+            t.ycash_signature(&hawkeye_store::YcashSignKey {
+                domain: hawkeye_store::SignDomain::YcashUnlock,
+                set_id: env.set.0,
+                prevout: first,
+            })
+        })
+        .unwrap()
+        .unwrap();
+    let tx = Transaction::decode_hex(&rec.signed_hex).unwrap();
+    let fee = tx
+        .inputs
+        .iter()
+        .find(|i| CoreOutPoint::new(i.prevout.txid.0, i.prevout.vout) != first)
+        .unwrap()
+        .prevout;
+    let spend = Transaction::new_v4(
+        vec![TxIn {
+            prevout: fee,
+            script_sig: vec![0x51],
+            sequence: u32::MAX,
+        }],
+        vec![TxOut {
+            value: 1000,
+            script_pubkey: YcashRecipient::p2pkh([0x14; 20]).script(),
+        }],
+        0,
+        0,
+    );
+    env.mock.state().submit(spend.encode()).unwrap();
+    env.mine(1);
+    engines[leader].tick().await; // 1 deep: held, never re-sent (its fee input is gone)
+    assert!(unlocks_for(&env, nonce).is_empty());
+    env.mine(1);
+    engines[leader].tick().await; // dead
+    engines[leader].tick().await; // another vault
+    let rows = engines[leader]
+        .ctx()
+        .db(|t| t.unlock_burn_rows(&env.set.0, &k))
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|r| r.prevout == first && !r.is_live()));
+    let posted = unlocks_for(&env, nonce);
+    assert_eq!(posted.len(), 1);
+    assert_ne!(
+        CoreOutPoint::new(posted[0].1.txid.0, posted[0].1.vout),
+        first
+    );
+}
+
+/// A peer that answers `/unlock/sign` with a forged transaction, signed by a member key.
+async fn rogue_peer(env: &Env, member: SecretKey, forge: fn(&mut Transaction)) -> String {
+    use axum::http::{HeaderMap, StatusCode};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let set = env.set.0;
+    let dep = env.params().deployment;
+    let app = axum::Router::new().route(
+        "/unlock/sign",
+        axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+            let member = member.clone();
+            async move {
+                let h = |n: &str| headers.get(n).unwrap().to_str().unwrap().to_owned();
+                let nonce = hawkeye_core::peerauth::parse_nonce(&h("x-hawkeye-nonce")).unwrap();
+                let msg =
+                    hawkeye_core::peerauth::request_msg(&hawkeye_core::peerauth::PeerRequest {
+                        set_id: &set,
+                        deployment: &dep,
+                        method: "POST",
+                        path: "/unlock/sign",
+                        timestamp: h("x-hawkeye-time").parse().unwrap(),
+                        nonce: &nonce,
+                        body: &body,
+                    })
+                    .unwrap();
+                let req: hawkeye::peers::UnlockSignRequest = serde_json::from_slice(&body).unwrap();
+                let mut tx = Transaction::decode_hex(&req.hex).unwrap();
+                forge(&mut tx);
+                let out = serde_json::to_vec(&hawkeye::peers::UnlockSignResponse {
+                    hex: tx.encode_hex(),
+                    complete: true,
+                    matched: "forged".into(),
+                })
+                .unwrap();
+                let rs = hawkeye_core::peerauth::sign(
+                    &member,
+                    &hawkeye_core::peerauth::response_msg(&msg, &out),
+                )
+                .unwrap();
+                (
+                    StatusCode::OK,
+                    [
+                        ("x-hawkeye-member", hex::encode(member.public_key())),
+                        ("x-hawkeye-sig", hex::encode(rs)),
+                        ("content-type", "application/json".to_owned()),
+                    ],
+                    out,
+                )
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    url
+}
+
+/// Two junk 65-byte pushes on the template input (the 05/L-1 attack).
+fn junk_pushes(tx: &mut Transaction) {
+    let idx = tx
+        .inputs
+        .iter()
+        .position(|i| i.script_sig.last() == Some(&0x51))
+        .unwrap();
+    let mut ss = vec![];
+    for b in [0x99u8, 0x98] {
+        let mut j = vec![0x1f];
+        j.extend([b; 64]);
+        hawkeye_ycash::tx::push_data(&mut ss, &j);
+    }
+    ss.push(0x51);
+    tx.inputs[idx].script_sig = ss;
+}
+
+/// A changed output (another transaction), signatures kept.
+fn changed_output(tx: &mut Transaction) {
+    tx.outputs[0].value -= 1;
+}
+
+/// (k4) Finding 05/L-1: a member's peer answering with junk pushes, or with another
+/// transaction, is rejected; the honest peer's co-signature is adopted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k4_peer_returns_junk_pushes() {
+    let Some(env) = setup_with(views(2, 1)).await else {
+        return;
+    };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x48; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let honest = (leader + 1) % 3;
+    let bad = (leader + 2) % 3;
+    drop(engines);
+    // restart: the honest peer serves its API; two forged peers (both answering as the third
+    // member) come first in the leader's list
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let honest_url = format!("http://{}", l.local_addr().unwrap());
+    let mut h = env.engine_with_peers(honest, vec![]).await;
+    let ctx = h.ctx().clone();
+    tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+    let junk = rogue_peer(&env, env.keys[bad].clone(), junk_pushes).await;
+    let changed = rogue_peer(&env, env.keys[bad].clone(), changed_output).await;
+    let mut lead = env
+        .engine_with_peers(leader, vec![junk, changed, honest_url])
+        .await;
+    h.tick().await;
+    lead.tick().await;
+    let posted = unlocks_for(&env, nonce);
+    assert_eq!(posted.len(), 1, "the unlock went out");
+    let idx = posted[0]
+        .0
+        .inputs
+        .iter()
+        .position(|i| i.prevout == posted[0].1)
+        .unwrap();
+    let s = hawkeye_core::template::parse_selector(
+        hawkeye_core::template::TemplateKind::Vault,
+        &posted[0].0.inputs[idx].script_sig,
+    )
+    .unwrap();
+    let mut signers: Vec<[u8; 33]> = s
+        .args
+        .iter()
+        .map(|a| a[1..34].try_into().unwrap())
+        .collect();
+    signers.sort_unstable();
+    let mut want = vec![env.key_of_index(leader), env.key_of_index(honest)];
+    want.sort_unstable();
+    assert_eq!(signers, want, "the leader's and the honest peer's, no junk");
+}
+
+/// (k5) cancelThreshold 2: the intent's cancel leader gathers a peer's cancel signature over
+/// `POST /cancel/sign` and the cancel confirms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k5_cancel_cosign_endpoint() {
+    let Some(env) = setup_with(views(1, 2)).await else {
+        return;
+    };
+    let (mut engines, _urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    let (intent, _signer) = rogue_unlock(&env).await;
+    for _ in 0..3 {
+        tick_all(&mut engines).await;
+    }
+    let cancels = env.mock.state().calls_to("set_signcancel").len();
+    assert!(cancels >= 2, "the leader's and a peer's signature");
+    env.mine(1);
+    tick_all(&mut engines).await;
+    let cancelled: usize = engines
+        .iter()
+        .map(|e| {
+            e.ctx()
+                .db(|t| t.intents_in_state(IntentState::Cancelled))
+                .unwrap()
+                .len()
+        })
+        .sum();
+    assert!(cancelled >= 1, "the cancel of {intent} confirmed");
+    let st = env.mock.state();
+    assert!(
+        !st.templates
+            .contains_key(&OutPoint::new(Hash256(intent.txid), intent.vout)),
+        "the intent is spent"
+    );
+}
+
+/// (k6) Finding 05/N-2: fewer than 8 confirmed fee coins raise `fee-coins-low`; a split into
+/// 16 coins clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k6_fee_coins_alarm() {
+    let Some(env) = setup().await else { return };
+    {
+        let mut st = env.mock.state();
+        st.unspent.truncate(3);
+    }
+    let mut e = env.engine(0).await;
+    e.tick().await;
+    assert!(
+        e.alarms().iter().any(|a| a.name == "fee-coins-low"),
+        "{:?}",
+        e.alarms()
+    );
+    let c = env.mock.client();
+    let mut to = vec![];
+    for _ in 0..16 {
+        to.push((c.getnewaddress().await.unwrap(), Amount(1_000_000)));
+    }
+    c.sendmany(&to).await.unwrap();
+    env.mine(1);
+    for _ in 0..20 {
+        e.tick().await;
+    }
+    assert!(
+        !e.alarms().iter().any(|a| a.name == "fee-coins-low"),
+        "{:?}",
+        e.alarms()
+    );
+    let st = e.ctx().status.read().unwrap().clone();
+    assert!(st.fee_coins.unwrap() >= 16);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1880,6 +2650,66 @@ async fn l_optimistic_propose_window_execute() {
         assert!(challenges(e).is_empty());
         assert!(open_cases(e).is_empty());
     }
+}
+
+/// (o) 05/M-1: with a separate gas account per attestor, the proposal and the execution are
+/// sent from the gas accounts (the guardians send nothing) while the EIP-712 attestation is the
+/// guardian's (the contract accepted it); the status reports the sender and its balance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o_gas_account_sends_the_guardian_attests() {
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    let senders: Vec<SecretKey> = (20..23).map(secret).collect();
+    for k in &senders {
+        set_balance(&env.provider, hawkeye::convert::addr(&k.eth_address())).await;
+    }
+    let mut engines = vec![];
+    for (i, k) in senders.iter().enumerate() {
+        engines.push(env.engine_full(i, vec![], Some(k.clone()), |_| {}).await);
+    }
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let lock_id = drive_mint(&env, &mut engines, &op).await;
+    let c = env.eth(&env.holder).await;
+    let p = c
+        .proposal(B256::from(lock_id))
+        .await
+        .unwrap()
+        .expect("proposed");
+    assert!(
+        (0..3).any(|i| hawkeye::convert::addr(&env.keys[i].eth_address()) == p.proposer),
+        "the proposer is a guardian (its EIP-712 signature)"
+    );
+    env.warp(WINDOW).await;
+    eth_rounds(&env, &mut engines, 3).await;
+    assert_eq!(
+        c.balance_of(hawkeye::convert::addr(&to)).await.unwrap(),
+        U256::from(1_000_000_000u64)
+    );
+    let nonce = |k: &SecretKey| {
+        let a = hawkeye::convert::addr(&k.eth_address());
+        let p = env.provider.clone();
+        async move { p.get_transaction_count(a).await.unwrap() }
+    };
+    let mut sent = 0;
+    for k in &senders {
+        sent += nonce(k).await;
+    }
+    assert!(
+        sent >= 2,
+        "the gas accounts sent the proposal and the execution"
+    );
+    for k in &env.keys {
+        assert_eq!(nonce(k).await, 0, "a guardian sends nothing");
+    }
+    let st = engines[0].ctx().status.read().unwrap().clone();
+    assert_eq!(
+        st.sender.as_deref(),
+        Some(senders[0].eth_address().to_checksum().as_str())
+    );
+    assert!(st.sender_balance.as_ref().unwrap().parse::<u128>().unwrap() > 0);
+    serde_json::to_value(&st).expect("a wei balance above u64 serialises");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

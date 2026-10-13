@@ -13,6 +13,10 @@ struct Args {
     /// The config file (hawkeye.toml).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Accept a group/world-readable config (with a secret), keystore, key file or ledger on
+    /// mainnet (elsewhere they are only warned about).
+    #[arg(long, global = true)]
+    insecure_file_permissions: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -143,6 +147,16 @@ enum Cmd {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Attestor: split the node wallet's funds into N fresh fee coins (one `sendmany` to N new
+    /// wallet addresses), so N cancels can be funded in one block (plan §5.5).
+    SplitCoins {
+        /// How many coins.
+        #[arg(long, default_value_t = 16)]
+        count: u32,
+        /// YEC per coin (default 0.01).
+        #[arg(long, value_name = "YEC")]
+        amount: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -167,6 +181,19 @@ enum KeysCmd {
         /// 64 hex digits.
         #[arg(long)]
         secret: String,
+    },
+    /// Write a key (64 hex digits from an environment variable) as an encrypted keystore v3,
+    /// created owner-only (0600).
+    Encrypt {
+        /// The keystore file to create (must not exist).
+        #[arg(long)]
+        out: PathBuf,
+        /// The variable holding the key.
+        #[arg(long, default_value = "HAWKEYE_SECRET")]
+        secret_env: String,
+        /// The variable holding the password.
+        #[arg(long, default_value = "HAWKEYE_KEYSTORE_PASSWORD")]
+        password_env: String,
     },
 }
 
@@ -208,8 +235,41 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&keys::key_info(&k))?);
         return Ok(());
     }
+    if let Cmd::Keys {
+        cmd:
+            KeysCmd::Encrypt {
+                out,
+                secret_env,
+                password_env,
+            },
+    } = &args.cmd
+    {
+        let k = keys::parse_secret(
+            &std::env::var(secret_env).with_context(|| format!("the key variable {secret_env}"))?,
+        )?;
+        let pw = std::env::var(password_env)
+            .with_context(|| format!("the password variable {password_env}"))?;
+        keys::encrypt_keystore(&k, out, &pw)?;
+        println!("{}", serde_json::to_string(&keys::key_info(&k))?);
+        return Ok(());
+    }
     let s = settings(&args)?;
     init_logging(&s.log_level, s.log_json);
+    for w in &s.warnings {
+        tracing::warn!(event = "config_warning", detail = %w);
+    }
+    if s.insecure_rpc && s.params.mainnet {
+        tracing::error!(
+            event = "insecure_rpc",
+            url = %s.ycash_url,
+            "mainnet: the ycashd RPC credentials cross the network in clear ([ycash] \
+             allow_insecure_rpc)"
+        );
+    }
+    let path = args.config.as_ref().expect("settings() needs --config");
+    for w in s.check_file_permissions(path, args.insecure_file_permissions)? {
+        tracing::warn!(event = "file_permissions", detail = %w);
+    }
     match &args.cmd {
         Cmd::Run {
             i_accept_blind_start,
@@ -287,6 +347,7 @@ async fn main() -> Result<()> {
         Cmd::Recover => cli::recover(&s).await,
         Cmd::Leave => cli::leave(&s).await,
         Cmd::WithdrawBond { to } => cli::withdraw_bond(&s, to.as_deref()).await,
+        Cmd::SplitCoins { count, amount } => cli::split_coins(&s, *count, amount.as_deref()).await,
         Cmd::Keys { .. } => unreachable!(),
     }
 }

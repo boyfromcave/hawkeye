@@ -24,6 +24,7 @@
 //! | [`policy`] | the lock policy (§4.1) |
 //! | [`matcher`] | intent classification (§3.2) |
 //! | [`leader`] | the leader schedule (§5.2) |
+//! | [`peerauth`] | the peer channel's member-key request / response signatures (§6, HK-13) |
 //!
 //! Ycash hashes and outpoints are in internal byte order throughout.
 
@@ -40,6 +41,7 @@ pub mod lock;
 pub mod matcher;
 pub mod memo;
 pub mod near;
+pub mod peerauth;
 pub mod policy;
 pub mod pq;
 pub mod recipient;

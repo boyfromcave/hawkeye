@@ -20,6 +20,7 @@ pub mod mock;
 pub mod primitives;
 pub mod redacted;
 pub mod stock;
+pub mod transport;
 pub mod tx;
 pub mod types;
 

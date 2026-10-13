@@ -573,6 +573,17 @@ impl YcashRpc {
         self.call(m, params(ps)).await
     }
 
+    /// `sendmany "" {"address": amount, …}`: one wallet transaction paying every address
+    /// (`hawkeye split-coins`: restoring fee-coin capacity, remedial report 05/H-1 §4.5).
+    pub async fn sendmany(&self, amounts: &[(String, Amount)]) -> Result<Txid, Error> {
+        let m = "sendmany";
+        let mut o = serde_json::Map::new();
+        for (a, v) in amounts {
+            o.insert(a.clone(), val(m, v)?);
+        }
+        self.call(m, vec!["".into(), Value::Object(o)]).await
+    }
+
     /// Regtest only: mine `n` blocks to the wallet.
     pub async fn generate(&self, n: u32) -> Result<Vec<BlockHash>, Error> {
         self.call("generate", vec![n.into()]).await

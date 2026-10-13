@@ -22,6 +22,8 @@ kind = "ethereum"
 rpc_url = "http://127.0.0.1:8545"              # your own execution + consensus client
 deployment = "../eth/deployments/1.json"        # the committed mainnet deployment
 finality = "finalized"                          # mainnet refuses a depth-only finality
+sender_keystore = "gas-key.json"                # a gas-only account: mainnet refuses the member key as sender (05/M-1)
+sender_password_env = "HAWKEYE_SENDER_PASSWORD"
 
 [bridge]
 set_id = "1111111111111111111111111111111111111111111111111111111111111111"   # the mainnet set
@@ -38,6 +40,7 @@ mint_mode = "optimistic"
 [keys]
 keystore = "member-key.json"                    # mainnet refuses secret_hex
 password_env = "HAWKEYE_KEYSTORE_PASSWORD"
+ycash_signing = "self"                          # the member key never enters wallet.dat (05/M-1, HK-14; README "Key custody")
 
 [store]
 path = "hawkeye.db"
@@ -49,7 +52,8 @@ listen = "127.0.0.1:7801"
 auto_slash = false
 
 [peers]
-urls = []
+urls = []                                       # https:// (or loopback) only on mainnet (HK-13)
+require_auth = true                             # member-key signed peer requests; mainnet refuses false
 
 [devnet]
 drills = false                                  # mainnet refuses drills

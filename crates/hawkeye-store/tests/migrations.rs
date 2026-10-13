@@ -14,11 +14,13 @@ const TABLES: &[&str] = &[
     "exposure_acks",
     "intents",
     "locks",
+    "meta",
     "pending_mints",
     "set_sigs_seen",
     "sign_once_challenge",
     "sign_once_drill_mint",
     "sign_once_mint",
+    "sign_once_unlock_burn",
     "sign_once_ycash",
     "slash_cases",
     "slash_progress",
@@ -655,6 +657,142 @@ fn constraints_are_enforced() {
         Ok::<_, StoreError>(())
     })
     .unwrap();
+}
+
+/// Schema v6 (remedial report 05/H-1 §4.3): a v5 ledger with unlock records keeps them; the
+/// backfill writes one `leader` row per record whose signed hex names a burn (here: the decoder
+/// stub reads the burn from the hex), once; the new rows are immutable but for the dead marker.
+#[test]
+fn a_v5_ledger_migrates_to_v6_and_backfills_unlock_burns() {
+    use hawkeye_core::EthAddress;
+    use hawkeye_store::{BurnKey, UnlockOrigin};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let dep = hawkeye_core::Deployment {
+        chain_id: 31337,
+        bridge: EthAddress([0xb0; 20]),
+    };
+    {
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        for m in &MIGRATIONS[..5] {
+            raw.execute_batch(m).unwrap();
+        }
+        raw.pragma_update(None, "user_version", 5).unwrap();
+        for (n, hex) in [(1u8, "burn-7"), (2, "roll"), (3, "burn-9")] {
+            raw.execute(
+                "INSERT INTO sign_once_ycash (domain, set_id, prevout_txid, prevout_vout, sighash,
+                                              built_hex, signed_hex, signed_at)
+                 VALUES ('ycash-unlock', ?1, ?2, 0, ?3, 'b', ?4, ?5)",
+                (
+                    vec![0x5eu8; 32],
+                    vec![n; 32],
+                    vec![0u8; 32],
+                    hex,
+                    i64::from(n),
+                ),
+            )
+            .unwrap();
+        }
+        raw.execute(
+            "INSERT INTO sign_once_ycash (domain, set_id, prevout_txid, prevout_vout, sighash,
+                                          built_hex, signed_hex, signed_at)
+             VALUES ('ycash-cancel', ?1, ?2, 0, ?3, 'b', 'burn-7', 9)",
+            (vec![0x5eu8; 32], vec![4u8; 32], vec![0u8; 32]),
+        )
+        .unwrap();
+    }
+    let mut s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap() as usize, MIGRATIONS.len());
+    assert_eq!(tables(&path), TABLES);
+    let decode = |hex: &str| hex.strip_prefix("burn-").map(|n| (dep, n.parse().unwrap()));
+    assert_eq!(s.backfill_unlock_burns(decode).unwrap(), 2);
+    // once only
+    assert_eq!(s.backfill_unlock_burns(decode).unwrap(), 0);
+    s.tx(|t| {
+        let rows = t.unlock_burn_rows(&[0x5e; 32], &BurnKey::new(dep, 7))?;
+        assert_eq!(rows.len(), 1, "the cancel record is not an unlock");
+        assert_eq!(rows[0].origin, UnlockOrigin::Leader);
+        assert_eq!(rows[0].prevout.txid, [1; 32]);
+        assert!(rows[0].is_live());
+        assert_eq!(
+            t.live_unlock_for_burn(&[0x5e; 32], &BurnKey::new(dep, 9))?
+                .unwrap()
+                .prevout
+                .txid,
+            [3; 32]
+        );
+        assert_eq!(t.meta("backfill_unlock_burns")?.as_deref(), Some("done"));
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+    drop(s);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        raw.execute("DELETE FROM sign_once_unlock_burn", [])
+            .is_err()
+    );
+    assert!(
+        raw.execute("UPDATE sign_once_unlock_burn SET origin = 'cosign'", [])
+            .is_err()
+    );
+    assert!(
+        raw.execute("UPDATE sign_once_unlock_burn SET nonce = 8", [])
+            .is_err()
+    );
+    // the dead marker: once, from NULL, both columns together
+    assert!(
+        raw.execute(
+            "UPDATE sign_once_unlock_burn SET dead_reason = 'x' WHERE nonce = 7",
+            []
+        )
+        .is_err()
+    );
+    assert_eq!(
+        raw.execute(
+            "UPDATE sign_once_unlock_burn SET dead_reason = 'x', dead_height = 5 WHERE nonce = 7",
+            []
+        )
+        .unwrap(),
+        1
+    );
+    assert!(
+        raw.execute(
+            "UPDATE sign_once_unlock_burn SET dead_reason = NULL, dead_height = NULL WHERE nonce = 7",
+            []
+        )
+        .is_err(),
+        "a dead row is never un-deaded"
+    );
+    assert!(
+        raw.execute(
+            "UPDATE sign_once_unlock_burn SET dead_reason = 'y', dead_height = 6 WHERE nonce = 7",
+            []
+        )
+        .is_err()
+    );
+}
+
+/// Remedial report 05/L-2: a new ledger and its WAL files are owner-only (`0600`).
+#[cfg(unix)]
+#[test]
+fn a_new_ledger_is_created_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let mut s = Store::open(&path).unwrap();
+    s.tx(|t| t.set_meta("x", "y")).unwrap();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    drop(s);
+    // an existing group-readable ledger is left as it is by open (the daemon refuses it on
+    // mainnet: config::check_file_permissions); its WAL files are restricted
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _s = Store::open(&path).unwrap();
+    assert_eq!(mode(&path), 0o644);
+    let wal = dir.path().join("ledger.sqlite-wal");
+    if wal.exists() {
+        assert_eq!(mode(&wal) & 0o077, 0);
+    }
 }
 
 /// Schema v7 (audit 05/H-2): `pending_mints.provisional`, 0 for every row a v5 ledger already had

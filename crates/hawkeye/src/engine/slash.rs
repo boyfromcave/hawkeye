@@ -69,9 +69,33 @@ fn sign_act(
     let ycash = ctx.ycash.clone();
     let set = ctx.set_hash();
     let status = std::cell::Cell::new(None);
+    // self-signed acts (05/M-1): the member key signs ActMsg itself; the act needs the set's
+    // slashThreshold signatures (SET_REMOVE / SET_WINDDOWN)
+    let self_signed = ctx.params.ycash_signing == crate::config::YcashSigning::SelfSigned;
+    let required = if self_signed {
+        let snap = ctx
+            .auth
+            .set
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let info = match snap {
+            Some(i) => i,
+            None => block_on(ycash.set_getinfo(&set, None))?,
+        };
+        i32::try_from(info.set.params.slashthreshold).unwrap_or(i32::MAX)
+    } else {
+        0
+    };
     let rec = ctx.db(|t| {
         let rec = t.sign_once_ycash(&key, act_hex, |h| {
             let hex: HexBytes = h.parse().map_err(|e| format!("{e}"))?;
+            if self_signed {
+                let (signed, _msg, n) =
+                    super::sign::self_sign_act(&ctx.key, h).map_err(|e| format!("{e:#}"))?;
+                status.set(Some((i64::from(n) >= i64::from(required), n, required)));
+                return Ok::<_, String>((signed, sha256d(&hex.0)));
+            }
             let r = block_on(ycash.set_signact(&hex, Some(&set))).map_err(|e| e.to_string())?;
             status.set(Some((r.complete, r.signatures, r.required)));
             Ok::<_, String>((r.hex.to_string(), sha256d(&hex.0)))
@@ -131,7 +155,7 @@ fn ev_str<'a>(ev: &'a serde_json::Value, k: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("evidence without {k:?}"))
 }
 
-fn parse_outpoint(s: &str) -> Result<CoreOutPoint> {
+pub(crate) fn parse_outpoint(s: &str) -> Result<CoreOutPoint> {
     let (txid, vout) = s
         .split_once(':')
         .ok_or_else(|| anyhow!("outpoint {s:?} is not txid:vout"))?;
@@ -713,7 +737,13 @@ impl Engine {
                     act: prog.act_hex.clone(),
                 };
                 match self.ctx.peers.slash_sign(&peer, &req).await {
-                    Ok(r) => {
+                    Ok(signed) if !self.responder_ok(signed.responder) => {
+                        warn!(event = "slash_vote_rejected", case = c.id, peer = %peer,
+                              responder = ?signed.responder.map(hex::encode),
+                              "the answer is signed by no current member");
+                    }
+                    Ok(signed) => {
+                        let r = signed.body;
                         info!(event = "slash_vote_received", case = c.id, peer = %peer,
                               signatures = r.signatures, required = r.required, complete = r.complete);
                         prog.act_hex = r.hex;

@@ -8,7 +8,8 @@
 //! | [`engine`] | the tick: Ycash follower, mint, burns, watcher, slash, heartbeat, status |
 //! | [`foreign`] | the foreign-chain adapter (`ForeignChain`; Ethereum today, NEAR plan §4) |
 //! | [`attribution`] | set-signature attribution behind a trait |
-//! | [`peers`] | the peer channel v1 and the API's wire types |
+//! | [`peers`] | the peer channel client and the API's wire types |
+//! | [`peer_auth`] | the peer channel's member-key request / response authentication (HK-13) |
 //! | [`api`] | the axum status / peer API |
 //! | [`status`] | the status summary and Prometheus rendering |
 //! | [`daemon`] | connect, start-up checks, the run loop |
@@ -25,5 +26,6 @@ pub mod engine;
 pub mod floors;
 pub mod foreign;
 pub mod keys;
+pub mod peer_auth;
 pub mod peers;
 pub mod status;

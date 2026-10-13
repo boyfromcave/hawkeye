@@ -1,5 +1,5 @@
 //! The one-shot commands: `enroll`, `status`, `lock`, `burn`, `rogue-unlock`, `rogue-mint`,
-//! `recover`, `leave`, `withdraw-bond`.
+//! `recover`, `leave`, `withdraw-bond`, `split-coins`.
 //! Each prints one JSON document on stdout (logs go to stderr).
 
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use crate::attribution::CoreAttributor;
 use crate::config::Settings;
 use crate::convert::op_core;
-use crate::engine::{Engine, block_on};
+use crate::engine::Engine;
 use crate::foreign::{self, Account};
 use crate::keys::{key_info, parse_secret, wif};
 
@@ -48,9 +48,18 @@ fn print(v: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// `hawkeye enroll`: import the member key into the node wallet without a rescan (plan §3.5).
+/// `hawkeye enroll`: import the member key into the node wallet without a rescan (plan §3.5),
+/// in `[keys] ycash_signing = "wallet"` mode — the wallet then holds it **in clear** (Ycash's
+/// wallet encryption is disabled; README "Key custody"). In `"self"` mode (05/M-1) nothing is
+/// imported: the key's forms are printed and the wallet only funds fees.
 pub async fn enroll(s: &Settings) -> Result<()> {
     let key = s.load_key()?;
+    if s.params.ycash_signing == crate::config::YcashSigning::SelfSigned {
+        info!(event = "enrolled_self_signing", member = %hex::encode(key.public_key()),
+              "ycash_signing = \"self\": the member key is not imported into the node wallet; \
+               fund the wallet's own address for fees");
+        return print(&serde_json::to_value(key_info(&key))?);
+    }
     let node = ycash(s)?;
     let address = node
         .importprivkey(&wif(&key, s.network), "hawkeye", false)
@@ -240,6 +249,12 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
         st.foreign.lag
     );
     println!("live members {}", st.live_members);
+    if let (Some(who), Some(bal)) = (&st.sender, &st.sender_balance) {
+        println!("{} sender {who} balance {bal}", st.foreign_kind);
+    }
+    if let Some(n) = st.fee_coins {
+        println!("fee coins {n}");
+    }
     for (name, m) in [
         ("locks", &st.locks),
         ("burns", &st.burns),
@@ -501,7 +516,7 @@ pub async fn burn(
                 Some(k) => parse_secret(k)?,
                 None => s.load_key().context("no --eth-key and no [keys] key")?,
             };
-            foreign::connect(s, &key).await?
+            foreign::connect_sending_as(s, &key).await?
         }
         BridgeKind::Near => {
             ensure!(
@@ -678,10 +693,27 @@ pub async fn rogue_unlock(
         None => built.hex.to_string(),
     };
     let n2 = node.clone();
-    let rec = store.sign_once_ycash(&key, &unsigned, |h| {
-        let hex: HexBytes = h.parse().map_err(|e| format!("{e}"))?;
-        let r = block_on(n2.set_signunlock(&hex)).map_err(|e| e.to_string())?;
-        Ok::<_, String>((r.hex.to_string(), r.sighash.0))
+    // drill D-3 records its replay per burn as a `drill` row and skips the per-burn check: the
+    // double release is the point (the watchers must cancel it)
+    let burn = replay_burn.map(|n| hawkeye_store::UnlockBurn {
+        key: hawkeye_store::BurnKey::new(s.params.deployment, n),
+        origin: hawkeye_store::UnlockOrigin::Drill,
+        allow_double: true,
+    });
+    let member = s.load_key()?;
+    let signer = crate::engine::sign::SetSigning::prepare_with(
+        &n2,
+        &s.params,
+        &member,
+        hawkeye_core::setsig::Role::Unlock,
+        op_core(&vault),
+    )
+    .await?;
+    let rec = store.tx(|t| {
+        t.sign_once_unlock(&key, burn.as_ref(), &unsigned, |h| {
+            let o = signer.sign(h)?;
+            Ok::<_, String>((o.hex, o.sighash))
+        })
     })?;
     let txid = node.vault_send(&rec.signed_hex.parse()?).await?;
     info!(event = "rogue_unlock_sent", txid = %txid, vault = %vault, amount = value,
@@ -951,6 +983,31 @@ pub async fn withdraw_bond_with(
     let value = out.value.zat() - BOND_WITHDRAW_FEE;
     info!(event = "bond_withdrawn", txid = %txid, bond = %op, value);
     Ok(json!({"txid": txid.to_string(), "bondoutpoint": op.to_string(), "value_zat": value}))
+}
+
+/// The default amount of one `split-coins` coin: 0.01 YEC (a vault spend's fee is 0.0001).
+pub const SPLIT_COIN_DEFAULT: &str = "0.01";
+
+/// `hawkeye split-coins --count N [--amount YEC]` (remedial report 05/H-1 §4.5): one stock
+/// `sendmany` from the node wallet to `N` fresh addresses of the same wallet, so the next
+/// block confirms `N` coins that each fund one cancel (the node's `Fund` spends confirmed
+/// coins only).
+pub async fn split_coins(s: &Settings, count: u32, amount: Option<&str>) -> Result<()> {
+    ensure!((1..=500).contains(&count), "--count must be 1..=500");
+    let each = zat(amount.unwrap_or(SPLIT_COIN_DEFAULT))?;
+    ensure!(
+        each >= crate::engine::watch::VAULT_RPC_FEE_ZAT
+            + crate::engine::watch::VAULT_RPC_MIN_CHANGE_ZAT,
+        "--amount must be at least 0.00011 YEC (VAULT_RPC_FEE + VAULT_RPC_MIN_CHANGE)"
+    );
+    let node = ycash(s)?;
+    let mut to = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        to.push((node.getnewaddress().await?, Amount::from_zat(each)));
+    }
+    let txid = node.sendmany(&to).await.context("sendmany")?;
+    info!(event = "split_coins_sent", txid = %txid, count, amount_zat = each);
+    print(&json!({"txid": txid.to_string(), "count": count, "amount_zat": each}))
 }
 
 /// The signed bond withdrawal: input `bond` (whose output is `bond_spk`, `value_zat`), one
