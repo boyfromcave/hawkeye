@@ -301,7 +301,9 @@ pub async fn run(s: &Settings, accept_equivocation_risk: bool) -> Result<()> {
             error!(event = "api_failed", error = %e);
         }
     });
-    let mut engine = Engine::new(ctx);
+    let hwm = crate::restore::hwm_path(&s.store_path);
+    crate::restore::check_restore(&ctx, &hwm).await?;
+    let mut engine = Engine::new(ctx).with_ledger_hwm(hwm);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         let r = engine.tick().await;

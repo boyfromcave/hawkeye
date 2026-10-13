@@ -77,6 +77,21 @@ pub async fn enroll(s: &Settings) -> Result<()> {
 /// this member on the chain or in the mempool without a record here), then its unlock and cancel
 /// records go to `set_importsigned` (a conflicting node record refuses the whole import:
 /// `set-sign-once`) and `set_acknowledgerestore` clears the marker. Never run by the daemon.
+/// `hawkeye acknowledge-ledger-restore` (review L-2): clear `meta.ledger_restored` and reset the
+/// ledger's high-water mark to its current record count. The operator's statement that the
+/// restored ledger lacks no unlock this member signed and might still be revived.
+pub fn acknowledge_ledger_restore(s: &Settings) -> Result<()> {
+    let mut store = Store::open(&s.store_path)?;
+    let (was, count) = store.tx(|t| {
+        let was = t.meta(crate::engine::burn::LEDGER_RESTORED)?;
+        t.set_meta(crate::engine::burn::LEDGER_RESTORED, "acknowledged")?;
+        Ok::<_, hawkeye_store::StoreError>((was, t.ycash_signature_count()?))
+    })?;
+    crate::restore::reset_hwm(&crate::restore::hwm_path(&s.store_path), count)?;
+    info!(event = "ledger_restore_acknowledged", previous = ?was, records = count);
+    print(&json!({"previous": was, "records": count}))
+}
+
 pub async fn acknowledge_restore(s: &Settings) -> Result<()> {
     if s.params.ycash_signing == crate::config::YcashSigning::SelfSigned {
         return print(&json!({"restored": false, "note":

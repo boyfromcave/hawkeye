@@ -33,6 +33,8 @@ pub fn router(ctx: Ctx) -> Router {
         .route("/slash/sign", post(slash_sign))
         .route("/unlock/sign", post(unlock_sign))
         .route("/cancel/sign", post(cancel_sign))
+        .route("/burns/unlock", post(burn_unlock))
+        .route("/vaults/orphaned", post(vault_orphaned))
         .route_layer(axum::middleware::from_fn_with_state(
             ctx.clone(),
             crate::peer_auth::layer,
@@ -101,23 +103,8 @@ async fn lock(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
 
 async fn burn(State(ctx): State<Ctx>, Path(nonce): Path<u64>) -> Response {
     let k = BurnKey::new(ctx.params.deployment, nonce);
-    let held = ctx.db(|t| {
-        let Some(row) = t.live_unlock_for_burn(&ctx.params.set_id, &k)? else {
-            return Ok(None);
-        };
-        if row.origin == hawkeye_store::UnlockOrigin::Drill {
-            return Ok(None);
-        }
-        Ok(t.ycash_signature(&hawkeye_store::YcashSignKey {
-            domain: hawkeye_store::SignDomain::YcashUnlock,
-            set_id: ctx.params.set_id,
-            prevout: row.prevout,
-        })?
-        .map(|r| r.signed_hex))
-    });
     match ctx.db(|t| t.burn(&k)) {
         Ok(Some(b)) => Json(BurnView {
-            unlock: held.ok().flatten(),
             nonce,
             tx_hash: format!("0x{}", hex::encode(b.tx_hash)),
             amount: b.amount,
@@ -133,6 +120,63 @@ async fn burn(State(ctx): State<Ctx>, Path(nonce): Path<u64>) -> Response {
         .into_response(),
         Ok(None) => err(StatusCode::NOT_FOUND, "unknown burn"),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// `POST /burns/unlock` (authenticated, review H-2): whether this attestor holds a live signed
+/// unlock for the burn, and the bytes while the burn is unpaid here. Revivable signed bytes are
+/// never served to anyone but a current member, nor once the burn is paid.
+async fn burn_unlock(
+    State(ctx): State<Ctx>,
+    member: Option<Extension<PeerMember>>,
+    Json(req): Json<crate::peers::BurnUnlockRequest>,
+) -> Response {
+    use hawkeye_store::BurnState;
+    if member.is_none() {
+        return err(StatusCode::FORBIDDEN, "member-signed requests only");
+    }
+    let k = BurnKey::new(ctx.params.deployment, req.nonce);
+    let r = ctx.db(|t| {
+        let burn = t.burn(&k)?;
+        let row = t.live_unlock_for_burn(&ctx.params.set_id, &k)?;
+        let unpaid = burn.as_ref().is_some_and(|b| {
+            matches!(
+                b.state,
+                BurnState::Finalized | BurnState::Assigned | BurnState::WaitingCap
+            )
+        });
+        let unlock = match (&row, unpaid) {
+            (Some(r), true) => t
+                .ycash_signature(&hawkeye_store::YcashSignKey {
+                    domain: hawkeye_store::SignDomain::YcashUnlock,
+                    set_id: ctx.params.set_id,
+                    prevout: r.prevout,
+                })?
+                .map(|r| r.signed_hex),
+            _ => None,
+        };
+        Ok(crate::peers::BurnUnlockResponse {
+            nonce: req.nonce,
+            state: burn.map_or_else(|| "unknown".to_owned(), |b| b.state.to_string()),
+            held: row.is_some(),
+            unlock,
+        })
+    });
+    match r {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+async fn vault_orphaned(
+    State(ctx): State<Ctx>,
+    member: Option<Extension<PeerMember>>,
+    Json(req): Json<crate::peers::OrphanRequest>,
+) -> Response {
+    let requester = member.map(|m| m.0.0);
+    match crate::engine::roll::verify_orphan(&ctx, requester, &req).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => err(StatusCode::FORBIDDEN, format!("{e:#}")),
     }
 }
 

@@ -216,9 +216,11 @@ pub(crate) struct Memory {
     /// Peers whose co-signatures failed the adoption checks, by URL: consecutive failures
     /// (two or more: asked last).
     pub peer_backoff: HashMap<String, u32>,
-    /// A signed unlock's fee input (or vault) first seen spent in a block, at this tip: the
-    /// dead-marker rule counts `C_Y` from here (a lower bound on the spend's depth).
-    pub conflict_seen: HashMap<CoreOutPoint, u32>,
+    /// Orphaned vaults reported to the peers: the tick of the last report (review H-2).
+    pub orphan_reported: HashMap<CoreOutPoint, u64>,
+    /// Pending burns' unmined intents seen out of the mempool, by txid: the tip first seen so
+    /// (review M-3).
+    pub evicted_since: HashMap<Hash32, u32>,
     /// Once-only warnings about a burn held by a live unlock this attestor will not re-send.
     pub held_logged: HashSet<u64>,
     /// The fee coins counted at the last capacity check.
@@ -242,6 +244,8 @@ pub(crate) struct FinalityWatch {
 pub struct Engine {
     pub(crate) ctx: Ctx,
     pub(crate) mem: Memory,
+    /// The ledger's high-water-mark file (review L-2), raised after every tick.
+    pub(crate) ledger_hwm: Option<std::path::PathBuf>,
 }
 
 impl Engine {
@@ -249,11 +253,18 @@ impl Engine {
     pub fn new(ctx: Ctx) -> Self {
         Self {
             ctx,
+            ledger_hwm: None,
             mem: Memory {
                 guardian_check_due: true,
                 ..Memory::default()
             },
         }
+    }
+
+    /// Keep the ledger's high-water mark at `path` (review L-2).
+    pub fn with_ledger_hwm(mut self, path: std::path::PathBuf) -> Self {
+        self.ledger_hwm = Some(path);
+        self
     }
 
     /// The shared context.
@@ -315,12 +326,37 @@ impl Engine {
         step!("locks", self.evaluate_locks());
         step!("mint", self.mint());
         step!("burns", self.burns());
+        step!("orphans", self.orphans());
         step!("rolls", self.rolls());
         step!("releases", self.releases());
         step!("slash", self.slash());
         step!("heartbeat", self.heartbeat());
         step!("supply", self.supply());
         step!("gas", self.check_gas());
+        if let Some(p) = &self.ledger_hwm
+            && let Ok(n) = self.ctx.db(|t| t.ycash_signature_count())
+            && let Err(e) = crate::restore::write_hwm(p, n)
+        {
+            warn!(event = "ledger_hwm_failed", error = %format!("{e:#}"));
+        }
+        match self.ledger_restored() {
+            Ok(true) => {
+                let why = self
+                    .ctx
+                    .db(|t| t.meta(burn::LEDGER_RESTORED))
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                self.alarm(
+                    "ledger-restored",
+                    format!(
+                        "{why}: fresh unlocks wait for every member's signed answer \
+                         (`hawkeye acknowledge-ledger-restore` once safe)"
+                    ),
+                );
+            }
+            _ => self.clear_alarm("ledger-restored"),
+        }
         self.publish_status(&report);
         report
     }

@@ -69,12 +69,49 @@ pub struct BurnView {
     pub leader: Option<String>,
     /// The intent paying it.
     pub intent: Option<String>,
-    /// The signed unlock (hex) this attestor holds for the burn and that may still confirm — as
-    /// its leader or co-signer, never a drill's. Not a secret: it pays the burn's own recipient,
-    /// and a takeover leader re-sends it (re-funded) instead of signing another vault for the
-    /// burn (audit 01/V-2: a signed unlock stays revivable while its vault is unspent).
+}
+
+/// `POST /burns/unlock` request (authenticated, review H-2): the signed unlock a peer holds for a
+/// burn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BurnUnlockRequest {
+    /// The burn nonce (this deployment).
+    pub nonce: u64,
+}
+
+/// `POST /burns/unlock` answer (signed by the peer, HK-13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BurnUnlockResponse {
+    /// The burn nonce.
+    pub nonce: u64,
+    /// The burn's state in the peer's ledger (`unknown` when it has none).
+    pub state: String,
+    /// The peer holds a live (non-drill) signed unlock for the burn: it, or a co-signer, signed
+    /// one that may still confirm (01/V-2). `false` is the peer's signed statement that it holds
+    /// none (review M-1).
+    pub held: bool,
+    /// That signed unlock (hex), served only while the burn is unpaid in the peer's ledger
+    /// (`FINALIZED`, `ASSIGNED`, `WAITING_CAP`): a takeover leader re-sends it (re-funded)
+    /// instead of signing another vault for the burn. Never on the public `GET /burns/<nonce>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlock: Option<String>,
+}
+
+/// `POST /vaults/orphaned` request (authenticated, review H-2): a member that holds a signed
+/// unlock of `vault` for burn `nonce` reports that the burn was paid by another vault.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrphanRequest {
+    /// The burn nonce.
+    pub nonce: u64,
+    /// The orphaned vault (`txid:vout`).
+    pub vault: String,
+}
+
+/// `POST /vaults/orphaned` answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrphanResponse {
+    /// The vault was marked `ROLL_DUE` here now.
+    pub marked: bool,
 }
 
 /// `POST /slash/sign` request.
@@ -205,17 +242,19 @@ impl Peers {
         Ok(r.json().await?)
     }
 
-    /// `GET <peer>/burns/<nonce>` (read-only, unsigned).
-    pub async fn burn(&self, peer: &str, nonce: u64) -> Result<BurnView> {
-        let r = self
-            .http
-            .get(format!("{peer}/burns/{nonce}"))
-            .send()
-            .await?;
-        if !r.status().is_success() {
-            return Err(anyhow!("{peer}: HTTP {}", r.status()));
-        }
-        Ok(r.json().await?)
+    /// `POST <peer>/vaults/orphaned` (authenticated).
+    pub async fn orphaned(
+        &self,
+        peer: &str,
+        req: &OrphanRequest,
+    ) -> Result<Signed<OrphanResponse>> {
+        self.post_signed(peer, "/vaults/orphaned", req).await
+    }
+
+    /// `POST <peer>/burns/unlock` (authenticated; the answer is signed).
+    pub async fn burn_unlock(&self, peer: &str, nonce: u64) -> Result<Signed<BurnUnlockResponse>> {
+        self.post_signed(peer, "/burns/unlock", &BurnUnlockRequest { nonce })
+            .await
     }
 
     /// `POST <peer><path>` with `req` as JSON, signed when this client has a member key; the

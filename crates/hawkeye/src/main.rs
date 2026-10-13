@@ -68,6 +68,11 @@ enum Cmd {
     /// other copy of the member key has signed: run it once after enrolment and the `SET_JOIN`, or
     /// after a restore (docs/operations.md §4, §5).
     AcknowledgeRestore,
+    /// Clear the ledger's restore flag (review L-2: `alarm ledger-restored`) after confirming no
+    /// unlock this member signed is missing from it (`audit-ledger`, and the other attestors'
+    /// answers): fresh unlocks then go back to asking only each burn's previous leaders. Resets
+    /// the ledger's high-water mark to its current record count.
+    AcknowledgeLedgerRestore,
     /// Key helpers.
     Keys {
         #[command(subcommand)]
@@ -309,6 +314,7 @@ async fn main() -> Result<()> {
         Cmd::Status { json, .. } => cli::status(&s, *json).await,
         Cmd::Enroll => cli::enroll(&s).await,
         Cmd::AcknowledgeRestore => cli::acknowledge_restore(&s).await,
+        Cmd::AcknowledgeLedgerRestore => cli::acknowledge_ledger_restore(&s),
         Cmd::Lock {
             amount,
             amount_pos,

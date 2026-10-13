@@ -35,6 +35,70 @@ use hawkeye_core::setsig::Role;
 /// Blocks added to the new `ownerHeight` beyond `MIN_OWNER_AGE + ROLL_MARGIN`.
 pub const ROLL_SLACK: u32 = 10;
 
+/// Whether vault `vault` is **orphaned** for burn `burn` in this ledger (review H-2): the burn was
+/// paid by another vault's intent, mined at least `C_Y` deep, while `vault` (whose signed unlock
+/// for the same burn some member holds) is still in the ledger as a live set vault. Returns the
+/// paying intent.
+pub(crate) fn orphan_of(
+    t: &hawkeye_store::Tx<'_>,
+    burn: &hawkeye_store::BurnKey,
+    vault: &hawkeye_core::OutPoint,
+    tip: u32,
+    confirmations: u32,
+) -> Result<Option<hawkeye_core::OutPoint>, hawkeye_store::StoreError> {
+    use hawkeye_store::BurnState;
+    let Some(b) = t.burn(burn)? else {
+        return Ok(None);
+    };
+    if !matches!(b.state, BurnState::IntentConfirmed | BurnState::Released) {
+        return Ok(None);
+    }
+    let Some(op) = b.intent else { return Ok(None) };
+    let Some(i) = t.intent(&op)? else {
+        return Ok(None);
+    };
+    let deep = i
+        .confirmed_height
+        .is_some_and(|h| (tip + 1).saturating_sub(h) >= confirmations);
+    if !deep || i.origin_vault.is_none() || i.origin_vault == Some(*vault) {
+        return Ok(None);
+    }
+    let live = t
+        .vault(vault)?
+        .is_some_and(|v| matches!(v.state, VaultState::Live | VaultState::RollDue));
+    Ok(live.then_some(op))
+}
+
+/// Mark an orphaned vault `ROLL_DUE` (from `LIVE`): its roll leader — never a member that signed
+/// it — rolls it now, which spends it, so the orphaned signed unlock dies (review H-2).
+pub(crate) fn mark_orphan(
+    t: &hawkeye_store::Tx<'_>,
+    vault: &hawkeye_core::OutPoint,
+    nonce: u64,
+    tip: u32,
+) -> Result<bool, hawkeye_store::StoreError> {
+    if t.vault(vault)?.is_some_and(|v| v.state == VaultState::Live) {
+        t.transition_vault(
+            vault,
+            VaultState::RollDue,
+            Some(tip),
+            Some(&format!(
+                "orphaned signed unlock of burn {nonce}: rolled so it can never confirm"
+            )),
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The height a roll's takeover counts from: when the vault fell due by `ROLL_MARGIN` (or was
+/// created, if born due) — or, earlier, when it was marked `ROLL_DUE` for another reason (an
+/// orphaned signed unlock, review H-2: the vault is rolled so the old bytes die).
+pub fn roll_due_from(owner_height: u32, margin: u32, created: u32, marked: Option<u32>) -> u32 {
+    let natural = owner_height.saturating_sub(margin).max(created);
+    marked.map_or(natural, |m| natural.min(m))
+}
+
 /// The new `ownerHeight` a roll at `tip` writes.
 pub fn rolled_owner_height(tip: u32, min_owner_age: u32, roll_margin: u32) -> u32 {
     tip.saturating_add(1)
@@ -109,6 +173,59 @@ impl Engine {
         Ok(())
     }
 
+    /// Orphaned signed unlocks this attestor holds (review H-2): a burn paid by another vault
+    /// while the vault of the unlock it signed for it is unspent. Those bytes stay revivable
+    /// (01/V-2) — a second payment of the burn — until the vault is spent, which this attestor
+    /// can never do itself (sign-once per vault). So it marks the vault `ROLL_DUE` and tells the
+    /// other members (`POST /vaults/orphaned`, every 20 ticks), whose roll leader rolls it.
+    pub(crate) async fn orphans(&mut self) -> Result<()> {
+        let p = self.ctx.params.clone();
+        let tip = self.mem.tip;
+        let rows = self.ctx.db(|t| t.live_unlock_rows(&p.set_id))?;
+        for r in rows {
+            let Some(paid_by) = self
+                .ctx
+                .db(|t| orphan_of(t, &r.key, &r.prevout, tip, p.confirmations))?
+            else {
+                continue;
+            };
+            let op = op_rpc(&r.prevout);
+            if self
+                .ctx
+                .ycash
+                .gettxout(&op.txid, op.vout, true)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
+            if self
+                .ctx
+                .db(|t| mark_orphan(t, &r.prevout, r.key.nonce, tip))?
+            {
+                warn!(event = "unlock_orphaned", nonce = r.key.nonce, vault = %r.prevout,
+                      paid_by = %paid_by, "the burn was paid by another vault: rolling this one");
+            }
+            let last = self.mem.orphan_reported.get(&r.prevout).copied();
+            if last.is_some_and(|t| self.mem.ticks < t + 20) {
+                continue;
+            }
+            self.mem.orphan_reported.insert(r.prevout, self.mem.ticks);
+            let req = crate::peers::OrphanRequest {
+                nonce: r.key.nonce,
+                vault: r.prevout.to_string(),
+            };
+            for peer in self.ctx.peers.urls().to_vec() {
+                match self.ctx.peers.orphaned(&peer, &req).await {
+                    Ok(a) => info!(event = "orphan_reported", peer = %peer, vault = %r.prevout,
+                                   marked = a.body.marked),
+                    Err(e) => info!(event = "orphan_report_failed", peer = %peer, error = %e),
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Rolls this attestor signed whose unlock is neither mined nor in the mempool: re-send the
     /// stored bytes (sign-once: never rebuilt, never re-signed).
     async fn resend_rolls(&mut self) -> Result<()> {
@@ -163,10 +280,8 @@ impl Engine {
                 continue; // being spent, or signed for another spend
             }
             // takeover counts from the moment it fell due (or was created, if born due)
-            let due_from = v
-                .owner_height
-                .saturating_sub(p.roll_margin)
-                .max(v.created_height);
+            let marked = self.ctx.db(|t| t.vault_due_height(&v.outpoint))?;
+            let due_from = roll_due_from(v.owner_height, p.roll_margin, v.created_height, marked);
             let since = tip.saturating_sub(due_from);
             let Some(leader) =
                 mint_leader_for(&lock_id(&v.outpoint), self.live(), since, p.takeover)
@@ -243,6 +358,9 @@ impl Engine {
         .await?;
         let with_memo = insert_op_return(&built.hex.to_string(), &memo.encode())
             .map_err(|e| anyhow!("memo: {e}"))?;
+        // no change output: whoever ever funds these bytes pays the fee only (H-1)
+        let with_memo =
+            super::sign::fund_exactly(&self.ctx.ycash, &with_memo, &v.outpoint, value).await?;
         let signer = SetSigning::prepare(&self.ctx, &with_memo, Role::Unlock, v.outpoint).await?;
         let rec = self.ctx.db(|t| {
             // a roll pays no burn: per vault only
@@ -305,4 +423,36 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// `POST /vaults/orphaned` (authenticated): mark a vault orphaned here only if this ledger itself
+/// shows the burn paid by another vault `C_Y` deep while the vault is live (review H-2).
+pub async fn verify_orphan(
+    ctx: &super::Ctx,
+    requester: Option<hawkeye_core::PubKey33>,
+    req: &crate::peers::OrphanRequest,
+) -> Result<crate::peers::OrphanResponse> {
+    let requester = requester.ok_or_else(|| anyhow!("member-signed requests only"))?;
+    let vault = super::slash::parse_outpoint(&req.vault)?;
+    let k = hawkeye_store::BurnKey::new(ctx.params.deployment, req.nonce);
+    let tip = ctx.ycash.getblockcount().await?;
+    let conf = ctx.params.confirmations;
+    let paid_by = ctx
+        .db(|t| orphan_of(t, &k, &vault, tip, conf))?
+        .ok_or_else(|| {
+            anyhow!(
+                "vault {vault} is not orphaned here: burn {} is not paid by another vault C_Y \
+                 deep, or the vault is not live",
+                req.nonce
+            )
+        })?;
+    let op = op_rpc(&vault);
+    ensure!(
+        ctx.ycash.gettxout(&op.txid, op.vout, true).await?.is_some(),
+        "vault {vault} is spent"
+    );
+    let marked = ctx.db(|t| mark_orphan(t, &vault, req.nonce, tip))?;
+    info!(event = "orphan_marked", vault = %vault, nonce = req.nonce, paid_by = %paid_by,
+          requester = %hex::encode(requester), marked);
+    Ok(crate::peers::OrphanResponse { marked })
 }

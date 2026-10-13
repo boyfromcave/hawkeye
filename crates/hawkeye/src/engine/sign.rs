@@ -516,50 +516,137 @@ pub async fn send_set_signed(
         Err(e) if fee_input_lost(&e) => e,
         Err(e) => return Err(e),
     };
-    let refunded = match ycash.vault_refee(hex).await {
-        Ok(r) => r,
+    match checked_refee(ycash, hex, template).await {
+        Ok(h) => ycash.vault_send(&h).await,
         Err(e) => {
-            tracing::warn!(event = "refee_failed", template = %template, error = %e,
+            tracing::warn!(event = "refee_refused", template = %template, error = %e,
                            send_error = %err);
-            return Err(err);
+            Err(err)
         }
+    }
+}
+
+/// The most this wallet pays to re-fund (or exactly fund) a set-signed spend, zatoshi: its fee,
+/// nothing else (review H-1). 0.001 YEC: far above a ZIP-317 fee of a 2-in / 3-out unlock.
+pub const MAX_REFUND_ZAT: u64 = 100_000;
+
+/// **Review H-1.** A set-signed UNLOCK (burn or roll) may move only the template coin: the value
+/// of all its outputs equals the vault's value exactly (the intent, the byte-identical re-lock
+/// of the remainder, a zero-value memo), so whoever funds it — the builder, a re-funder, a
+/// takeover leader — pays the fee and nothing more. The node (S-2) bounds only the vault's
+/// value; a change output, or any output beyond it, would be paid by the fee inputs, and
+/// `vault_refee` funds whatever the outputs need. Hawkeye builds no change
+/// ([`fund_exactly`]); co-signers and adopters refuse anything else.
+pub fn unlock_value_bounded(tx: &Transaction, vault_value: u64) -> Result<()> {
+    let mut total: u64 = 0;
+    for o in &tx.outputs {
+        let v = u64::try_from(o.value).map_err(|_| anyhow!("a negative output"))?;
+        total = total
+            .checked_add(v)
+            .ok_or_else(|| anyhow!("outputs overflow"))?;
+    }
+    ensure!(
+        total == vault_value,
+        "the outputs move {total} zat, the vault holds {vault_value}: an unlock may carry no \
+         change or extra output (its funder would pay it, review H-1)"
+    );
+    Ok(())
+}
+
+/// What re-funding costs this wallet: the outputs' value beyond the template coin, plus the fee.
+pub fn refund_cost(tx: &Transaction, template_value: u64, fee_zat: u64) -> Result<u64> {
+    let mut total: u64 = 0;
+    for o in &tx.outputs {
+        total = total
+            .checked_add(u64::try_from(o.value).map_err(|_| anyhow!("a negative output"))?)
+            .ok_or_else(|| anyhow!("outputs overflow"))?;
+    }
+    Ok(total.saturating_sub(template_value).saturating_add(fee_zat))
+}
+
+fn refused(message: String) -> hawkeye_ycash::Error {
+    hawkeye_ycash::Error::Rpc(hawkeye_ycash::RpcError {
+        method: "vault_refee".into(),
+        code: -8,
+        message,
+    })
+}
+
+/// Re-fund `hex` with `vault_refee` and check it before anything is sent: only the fee inputs
+/// changed ([`same_set_signed_spend`]), and this wallet pays at most [`MAX_REFUND_ZAT`] in all
+/// (fee plus any value the outputs take beyond the template coin, review H-1). Fails closed:
+/// a transaction that does not decode, a template coin that is gone, a cost over the bound.
+async fn checked_refee(
+    ycash: &YcashRpc,
+    hex: &HexBytes,
+    template: &CoreOutPoint,
+) -> core::result::Result<HexBytes, hawkeye_ycash::Error> {
+    let op = op_rpc(template);
+    let coin = ycash
+        .gettxout(&op.txid, op.vout, true)
+        .await?
+        .ok_or_else(|| refused(format!("the template coin {template} is spent")))?;
+    let value = u64::try_from(coin.value.zat()).unwrap_or(0);
+    let refunded = ycash.vault_refee(hex).await?;
+    let (Ok(old), Ok(new)) = (
+        Transaction::decode(&hex.0),
+        Transaction::decode(&refunded.hex.0),
+    ) else {
+        return Err(refused("a re-funded spend that does not decode".into()));
     };
-    let checked = Transaction::decode(&hex.0)
-        .map_err(|e| anyhow!("{e}"))
-        .and_then(|old| {
-            let new = Transaction::decode(&refunded.hex.0).map_err(|e| anyhow!("{e}"))?;
-            same_set_signed_spend(&old, &new, template)
-        });
-    if let Err(why) = checked {
-        tracing::warn!(event = "refee_refused", template = %template, reason = %format!("{why:#}"));
-        return Err(err);
+    if let Err(why) = same_set_signed_spend(&old, &new, template) {
+        return Err(refused(format!("the re-funded spend changed: {why:#}")));
+    }
+    let fee = u64::try_from(refunded.fee.zat()).unwrap_or(u64::MAX);
+    let cost = refund_cost(&new, value, fee).map_err(|e| refused(format!("{e:#}")))?;
+    if fee > MAX_REFUND_ZAT || cost > MAX_REFUND_ZAT {
+        return Err(refused(format!(
+            "re-funding {template} would cost this wallet {cost} zat (fee {fee}) > \
+             {MAX_REFUND_ZAT}: not sent (review H-1)"
+        )));
     }
     tracing::info!(event = "refee", template = %template, replaced = refunded.replaced.len(),
-                   fee = %refunded.fee, sighash = %hex::encode(refunded.sighash.0));
-    ycash.vault_send(&refunded.hex).await
+                   fee = %refunded.fee, cost);
+    Ok(refunded.hex)
 }
 
 /// `vault_send` of set-signed bytes after re-funding **every** fee input with `vault_refee`
 /// (01/V-2): for bytes this wallet did not fund — a co-signed unlock adopted as the burn's new
-/// leader, a previous leader's unlock fetched at takeover — or whose fee input is gone. Only the
-/// fee inputs may change ([`same_set_signed_spend`]).
+/// leader, a previous leader's unlock fetched at takeover — or whose fee input is gone. The
+/// re-fund is checked first (`checked_refee`: only the fee inputs change, and it costs at most
+/// [`MAX_REFUND_ZAT`]); nothing is sent otherwise.
 pub async fn send_refunded(
     ycash: &YcashRpc,
     hex: &HexBytes,
     template: &CoreOutPoint,
 ) -> core::result::Result<hawkeye_ycash::primitives::Txid, hawkeye_ycash::Error> {
-    let refunded = ycash.vault_refee(hex).await?;
-    let old = Transaction::decode(&hex.0);
-    let new = Transaction::decode(&refunded.hex.0);
-    if let (Ok(old), Ok(new)) = (old, new)
-        && let Err(why) = same_set_signed_spend(&old, &new, template)
-    {
-        tracing::warn!(event = "refee_refused", template = %template, reason = %format!("{why:#}"));
-        return ycash.vault_send(hex).await;
-    }
-    tracing::info!(event = "refee", template = %template, replaced = refunded.replaced.len(),
-                   fee = %refunded.fee);
-    ycash.vault_send(&refunded.hex).await
+    let h = checked_refee(ycash, hex, template).await?;
+    ycash.vault_send(&h).await
+}
+
+/// Fund an **unsigned** unlock exactly (review H-1): drop the change output(s) the node's build
+/// added (P2PKH / P2SH outputs: an unlock pays its recipient through the intent), then
+/// `vault_refee`, which funds exactly the fee. The result moves the vault's value and nothing
+/// else ([`unlock_value_bounded`]), so no re-funder can ever be made to pay a change output.
+pub async fn fund_exactly(
+    ycash: &YcashRpc,
+    hex: &str,
+    template: &CoreOutPoint,
+    vault_value: u64,
+) -> Result<String> {
+    let mut tx = Transaction::decode_hex(hex).map_err(|e| anyhow!("{e}"))?;
+    tx.outputs.retain(|o| {
+        hawkeye_core::script::parse_p2pkh(&o.script_pubkey).is_none()
+            && hawkeye_core::script::parse_p2sh(&o.script_pubkey).is_none()
+    });
+    unlock_value_bounded(&tx, vault_value)?;
+    let stripped = HexBytes(tx.encode());
+    let h = checked_refee(ycash, &stripped, template)
+        .await
+        .map_err(|e| anyhow!("funding the unlock exactly: {e}"))?;
+    let funded = Transaction::decode(&h.0).map_err(|e| anyhow!("{e}"))?;
+    unlock_value_bounded(&funded, vault_value)?;
+    Ok(funded.encode_hex())
 }
 
 /// `vault_buildunlock` of `vault` to `recipients`. The node wallet remembers one build per vault
