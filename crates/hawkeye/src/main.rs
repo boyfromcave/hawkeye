@@ -20,7 +20,19 @@ struct Args {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the daemon (attestor + watcher + heartbeat + API).
-    Run,
+    Run {
+        /// Off mainnet: start the follower at `[ycash] start_height` even though the set has older
+        /// vaults of the bridge's tag. Such an attestor never saw those locks and challenges (and
+        /// opens fraud cases against) honest proposals for them (audit 05/L-5). Refused on mainnet.
+        #[arg(long)]
+        i_accept_blind_start: bool,
+    },
+    /// Exposures (audit 05/L-5): signed locks that left the active chain, minted or not. While
+    /// one is unacknowledged the daemon pauses its own mint-side acts (off regtest).
+    Exposure {
+        #[command(subcommand)]
+        cmd: ExposureCmd,
+    },
     /// Print a summary of the ledger, the node and the chain.
     Status {
         /// As JSON.
@@ -134,6 +146,21 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ExposureCmd {
+    /// List the unacknowledged exposures.
+    List,
+    /// Acknowledge the exposure of a lock (after the set paused the bridge or lowered its cap and
+    /// the supply was reconciled): the daemon stops pausing for it.
+    Ack {
+        /// The lockId, 0x-hex.
+        lock_id: String,
+        /// What was done about it (kept with the acknowledgement).
+        #[arg(long)]
+        note: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum KeysCmd {
     /// Print the member key, its Ethereum address and its NEAR guardian key.
     Derive {
@@ -184,7 +211,19 @@ async fn main() -> Result<()> {
     let s = settings(&args)?;
     init_logging(&s.log_level, s.log_json);
     match &args.cmd {
-        Cmd::Run => daemon::run(&s).await,
+        Cmd::Run {
+            i_accept_blind_start,
+        } => {
+            let mut s = s;
+            s.params.accept_blind_start = *i_accept_blind_start;
+            daemon::run(&s).await
+        }
+        Cmd::Exposure {
+            cmd: ExposureCmd::List,
+        } => cli::exposure_list(&s),
+        Cmd::Exposure {
+            cmd: ExposureCmd::Ack { lock_id, note },
+        } => cli::exposure_ack(&s, lock_id, note),
         Cmd::Status { json, params: true } => cli::status_params(&s, *json).await,
         Cmd::Status { json, .. } => cli::status(&s, *json).await,
         Cmd::Enroll => cli::enroll(&s).await,

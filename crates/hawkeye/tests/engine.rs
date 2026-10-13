@@ -285,6 +285,7 @@ impl Env {
             auto_slash: true,
             drills: true,
             fallback_to_threshold: true,
+            accept_blind_start: false,
             ycash_start_height: Some(1),
         }
     }
@@ -3048,4 +3049,187 @@ async fn r2_delay_mismatch_warns() {
             .unwrap(),
         (0, 1)
     );
+}
+
+// ------------------------------------------------------------------------------------------
+// audit 05/L-5: exposure (a signed lock that left the active chain) and the blind start
+
+impl Env {
+    /// A Ycash reorg that drops every block from `height` up and mines a longer branch of empty
+    /// blocks (the mock's UTXO effects are not undone: the follower only sees the blocks).
+    fn reorg_from(&self, height: u32) {
+        let mut st = self.mock.state();
+        let old = st.blocks.len();
+        st.blocks.truncate(height as usize);
+        st.mempool.clear();
+        let n = u32::try_from(old - height as usize).unwrap() + 1;
+        st.mine(n);
+    }
+}
+
+fn lock_state(e: &Engine, id: &[u8; 32]) -> LockState {
+    e.ctx().db(|t| t.lock(id)).unwrap().unwrap().state
+}
+
+/// A threshold mint lands for a lock whose Ycash block is then reorged away before the `Minted`
+/// is final: the lock ends MINTED_UNBACKED, `exposure` is raised (status and metrics), and on
+/// mainnet semantics this attestor signs nothing new until `exposure ack`; challenges go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u_minted_on_reorged_lock_pauses_own_mints() {
+    let Some(env) = setup_with(Opts {
+        mint_cap: 100_000_000_000,
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let mut e = vec![
+        env.engine_with(0, vec![], |p| {
+            p.mainnet = true;
+            p.drills = false;
+        })
+        .await,
+    ];
+    tick_all(&mut e).await;
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let l1 = hawkeye_core::lock::lock_id(&op);
+    env.mine(C_Y);
+    let c = env.eth(&env.holder).await;
+    let mut rounds = 0;
+    // policy-OK, signed, threshold mint submitted; no Ethereum block mined, so not final yet
+    while c.total_supply().await.unwrap() == U256::ZERO {
+        rounds += 1;
+        assert!(
+            rounds <= 20,
+            "no mint after {rounds} ticks: {:?}",
+            lock_state(&e[0], &l1)
+        );
+        env.mine(1); // the leader may be another member: takeover after TAKEOVER blocks
+        tick_all(&mut e).await;
+    }
+    let height = e[0]
+        .ctx()
+        .db(|t| t.lock(&l1))
+        .unwrap()
+        .unwrap()
+        .block_height;
+    assert_ne!(
+        lock_state(&e[0], &l1),
+        LockState::Minted,
+        "the Minted is not final yet"
+    );
+    env.reorg_from(height);
+    tick_all(&mut e).await;
+    env.eth_mine(3).await;
+    tick_all(&mut e).await;
+    assert_eq!(lock_state(&e[0], &l1), LockState::MintedUnbacked);
+    let a = e[0].alarms();
+    assert!(a.iter().any(|a| a.name == "exposure"), "{a:?}");
+    let st = e[0].ctx().status.read().unwrap().clone();
+    assert_eq!(st.exposure, vec![format!("0x{}", hex::encode(l1))]);
+    assert!(hawkeye::status::render_metrics(&st).contains("hawkeye_exposure_unacked 1"));
+    assert_eq!(
+        fraud_cases(&e[0], env.key_of_index(0)),
+        0,
+        "no slash for a reorg"
+    );
+    // a new policy-OK lock is not signed while the exposure is unacknowledged
+    let op2 = env.lock(500_000_000, &to);
+    let l2 = hawkeye_core::lock::lock_id(&op2);
+    env.mine(C_Y);
+    for _ in 0..3 {
+        tick_all(&mut e).await;
+        env.eth_mine(3).await;
+    }
+    assert_eq!(lock_state(&e[0], &l2), LockState::PolicyOk, "paused");
+    // the operator acknowledges: the pause ends and the lock mints
+    e[0].ctx()
+        .db(|t| t.ack_exposure(&l1, "set paused the bridge; supply reconciled"))
+        .unwrap();
+    for _ in 0..3 {
+        tick_all(&mut e).await;
+        env.eth_mine(3).await;
+    }
+    assert!(!e[0].alarms().iter().any(|a| a.name == "exposure"));
+    assert_eq!(lock_state(&e[0], &l2), LockState::Minted);
+}
+
+/// A proposed, not yet executed lock whose Ycash block reorgs away: its own proposer withdraws
+/// the proposal by challenge (no fraud case), and the lock is an exposure until acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u2_signed_then_reorged_proposal_is_challenged() {
+    let Some(env) = setup_with(opt()).await else {
+        return;
+    };
+    let mut engines = three(&env).await;
+    let to = env.holder.eth_address();
+    let op = env.lock(1_000_000_000, &to);
+    let lock_id = drive_mint(&env, &mut engines, &op).await;
+    let c = env.eth(&env.holder).await;
+    let p = c
+        .proposal(B256::from(lock_id))
+        .await
+        .unwrap()
+        .expect("proposed");
+    let proposer = (0..3)
+        .find(|&i| hawkeye::convert::addr(&env.keys[i].eth_address()) == p.proposer)
+        .unwrap();
+    let height = engines[proposer]
+        .ctx()
+        .db(|t| t.lock(&lock_id))
+        .unwrap()
+        .unwrap()
+        .block_height;
+    env.reorg_from(height);
+    // only the proposer ticks: it withdraws its own proposal
+    let mut own = vec![engines.remove(proposer)];
+    tick_all(&mut own).await;
+    assert!(
+        c.proposal(B256::from(lock_id)).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert_eq!(challenges(&own[0]).len(), 1);
+    assert_eq!(lock_state(&own[0], &lock_id), LockState::Reorged);
+    for _ in 0..3 {
+        env.eth_mine(3).await;
+        tick_all(&mut own).await;
+    }
+    assert!(own[0].alarms().iter().any(|a| a.name == "exposure"));
+    assert!(open_cases(&own[0]).is_empty(), "{:?}", open_cases(&own[0]));
+    assert_eq!(c.total_supply().await.unwrap(), U256::ZERO);
+}
+
+/// `ycash.start_height` above the set's oldest bridge vault: the follower refuses to start
+/// (it would challenge honest proposals for locks it never saw) unless the operator accepts a
+/// blind start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u3_blind_start_refused() {
+    let Some(env) = setup().await else {
+        return;
+    };
+    env.lock(1_000_000_000, &env.holder.eth_address());
+    env.mine(10);
+    let late = env.mock.state().tip_height();
+    let mut e = env
+        .engine_with(0, vec![], |p| p.ycash_start_height = Some(late))
+        .await;
+    let r = e.tick().await;
+    assert!(
+        r.errors
+            .iter()
+            .any(|x| x.contains("is above the set's oldest WYEC vault")),
+        "{:?}",
+        r.errors
+    );
+    drop(e);
+    let mut e = env
+        .engine_with(1, vec![], |p| {
+            p.ycash_start_height = Some(late);
+            p.accept_blind_start = true;
+        })
+        .await;
+    let r = e.tick().await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
 }

@@ -217,6 +217,10 @@ states! {
     Minted = "MINTED",
     /// The lock left the active chain.
     Reorged = "REORGED",
+    /// `Minted` observed on the foreign chain for a lock that had left the active chain (audit
+    /// 05/L-5): wYEC without YEC behind it. Terminal; an exposure until an operator
+    /// acknowledges it (`hawkeye exposure ack`).
+    MintedUnbacked = "MINTED_UNBACKED",
 }
 
 impl Machine for LockState {
@@ -233,6 +237,7 @@ impl Machine for LockState {
         Self::Executed,
         Self::Minted,
         Self::Reorged,
+        Self::MintedUnbacked,
     ];
     fn edge(self, to: Self) -> Option<Edge> {
         use LockState::*;
@@ -252,7 +257,8 @@ impl Machine for LockState {
                 | (Challenged, Proposed)
                 | (Executed, Minted)
                 | (Reorged, Seen)
-        ) || (to == Reorged && self != Reorged);
+                | (Reorged, MintedUnbacked)
+        ) || (to == Reorged && self != Reorged && self != MintedUnbacked);
         fwd.then_some(Edge::Forward)
     }
 }
@@ -669,6 +675,9 @@ mod tests {
     fn terminal_states() {
         assert!(LockState::PolicyRejected.edge(LockState::Reorged).is_some());
         assert!(!LockState::Minted.is_terminal()); // → REORGED (exposure)
+        assert!(LockState::MintedUnbacked.is_terminal());
+        assert!(LockState::Reorged.edge(LockState::MintedUnbacked).is_some());
+        assert!(LockState::Signed.edge(LockState::MintedUnbacked).is_none());
         assert!(BurnState::Orphaned.is_terminal());
         assert!(BurnState::Released.is_terminal());
         // → RELEASED: a release recorded while the burn was unknown here is adopted later

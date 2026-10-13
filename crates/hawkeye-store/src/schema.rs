@@ -11,7 +11,10 @@
 /// `sign_once_unlock_burn`, `meta`), `V7` this lane's (audit 05/H-2: `pending_mints.provisional`).
 /// On this branch alone V7 is the sixth entry; merged after H-1 the list is
 /// `[V1, V2, V3, V4, V5, V6, V7]`. V7 touches only `pending_mints`, so it applies on top of either.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V7];
+///
+/// Wave 2 (lane bridge-wave2): `V8` (audit 05/L-5, `exposure_acks`) and `V9` (audit 05/L-3,
+/// `sign_once_mint` keyed per deployment) follow; with V6 merged the list is `[V1..V9]`.
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V7, V8];
 
 /// Version 1: the H4 ledger.
 const V1: &str = r#"
@@ -504,6 +507,17 @@ CREATE TRIGGER sign_once_drill_mint_immutable_update BEFORE UPDATE ON sign_once_
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
 CREATE TRIGGER sign_once_drill_mint_immutable_delete BEFORE DELETE ON sign_once_drill_mint
 BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+"#;
+
+/// Version 8 (audit 05/L-5): `exposure_acks`, an operator's acknowledgement of an exposure (a
+/// signed lock that left the active chain, minted or not: `REORGED` or `MINTED_UNBACKED`). An
+/// unacknowledged exposure pauses this attestor's own mint-side acts off regtest.
+const V8: &str = r#"
+CREATE TABLE exposure_acks (
+    lock_id   BLOB    PRIMARY KEY CHECK (length(lock_id) = 32),
+    note      TEXT    NOT NULL,
+    acked_at  INTEGER NOT NULL
+) WITHOUT ROWID;
 "#;
 
 /// Version 7 (audit 05/H-2): `pending_mints.provisional`. The watcher reads `MintProposed` at

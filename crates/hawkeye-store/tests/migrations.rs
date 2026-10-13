@@ -11,6 +11,7 @@ const TABLES: &[&str] = &[
     "chain_cursor",
     "equivocations_sent",
     "events",
+    "exposure_acks",
     "intents",
     "locks",
     "pending_mints",

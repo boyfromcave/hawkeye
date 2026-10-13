@@ -205,6 +205,10 @@ pub(crate) struct Memory {
     pub mint_cap_unbounded: bool,
     /// Added to the wall clock (tests drive the finality watch without waiting).
     pub clock_offset: Duration,
+    /// Unacknowledged exposures (audit 05/L-5): lock ids, from the ledger every tick.
+    pub exposures: Vec<Hash32>,
+    /// Locks whose proposal this attestor withdrew (challenged) after the lock reorged.
+    pub withdrawn: HashSet<Hash32>,
 }
 
 /// When the foreign chain's finalized height last moved (audit 05/H-2).
@@ -287,6 +291,7 @@ impl Engine {
         step!("eth", self.scan_eth());
         step!("eth-latest", self.scan_proposals_latest());
         step!("minted", self.check_pending_mints());
+        step!("exposure", self.refresh_exposures());
         step!("guardians", self.check_guardians());
         step!("watch", self.watch());
         step!("locks", self.evaluate_locks());
@@ -551,6 +556,12 @@ impl Engine {
             ticks: self.mem.ticks,
             last_errors: report.errors.clone(),
             finality_stalled: self.mem.finality_stalled,
+            exposure: self
+                .mem
+                .exposures
+                .iter()
+                .map(|id| format!("0x{}", hex::encode(id)))
+                .collect(),
             eth_finalized_age_secs,
         })
     }
@@ -638,6 +649,55 @@ impl Engine {
         self.signing_paused()
             || (self.ctx.params.mainnet
                 && (self.mem.finality_stalled || self.mem.mint_cap_unbounded))
+            || (self.exposure_pauses() && !self.mem.exposures.is_empty())
+    }
+
+    /// Whether an unacknowledged exposure pauses own mint-side acts here (audit 05/L-5): on
+    /// mainnet and testnet; on regtest it is an alarm only.
+    fn exposure_pauses(&self) -> bool {
+        self.ctx.params.mainnet
+            || self.ctx.params.network == hawkeye_core::address::Network::Testnet
+    }
+
+    /// The exposures from the ledger (audit 05/L-5): signed locks that left the active chain
+    /// (`REORGED`) or were minted after they did (`MINTED_UNBACKED`), not acknowledged with
+    /// `hawkeye exposure ack`. Raises or clears the `exposure` alarm; while any is unacknowledged
+    /// this attestor's own `Mint` signatures, proposals, executions and threshold mints pause
+    /// (off regtest). Challenges, cancels, heartbeats, releases and slash votes go on.
+    pub(crate) async fn refresh_exposures(&mut self) -> Result<()> {
+        let rows = self.ctx.db(|t| t.unacked_exposures())?;
+        self.mem.exposures = rows.iter().map(|l| l.lock_id).collect();
+        if rows.is_empty() {
+            self.clear_alarm("exposure");
+            return Ok(());
+        }
+        let list: Vec<String> = rows
+            .iter()
+            .map(|l| {
+                format!(
+                    "0x{} {} {} zat to {}",
+                    hex::encode(l.lock_id),
+                    l.state,
+                    l.value_zat,
+                    l.destination
+                        .as_ref()
+                        .map_or_else(|| "?".to_owned(), ToString::to_string)
+                )
+            })
+            .collect();
+        let paused = if self.exposure_pauses() {
+            "; own mint-side acts paused until `hawkeye exposure ack <lockId>`"
+        } else {
+            ""
+        };
+        self.alarm(
+            "exposure",
+            format!(
+                "signed locks left the active chain (unacknowledged): {}{paused}",
+                list.join(", ")
+            ),
+        );
+        Ok(())
     }
 
     /// Live members sorted (the leader order).

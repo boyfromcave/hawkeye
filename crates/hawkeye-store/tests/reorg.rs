@@ -351,3 +351,50 @@ fn matcher_view_of_consumption() {
     })
     .unwrap();
 }
+
+/// Audit 05/L-5: a signed lock rewound is an exposure until acknowledged; an unsigned lock is
+/// no exposure; a reorged lock minted later is MINTED_UNBACKED, still an exposure.
+#[test]
+fn exposures_until_acknowledged() {
+    let mut s = store();
+    let (a, b) = s
+        .tx(|t| Ok::<_, StoreError>((policy_ok_lock(t, 1, 105), policy_ok_lock(t, 2, 106))))
+        .unwrap();
+    for (id, n) in [(a, 1), (b, 2)] {
+        s.sign_once_mint(
+            &id,
+            new_lock(n, 0).value_zat,
+            &DEST,
+            &[n as u8; 32],
+            fake_sig,
+        )
+        .unwrap();
+    }
+    s.tx(|t| {
+        assert!(
+            t.ack_exposure(&a, "x").is_err(),
+            "a signed lock on the chain is no exposure"
+        );
+        let rep = t.rewind_ycash_to(104)?;
+        assert_eq!(rep.exposures.len(), 2);
+        assert_eq!(t.unacked_exposures()?.len(), 2);
+        t.transition_lock(
+            &b,
+            LockState::MintedUnbacked,
+            Some(104),
+            Some("Minted observed"),
+        )?;
+        assert!(t.ack_exposure(&a, "reconciled; the set paused the bridge")?);
+        assert!(!t.ack_exposure(&a, "again")?);
+        let left = t.unacked_exposures()?;
+        assert_eq!(left.len(), 1);
+        assert_eq!(
+            (left[0].lock_id, left[0].state),
+            (b, LockState::MintedUnbacked)
+        );
+        assert!(t.ack_exposure(&b, "accepted loss")?);
+        assert!(t.unacked_exposures()?.is_empty());
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+}

@@ -208,6 +208,7 @@ impl Env {
             auto_slash: true,
             drills: true,
             fallback_to_threshold: true,
+            accept_blind_start: false,
             ycash_start_height: Some(1),
         }
     }
