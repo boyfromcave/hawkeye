@@ -1,6 +1,6 @@
 //! Hawkeye's adapter to `ycashd` (plan §6, phase H2).
 //!
-//! - [`YcashRpc`]: an async JSON-RPC client typed to the vault primitive's 23 `set_*` / `vault_*`
+//! - [`YcashRpc`]: an async JSON-RPC client typed to the vault primitive's 27 `set_*` / `vault_*`
 //!   RPCs (`ycash-dd/doc/vault-rpc.md`, `doc/vault-rpc-contract.json`) and the stock RPCs Hawkeye
 //!   uses. Amounts are exact integer zatoshi ([`Amount`]); errors carry the node's code and message
 //!   and recognise the documented reasons ([`RpcError::reason`]).
