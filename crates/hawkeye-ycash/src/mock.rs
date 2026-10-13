@@ -199,6 +199,12 @@ pub struct MockState {
     pub recipients: HashMap<Bytes32, Vec<u8>>,
     /// `-rpcuser`/`-rpcpassword`, checked when set.
     pub auth: Option<(String, String)>,
+    /// Per-wallet views of the shared wallet: a client of [`MockYcashd::wallet_client`]
+    /// `name` signs set and act signatures with these member keys only (several attestors'
+    /// nodes simulated by one mock; a name with no view sees every wallet key).
+    pub wallet_views: HashMap<String, BTreeSet<PubKey>>,
+    /// The wallet the current call came through (`/wallet/<name>`), if any.
+    current_wallet: Option<String>,
     pub calls: Vec<Call>,
     canned: HashMap<String, VecDeque<Reply>>,
     http_failures: VecDeque<u16>,
@@ -450,6 +456,8 @@ impl MockState {
             sign_once: HashMap::new(),
             recipients: HashMap::new(),
             auth: None,
+            wallet_views: HashMap::new(),
+            current_wallet: None,
             calls: vec![],
             canned: HashMap::new(),
             http_failures: VecDeque::new(),
@@ -519,6 +527,29 @@ impl MockState {
     fn fresh(&mut self, what: &str) -> [u8; 32] {
         self.counter += 1;
         sha256(format!("{what}/{}", self.counter).as_bytes())
+    }
+
+    /// `n` confirmed P2PKH wallet coins of `amount` zatoshi each (fee capacity, `listunspent`).
+    pub fn add_wallet_coins(&mut self, n: usize, amount: i64) {
+        for _ in 0..n {
+            let prev = Hash256(self.fresh("walletcoin"));
+            let a = format!("tmMock{}", hex::encode(&prev.0[..10]));
+            let spk = p2pkh(&sha256(&prev.0));
+            self.addresses.insert(a.clone(), spk.clone());
+            self.unspent.push(Unspent {
+                txid: prev,
+                vout: 0,
+                generated: false,
+                address: Some(a),
+                account: None,
+                redeem_script: None,
+                script_pub_key: HexBytes(spk),
+                amount: Amount(amount),
+                amount_zat: amount,
+                confirmations: 6,
+                spendable: true,
+            });
+        }
     }
 
     /// A new key in the wallet.
@@ -1085,6 +1116,23 @@ impl MockState {
         }
         let coin = needed + COIN;
         let prev = Hash256(self.fresh("coin"));
+        // the coin is a confirmed wallet P2PKH output (gettxout, validateaddress see it)
+        let a = format!("tmMock{}", hex::encode(&prev.0[..10]));
+        let spk = p2pkh(&sha256(&prev.0));
+        self.addresses.insert(a.clone(), spk.clone());
+        self.unspent.push(Unspent {
+            txid: prev,
+            vout: 0,
+            generated: false,
+            address: Some(a),
+            account: None,
+            redeem_script: None,
+            script_pub_key: HexBytes(spk),
+            amount: Amount(coin),
+            amount_zat: coin,
+            confirmations: 6,
+            spendable: true,
+        });
         tx.inputs.push(TxIn {
             prevout: OutPoint::new(prev, 0),
             script_sig: vec![],
@@ -1325,7 +1373,29 @@ impl MockState {
                 self.wallet_keys.insert(PubKey(k));
                 Ok(a.into())
             }
-            "listunspent" => to_json(&self.unspent),
+            "listunspent" => {
+                // confirmations from the chain for coins of known transactions (phantom
+                // funding coins keep theirs); minconf / maxconf applied
+                let minconf: i64 = opt_arg::<i64>(p, 0, "minconf")?.unwrap_or(1);
+                let maxconf: i64 = opt_arg::<i64>(p, 1, "maxconf")?.unwrap_or(9_999_999);
+                let tip = i64::from(self.tip_height());
+                let rows: Vec<Unspent> = self
+                    .unspent
+                    .iter()
+                    .cloned()
+                    .map(|mut u| {
+                        if let Some((_, b)) = self.txs.get(&u.txid) {
+                            u.confirmations = b
+                                .and_then(|b| self.blocks.iter().find(|x| x.hash == b))
+                                .map_or(0, |x| tip - i64::from(x.height) + 1);
+                        }
+                        u
+                    })
+                    .filter(|u| u.confirmations >= minconf && u.confirmations <= maxconf)
+                    .collect();
+                to_json(&rows)
+            }
+            "sendmany" => self.sendmany(p),
             "gettxout" => self.gettxout(p),
             "generate" => {
                 let n: u32 = arg(p, 0, "numblocks")?;
@@ -1498,8 +1568,21 @@ impl MockState {
             .unwrap_or_default()
             .into_iter()
             .filter(|m| m.current && self.wallet_keys.contains(&m.key) && Some(&m.key) != except)
+            .filter(|m| self.in_view(&m.key))
             .map(|m| m.key)
             .collect()
+    }
+
+    /// Whether the current call's wallet view holds `key` (no view: every wallet key).
+    fn in_view(&self, key: &PubKey) -> bool {
+        match self
+            .current_wallet
+            .as_ref()
+            .and_then(|w| self.wallet_views.get(w))
+        {
+            Some(v) => v.contains(key),
+            None => true,
+        }
     }
 
     fn set_join(&mut self, p: &[Value]) -> RpcResult {
@@ -1670,6 +1753,11 @@ impl MockState {
         let Some((value, spk)) = found else {
             return Ok(Value::Null);
         };
+        let wallet_address = self
+            .unspent
+            .iter()
+            .find(|u| u.txid == txid && u.vout == vout)
+            .and_then(|u| u.address.clone());
         let height = self
             .txs
             .get(&txid)
@@ -1680,10 +1768,57 @@ impl MockState {
             "bestblock": self.tip_hash(),
             "confirmations": self.tip_height() - height + 1,
             "value": Amount(value).to_string(),
-            "scriptPubKey": {"asm": "", "hex": hex::encode(&spk), "type": "scripthash"},
+            "scriptPubKey": match &wallet_address {
+                Some(a) => json!({"asm": "", "hex": hex::encode(&spk), "type": "pubkeyhash",
+                                  "reqSigs": 1, "addresses": [a]}),
+                None => json!({"asm": "", "hex": hex::encode(&spk), "type": "scripthash"}),
+            },
             "version": 4,
             "coinbase": false,
         }))
+    }
+
+    /// `sendmany "" {"address": amount, …}`: one transaction from a phantom funding coin,
+    /// one output per address (a new wallet coin when the address is the wallet's), change to
+    /// the wallet; mempool.
+    fn sendmany(&mut self, p: &[Value]) -> RpcResult {
+        let to: serde_json::Map<String, Value> = arg(p, 1, "amounts")?;
+        let mut outputs = vec![];
+        let mut mine = vec![];
+        for (a, v) in &to {
+            let amount: Amount = serde_json::from_value(v.clone())
+                .map_err(|e| (-3, format!("amount for {a}: {e}")))?;
+            let Some(spk) = self.address_script(a) else {
+                return err(-5, format!("Invalid Ycash address: {a}"));
+            };
+            if self.addresses.contains_key(a) {
+                mine.push((outputs.len() as u32, a.clone(), spk.clone(), amount));
+            }
+            outputs.push(TxOut {
+                value: amount.0,
+                script_pubkey: spk,
+            });
+        }
+        let mut tx = Transaction::new_v4(vec![], outputs, 0, 0);
+        self.fund(&mut tx, 0);
+        self.sign_wallet_inputs(&mut tx);
+        let txid = self.submit(tx.encode())?;
+        for (vout, a, spk, amount) in mine {
+            self.unspent.push(Unspent {
+                txid,
+                vout,
+                generated: false,
+                address: Some(a),
+                account: None,
+                redeem_script: None,
+                script_pub_key: HexBytes(spk),
+                amount,
+                amount_zat: amount.0,
+                confirmations: 0,
+                spendable: true,
+            });
+        }
+        to_json(&txid)
     }
 
     fn spent_in_mempool(&self, op: &OutPoint) -> bool {
@@ -2638,7 +2773,25 @@ fn lock(s: &Shared) -> MutexGuard<'_, MockState> {
     s.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+async fn handle_wallet(
+    State(st): State<Shared>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    handle_as(st, Some(name), headers, body).await
+}
+
 async fn handle(State(st): State<Shared>, headers: HeaderMap, body: String) -> Response {
+    handle_as(st, None, headers, body).await
+}
+
+async fn handle_as(
+    st: Shared,
+    wallet: Option<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let reply = |status: StatusCode, body: String| {
         (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
     };
@@ -2679,11 +2832,13 @@ async fn handle(State(st): State<Shared>, headers: HeaderMap, body: String) -> R
         _ => vec![],
     };
     let canned = s.canned.get_mut(&method).and_then(VecDeque::pop_front);
+    s.current_wallet = wallet;
     let result = match canned {
         Some(Reply::Result(v)) => Ok(v),
         Some(Reply::Error { code, message }) => Err((code, message)),
         None => s.dispatch(&method, &params),
     };
+    s.current_wallet = None;
     s.calls.push(Call {
         method,
         params,
@@ -2729,6 +2884,7 @@ impl MockYcashd {
         let state: Shared = Arc::new(Mutex::new(state));
         let app = Router::new()
             .route("/", post(handle))
+            .route("/wallet/{name}", post(handle_wallet))
             .with_state(state.clone());
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -2763,6 +2919,19 @@ impl MockYcashd {
             None => Auth::None,
         };
         YcashRpc::new(self.url(), auth).expect("client builds")
+    }
+
+    /// A client of the wallet view `name` ([`MockState::wallet_views`]): one simulated
+    /// attestor node of a shared mock.
+    pub fn wallet_client(&self, name: &str) -> YcashRpc {
+        let auth = match &self.state().auth {
+            Some((u, p)) => Auth::UserPass {
+                user: u.clone(),
+                password: p.clone(),
+            },
+            None => Auth::None,
+        };
+        YcashRpc::new(format!("http://{}/wallet/{name}", self.addr), auth).expect("client builds")
     }
 
     /// The state, locked.
