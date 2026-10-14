@@ -200,12 +200,6 @@ pub fn classify_intent_for(
             let Some(burn) = lookup(memo.reference).filter(|b| b.tx_hash == memo.data) else {
                 return U(Unmatched::UnknownBurn);
             };
-            if let Some(by) = burn.consumed_by.filter(|c| c.txid != obs.txid) {
-                return U(Unmatched::ConsumedBurn {
-                    by,
-                    benign_race: is_benign_race(by.first_seen, obs.first_seen, ctx.takeover),
-                });
-            }
             if obs.value != burn.amount {
                 return U(Unmatched::WrongValue {
                     expected: burn.amount,
@@ -217,6 +211,12 @@ pub fn classify_intent_for(
             };
             if recipient.recipient_hash() != obs.intent.recipient_hash {
                 return U(Unmatched::WrongRecipient);
+            }
+            if let Some(by) = burn.consumed_by.filter(|c| c.txid != obs.txid) {
+                return U(Unmatched::ConsumedBurn {
+                    by,
+                    benign_race: is_benign_race(by.first_seen, obs.first_seen, ctx.takeover),
+                });
             }
             Classification::MatchedBurn { nonce: burn.nonce }
         }
@@ -386,6 +386,19 @@ mod tests {
             U(Unmatched::ConsumedBurn {
                 by: earlier,
                 benign_race: false
+            })
+        );
+
+        let thief = intent_for(&vault(), &YcashRecipient::p2pkh([0x66; 20]).script()).unwrap();
+        assert_eq!(
+            Case::with(thief, memo9(), 5000).classify(10, &[burn(Some(earlier))]),
+            U(Unmatched::WrongRecipient)
+        );
+        assert_eq!(
+            Case::with(c.intent, memo9(), 4999).classify(10, &[burn(Some(earlier))]),
+            U(Unmatched::WrongValue {
+                expected: 5000,
+                got: 4999
             })
         );
 
