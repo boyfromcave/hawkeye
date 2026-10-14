@@ -189,3 +189,88 @@ fn the_withdrawal_refuses_a_foreign_bond_script() {
     .unwrap();
     assert_eq!((tx.lock_time, tx.expiry_height), (20, 60));
 }
+
+/// A live leader unlock of an unspent vault makes `hawkeye leave` refuse (W4-B-2).
+#[tokio::test]
+async fn leave_refuses_with_a_live_signed_unlock() {
+    use hawkeye::cli::live_unlock_reason;
+    use hawkeye_core::{Deployment, EthAddress};
+    use hawkeye_store::{SignDomain, UnlockBurn, UnlockOrigin, YcashSignKey};
+    use hawkeye_ycash::HexBytes;
+    use hawkeye_ycash::types::VaultFields;
+    let (m, set, keys) = setup().await;
+    let c = m.client();
+    let vault = {
+        let mut st = m.state();
+        let owner = st.new_wallet_owner();
+        st.add_vault(
+            VaultFields {
+                tag: HexBytes(b"WYEC".to_vec()),
+                tagtext: "WYEC".into(),
+                setid: set,
+                cancelsetid: set,
+                delay: 1,
+                ownerheight: 100_000,
+                appheight: 0,
+                owner,
+                ownerscheme: 1,
+            },
+            Amount(100_000_000),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = hawkeye_store::Store::open(dir.path().join("hawkeye.db")).unwrap();
+    let dep = Deployment {
+        chain_id: 1,
+        bridge: EthAddress([1; 20]),
+    };
+    let prev = hawkeye_core::OutPoint::new(vault.txid.0, vault.vout);
+    let burn = hawkeye_store::BurnKey::new(dep, 3);
+    store
+        .tx(|t| {
+            t.sign_once_unlock(
+                &YcashSignKey {
+                    domain: SignDomain::YcashUnlock,
+                    set_id: set.0,
+                    prevout: prev,
+                },
+                Some(&UnlockBurn {
+                    key: burn,
+                    origin: UnlockOrigin::Leader,
+                    allow_double: false,
+                }),
+                "aabb",
+                |_| Ok::<_, String>(("aabb".into(), [9; 32])),
+            )?;
+            Ok::<_, hawkeye_store::StoreError>(())
+        })
+        .unwrap();
+    let why = live_unlock_reason(&mut store, set.0, dep, &c, keys[0].public_key())
+        .await
+        .unwrap()
+        .expect("refused");
+    assert!(why.contains("burn 3 on vault"), "{why}");
+    assert!(why.contains("--with-live-unlocks"), "{why}");
+}
+
+/// `--with-live-unlocks` is the same `set_leave` once the operator accepts the cost.
+#[tokio::test]
+async fn leave_with_live_unlocks_flag_proceeds() {
+    use hawkeye::cli::live_unlock_reason;
+    use hawkeye_core::{Deployment, EthAddress};
+    let (m, set, keys) = setup().await;
+    let c = m.client();
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = hawkeye_store::Store::open(dir.path().join("hawkeye.db")).unwrap();
+    let dep = Deployment {
+        chain_id: 1,
+        bridge: EthAddress([1; 20]),
+    };
+    assert!(
+        live_unlock_reason(&mut store, set.0, dep, &c, keys[0].public_key())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    leave_set(&c, &keys[0], &set).await.expect("leave proceeds");
+}

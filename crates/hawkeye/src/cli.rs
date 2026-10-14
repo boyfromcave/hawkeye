@@ -1119,20 +1119,27 @@ pub async fn live_unlocks_block(
     let me = key.public_key();
     let mut store = hawkeye_store::Store::open_readonly(&s.store_path)
         .with_context(|| format!("ledger {}", s.store_path.display()))?;
-    let set = s.params.set_id;
+    live_unlock_reason(&mut store, s.params.set_id, s.params.deployment, node, me).await
+}
+
+/// The refusal [`live_unlocks_block`] would produce for an already-open ledger.
+pub async fn live_unlock_reason(
+    store: &mut hawkeye_store::Store,
+    set: [u8; 32],
+    deployment: hawkeye_core::Deployment,
+    node: &YcashRpc,
+    me: [u8; 33],
+) -> Result<Option<String>> {
     let (rows, assigned, pending) = store.read(|t| {
         let rows = t.live_unlock_rows(&set)?;
         let assigned = t
-            .burns_in_state(&s.params.deployment, hawkeye_store::BurnState::Assigned)?
+            .burns_in_state(&deployment, hawkeye_store::BurnState::Assigned)?
             .into_iter()
             .filter(|b| b.leader == Some(me))
             .map(|b| b.key.nonce)
             .collect::<Vec<_>>();
         let pending = t
-            .burns_in_state(
-                &s.params.deployment,
-                hawkeye_store::BurnState::IntentPending,
-            )?
+            .burns_in_state(&deployment, hawkeye_store::BurnState::IntentPending)?
             .into_iter()
             .filter(|b| b.leader == Some(me))
             .map(|b| b.key.nonce)

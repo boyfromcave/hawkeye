@@ -178,7 +178,7 @@ a minute): drift raised by a Ycash-side change can take up to that long to appea
 | 1 | new attestor | key ceremony (section 4), `set_join` with the bond |
 | 2 | everyone | wait until `set_getinfo` shows the new member `current` |
 | 3 | governance round | sign `SetGuardians(new set: with the joiner, without the leaver, threshold)` with the current threshold and submit; drift is raised now |
-| 4 | leaving attestor | **immediately**: stop its daemon, `hawkeye leave` |
+| 4 | leaving attestor | **immediately**: stop its daemon, `hawkeye leave`. The command refuses while this ledger holds a live leader or cosign unlock of an unspent vault, or a burn assigned to this member (`--with-live-unlocks` proceeds: the set re-signs those burns and rolls the vaults) |
 | 5 | everyone | `guardian-drift` clears (within a minute of the leave being mined) |
 | 6 | leaving attestor | `hawkeye withdraw-bond` after the set's `maturity` (≥ 16,128 blocks, 14 days, on mainnet) |
 
@@ -248,6 +248,10 @@ within a working day.
 | `gone-member-answered` | page | a member declared gone (`declare-leader-gone`) answered that it holds a signed unlock for a burn: the declaration was wrong, the member's hold stands | find out why the member was declared gone; adopt or wait for its unlock |
 | `ledger-restored` | page | the ledger holds fewer sign-once records than its high-water mark (`hawkeye.db.hwm`), or the node wallet (`"wallet"` mode) signed an unlock or cancel the ledger has no record of: it was restored from a backup (review L-2); fresh unlocks wait for every member's signed "none" | `hawkeye audit-ledger`; ask the other attestors; then `hawkeye acknowledge-ledger-restore` |
 | `unlock-dead` | ticket | a signed unlock can no longer confirm: its **vault** was spent by another transaction at least `C_Y` deep (from the ledger's own spend record, the follower at the tip), or by this unlock whose intent was then cancelled `C_Y` deep; a fee-input spend never makes it dead (it can be re-funded, 01/V-2); one more vault may now be signed for the burn | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
+| `unlock-unconfirmable` | ticket | a signed unlock's set signatures can no longer satisfy `CheckSetSigs` (a signer left or was ejected, or the signatures were made under a branch that is no longer the next block's and that activation is `C_Y` deep); the burn is re-signed from another vault and this vault is rolled | check that the roll confirms and the burn is released once; do not re-sign the stored bytes |
+| `departed-signer-revivable` | page | a member who left has joined again while a vault their earlier unlock spends is still unspent; that unlock becomes valid again at `joinHeight + maturity` | roll the vault before that height; do not rebroadcast the old unlock |
+| `vault-pinned` | page | a vault inside half of `ROLL_MARGIN` cannot be rolled by this member because it signed an unlock of it, and no roll of it is in the mempool | check that another member rolls it |
+| `legacy_adoption_row` | ticket | upgrading only: a `ycash-unlock` record from before W4-B-2 has no signature of this member (an adoption recorded as if this member had signed) | settle burns before upgrading; the vault is rolled by a member who did not sign it |
 | `roll-overdue` | ticket | vaults past half their `ROLL_MARGIN` without a roll (HK-6) | check the roll leader and the rate limit |
 | `roll-waiting-cap` | ticket | rolls wait for rate-limit room | expected under load; governance if it persists |
 | `fee-coins-low` | ticket | fewer than 8 confirmed fee coins in the node wallet: a flood of intents can outrun the cancels | fund the wallet; `hawkeye split-coins --count 16` |
@@ -349,6 +353,10 @@ out:
 
 1. **On chain (preferred):** remove the member from the set (`SET_REMOVE`, plan §2.3). It is no
    longer current, its signatures can never confirm, and its answer stops being required at once.
+   A live unlock that member signed dies on every ledger; the vault is rolled at once and the
+   burn is re-signed after one takeover. Removing a member who still has an unmined signed
+   unlock is safe after this (the row dies, the vault rolls); it is not free of cost (one roll
+   fee, and the burn waits a takeover).
 2. **Off chain, the operator override:** each attestor that agrees runs
    `hawkeye declare-leader-gone <member key> --reason "<why>" [--expires-in <blocks>]`. It signs
    a declaration (`sha256d("HawkeyeMemberGone" ‖ setId ‖ member ‖ seq ‖ expiry)` with its member
@@ -427,8 +435,15 @@ i. **A griefer** (`matching-proposal-challenged`): the fallback mints the lock; 
 1. Stop `hawkeye` (and `ycashd` if it is upgraded too); back up (section 5).
 2. Install the new binary; `hawkeye status --params`; `hawkeye audit-ledger`.
 3. Start. Ledger migrations run on the first read-write open (`run`, `status`), are automatic and
-   forward-only (schema v9 at this writing). Never run an older binary on a migrated ledger (it
+   forward-only (schema v10 at this writing). Never run an older binary on a migrated ledger (it
    refuses: `SchemaTooNew`); `audit-ledger` never migrates.
+
+Settle every burn before a **Ycash network upgrade** activates as well: unlocks signed under the
+old branch id cannot confirm after it; Hawkeye marks them dead `C_Y` past the activation and
+rolls their vaults; it never re-signs a stored unlock or cancel under the new branch — a second
+set signature over a different sighash for the same prevout is a provable equivocation. Settle
+every burn before upgrading Hawkeye too (the H-1 shape change, and so a pre-fix adoption row is
+not left pinning a vault).
 
 **Peer authentication rollout** (`[peers] require_auth`, HK-13). An old peer cannot sign requests
 and an old server ignores the headers: new → old works, old → new fails 401. Upgrade **every
@@ -448,7 +463,7 @@ accepts that slash and cancel gathering is unavailable until the last attestor h
 | `hawkeye keys derive --secret <hex>` / `keys encrypt --out <file>` | key ceremony (section 4) |
 | `hawkeye split-coins [--count N] [--amount YEC]` | fresh fee coins |
 | `hawkeye acknowledge-restore` | `"wallet"` mode: import the ledger's sign-once records into the node wallet and clear its restore marker (07/F-5) |
-| `hawkeye leave` / `hawkeye withdraw-bond [--to <addr>]` | leave the set; bond after `maturity` |
+| `hawkeye leave [--with-live-unlocks]` / `hawkeye withdraw-bond [--to <addr>]` | leave the set (refuses while a live signed unlock or assigned burn is held, unless the flag); bond after `maturity` |
 
 | File | Mode | Backed up |
 |---|---|---|

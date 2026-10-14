@@ -63,7 +63,7 @@ impl Attributor for MockAttributor {
         input_index: usize,
         prev_spk: &[u8],
         _value: u64,
-        _branch: u32,
+        branch: u32,
     ) -> Result<Attribution, String> {
         use hawkeye_core::template::{TemplateKind, parse_selector, parse_vault};
         let tx = Transaction::decode(tx_bytes).map_err(|e| e.to_string())?;
@@ -87,15 +87,22 @@ impl Attributor for MockAttributor {
         if role == Role::Unlock && spend.selector != 1 {
             return Err("not an unlock".into());
         }
+        let expect = hawkeye_ycash::mock::MockState::branch_sighash(&tx, input_index, branch);
         let mut signers = vec![];
         let mut sighash = [0u8; 32];
         for a in &spend.args {
             let sig: [u8; 65] = a.as_slice().try_into().map_err(|_| "not 65 bytes")?;
+            if sig[34..] != expect.0[..31] {
+                continue;
+            }
             sighash[..31].copy_from_slice(&sig[34..]);
             signers.push(SetSigner {
                 pubkey: sig[1..34].try_into().expect("33"),
                 signature: sig,
             });
+        }
+        if signers.is_empty() {
+            return Err("no set signature under this branch".into());
         }
         Ok(Attribution {
             set_id,
@@ -1615,11 +1622,22 @@ async fn h_cancel_equivocation_detected() {
         prev.outputs[v.vout as usize].script_pubkey.clone()
     };
     // two different cancels of one intent, both signed by `cheat`
-    let cancel = |sighash: u8, value: i64| {
-        let sig = hawkeye_ycash::mock::mock_set_sig(
-            &PubKey(cheat),
-            &hawkeye_ycash::Bytes32([sighash; 32]),
+    let cancel = |value: i64| {
+        let tx = Transaction::new_v4(
+            vec![TxIn {
+                prevout: OutPoint::new(Hash256(intent.txid), intent.vout),
+                script_sig: vec![],
+                sequence: u32::MAX,
+            }],
+            vec![TxOut {
+                value,
+                script_pubkey: vault_spk.clone(),
+            }],
+            0,
+            0,
         );
+        let sh = hawkeye_ycash::mock::MockState::branch_sighash(&tx, 0, 0x6d5b_7a31);
+        let sig = hawkeye_ycash::mock::mock_set_sig(&PubKey(cheat), &sh);
         let mut ss = vec![sig.len() as u8];
         ss.extend(&sig);
         ss.push(0x52);
@@ -1640,14 +1658,14 @@ async fn h_cancel_equivocation_detected() {
     let first = env
         .mock
         .state()
-        .submit(cancel(1, 100_000_000).encode())
+        .submit(cancel(100_000_000).encode())
         .unwrap();
     tick_all(&mut engines).await;
     assert!(env.mock.state().calls_to("set_equivocation").is_empty());
     {
         let mut st = env.mock.state();
         st.mempool.retain(|t| *t != first);
-        st.submit(cancel(2, 99_000_000).encode()).unwrap();
+        st.submit(cancel(99_000_000).encode()).unwrap();
     }
     tick_all(&mut engines).await;
     let n = env.mock.state().calls_to("set_equivocation").len();
@@ -2458,7 +2476,7 @@ async fn k8_takeover_resends_the_previous_signed_unlock() {
         .unwrap()
         .unwrap();
     assert_eq!(row.prevout, first);
-    assert_eq!(row.origin, hawkeye_store::UnlockOrigin::Leader);
+    assert_eq!(row.origin, hawkeye_store::UnlockOrigin::Adopted);
 }
 
 /// (k9) The same at `unlockThreshold = 2`: the silent leader's unlock carries its own and a
@@ -5257,7 +5275,9 @@ fn row_of(
 async fn r7_reorged_conflict_never_makes_a_row_dead() {
     let Some(env) = setup().await else { return };
     let mut engines = three(&env).await;
-    lock_and_mint(&env, &mut engines).await;
+    // takeover is 1,000 here, so the vault must sit beyond roll_margin + takeover × |live|
+    let (op, _) = env.lock_aged(1_000_000_000, &env.holder.eth_address(), 20_000);
+    drive_mint(&env, &mut engines, &op).await;
     let r = YcashRecipient::p2pkh([0x67; 20]);
     let nonce = env.burn(300_000_000, &r).await;
     env.eth_mine(3).await;
@@ -5288,7 +5308,8 @@ async fn r7_reorged_conflict_never_makes_a_row_dead() {
 async fn r8_lagging_follower_never_declares_dead() {
     let Some(env) = setup().await else { return };
     let mut engines = three(&env).await;
-    lock_and_mint(&env, &mut engines).await;
+    let (op, _) = env.lock_aged(1_000_000_000, &env.holder.eth_address(), 20_000);
+    drive_mint(&env, &mut engines, &op).await;
     let r = YcashRecipient::p2pkh([0x68; 20]);
     let nonce = env.burn(300_000_000, &r).await;
     env.eth_mine(3).await;
@@ -6295,4 +6316,308 @@ async fn v3_old_restore_reports_are_pruned() {
         .map(|(k, _)| k)
         .collect();
     assert_eq!(left, vec![recent]);
+}
+
+fn drop_unlocks(env: &Env, nonce: u64) {
+    let ids: Vec<_> = unlocks_for(env, nonce)
+        .into_iter()
+        .map(|(t, _)| t.txid())
+        .collect();
+    let mut st = env.mock.state();
+    st.mempool.retain(|t| !ids.contains(t));
+}
+
+fn core_of(op: &OutPoint) -> CoreOutPoint {
+    CoreOutPoint::new(op.txid.0, op.vout)
+}
+
+fn alarm_named(e: &Engine, name: &str) -> bool {
+    e.alarms().iter().any(|a| a.name == name)
+}
+
+/// Drive `nonce` until its leader has an unlock in the mempool and every engine has ticked
+/// while that unlock is still there. Returns the vault.
+async fn signed_observed(env: &Env, engines: &mut [Engine], nonce: u64) -> OutPoint {
+    let leader = leader_index(env, nonce);
+    let mut vault = None;
+    for _ in 0..8 {
+        engines[leader].tick().await;
+        if let Some((_, v)) = unlocks_for(env, nonce).into_iter().next() {
+            vault = Some(v);
+            break;
+        }
+        env.mine(1);
+    }
+    let vault = vault.expect("the leader signed an unlock");
+    tick_all(engines).await;
+    vault
+}
+
+/// W4-B-2: an unlock signed only by a member who then leaves is not adopted. The burn is paid
+/// from another vault and the first vault is rolled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b2_unlock_signed_by_a_departed_member_is_never_adopted() {
+    let opts = Opts {
+        wallet_views: true,
+        ..Opts::default()
+    };
+    let Some(env) = setup_with(opts).await else {
+        return;
+    };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x71; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let v1 = signed_observed(&env, &mut engines, nonce).await;
+    let owner = {
+        let st = env.mock.state();
+        st.templates[&v1].as_vault().unwrap().fields.ownerheight
+    };
+    drop_unlocks(&env, nonce);
+    {
+        let mut st = env.mock.state();
+        let h = st.tip_height();
+        st.leave_member(&env.set, &PubKey(env.key_of_index(leader)), h);
+    }
+    tick_all(&mut engines).await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let v1c = core_of(&v1);
+    for _ in 0..(4 * TAKEOVER) {
+        env.mine(1);
+        tick_all(&mut engines).await;
+        let done = engines.iter().all(|e| {
+            e.ctx().db(|t| t.burn(&k)).unwrap().unwrap().state == BurnState::Released
+                && e.ctx().db(|t| t.vault(&v1c)).unwrap().unwrap().state == VaultState::Rolled
+        });
+        if done {
+            break;
+        }
+    }
+    for e in &engines {
+        let rows = e
+            .ctx()
+            .db(|t| t.unlock_burns_of_vault(&env.set.0, &v1c))
+            .unwrap();
+        assert!(
+            rows.iter()
+                .all(|r| r.origin != hawkeye_store::UnlockOrigin::Adopted),
+            "no adopted row: {rows:?}"
+        );
+        let v = e.ctx().db(|t| t.vault(&v1c)).unwrap().unwrap();
+        assert_eq!(
+            v.state,
+            VaultState::Rolled,
+            "rolled before owner height {owner}"
+        );
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        assert_eq!(b.state, BurnState::Released);
+        assert!(open_cases(e).is_empty(), "{:?}", open_cases(e));
+    }
+}
+
+/// A ledger that already holds the pre-fix adoption (origin leader, no signature of this
+/// member) marks the row dead and still rolls the vault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b2_pre_fix_adopted_rows_die_and_the_vault_rolls() {
+    use hawkeye_store::{SignDomain, UnlockBurn, UnlockOrigin, YcashSignKey};
+    let opts = Opts {
+        wallet_views: true,
+        ..Opts::default()
+    };
+    let Some(env) = setup_with(opts).await else {
+        return;
+    };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x72; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let v1 = signed_observed(&env, &mut engines, nonce).await;
+    drop_unlocks(&env, nonce);
+    let v1c = core_of(&v1);
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let hex = engines[leader]
+        .ctx()
+        .db(|t| {
+            let key = YcashSignKey {
+                domain: SignDomain::YcashUnlock,
+                set_id: env.set.0,
+                prevout: v1c,
+            };
+            Ok(t.ycash_signature(&key)?.unwrap().signed_hex)
+        })
+        .unwrap();
+    for (i, e) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        let hex = hex.clone();
+        e.ctx()
+            .db(|t| {
+                let key = YcashSignKey {
+                    domain: SignDomain::YcashUnlock,
+                    set_id: env.set.0,
+                    prevout: v1c,
+                };
+                t.sign_once_unlock(
+                    &key,
+                    Some(&UnlockBurn {
+                        key: k,
+                        origin: UnlockOrigin::Leader,
+                        allow_double: false,
+                    }),
+                    &hex.clone(),
+                    move |_| Ok::<_, String>((hex, [0x22; 32])),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    {
+        let mut st = env.mock.state();
+        let h = st.tip_height();
+        st.leave_member(&env.set, &PubKey(env.key_of_index(leader)), h);
+    }
+    for _ in 0..(4 * TAKEOVER) {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    assert!(
+        engines
+            .iter()
+            .any(|e| alarm_named(e, "legacy_adoption_row")),
+        "legacy adoption reported"
+    );
+    for e in &engines {
+        let rows = e
+            .ctx()
+            .db(|t| t.unlock_burns_of_vault(&env.set.0, &v1c))
+            .unwrap();
+        assert!(rows.iter().all(|r| !r.is_live()), "rows dead: {rows:?}");
+        assert_eq!(
+            e.ctx().db(|t| t.vault(&v1c)).unwrap().unwrap().state,
+            VaultState::Rolled
+        );
+        assert_eq!(
+            e.ctx().db(|t| t.burn(&k)).unwrap().unwrap().state,
+            BurnState::Released
+        );
+    }
+}
+
+/// Burns are not drawn on roll-due vaults, nor on a live vault that falls due inside one
+/// takeover rotation (V-N2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b2_burns_never_draw_on_roll_due_vaults() {
+    let opts = Opts {
+        min_owner_age: 5,
+        roll_margin: 40,
+        ..Opts::default()
+    };
+    let Some(env) = setup_with(opts).await else {
+        return;
+    };
+    let mut engines = three(&env).await;
+    let to = env.holder.eth_address();
+    let (near, _) = env.lock_aged(1_000_000_000, &to, 5);
+    let (far, _) = env.lock_aged(1_000_000_000, &to, 5_000);
+    drive_mint(&env, &mut engines, &near).await;
+    drive_mint(&env, &mut engines, &far).await;
+    // the near vault is inside ROLL_MARGIN and becomes ROLL_DUE
+    for _ in 0..3 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    for e in &engines {
+        assert_eq!(
+            e.ctx().db(|t| t.vault(&near)).unwrap().unwrap().state,
+            VaultState::RollDue
+        );
+        assert_eq!(
+            e.ctx().db(|t| t.vault(&far)).unwrap().unwrap().state,
+            VaultState::Live
+        );
+    }
+    let r = YcashRecipient::p2pkh([0x73; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    for _ in 0..TAKEOVER + 4 {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    let spent: Vec<_> = unlocks_for(&env, nonce)
+        .into_iter()
+        .map(|(_, v)| core_of(&v))
+        .collect();
+    assert!(
+        spent.iter().all(|v| *v == far),
+        "the unlock spends the live vault, not the roll-due one: {spent:?}"
+    );
+}
+
+/// After the next branch activates and is C_Y deep, an unmined unlock signed under the old
+/// branch dies and its vault is rolled (W4-B-5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b5_unlock_signed_under_the_old_branch_dies_after_activation_plus_cy() {
+    let opts = Opts {
+        wallet_views: true,
+        ..Opts::default()
+    };
+    let Some(env) = setup_with(opts).await else {
+        return;
+    };
+    let mut engines = three(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x74; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let v1 = signed_observed(&env, &mut engines, nonce).await;
+    drop_unlocks(&env, nonce);
+    let activation = env.mock.state().next_height();
+    env.mock.state().set_next_branch(0x2222_2222, activation);
+    tick_all(&mut engines).await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let v1c = core_of(&v1);
+    assert!(
+        engines.iter().any(|e| {
+            e.ctx()
+                .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+                .unwrap()
+                .is_some()
+        }),
+        "the row is not dead yet"
+    );
+    for _ in 0..C_Y + 1 {
+        env.mine(1);
+    }
+    tick_all(&mut engines).await;
+    assert!(
+        engines.iter().all(|e| {
+            e.ctx()
+                .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+                .unwrap()
+                .is_none()
+        }),
+        "dead once the new branch is C_Y deep"
+    );
+    for _ in 0..(3 * TAKEOVER) {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    for e in &engines {
+        assert_eq!(
+            e.ctx().db(|t| t.vault(&v1c)).unwrap().unwrap().state,
+            VaultState::Rolled
+        );
+        assert_eq!(
+            e.ctx().db(|t| t.burn(&k)).unwrap().unwrap().state,
+            BurnState::Released
+        );
+    }
 }

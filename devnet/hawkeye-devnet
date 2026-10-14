@@ -3643,6 +3643,53 @@ format = "text"
                 % (rq, magic, len(rtx["hex"]) // 2, sigs[0][2], size, zat(fee), yec(supply), " (bridge on NEAR)" if self.is_near() else ""))
 
 
+    # ================================================================ W4-B-2: leave with a live unlock
+    def drill_leave_with_live_unlock(self, timeout):
+        """Burn, keep the leader's unlock unmined, leave with --with-live-unlocks, and check the
+        takeover signs a fresh vault, the burn is released once, and the old vault is rolled.
+        Real CheckSetSigs, so this is the drill the mock cannot be (run on both node lines)."""
+        p = self.bridge()
+        self.step("two locks, so a fresh vault remains after the first is pinned")
+        self.lock_mint("10", 10 * COIN, timeout)
+        self.lock_mint("10", 10 * COIN, timeout)
+        nonce = self.burn_nonce()
+        lead = self.burn_leader(nonce)
+        la = self.attestor(lead)
+        self.step("burn 4 wYEC and pause the miner once the leader has broadcast the unlock")
+        from_h = self.tip()
+        b = self.burn_tracked("4")
+        def signed():
+            ev = self.log_events(la, "unlock_sent", nonce=nonce)
+            return ev or None
+        self.wait_for("leader logged unlock_sent", signed, timeout)
+        self.pause(True)
+        self.step("hawkeye leave --with-live-unlocks on attestor%d" % lead)
+        out = self.hawkeye(la["config"], "leave", "--with-live-unlocks", timeout=180).stdout.strip()
+        self.say("  attestor%d: %s" % (lead, out.splitlines()[-1][:220] if out else "ok"))
+        self.silence(lead, True)
+        self.pause(False)
+        self.step("a takeover leader logs unlock_prior_unconfirmable and pays the burn once")
+        def unconfirmable():
+            ev = [ln for a in self.s["attestors"] if a["index"] != lead
+                  for ln in self.log_events(a, "unlock_prior_unconfirmable", nonce=nonce)]
+            return ev or None
+        hits = self.wait_for("unlock_prior_unconfirmable", unconfirmable, timeout + 60)
+        for ln in hits[:3]:
+            self.say("  %s" % ln.strip()[:220])
+        self.wait_for("4 YEC received at %s" % b["recipient"],
+                      lambda: self.received(b["recipient"]) == 4, timeout + 60)
+        found = self.burn_intents(nonce, from_h)
+        if len(found) != 1:
+            die("%d intents for burn %d: %s" % (len(found), nonce, jdump(found)))
+        def rolled():
+            ev = [ln for a in self.s["attestors"] if a["index"] != lead
+                  for ln in self.log_events(a, "vault_rolled")]
+            return ev or None
+        rolls = self.wait_for("vault_rolled", rolled, timeout)
+        self.say("  %s" % rolls[0].strip()[:220])
+        return ("leader attestor%d left with an unmined unlock; unlock_prior_unconfirmable, one release, vault rolled"
+                % lead)
+
 # ====================================================================== CLI
 
 # `scenario <name>` drills beyond demo and roll: (title, Devnet method, run_drill overrides).
@@ -3656,6 +3703,7 @@ DRILLS = {
     "rogue-mint": ("plan §8 D-5: rogue mint, an optimistic proposal with no lock", "drill_rogue_mint", {}),
     "pq-recipient": ("plan §9.1 R5: a burn to a plain-YEC post-quantum address, released and spent", "drill_pq_recipient", {}),
     "rotation": ("docs/operations.md §7: guardian rotation order and guardian-drift (audit 05/M-3)", "drill_rotation", {}),
+    "leave-with-live-unlock": ("W4-B-2: a leader leaves with an unmined unlock; the burn is re-signed and the vault rolled", "drill_leave_with_live_unlock", {}),
 }
 
 # The scenarios that run with --foreign near (NEAR plan NH5; pq-recipient: NH-R5).

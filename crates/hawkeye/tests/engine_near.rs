@@ -51,7 +51,7 @@ impl Attributor for MockAttributor {
         input_index: usize,
         prev_spk: &[u8],
         _value: u64,
-        _branch: u32,
+        branch: u32,
     ) -> Result<Attribution, String> {
         use hawkeye_core::template::{TemplateKind, parse_selector, parse_vault};
         let tx = Transaction::decode(tx_bytes).map_err(|e| e.to_string())?;
@@ -75,15 +75,22 @@ impl Attributor for MockAttributor {
         if role == Role::Unlock && spend.selector != 1 {
             return Err("not an unlock".into());
         }
+        let expect = hawkeye_ycash::mock::MockState::branch_sighash(&tx, input_index, branch);
         let mut signers = vec![];
         let mut sighash = [0u8; 32];
         for a in &spend.args {
             let sig: [u8; 65] = a.as_slice().try_into().map_err(|_| "not 65 bytes")?;
+            if sig[34..] != expect.0[..31] {
+                continue;
+            }
             sighash[..31].copy_from_slice(&sig[34..]);
             signers.push(SetSigner {
                 pubkey: sig[1..34].try_into().expect("33"),
                 signature: sig,
             });
+        }
+        if signers.is_empty() {
+            return Err("no set signature under this branch".into());
         }
         Ok(Attribution {
             set_id,
