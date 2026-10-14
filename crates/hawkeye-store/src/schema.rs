@@ -13,8 +13,9 @@
 /// `V8` (audit 05/L-5, `exposure_acks`) and `V9` (audit 05/L-3, `sign_once_mint` keyed per
 /// deployment) are lane `bridge-wave2`'s. `V10` (W4-B-2 / W4-B-5) widens
 /// `sign_once_unlock_burn` with origin `adopted` and the signing branch, and adds
-/// `sign_once_ycash.branch_id`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+/// `sign_once_ycash.branch_id`. `V11` (W3-B-2) adds `slash_decisions`, an operator's immutable
+/// approve/reject of one slash case.
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 /// Version 1: the H4 ledger.
 const V1: &str = r#"
@@ -730,4 +731,20 @@ CREATE TABLE meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 ) WITHOUT ROWID;
+"#;
+
+/// Version 11 (W3-B-2): an operator's decision on one slash case. With `auto_slash = false` this
+/// attestor votes, as case owner or for a peer, only on an approved case. One decision per case,
+/// immutable.
+const V11: &str = r#"
+CREATE TABLE slash_decisions (
+    case_id     INTEGER PRIMARY KEY REFERENCES slash_cases (id),
+    decision    TEXT    NOT NULL CHECK (decision IN ('approve', 'reject')),
+    note        TEXT    NOT NULL CHECK (length(note) > 0),
+    decided_at  INTEGER NOT NULL
+);
+CREATE TRIGGER slash_decisions_immutable_update BEFORE UPDATE ON slash_decisions
+BEGIN SELECT RAISE(ABORT, 'slash decisions are immutable'); END;
+CREATE TRIGGER slash_decisions_immutable_delete BEFORE DELETE ON slash_decisions
+BEGIN SELECT RAISE(ABORT, 'slash decisions are immutable'); END;
 "#;

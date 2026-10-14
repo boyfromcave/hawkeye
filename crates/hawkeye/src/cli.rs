@@ -13,7 +13,7 @@ use hawkeye_core::template::VaultParams;
 use hawkeye_core::{
     AccountId, BridgeKind, Destination, EthAddress, Guardian, OutPoint as CoreOutPoint,
 };
-use hawkeye_store::{SignDomain, Store, YcashSignKey};
+use hawkeye_store::{SignDomain, SlashDecision, SlashState, Store, YcashSignKey};
 use hawkeye_ycash::tx::{Transaction, TxIn, TxOut};
 use hawkeye_ycash::types::{MemberStatus, Recipient, TemplateKind, VaultListFilter};
 use hawkeye_ycash::{Amount, HexBytes, YcashRpc};
@@ -427,6 +427,49 @@ pub fn exposure_ack(s: &Settings, lock_id: &str, note: &str) -> Result<()> {
     let mut store = Store::open(&s.store_path)?;
     let new = store.tx(|t| t.ack_exposure(&id, note))?;
     print(&json!({ "lock_id": format!("0x{}", hex::encode(id)), "acknowledged": true, "new": new }))
+}
+
+/// `hawkeye slash list` (audit W3-B-2).
+pub fn slash_list(s: &Settings) -> Result<()> {
+    let mut store = Store::open(&s.store_path)?;
+    let rows = store.tx(|t| {
+        let mut out = vec![];
+        for st in [SlashState::Opened, SlashState::Voted, SlashState::Submitted] {
+            for c in t.slash_cases_in_state(st)? {
+                let d = t.slash_decision(c.id)?;
+                out.push(json!({
+                    "id": c.id,
+                    "fault": c.fault.to_string(),
+                    "target": hex::encode(c.target_key),
+                    "state": c.state.to_string(),
+                    "opened_height": c.opened_height,
+                    "decision": d.map(SlashDecision::as_str),
+                }));
+            }
+        }
+        Ok::<_, hawkeye_store::StoreError>(out)
+    })?;
+    print(&serde_json::Value::Array(rows))
+}
+
+/// `hawkeye slash approve|reject <id> --note …` (audit W3-B-2).
+pub fn slash_decide(s: &Settings, id: i64, decision: SlashDecision, note: &str) -> Result<()> {
+    ensure!(
+        !note.trim().is_empty(),
+        "--note: say why this case is {}d",
+        decision.as_str()
+    );
+    let mut store = Store::open(&s.store_path)?;
+    store.tx(|t| t.decide_slash(id, decision, note))?;
+    warn!(
+        event = "slash_decided",
+        case = id,
+        decision = decision.as_str(),
+        note
+    );
+    print(
+        &json!({ "case": id, "decision": decision.as_str(), "note": "the daemon acts on it at its next tick" }),
+    )
 }
 
 pub async fn status(s: &Settings, as_json: bool) -> Result<()> {

@@ -24,6 +24,7 @@ const TABLES: &[&str] = &[
     "sign_once_unlock_burn",
     "sign_once_ycash",
     "slash_cases",
+    "slash_decisions",
     "slash_progress",
     "slash_votes",
     "slash_votes_given",
@@ -941,7 +942,7 @@ fn v10_preserves_unlock_burn_rows_and_accepts_adopted() {
         .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 10);
+    assert_eq!(s.schema_version().unwrap(), 11);
     let burn = hawkeye_store::BurnKey::new(DEP, 7);
     let prev = hawkeye_core::OutPoint::new(txid.clone().try_into().unwrap(), 0);
     s.tx(|t| {
@@ -995,4 +996,40 @@ fn v10_preserves_unlock_burn_rows_and_accepts_adopted() {
         )
         .is_err()
     );
+}
+
+/// V11 (W3-B-2): one immutable operator decision per slash case.
+#[test]
+fn v11_slash_decisions_are_one_per_case_and_immutable() {
+    use hawkeye_store::{FaultKind, NewSlashCase, SlashDecision};
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path().join("ledger.sqlite")).unwrap();
+    s.tx(|t| {
+        let (c, _) = t.open_slash_case(&NewSlashCase {
+            target_key: [2; 33],
+            fault: FaultKind::Griefing,
+            subject: vec![1],
+            evidence_json: "{}".into(),
+            opened_height: Some(5),
+        })?;
+        assert_eq!(t.slash_decision(c.id)?, None);
+        t.decide_slash(c.id, SlashDecision::Approve, "checked")?;
+        assert_eq!(t.slash_decision(c.id)?, Some(SlashDecision::Approve));
+        assert!(
+            t.decide_slash(c.id, SlashDecision::Reject, "again")
+                .is_err()
+        );
+        assert!(
+            t.decide_slash(c.id + 1, SlashDecision::Reject, "none")
+                .is_err()
+        );
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+    let raw = rusqlite::Connection::open(dir.path().join("ledger.sqlite")).unwrap();
+    assert!(
+        raw.execute("UPDATE slash_decisions SET decision = 'reject'", [])
+            .is_err()
+    );
+    assert!(raw.execute("DELETE FROM slash_decisions", []).is_err());
 }
