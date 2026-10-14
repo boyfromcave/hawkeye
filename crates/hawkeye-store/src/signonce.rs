@@ -123,6 +123,8 @@ pub struct YcashSignRecord {
     pub signed_hex: String,
     /// Unix seconds.
     pub signed_at: i64,
+    /// The consensus branch the signature was made under (W4-B-5). NULL on rows from before V10.
+    pub branch_id: Option<u32>,
 }
 
 const MINT_COLS: &str =
@@ -549,6 +551,22 @@ impl Tx<'_> {
         F: FnOnce(&str) -> core::result::Result<(String, Hash32), E>,
         E: Into<SignerError>,
     {
+        self.sign_once_ycash_at(key, built_hex, None, sign)
+    }
+
+    /// [`Tx::sign_once_ycash`] recording the consensus branch the signature was made under
+    /// (W4-B-5). `None` leaves `branch_id` NULL (rows written before the signer knew it).
+    pub fn sign_once_ycash_at<F, E>(
+        &self,
+        key: &YcashSignKey,
+        built_hex: &str,
+        branch_id: Option<u32>,
+        sign: F,
+    ) -> Result<YcashSignRecord>
+    where
+        F: FnOnce(&str) -> core::result::Result<(String, Hash32), E>,
+        E: Into<SignerError>,
+    {
         Self::ycash_domain(key)?;
         if let Some(old) = self.ycash_signature(key)? {
             return if old.built_hex == built_hex {
@@ -564,8 +582,8 @@ impl Tx<'_> {
         let (signed_hex, sighash) = sign(built_hex).map_err(|e| StoreError::Signer(e.into()))?;
         self.conn().execute(
             "INSERT INTO sign_once_ycash (domain, set_id, prevout_txid, prevout_vout, sighash,
-                                          built_hex, signed_hex, signed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                          built_hex, signed_hex, signed_at, branch_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 key.domain,
                 key.set_id,
@@ -574,7 +592,8 @@ impl Tx<'_> {
                 sighash,
                 built_hex,
                 signed_hex,
-                self.now()
+                self.now(),
+                branch_id
             ],
         )?;
         self.ycash_signature(key)?
@@ -599,7 +618,8 @@ impl Tx<'_> {
     /// Every stored Ycash signature of `set_id`, by domain and prevout (`hawkeye audit-ledger`).
     pub fn ycash_signatures(&self, set_id: &Hash32) -> Result<Vec<YcashSignRecord>> {
         self.all(
-            "SELECT domain, prevout_txid, prevout_vout, sighash, built_hex, signed_hex, signed_at
+            "SELECT domain, prevout_txid, prevout_vout, sighash, built_hex, signed_hex, signed_at,
+                    branch_id
              FROM sign_once_ycash WHERE set_id = ?1
              ORDER BY domain, prevout_txid, prevout_vout",
             params![set_id],
@@ -614,6 +634,7 @@ impl Tx<'_> {
                     built_hex: r.get(4)?,
                     signed_hex: r.get(5)?,
                     signed_at: r.get(6)?,
+                    branch_id: r.get(7)?,
                 })
             },
         )
@@ -622,7 +643,7 @@ impl Tx<'_> {
     /// The stored Ycash signature for `key`.
     pub fn ycash_signature(&self, key: &YcashSignKey) -> Result<Option<YcashSignRecord>> {
         self.one(
-            "SELECT sighash, built_hex, signed_hex, signed_at FROM sign_once_ycash
+            "SELECT sighash, built_hex, signed_hex, signed_at, branch_id FROM sign_once_ycash
              WHERE domain = ?1 AND set_id = ?2 AND prevout_txid = ?3 AND prevout_vout = ?4",
             params![key.domain, key.set_id, key.prevout.txid, key.prevout.vout],
             |r| {
@@ -632,6 +653,7 @@ impl Tx<'_> {
                     built_hex: r.get(1)?,
                     signed_hex: r.get(2)?,
                     signed_at: r.get(3)?,
+                    branch_id: r.get(4)?,
                 })
             },
         )
@@ -658,6 +680,10 @@ pub enum UnlockOrigin {
     Cosign,
     /// Drill D-3 (`rogue-unlock --replay-burn`): a deliberate second unlock for a burn.
     Drill,
+    /// A takeover adopted another member's signed unlock without adding a signature of this
+    /// member (W4-B-2). The bytes live in [`UnlockBurnRecord::adopted_hex`]; there is no
+    /// `sign_once_ycash` row, so this member can still sign a different spend of the vault.
+    Adopted,
 }
 
 impl UnlockOrigin {
@@ -667,6 +693,7 @@ impl UnlockOrigin {
             Self::Leader => "leader",
             Self::Cosign => "cosign",
             Self::Drill => "drill",
+            Self::Adopted => "adopted",
         }
     }
 
@@ -675,6 +702,7 @@ impl UnlockOrigin {
             "leader" => Self::Leader,
             "cosign" => Self::Cosign,
             "drill" => Self::Drill,
+            "adopted" => Self::Adopted,
             _ => return None,
         })
     }
@@ -715,6 +743,12 @@ pub struct UnlockBurnRecord {
     pub dead_reason: Option<String>,
     /// The Ycash height the row was marked dead at.
     pub dead_height: Option<u32>,
+    /// The signed transaction, for [`UnlockOrigin::Adopted`] (no `sign_once_ycash` row).
+    pub adopted_hex: Option<String>,
+    /// The consensus branch the set signature was made under (W4-B-5).
+    pub branch_id: Option<u32>,
+    /// The Ycash height the signature was made at.
+    pub signed_height: Option<u32>,
 }
 
 impl UnlockBurnRecord {
@@ -725,7 +759,8 @@ impl UnlockBurnRecord {
 }
 
 const UNLOCK_BURN_COLS: &str = "set_id, chain_id, bridge, nonce, prevout_txid, prevout_vout, \
-                                origin, signed_at, dead_reason, dead_height";
+                                origin, signed_at, dead_reason, dead_height, adopted_hex, \
+                                branch_id, signed_height";
 
 fn unlock_burn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UnlockBurnRecord> {
     let origin: String = r.get(6)?;
@@ -749,6 +784,9 @@ fn unlock_burn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UnlockBurnRecord> 
         signed_at: r.get(7)?,
         dead_reason: r.get(8)?,
         dead_height: r.get(9)?,
+        adopted_hex: r.get(10)?,
+        branch_id: r.get(11)?,
+        signed_height: r.get(12)?,
     })
 }
 
@@ -776,6 +814,24 @@ impl Tx<'_> {
         F: FnOnce(&str) -> core::result::Result<(String, Hash32), E>,
         E: Into<SignerError>,
     {
+        self.sign_once_unlock_at(key, burn, built_hex, None, None, sign)
+    }
+
+    /// [`Tx::sign_once_unlock`] recording the branch and height the signature was made at
+    /// (W4-B-5).
+    pub fn sign_once_unlock_at<F, E>(
+        &self,
+        key: &YcashSignKey,
+        burn: Option<&UnlockBurn>,
+        built_hex: &str,
+        branch_id: Option<u32>,
+        signed_height: Option<u32>,
+        sign: F,
+    ) -> Result<YcashSignRecord>
+    where
+        F: FnOnce(&str) -> core::result::Result<(String, Hash32), E>,
+        E: Into<SignerError>,
+    {
         if key.domain != SignDomain::YcashUnlock {
             return Err(StoreError::Invalid(format!(
                 "{} is not the unlock sign-once domain",
@@ -788,6 +844,11 @@ impl Tx<'_> {
         {
             return Err(StoreError::Invalid(
                 "allow_double is for the drill origin only".into(),
+            ));
+        }
+        if burn.is_some_and(|b| b.origin == UnlockOrigin::Adopted) {
+            return Err(StoreError::Invalid(
+                "an adopted unlock adds no signature: use adopt_unlock".into(),
             ));
         }
         if let Some(old) = self.ycash_signature(key)? {
@@ -828,8 +889,8 @@ impl Tx<'_> {
         let (signed_hex, sighash) = sign(built_hex).map_err(|e| StoreError::Signer(e.into()))?;
         self.conn().execute(
             "INSERT INTO sign_once_ycash (domain, set_id, prevout_txid, prevout_vout, sighash,
-                                          built_hex, signed_hex, signed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                          built_hex, signed_hex, signed_at, branch_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 key.domain,
                 key.set_id,
@@ -838,11 +899,21 @@ impl Tx<'_> {
                 sighash,
                 built_hex,
                 signed_hex,
-                self.now()
+                self.now(),
+                branch_id
             ],
         )?;
         if let Some(b) = burn {
-            self.insert_unlock_burn(&key.set_id, &b.key, &key.prevout, b.origin, false)?;
+            self.insert_unlock_burn(
+                &key.set_id,
+                &b.key,
+                &key.prevout,
+                b.origin,
+                false,
+                None,
+                branch_id,
+                signed_height,
+            )?;
         }
         self.ycash_signature(key)?
             .ok_or_else(|| StoreError::corrupt("sign-once record vanished"))
@@ -855,12 +926,16 @@ impl Tx<'_> {
         prevout: &OutPoint,
         origin: UnlockOrigin,
         or_ignore: bool,
+        adopted_hex: Option<&str>,
+        branch_id: Option<u32>,
+        signed_height: Option<u32>,
     ) -> Result<usize> {
         Ok(self.conn().execute(
             &format!(
                 "INSERT {} INTO sign_once_unlock_burn (set_id, chain_id, bridge, nonce,
-                     prevout_txid, prevout_vout, origin, signed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     prevout_txid, prevout_vout, origin, signed_at, adopted_hex, branch_id,
+                     signed_height)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 if or_ignore { "OR IGNORE" } else { "" }
             ),
             params![
@@ -871,9 +946,76 @@ impl Tx<'_> {
                 prevout.txid,
                 prevout.vout,
                 origin.as_str(),
-                self.now()
+                self.now(),
+                adopted_hex,
+                branch_id,
+                signed_height
             ],
         )?)
+    }
+
+    /// Record an adopted unlock (W4-B-2): the per-burn guard of [`Tx::sign_once_unlock`] steps
+    /// 1–2, then only the per-burn row. This member added no signature, so there is no
+    /// `sign_once_ycash` row and a later roll of `prevout` is not blocked.
+    ///
+    /// Refuses a live row of `burn` that names another vault, and a `ycash-unlock` record of
+    /// `prevout` whose bytes differ. Idempotent when a live row already names this vault.
+    pub fn adopt_unlock(
+        &self,
+        set_id: &Hash32,
+        burn: &crate::BurnKey,
+        prevout: &OutPoint,
+        hex: &str,
+        signed_height: u32,
+        branch_id: Option<u32>,
+    ) -> Result<()> {
+        let key = YcashSignKey {
+            domain: SignDomain::YcashUnlock,
+            set_id: *set_id,
+            prevout: *prevout,
+        };
+        if let Some(old) = self.ycash_signature(&key)?
+            && old.signed_hex != hex
+            && old.built_hex != hex
+        {
+            return Err(StoreError::SignOnceConflict {
+                domain: key.domain.as_str(),
+                key: key_id(&key),
+                detail: "a different transaction was already signed for this prevout".into(),
+            });
+        }
+        if let Some(live) = self
+            .unlock_burn_rows(set_id, burn)?
+            .into_iter()
+            .find(|r| r.is_live() && r.prevout != *prevout)
+        {
+            return Err(StoreError::SignOnceConflict {
+                domain: SignDomain::YcashUnlock.as_str(),
+                key: format!("burn {burn}"),
+                detail: format!(
+                    "a live {} unlock of vault {} already pays this burn",
+                    live.origin, live.prevout
+                ),
+            });
+        }
+        if self
+            .unlock_burn_rows(set_id, burn)?
+            .iter()
+            .any(|r| r.prevout == *prevout)
+        {
+            return Ok(());
+        }
+        self.insert_unlock_burn(
+            set_id,
+            burn,
+            prevout,
+            UnlockOrigin::Adopted,
+            false,
+            Some(hex),
+            branch_id,
+            Some(signed_height),
+        )?;
+        Ok(())
     }
 
     /// Every per-burn unlock row of `burn` under `set_id`, oldest first (live and dead).
@@ -1047,6 +1189,9 @@ impl Tx<'_> {
                 &prevout,
                 UnlockOrigin::Leader,
                 true,
+                None,
+                None,
+                None,
             )?;
         }
         self.set_meta(BACKFILL_UNLOCK_BURNS, "done")?;

@@ -911,3 +911,88 @@ fn provisional_pending_mints_finalize_or_drop() {
     })
     .unwrap();
 }
+
+/// V9 → V10 (W4-B-2): every `sign_once_unlock_burn` row and its immutability triggers survive,
+/// and origin `adopted` is accepted.
+#[test]
+fn v10_preserves_unlock_burn_rows_and_accepts_adopted() {
+    use hawkeye_store::UnlockOrigin;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let set = vec![0x5eu8; 32];
+    let txid = vec![0x11u8; 32];
+    {
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        for m in &MIGRATIONS[..9] {
+            raw.execute_batch(m).unwrap();
+        }
+        raw.pragma_update(None, "user_version", 9).unwrap();
+        raw.execute(
+            "INSERT INTO sign_once_unlock_burn (set_id, chain_id, bridge, nonce, prevout_txid,
+                 prevout_vout, origin, signed_at)
+             VALUES (?1, ?2, ?3, 7, ?4, 0, 'leader', 1)",
+            (
+                set.clone(),
+                DEP.chain_id,
+                DEP.bridge.0.to_vec(),
+                txid.clone(),
+            ),
+        )
+        .unwrap();
+    }
+    let mut s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 10);
+    let burn = hawkeye_store::BurnKey::new(DEP, 7);
+    let prev = hawkeye_core::OutPoint::new(txid.clone().try_into().unwrap(), 0);
+    s.tx(|t| {
+        let rows = t.unlock_burn_rows(&set.clone().try_into().unwrap(), &burn)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].origin, UnlockOrigin::Leader);
+        assert!(rows[0].adopted_hex.is_none());
+        assert!(rows[0].branch_id.is_none());
+        t.adopt_unlock(
+            &[0x5e; 32],
+            &hawkeye_store::BurnKey::new(DEP, 8),
+            &prev,
+            "aabb",
+            10,
+            Some(0x6d5b7a31),
+        )?;
+        let adopted = t
+            .live_unlock_for_burn(&[0x5e; 32], &hawkeye_store::BurnKey::new(DEP, 8))?
+            .unwrap();
+        assert_eq!(adopted.origin, UnlockOrigin::Adopted);
+        assert_eq!(adopted.adopted_hex.as_deref(), Some("aabb"));
+        assert!(
+            t.ycash_signature(&hawkeye_store::YcashSignKey {
+                domain: hawkeye_store::SignDomain::YcashUnlock,
+                set_id: [0x5e; 32],
+                prevout: prev,
+            })?
+            .is_none()
+        );
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        raw.execute("DELETE FROM sign_once_unlock_burn", [])
+            .is_err()
+    );
+    assert!(
+        raw.execute(
+            "UPDATE sign_once_unlock_burn SET adopted_hex = 'zz' WHERE origin = 'adopted'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        raw.execute(
+            "INSERT INTO sign_once_unlock_burn (set_id, chain_id, bridge, nonce, prevout_txid,
+                 prevout_vout, origin, signed_at, adopted_hex)
+             VALUES (?1, ?2, ?3, 9, ?4, 1, 'nope', 1, 'x')",
+            (set, DEP.chain_id, DEP.bridge.0.to_vec(), txid),
+        )
+        .is_err()
+    );
+}

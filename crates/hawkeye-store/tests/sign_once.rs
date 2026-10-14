@@ -704,3 +704,50 @@ fn drill_rows_are_never_the_live_unlock() {
     })
     .unwrap();
 }
+
+/// W4-B-2: `adopt_unlock` refuses a second live vault for a burn and does not block a roll's
+/// `sign_once_ycash` of that vault; a real `ycash-unlock` record does.
+#[test]
+fn adopt_unlock_does_not_block_a_roll() {
+    use hawkeye_store::{UnlockBurn, UnlockOrigin};
+    let mut s = store();
+    let k = |n: u8| YcashSignKey {
+        domain: SignDomain::YcashUnlock,
+        set_id: SET,
+        prevout: op(n, 0),
+    };
+    let signed = |b: &str| Ok::<_, StoreError>((format!("signed({b})"), [0x22; 32]));
+    s.tx(|t| {
+        t.adopt_unlock(
+            &SET,
+            &burn_key(1),
+            &op(1, 0),
+            "adopted-bytes",
+            4,
+            Some(0x6d5b7a31),
+        )?;
+        assert!(matches!(
+            t.adopt_unlock(&SET, &burn_key(1), &op(2, 0), "other", 4, None),
+            Err(StoreError::SignOnceConflict { .. })
+        ));
+        // the adopted vault is free for this member's roll
+        t.sign_once_unlock(&k(1), None, "roll", signed)?;
+        // a vault this member actually signed is not
+        t.sign_once_unlock(
+            &k(3),
+            Some(&UnlockBurn {
+                key: burn_key(3),
+                origin: UnlockOrigin::Leader,
+                allow_double: false,
+            }),
+            "u3",
+            signed,
+        )?;
+        assert!(matches!(
+            t.sign_once_unlock(&k(3), None, "roll3", signed),
+            Err(StoreError::SignOnceConflict { .. })
+        ));
+        Ok::<_, StoreError>(())
+    })
+    .unwrap();
+}
