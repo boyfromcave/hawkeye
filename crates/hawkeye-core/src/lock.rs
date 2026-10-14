@@ -87,7 +87,8 @@ pub fn destination_script(to: &EthAddress) -> Vec<u8> {
 }
 
 /// Parse a destination `OP_RETURN` (plan §4.1 rule 3): exactly `OP_RETURN` and one canonical
-/// 32-byte push whose first 12 bytes are zero and which does not begin `0x5956` ("YV", an act).
+/// 32-byte push whose first 12 bytes are zero, which does not begin `0x5956` ("YV", an act) and
+/// whose address is not the zero address (a mint to it reverts).
 pub fn parse_destination(spk: &[u8]) -> Result<EthAddress> {
     if !is_op_return(spk) {
         return Err(Error::Destination("not an OP_RETURN"));
@@ -102,7 +103,11 @@ pub fn parse_destination(spk: &[u8]) -> Result<EthAddress> {
     if data[..12].iter().any(|&b| b != 0) {
         return Err(Error::Destination("first 12 bytes not zero"));
     }
-    Ok(EthAddress(data[12..].try_into().expect("20 bytes")))
+    let addr = EthAddress(data[12..].try_into().expect("20 bytes"));
+    if addr == EthAddress::ZERO {
+        return Err(Error::Destination("the zero address"));
+    }
+    Ok(addr)
 }
 
 /// The destination `OP_RETURN` of a NEAR lock: `OP_RETURN <"NR1" ‖ account id>` (one direct
@@ -166,6 +171,14 @@ mod tests {
         extra.push(0x00);
         assert!(parse_destination(&extra).is_err());
         assert!(parse_destination(&s[1..]).is_err());
+
+        assert_eq!(
+            parse_destination(&destination_script(&EthAddress::ZERO)),
+            Err(Error::Destination("the zero address"))
+        );
+        let mut one_bit = [0u8; 20];
+        one_bit[19] = 1;
+        assert!(parse_destination(&destination_script(&EthAddress(one_bit))).is_ok());
     }
 
     #[test]

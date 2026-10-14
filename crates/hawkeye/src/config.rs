@@ -716,6 +716,15 @@ impl Config {
             "optimistic" => MintMode::Optimistic,
             other => bail!("bridge.mint_mode {other:?}: threshold or optimistic"),
         };
+        if deployment.is_some() {
+            ensure!(
+                mainnet == (core_deployment.chain_id == hawkeye_eth::mode::MAINNET),
+                "[eth] deployment is on chain {} with network.name {:?}: a mainnet bridge pairs \
+                 Ycash mainnet with Ethereum mainnet (chain id 1), and only those",
+                core_deployment.chain_id,
+                self.network.name
+            );
+        }
         let chain_id = if mainnet {
             hawkeye_eth::mode::MAINNET
         } else {
@@ -1232,7 +1241,9 @@ format = "text"
         };
         std::fs::write(
             d.path().join("31337.json"),
-            DEPLOYMENT.replace(r#""threshold":1"#, r#""threshold":2"#),
+            DEPLOYMENT
+                .replace(r#""chainId":31337"#, r#""chainId":1"#)
+                .replace(r#""threshold":1"#, r#""threshold":2"#),
         )
         .unwrap();
         let e = format!("{:#}", main(sample("mainnet", "")).unwrap_err());
@@ -1260,6 +1271,7 @@ format = "text"
         );
         assert!(e.contains("mainnet refuses bridge.confirmations 19"), "{e}");
         // testnet warns, regtest is silent
+        std::fs::write(d.path().join("31337.json"), DEPLOYMENT).unwrap();
         let s = Config::parse(&sample("testnet", ""))
             .unwrap()
             .settings(d.path())
@@ -1284,7 +1296,9 @@ format = "text"
         let d = dir();
         std::fs::write(
             d.path().join("31337.json"),
-            DEPLOYMENT.replace(r#""threshold":1"#, r#""threshold":2"#),
+            DEPLOYMENT
+                .replace(r#""chainId":31337"#, r#""chainId":1"#)
+                .replace(r#""threshold":1"#, r#""threshold":2"#),
         )
         .unwrap();
         let text = mainnet_values(&sample("mainnet", ""))
@@ -1312,12 +1326,30 @@ format = "text"
         );
         assert!(e.contains("mainnet refuses ycash.start_height"), "{e}");
         // elsewhere it parses (the engine checks it against the set's vaults)
+        std::fs::write(d.path().join("31337.json"), DEPLOYMENT).unwrap();
         let reg = sample("regtest", "").replace(
             "rpc_password = \"p\"\n",
             "rpc_password = \"p\"\nstart_height = 100\n",
         );
         let s = Config::parse(&reg).unwrap().settings(d.path()).unwrap();
         assert_eq!(s.params.ycash_start_height, Some(100));
+    }
+
+    #[test]
+    fn chain_id_pairs_with_network() {
+        let d = dir();
+        let main = |dep: String, net: &str| {
+            std::fs::write(d.path().join("31337.json"), dep).unwrap();
+            Config::parse(&sample(net, ""))
+                .unwrap()
+                .settings(d.path())
+                .map(|_| ())
+        };
+        let e = format!("{:#}", main(DEPLOYMENT.into(), "mainnet").unwrap_err());
+        assert!(e.contains("chain 31337") && e.contains("chain id 1"), "{e}");
+        let chain1 = DEPLOYMENT.replace(r#""chainId":31337"#, r#""chainId":1"#);
+        let e = format!("{:#}", main(chain1, "regtest").unwrap_err());
+        assert!(e.contains("chain 1 with network.name"), "{e}");
     }
 
     /// The mainnet example config passes the mainnet checks (its deployment file aside).
@@ -1350,6 +1382,11 @@ format = "text"
     #[test]
     fn mainnet_refuses_dev_options() {
         let d = dir();
+        std::fs::write(
+            d.path().join("31337.json"),
+            DEPLOYMENT.replace(r#""chainId":31337"#, r#""chainId":1"#),
+        )
+        .unwrap();
         let c = Config::parse(&sample("mainnet", "")).unwrap();
         let e = c.settings(d.path()).unwrap_err().to_string();
         assert!(e.contains("mint_mode") || e.contains("secret_hex"), "{e}");
@@ -1363,7 +1400,9 @@ format = "text"
         let dep = |threshold: u8| {
             std::fs::write(
                 d.path().join("31337.json"),
-                DEPLOYMENT.replace(r#""threshold":1"#, &format!(r#""threshold":{threshold}"#)),
+                DEPLOYMENT
+                    .replace(r#""chainId":31337"#, r#""chainId":1"#)
+                    .replace(r#""threshold":1"#, &format!(r#""threshold":{threshold}"#)),
             )
             .unwrap();
         };
@@ -1408,6 +1447,7 @@ sender_keystore = \"s.json\"
         assert!(e.contains("threshold is 1"), "{e}");
         assert!(mainnet("threshold", Some(2)).is_err());
         // off mainnet both are allowed (development)
+        std::fs::write(d.path().join("31337.json"), DEPLOYMENT).unwrap();
         let s = Config::parse(
             &sample("regtest", "")
                 .replace("mint_mode = \"threshold\"", "mint_mode = \"optimistic\""),
@@ -1661,7 +1701,9 @@ sender_keystore = \"s.json\"
                 );
             std::fs::write(
                 d.path().join("31337.json"),
-                DEPLOYMENT.replace(r#""threshold":1"#, r#""threshold":2"#),
+                DEPLOYMENT
+                    .replace(r#""chainId":31337"#, r#""chainId":1"#)
+                    .replace(r#""threshold":1"#, r#""threshold":2"#),
             )
             .unwrap();
             Config::parse(&text).unwrap().settings(d.path())
@@ -1698,7 +1740,9 @@ sender_keystore = \"s.json\"
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
             d.path().join("31337.json"),
-            DEPLOYMENT.replace(r#""threshold":1"#, r#""threshold":2"#),
+            DEPLOYMENT
+                .replace(r#""chainId":31337"#, r#""chainId":1"#)
+                .replace(r#""threshold":1"#, r#""threshold":2"#),
         )
         .unwrap();
         d
