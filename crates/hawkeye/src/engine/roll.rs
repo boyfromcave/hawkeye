@@ -316,15 +316,45 @@ pub(crate) fn mark_orphan(
     nonce: u64,
     tip: u32,
 ) -> Result<bool, hawkeye_store::StoreError> {
+    mark_due(
+        t,
+        vault,
+        tip,
+        &format!("orphaned signed unlock of burn {nonce}: rolled so it can never confirm"),
+    )
+}
+
+/// Mark a vault `ROLL_DUE` because a signed unlock of it can no longer confirm (W4-B-2, W4-B-5).
+pub(crate) fn mark_unconfirmable(
+    t: &hawkeye_store::Tx<'_>,
+    vault: &hawkeye_core::OutPoint,
+    nonce: u64,
+    tip: u32,
+    why: &str,
+) -> Result<bool, hawkeye_store::StoreError> {
+    let kind = if why.contains("old branch") {
+        "old branch"
+    } else {
+        "departed signer"
+    };
+    mark_due(
+        t,
+        vault,
+        tip,
+        &format!(
+            "unconfirmable signed unlock of burn {nonce} ({kind}): rolled so it can never confirm"
+        ),
+    )
+}
+
+fn mark_due(
+    t: &hawkeye_store::Tx<'_>,
+    vault: &hawkeye_core::OutPoint,
+    tip: u32,
+    detail: &str,
+) -> Result<bool, hawkeye_store::StoreError> {
     if t.vault(vault)?.is_some_and(|v| v.state == VaultState::Live) {
-        t.transition_vault(
-            vault,
-            VaultState::RollDue,
-            Some(tip),
-            Some(&format!(
-                "orphaned signed unlock of burn {nonce}: rolled so it can never confirm"
-            )),
-        )?;
+        t.transition_vault(vault, VaultState::RollDue, Some(tip), Some(detail))?;
         return Ok(true);
     }
     Ok(false)
@@ -498,6 +528,7 @@ impl Engine {
                 debug!(event = "observed_unlock_pruned", nonce, records = n);
             }
         }
+        self.retire_unconfirmable().await?;
         let rows = self.ctx.db(|t| t.live_unlock_rows(&p.set_id))?;
         for r in rows {
             let Some(paid_by) = self
@@ -725,12 +756,21 @@ impl Engine {
         let with_memo =
             super::sign::fund_exactly(&self.ctx.ycash, &with_memo, &v.outpoint, value).await?;
         let signer = SetSigning::prepare(&self.ctx, &with_memo, Role::Unlock, v.outpoint).await?;
+        let branch = signer.branch_id();
+        let signed_height = tip;
         let rec = self.ctx.db(|t| {
             // a roll pays no burn: per vault only
-            let rec = t.sign_once_unlock(&key, None, &with_memo, |h| {
-                let o = signer.sign(h)?;
-                Ok::<_, String>((o.hex, o.sighash))
-            })?;
+            let rec = t.sign_once_unlock_at(
+                &key,
+                None,
+                &with_memo,
+                Some(branch),
+                Some(signed_height),
+                |h| {
+                    let o = signer.sign(h)?;
+                    Ok::<_, String>((o.hex, o.sighash))
+                },
+            )?;
             t.transition_vault(
                 &v.outpoint,
                 VaultState::Rolling,

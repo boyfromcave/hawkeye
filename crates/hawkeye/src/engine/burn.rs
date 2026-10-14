@@ -98,6 +98,9 @@ impl Engine {
             Ok(())
         })?;
         self.over_cap_alarm()?;
+        // every member, leader or not: a signed unlock whose signers are no longer current (or
+        // whose branch has been buried) dies here, before a fresh vault is chosen (W4-B-2)
+        self.retire_unconfirmable().await?;
         if !self.is_current_member() {
             return Ok(());
         }
@@ -295,6 +298,49 @@ impl Engine {
                 "a drill unlock of vault {vault} pays this burn here; it is never re-sent"
             )));
         }
+        // W4-B-2 / W4-B-5: the bytes must still satisfy CheckSetSigs at the next height. A
+        // departed signer, or a branch buried C_Y past its activation, can never confirm; the
+        // row dies and the vault is rolled. A branch change shallower than C_Y is held (a reorg
+        // below the activation would make the signatures valid again).
+        if let Some(coin) = self.vault_coin(&vault).await? {
+            match self.confirmable(&tx, &vault, &coin, row.branch_id).await? {
+                Confirmable::Yes => {}
+                Confirmable::Departed {
+                    signers,
+                    revivable_after,
+                } => {
+                    let keys = signers
+                        .iter()
+                        .map(hex::encode)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let when = revivable_after
+                        .map(|h| h.to_string())
+                        .unwrap_or_else(|| "never".into());
+                    return Ok(LiveUnlock::Dead(format!(
+                        "signer(s) {keys} no longer current (REMOVED/EJECTED); the bytes cannot \
+                         confirm unless a key rejoins (earliest height {when})"
+                    )));
+                }
+                Confirmable::WrongBranch { signed_under, next } => {
+                    let activation = self.branch_activation(next).await?;
+                    let buried = activation.is_some_and(|h| tip >= h.saturating_add(cy));
+                    let signed = signed_under
+                        .map(|b| format!("{b:08x}"))
+                        .unwrap_or_else(|| "unknown".into());
+                    if buried {
+                        return Ok(LiveUnlock::Dead(format!(
+                            "signed under branch {signed}, which is no longer the next block's \
+                             ({next:08x}); activation + C_Y has passed (old branch)"
+                        )));
+                    }
+                    return Ok(LiveUnlock::Hold(format!(
+                        "signed under branch {signed}; the next block is {next:08x} but the \
+                         activation is not yet C_Y deep"
+                    )));
+                }
+            }
+        }
         // every input but the vault: still unspent and this wallet's, else re-funded
         let mut refund = row.origin != UnlockOrigin::Leader;
         for i in &tx.inputs {
@@ -345,14 +391,27 @@ impl Engine {
             .db(|t| t.live_unlock_for_burn(&p.set_id, &b.key))?
         {
             Some(row) => {
-                let key = self.unlock_key_of(&row.prevout);
-                let rec = self.ctx.db(|t| t.ycash_signature(&key))?.ok_or_else(|| {
-                    anyhow!(
-                        "burn {nonce}: the live unlock of {} has no record",
-                        row.prevout
-                    )
-                })?;
-                match self.judge_live_unlock(&row, &rec.signed_hex).await? {
+                let signed_hex = match row.origin {
+                    UnlockOrigin::Adopted => row.adopted_hex.clone().ok_or_else(|| {
+                        anyhow!(
+                            "burn {nonce}: the adopted unlock of {} has no bytes",
+                            row.prevout
+                        )
+                    })?,
+                    _ => {
+                        let key = self.unlock_key_of(&row.prevout);
+                        self.ctx
+                            .db(|t| t.ycash_signature(&key))?
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "burn {nonce}: the live unlock of {} has no record",
+                                    row.prevout
+                                )
+                            })?
+                            .signed_hex
+                    }
+                };
+                match self.judge_live_unlock(&row, &signed_hex).await? {
                     LiveUnlock::Out => return Ok(()),
                     LiveUnlock::Hold(why) => {
                         if self.mem.held_logged.insert(nonce) {
@@ -367,20 +426,7 @@ impl Engine {
                     }
                     LiveUnlock::Dead(why) => {
                         let tip = self.mem.tip;
-                        self.ctx.db(|t| {
-                            t.mark_unlock_dead(&p.set_id, &b.key, &row.prevout, &why, tip)
-                        })?;
-                        warn!(event = "unlock_dead", nonce, vault = %row.prevout,
-                              origin = %row.origin, reason = %why,
-                              "the signed unlock can no longer confirm; another vault may be signed");
-                        self.mem.held_logged.remove(&nonce);
-                        self.alarm(
-                            "unlock-dead",
-                            format!(
-                                "burn {nonce}: unlock of vault {} is dead: {why}",
-                                row.prevout
-                            ),
-                        );
+                        self.kill_unlock(b, &row, &why, tip)?;
                         return Ok(());
                     }
                     LiveUnlock::Resend { hex: h, refund } => {
@@ -412,20 +458,40 @@ impl Engine {
                 // revivable while its vault is unspent; it is adopted, never doubled
                 let key = self.unlock_key_of(&vault);
                 let signer = SetSigning::prepare(&self.ctx, &hex, Role::Unlock, vault).await?;
+                let before = template_sig_count(&hex, &vault);
+                let branch = signer.branch_id();
+                let tip = self.mem.tip;
                 let burn = UnlockBurn {
                     key: b.key,
                     origin: UnlockOrigin::Leader,
                     allow_double: false,
                 };
-                let rec = self.ctx.db(|t| {
-                    t.sign_once_unlock(&key, Some(&burn), &hex, |h| {
-                        let o = signer.sign(h)?;
-                        Ok::<_, String>((o.hex, o.sighash))
-                    })
+                let adopted_hex = self.ctx.db(|t| {
+                    let o = signer
+                        .sign(&hex)
+                        .map_err(hawkeye_store::StoreError::Invalid)?;
+                    let signed = o.hex.clone();
+                    let sighash = o.sighash;
+                    // no signature of this member was added: record the adoption per burn only
+                    // (W4-B-2). A co-signer who completes the threshold still signs once.
+                    if template_sig_count(&signed, &vault) == before {
+                        t.adopt_unlock(&p.set_id, &b.key, &vault, &signed, tip, Some(branch))?;
+                        Ok(signed)
+                    } else {
+                        let rec = t.sign_once_unlock_at(
+                            &key,
+                            Some(&burn),
+                            &hex,
+                            Some(branch),
+                            Some(tip),
+                            move |_| Ok::<_, String>((signed, sighash)),
+                        )?;
+                        Ok(rec.signed_hex)
+                    }
                 })?;
                 warn!(event = "unlock_adopted", nonce, vault = %vault,
                       "takeover: the previous signed unlock of the burn is re-sent re-funded, no new vault is signed");
-                match self.complete_unlock(&rec.signed_hex).await? {
+                match self.complete_unlock(&adopted_hex).await? {
                     Some(h) => (h, vault, true),
                     None => return Ok(()),
                 }
@@ -487,12 +553,21 @@ impl Engine {
                     origin: UnlockOrigin::Leader,
                     allow_double: false,
                 };
+                let branch = signer.branch_id();
+                let signed_height = self.mem.tip;
                 let rec = self.ctx.db(|t| {
-                    t.sign_once_unlock(&key, Some(&burn), &with_memo, |h| {
-                        let o = signer.sign(h)?;
-                        complete.set(o.complete);
-                        Ok::<_, String>((o.hex, o.sighash))
-                    })
+                    t.sign_once_unlock_at(
+                        &key,
+                        Some(&burn),
+                        &with_memo,
+                        Some(branch),
+                        Some(signed_height),
+                        |h| {
+                            let o = signer.sign(h)?;
+                            complete.set(o.complete);
+                            Ok::<_, String>((o.hex, o.sighash))
+                        },
+                    )
                 })?;
                 info!(event = "unlock_signed", nonce, vault = %vault.outpoint, amount = b.amount,
                       recipient = %encode_address(&recipient, p.network), complete = complete.get());
@@ -670,8 +745,8 @@ impl Engine {
         let members = self.slashable_member_keys();
         // review N-3: an unlock of this burn this ledger observed on Ycash (mempool or block)
         // whose vault is still unspent is the burn's own spend: adopt it, whoever led it
-        if let Some((hex, vault)) = self.observed_unlock_for(b, &members).await? {
-            return Ok(Prior::Found(hex, vault));
+        if let Some(prior) = self.observed_unlock_for(b).await? {
+            return Ok(prior);
         }
         let mut required: Vec<PubKey33> = if restored {
             current.clone()
@@ -686,14 +761,14 @@ impl Engine {
             }
         }
         required.retain(|k| *k != me);
-        // review N-1: only a CURRENT member's set signature can ever confirm an unlock — the
-        // node's SetSnapshot::CheckSetSigs (ycash-dd src/vault/state.cpp:289-306) requires
+        // review N-1, W4-B-2: only a CURRENT member's set signature can ever confirm an unlock —
+        // the node's SetSnapshot::CheckSetSigs (ycash-dd src/vault/state.cpp:289-306) requires
         // exactly k signatures, each recovering to a member current at the spend's height — so
         // an unlock held by a member that is no longer current (removed, left) can never
-        // confirm, and that member need not answer. (A key that later rejoins is current again:
-        // it is then required again for every burn not yet freshly signed; for one already
-        // signed meanwhile, the watchers cancel a second intent as a benign race, and the
-        // orphan roll spends its vault.)
+        // confirm, and that member need not answer. A key that leaves and joins again makes any
+        // unlock it signed in its previous membership valid again; Hawkeye rolls every vault
+        // such an unlock spends as soon as the signer leaves (plan §5.1), and does not re-send
+        // those bytes (alarm `departed-signer-revivable`).
         let gone_now: Vec<PubKey33> = required
             .iter()
             .filter(|k| !current.contains(*k))
@@ -739,25 +814,38 @@ impl Engine {
                 warn!(event = "gone_declarations_cleared", member = %hex::encode(who),
                       "a member declared gone answered: its declarations are dropped");
             }
-            if signed.body.held || signed.body.unlock.is_some() {
-                held_from.insert(who);
-            }
-            match (signed.body.unlock, signed.body.held) {
-                (Some(hex), _) => match self.check_prior_unlock(b, &hex, &members).await {
-                    Ok(vault) => {
+            match (signed.body.unlock.clone(), signed.body.held) {
+                (Some(hex), _) => match self.check_prior_unlock(b, &hex).await {
+                    Ok(PriorVerdict::Adopt(vault)) => {
                         info!(event = "unlock_prior_found", nonce = b.key.nonce, peer = %peer,
                               vault = %vault);
                         return Ok(Prior::Found(hex, vault));
                     }
-                    Err(e) => warn!(event = "unlock_prior_rejected", nonce = b.key.nonce,
-                                    peer = %peer, error = %format!("{e:#}")),
+                    Ok(PriorVerdict::Unconfirmable { vault, hold, why }) => {
+                        warn!(event = "unlock_prior_unconfirmable", nonce = b.key.nonce,
+                              peer = %peer, vault = %vault, reason = %why);
+                        if hold {
+                            return Ok(Prior::Unknown(why));
+                        }
+                        self.note_unconfirmable(b, &vault, &why).await?;
+                    }
+                    Err(e) => {
+                        if signed.body.held || signed.body.unlock.is_some() {
+                            held_from.insert(who);
+                        }
+                        warn!(event = "unlock_prior_rejected", nonce = b.key.nonce,
+                              peer = %peer, error = %format!("{e:#}"));
+                    }
                 },
                 (None, false) => {
                     none_from.insert(who);
                 }
-                (None, true) => info!(event = "unlock_prior_held", nonce = b.key.nonce,
-                                      peer = %peer, state = %signed.body.state,
-                                      "the peer holds an unlock it no longer serves (paid in its view)"),
+                (None, true) => {
+                    held_from.insert(who);
+                    info!(event = "unlock_prior_held", nonce = b.key.nonce,
+                          peer = %peer, state = %signed.body.state,
+                          "the peer holds an unlock it no longer serves (paid in its view)");
+                }
             }
         }
         // a member declared gone that nevertheless answered "held": the declaration was wrong
@@ -848,11 +936,7 @@ impl Engine {
 
     /// An unlock of `b` this ledger observed whose vault is still unspent and which passes the
     /// adoption checks (review N-3): the burn's own spend, re-sent rather than rebuilt.
-    async fn observed_unlock_for(
-        &mut self,
-        b: &BurnRecord,
-        members: &[PubKey33],
-    ) -> Result<Option<(String, CoreOutPoint)>> {
+    async fn observed_unlock_for(&mut self, b: &BurnRecord) -> Result<Option<Prior>> {
         let rows = self
             .ctx
             .db(|t| t.meta_prefix(&super::ycash::observed_unlock_prefix(&b.key)))?;
@@ -863,11 +947,19 @@ impl Engine {
             else {
                 continue;
             };
-            match self.check_prior_unlock(b, &raw, members).await {
-                Ok(vault) => {
+            match self.check_prior_unlock(b, &raw).await {
+                Ok(PriorVerdict::Adopt(vault)) => {
                     info!(event = "unlock_observed_found", nonce = b.key.nonce, vault = %vault,
                           record = %key, "re-sending the burn's observed unlock");
-                    return Ok(Some((raw, vault)));
+                    return Ok(Some(Prior::Found(raw, vault)));
+                }
+                Ok(PriorVerdict::Unconfirmable { vault, hold, why }) => {
+                    warn!(event = "unlock_prior_unconfirmable", nonce = b.key.nonce,
+                          vault = %vault, record = %key, reason = %why);
+                    if hold {
+                        return Ok(Some(Prior::Unknown(why)));
+                    }
+                    self.note_unconfirmable(b, &vault, &why).await?;
                 }
                 Err(e) => debug!(event = "unlock_observed_skipped", nonce = b.key.nonce,
                                  record = %key, error = %format!("{e:#}")),
@@ -884,12 +976,347 @@ impl Engine {
             .is_some_and(|v| v != "acknowledged"))
     }
 
-    async fn check_prior_unlock(
+    fn poisoned(&self, b: &BurnRecord, vault: &CoreOutPoint) -> Result<bool> {
+        let key = format!("unconfirmable_unlock/{}/{vault}", b.key);
+        Ok(self.ctx.db(|t| t.meta(&key))?.is_some())
+    }
+
+    /// Mark `vault` due for a roll and remember that `b`'s unlock of it must not be adopted
+    /// again (W4-B-2). Idempotent.
+    async fn note_unconfirmable(
         &mut self,
         b: &BurnRecord,
-        hex: &str,
-        members: &[PubKey33],
-    ) -> Result<CoreOutPoint> {
+        vault: &CoreOutPoint,
+        why: &str,
+    ) -> Result<()> {
+        let tip = self.mem.tip;
+        let nonce = b.key.nonce;
+        let marked = self.ctx.db(|t| {
+            t.set_meta(&format!("unconfirmable_unlock/{}/{vault}", b.key), why)?;
+            super::roll::mark_unconfirmable(t, vault, nonce, tip, why)
+        })?;
+        if marked {
+            warn!(event = "unlock_unconfirmable", nonce, vault = %vault, reason = %why);
+        }
+        self.alarm(
+            "unlock-unconfirmable",
+            format!(
+                "burn {nonce}: unlock of vault {vault} can no longer confirm ({why}); the burn \
+                 is re-signed from another vault and {vault} rolled"
+            ),
+        );
+        Ok(())
+    }
+
+    fn kill_unlock(
+        &mut self,
+        b: &BurnRecord,
+        row: &UnlockBurnRecord,
+        why: &str,
+        tip: u32,
+    ) -> Result<()> {
+        let nonce = b.key.nonce;
+        self.ctx.db(|t| {
+            t.mark_unlock_dead(&self.ctx.params.set_id, &b.key, &row.prevout, why, tip)?;
+            if why.contains("no longer current") || why.contains("old branch") {
+                t.set_meta(
+                    &format!(
+                        "unconfirmable_unlock/{}/{vault}",
+                        b.key,
+                        vault = row.prevout
+                    ),
+                    why,
+                )?;
+                super::roll::mark_unconfirmable(t, &row.prevout, nonce, tip, why)?;
+            }
+            Ok(())
+        })?;
+        warn!(event = "unlock_dead", nonce, vault = %row.prevout,
+              origin = %row.origin, reason = %why,
+              "the signed unlock can no longer confirm; another vault may be signed");
+        self.mem.held_logged.remove(&nonce);
+        self.alarm(
+            "unlock-dead",
+            format!(
+                "burn {nonce}: unlock of vault {} is dead: {why}",
+                row.prevout
+            ),
+        );
+        if why.contains("no longer current") || why.contains("old branch") {
+            self.alarm(
+                "unlock-unconfirmable",
+                format!(
+                    "burn {nonce}: unlock of vault {} can no longer confirm ({why}); the burn \
+                     is re-signed from another vault and {} rolled",
+                    row.prevout, row.prevout
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// Every live unlock whose signatures can no longer satisfy `CheckSetSigs`, on this ledger
+    /// and among unlocks this ledger observed (W4-B-2, W4-B-5). Runs for every member.
+    pub(crate) async fn retire_unconfirmable(&mut self) -> Result<()> {
+        let p = self.ctx.params.clone();
+        let rows = self.ctx.db(|t| t.live_unlock_rows(&p.set_id))?;
+        for row in rows {
+            let hex = match row.origin {
+                UnlockOrigin::Adopted => row.adopted_hex.clone(),
+                _ => {
+                    let key = self.unlock_key_of(&row.prevout);
+                    self.ctx
+                        .db(|t| t.ycash_signature(&key))?
+                        .map(|r| r.signed_hex)
+                }
+            };
+            let Some(hex) = hex else { continue };
+            let Some(b) = self.ctx.db(|t| t.burn(&row.key))? else {
+                continue;
+            };
+            let op = op_rpc(&row.prevout);
+            if self
+                .ctx
+                .ycash
+                .gettxout(&op.txid, op.vout, true)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
+            if let LiveUnlock::Dead(why) = self.judge_live_unlock(&row, &hex).await? {
+                self.kill_unlock(&b, &row, &why, self.mem.tip)?;
+            }
+        }
+        self.rejoined_signers().await?;
+        Ok(())
+    }
+
+    /// A departed signer who is ACTIVE again, while a vault their dead unlock spends is still
+    /// unspent (V-N3). Page, and front the roll.
+    async fn rejoined_signers(&mut self) -> Result<()> {
+        let p = self.ctx.params.clone();
+        let rows = self.ctx.db(|t| t.unlock_burn_rows_of_set(&p.set_id))?;
+        for row in rows {
+            let departed = row
+                .dead_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("no longer current"));
+            if !departed {
+                continue;
+            }
+            let op = op_rpc(&row.prevout);
+            if self
+                .ctx
+                .ycash
+                .gettxout(&op.txid, op.vout, true)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
+            let Some(hex) = row.adopted_hex.clone().or_else(|| {
+                let key = self.unlock_key_of(&row.prevout);
+                self.ctx
+                    .db(|t| t.ycash_signature(&key))
+                    .ok()
+                    .flatten()
+                    .map(|r| r.signed_hex)
+            }) else {
+                continue;
+            };
+            let Ok(tx) = Transaction::decode_hex(&hex) else {
+                continue;
+            };
+            let Some(coin) = self.vault_coin(&row.prevout).await? else {
+                continue;
+            };
+            let Ok(a) = self
+                .attribute_under(&tx, &row.prevout, &coin, row.branch_id)
+                .await
+            else {
+                continue;
+            };
+            for s in a.signers {
+                let Some(m) = self.member(&s.pubkey).cloned() else {
+                    continue;
+                };
+                if m.status != hawkeye_ycash::types::MemberStatus::Active {
+                    continue;
+                }
+                let mature_at = m.joinheight.saturating_add(
+                    self.mem
+                        .set
+                        .as_ref()
+                        .map(|s| s.set.params.maturity)
+                        .unwrap_or(0),
+                );
+                self.alarm(
+                    "departed-signer-revivable",
+                    format!(
+                        "member {} joined again; its unlock of vault {} for burn {} (dead since \
+                         {}) becomes valid at height {mature_at}: the vault must be rolled first",
+                        hex::encode(s.pubkey),
+                        row.prevout,
+                        row.key.nonce,
+                        row.dead_height.unwrap_or(0)
+                    ),
+                );
+                let tip = self.mem.tip;
+                self.ctx.db(|t| {
+                    if t.vault(&row.prevout)?
+                        .is_some_and(|v| v.state == VaultState::Live)
+                    {
+                        super::roll::mark_unconfirmable(
+                            t,
+                            &row.prevout,
+                            row.key.nonce,
+                            m.joinheight.min(tip),
+                            "departed signer rejoined",
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn confirmable(
+        &self,
+        tx: &Transaction,
+        vault: &CoreOutPoint,
+        coin: &(Vec<u8>, u64),
+        signed_under: Option<u32>,
+    ) -> Result<Confirmable> {
+        let next = super::sign::next_branch_id(&self.ctx.ycash).await?;
+        let k = self.unlock_quorum();
+        let under = |branch: u32| self.attribute_under(tx, vault, coin, Some(branch));
+        let next_attr = under(next).await.ok();
+        let good = |a: &hawkeye_core::attribution::Attribution| {
+            let mut n = 0u32;
+            let mut seen = vec![];
+            for s in &a.signers {
+                if seen.contains(&s.pubkey) {
+                    continue;
+                }
+                seen.push(s.pubkey);
+                if self.signer_counts(&s.pubkey) {
+                    n += 1;
+                }
+            }
+            (n, a.signers.len() as u32, seen)
+        };
+        if let Some(a) = &next_attr {
+            let (n, total, _) = good(a);
+            if n == k && total == k {
+                return Ok(Confirmable::Yes);
+            }
+        }
+        let stored = signed_under.filter(|b| *b != next);
+        if let Some(branch) = stored
+            && let Some(a) = under(branch).await.ok()
+            && good(&a).0 == k
+            && a.signers.len() as u32 == k
+        {
+            return Ok(Confirmable::WrongBranch {
+                signed_under: Some(branch),
+                next,
+            });
+        }
+        if next_attr.is_none() && stored.is_none() {
+            // the signatures recover under no branch we were given: try the stored constant
+            // only when it differs, otherwise treat the signers we could not classify as departed
+        }
+        let signers: Vec<PubKey33> = next_attr
+            .as_ref()
+            .map(|a| a.signers.iter().map(|s| s.pubkey).collect())
+            .unwrap_or_default();
+        let mut revivable_after = None;
+        let mut never = false;
+        for key in &signers {
+            match self.signer_revival(key) {
+                Revival::Current => {}
+                Revival::After(h) => {
+                    revivable_after = Some(revivable_after.map_or(h, |e: u32| e.max(h)));
+                }
+                Revival::Never => never = true,
+            }
+        }
+        if signers.is_empty() {
+            never = true;
+        }
+        Ok(Confirmable::Departed {
+            signers,
+            revivable_after: if never { None } else { revivable_after },
+        })
+    }
+
+    async fn attribute_under(
+        &self,
+        tx: &Transaction,
+        vault: &CoreOutPoint,
+        coin: &(Vec<u8>, u64),
+        branch: Option<u32>,
+    ) -> Result<hawkeye_core::attribution::Attribution, String> {
+        let Some(idx) = super::sign::input_index(tx, vault) else {
+            return Err("no vault input".into());
+        };
+        let branch = match branch {
+            Some(b) => b,
+            None => super::sign::next_branch_id(&self.ctx.ycash)
+                .await
+                .map_err(|e| e.to_string())?,
+        };
+        self.ctx
+            .attributor
+            .attribute(&tx.encode(), idx, &coin.0, coin.1, branch)
+    }
+
+    /// A signer who is current, or Active and not yet mature (current-to-be).
+    fn signer_counts(&self, key: &PubKey33) -> bool {
+        matches!(self.signer_revival(key), Revival::Current)
+    }
+
+    fn signer_revival(&self, key: &PubKey33) -> Revival {
+        use hawkeye_ycash::types::MemberStatus;
+        let Some(m) = self.member(key) else {
+            return Revival::Never;
+        };
+        if m.current || m.status == MemberStatus::Active {
+            return Revival::Current;
+        }
+        if m.status == MemberStatus::Removed && !m.bondfrozen {
+            let maturity = self
+                .mem
+                .set
+                .as_ref()
+                .map(|s| s.set.params.maturity)
+                .unwrap_or(0);
+            let exit = m.exitheight.unwrap_or(self.mem.tip);
+            return Revival::After(exit.saturating_add(maturity).saturating_add(maturity));
+        }
+        Revival::Never
+    }
+
+    async fn branch_activation(&self, branch: u32) -> Result<Option<u32>> {
+        let info = self.ctx.ycash.getblockchaininfo().await?;
+        let key = format!("{branch:08x}");
+        Ok(info
+            .upgrades
+            .get(&key)
+            .or_else(|| info.upgrades.get(&format!("{branch:x}")))
+            .map(|u| u.activationheight.max(0) as u32))
+    }
+
+    async fn branch_buried(&self, next: u32) -> Result<bool> {
+        let Some(h) = self.branch_activation(next).await? else {
+            return Ok(false);
+        };
+        Ok(self.mem.tip >= h.saturating_add(self.ctx.params.confirmations))
+    }
+
+    async fn check_prior_unlock(&mut self, b: &BurnRecord, hex: &str) -> Result<PriorVerdict> {
         use hawkeye_core::matcher::Classification;
         let tx = Transaction::decode_hex(hex).map_err(|e| anyhow!("decode: {e}"))?;
         let f = classify_unlock(&self.ctx, &tx).await?;
@@ -901,24 +1328,52 @@ impl Engine {
             b.key.nonce,
             hawkeye_store::classification_code(&f.classification)
         );
-        let idx =
-            super::sign::input_index(&tx, &f.origin).ok_or_else(|| anyhow!("no vault input"))?;
-        let a = self
-            .ctx
-            .attributor
-            .attribute(
-                &tx.encode(),
-                idx,
-                &f.coin.0,
-                f.coin.1,
-                hawkeye_core::VAULT_BRANCH_ID,
-            )
-            .map_err(|e| anyhow!("signatures: {e}"))?;
-        anyhow::ensure!(!a.signers.is_empty(), "unsigned");
-        anyhow::ensure!(
-            a.signers.iter().all(|s| members.contains(&s.pubkey)),
-            "a signer is not a member of the set"
-        );
+        if self.poisoned(b, &f.origin)? {
+            return Ok(PriorVerdict::Unconfirmable {
+                vault: f.origin,
+                hold: false,
+                why: format!(
+                    "unlock of {} was already unconfirmable; it is not adopted again",
+                    f.origin
+                ),
+            });
+        }
+        let k = self.unlock_quorum();
+        match self.confirmable(&tx, &f.origin, &f.coin, None).await? {
+            Confirmable::Yes => {}
+            Confirmable::Departed {
+                signers,
+                revivable_after,
+            } => {
+                let keys = signers
+                    .iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let when = revivable_after
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| "never".into());
+                return Ok(PriorVerdict::Unconfirmable {
+                    vault: f.origin,
+                    hold: false,
+                    why: format!(
+                        "signer(s) {keys} no longer current (need {k} current); earliest rejoin \
+                         height {when}"
+                    ),
+                });
+            }
+            Confirmable::WrongBranch { signed_under, next } => {
+                let buried = self.branch_buried(next).await?;
+                let signed = signed_under
+                    .map(|b| format!("{b:08x}"))
+                    .unwrap_or_else(|| "unknown".into());
+                return Ok(PriorVerdict::Unconfirmable {
+                    vault: f.origin,
+                    hold: !buried,
+                    why: format!("signed under branch {signed}, next block is {next:08x}"),
+                });
+            }
+        }
         let mine = self.unlock_key_of(&f.origin);
         if let Some(r) = self.ctx.db(|t| t.ycash_signature(&mine))? {
             anyhow::ensure!(
@@ -931,7 +1386,7 @@ impl Engine {
                 f.origin
             );
         }
-        Ok(f.origin)
+        Ok(PriorVerdict::Adopt(f.origin))
     }
 
     /// The sign-once key of a vault's unlock.
@@ -1211,6 +1666,42 @@ pub async fn record_gone(
 /// says how; `acknowledged` once the operator clears it (`hawkeye acknowledge-ledger-restore`).
 pub const LEDGER_RESTORED: &str = "ledger_restored";
 
+/// Whether signed bytes could satisfy `CheckSetSigs` at the next height (W4-B-2, W4-B-5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Confirmable {
+    /// Exactly `unlockThreshold` distinct signers are current, or Active and not yet mature.
+    Yes,
+    /// Below k current signers. `revivable_after` is the earliest height a non-current signer
+    /// could be current again, or `None` when one can never be (ejected, or removed with a
+    /// frozen bond).
+    Departed {
+        signers: Vec<PubKey33>,
+        revivable_after: Option<u32>,
+    },
+    /// The signatures recover under `signed_under` but not under the next block's branch.
+    WrongBranch {
+        signed_under: Option<u32>,
+        next: u32,
+    },
+}
+
+enum Revival {
+    Current,
+    After(u32),
+    Never,
+}
+
+/// What [`Engine::check_prior_unlock`] decided.
+enum PriorVerdict {
+    Adopt(CoreOutPoint),
+    Unconfirmable {
+        vault: CoreOutPoint,
+        /// The branch change is not yet `C_Y` deep: do not sign a fresh vault yet.
+        hold: bool,
+        why: String,
+    },
+}
+
 /// What the peers said about other signed unlocks of a burn ([`Engine::prior_unlock`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Prior {
@@ -1240,6 +1731,18 @@ pub(crate) enum LiveUnlock {
     Dead(String),
     /// It is broadcast or mined: the watcher follows it.
     Out,
+}
+
+fn template_sig_count(hex: &str, vault: &CoreOutPoint) -> usize {
+    let Ok(tx) = Transaction::decode_hex(hex) else {
+        return 0;
+    };
+    let Some(idx) = super::sign::input_index(&tx, vault) else {
+        return 0;
+    };
+    super::sign::role_args(&tx, idx, Role::Unlock)
+        .map(|a| a.len())
+        .unwrap_or(0)
 }
 
 /// The node's `RateCap(basis, bps)` (`ycash-dd/src/vault/state.cpp`), bit for bit: the most an
@@ -1457,8 +1960,9 @@ pub async fn verify_and_sign_unlock(
     }
     let signer = SetSigning::prepare(ctx, &req.hex, Role::Unlock, origin).await?;
     let complete = std::cell::Cell::new(None);
+    let branch = signer.branch_id();
     let rec = ctx.db(|t| {
-        t.sign_once_unlock(&key, burn.as_ref(), &req.hex, |h| {
+        t.sign_once_unlock_at(&key, burn.as_ref(), &req.hex, Some(branch), None, |h| {
             let o = signer.sign(h)?;
             complete.set(Some(o.complete));
             Ok::<_, String>((o.hex, o.sighash))
@@ -1606,7 +2110,8 @@ pub(crate) fn merge_own_signature(
             i,
             &coin.0,
             coin.1,
-            hawkeye_core::VAULT_BRANCH_ID,
+            super::block_on(super::sign::next_branch_id(&ctx.ycash))
+                .unwrap_or(hawkeye_core::VAULT_BRANCH_ID),
         )
     };
     let Some(mine) = attribute(&old, oi)

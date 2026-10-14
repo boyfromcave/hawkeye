@@ -919,6 +919,7 @@ impl Tx<'_> {
             .ok_or_else(|| StoreError::corrupt("sign-once record vanished"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_unlock_burn(
         &self,
         set_id: &Hash32,
@@ -1069,6 +1070,18 @@ impl Tx<'_> {
             .unlock_burn_rows(set_id, burn)?
             .into_iter()
             .find(|r| r.is_live() && r.origin != UnlockOrigin::Drill))
+    }
+
+    /// Every per-burn unlock row of `set_id` (live and dead), oldest first.
+    pub fn unlock_burn_rows_of_set(&self, set_id: &Hash32) -> Result<Vec<UnlockBurnRecord>> {
+        self.all(
+            &format!(
+                "SELECT {UNLOCK_BURN_COLS} FROM sign_once_unlock_burn
+                 WHERE set_id = ?1 ORDER BY signed_at"
+            ),
+            params![set_id],
+            unlock_burn_row,
+        )
     }
 
     /// Every live non-drill per-burn row (the orphan check: a row whose burn was paid by another

@@ -3433,7 +3433,7 @@ mod tests {
         let signed = st.set_sign(&[built["hex"].clone()], 1).expect("sign");
         let hex = signed["hex"].clone();
         st.leave_member(&set, &key, st.tip_height());
-        let refused = st.vault_send(&[hex.clone()]).unwrap_err();
+        let refused = st.vault_send(std::slice::from_ref(&hex)).unwrap_err();
         assert!(
             refused.1.contains("mandatory-script-verify-flag-failed"),
             "{}",

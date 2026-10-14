@@ -226,7 +226,7 @@ pub async fn audit_view(
                 idx,
                 &o.script_pubkey,
                 u64::try_from(o.value).unwrap_or(0),
-                hawkeye_core::VAULT_BRANCH_ID,
+                super::engine::sign::branch_id_at(ycash, None).await?,
             );
             let Ok(a) = a else {
                 continue;
