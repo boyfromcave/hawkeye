@@ -497,9 +497,14 @@ impl Engine {
                 }
             }
             None => {
+                let live_n = u32::try_from(self.live().len()).unwrap_or(u32::MAX);
+                let horizon = self
+                    .mem
+                    .tip
+                    .saturating_add(p.roll_margin)
+                    .saturating_add(p.takeover.saturating_mul(live_n));
                 let vaults: Vec<VaultRecord> = self.ctx.db(|t| {
                     let mut v = t.vaults_in_state(VaultState::Live)?;
-                    v.extend(t.vaults_in_state(VaultState::RollDue)?);
                     v.sort_by_key(|x| x.owner_height);
                     Ok(v)
                 })?;
@@ -508,9 +513,19 @@ impl Engine {
                     if v.value_zat < b.amount || self.mem.mempool_spent.contains(&v.outpoint) {
                         continue;
                     }
+                    // falls due before a pin could be noticed and the vault rolled (V-N2)
+                    if v.owner_height <= horizon {
+                        continue;
+                    }
                     let key = self.unlock_key_of(&v.outpoint);
-                    if self.ctx.db(|t| t.ycash_signature(&key))?.is_some() {
-                        continue; // signed for another spend: busy until it is spent
+                    let busy = self.ctx.db(|t| {
+                        Ok(t.ycash_signature(&key)?.is_some()
+                            || t.unlock_burns_of_vault(&p.set_id, &v.outpoint)?
+                                .iter()
+                                .any(|r| r.is_live()))
+                    })?;
+                    if busy {
+                        continue; // signed, or adopted for a burn: busy until it is spent
                     }
                     chosen = Some((v.clone(), key));
                     break;
@@ -1252,7 +1267,7 @@ impl Engine {
         })
     }
 
-    async fn attribute_under(
+    pub(crate) async fn attribute_under(
         &self,
         tx: &Transaction,
         vault: &CoreOutPoint,

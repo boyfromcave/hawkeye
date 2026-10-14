@@ -180,8 +180,14 @@ enum Cmd {
     Recover,
     /// Attestor: leave the set (set_leave: the member's own SET_REMOVE, no burn). The bond stays
     /// locked and slashable for the set's maturity (>= 16,128 blocks on mainnet), then
-    /// `withdraw-bond` returns it. Stop the daemon first.
-    Leave,
+    /// `withdraw-bond` returns it. Stop the daemon first. Refuses while this ledger holds a live
+    /// signed unlock or an assigned burn, unless `--with-live-unlocks`.
+    Leave {
+        /// Leave even though this member holds a live signed unlock or an assigned burn. The set
+        /// re-signs those burns and rolls the vaults.
+        #[arg(long)]
+        with_live_unlocks: bool,
+    },
     /// Attestor: after `leave` and the set's maturity, spend the bond to --to (default a new
     /// address of the node wallet).
     WithdrawBond {
@@ -396,7 +402,7 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Recover => cli::recover(&s).await,
-        Cmd::Leave => cli::leave(&s).await,
+        Cmd::Leave { with_live_unlocks } => cli::leave(&s, *with_live_unlocks).await,
         Cmd::WithdrawBond { to } => cli::withdraw_bond(&s, to.as_deref()).await,
         Cmd::SplitCoins { count, amount } => cli::split_coins(&s, *count, amount.as_deref()).await,
         Cmd::Keys { .. } => unreachable!(),

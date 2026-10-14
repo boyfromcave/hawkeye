@@ -418,6 +418,8 @@ impl Engine {
                 .map(|i| i.value_zat)
                 .sum())
         })?;
+        let due_now = self.ctx.db(|t| t.vaults_in_state(VaultState::RollDue))?;
+        self.note_pinned(&due_now).await?;
         if self.is_current_member() && !self.signing_paused() {
             self.resend_rolls().await?;
             self.post_rolls().await?;
@@ -628,6 +630,11 @@ impl Engine {
             if self.mem.mempool_spent.contains(&v.outpoint) {
                 continue;
             }
+            let legacy = format!("legacy_roll/{}", v.outpoint);
+            if let Some(hex) = self.ctx.db(|t| t.meta(&legacy))? {
+                self.send_roll(&v, &hex).await?;
+                continue;
+            }
             let key = self.unlock_key(&v.outpoint);
             let Some(rec) = self.ctx.db(|t| t.ycash_signature(&key))? else {
                 continue;
@@ -666,12 +673,9 @@ impl Engine {
                 _ => {}
             }
             if self.mem.mempool_spent.contains(&v.outpoint)
-                || self
-                    .ctx
-                    .db(|t| t.ycash_signature(&self.unlock_key(&v.outpoint)))?
-                    .is_some()
+                || self.our_unlock_signature(&v.outpoint).await?
             {
-                continue; // being spent, or signed for another spend
+                continue; // being spent, or this member signed another spend of it
             }
             // takeover counts from the moment it fell due (or was created, if born due)
             let marked = self.ctx.db(|t| t.vault_due_height(&v.outpoint))?;
@@ -756,6 +760,28 @@ impl Engine {
         let with_memo =
             super::sign::fund_exactly(&self.ctx.ycash, &with_memo, &v.outpoint, value).await?;
         let signer = SetSigning::prepare(&self.ctx, &with_memo, Role::Unlock, v.outpoint).await?;
+        let legacy_key = format!("legacy_adoption/{}", v.outpoint);
+        if self.ctx.db(|t| t.meta(&legacy_key))?.is_some() {
+            let stored = format!("legacy_roll/{}", v.outpoint);
+            if let Some(hex) = self.ctx.db(|t| t.meta(&stored))? {
+                return self.send_roll(v, &hex).await;
+            }
+            let signed = signer.sign(&with_memo).map_err(|e| anyhow!(e))?;
+            self.ctx.db(|t| {
+                t.set_meta(&stored, &signed.hex)?;
+                t.transition_vault(
+                    &v.outpoint,
+                    VaultState::Rolling,
+                    Some(tip),
+                    Some(&format!("roll to ownerHeight {owner_height}")),
+                )?;
+                Ok(())
+            })?;
+            warn!(event = "roll_signed", vault = %v.outpoint, value,
+                  old_owner_height = v.owner_height, new_owner_height = owner_height,
+                  "legacy adoption record: the roll is signed once into the ledger metadata");
+            return self.send_roll(v, &signed.hex).await;
+        }
         let branch = signer.branch_id();
         let signed_height = tip;
         let rec = self.ctx.db(|t| {
@@ -785,6 +811,84 @@ impl Engine {
             return Ok(());
         };
         self.send_roll(v, &hex).await
+    }
+
+    /// This member signed a spend of `vault` (a `ycash-unlock` record that recovers to this
+    /// key). A record with none of this member's signatures is a pre-fix adoption: it does not
+    /// block the roll (W4-B-2).
+    async fn our_unlock_signature(&mut self, vault: &hawkeye_core::OutPoint) -> Result<bool> {
+        let key = self.unlock_key(vault);
+        let Some(rec) = self.ctx.db(|t| t.ycash_signature(&key))? else {
+            return Ok(false);
+        };
+        let legacy = format!("legacy_adoption/{vault}");
+        if self.ctx.db(|t| t.meta(&legacy))?.is_some() {
+            return Ok(false);
+        }
+        let Ok(tx) = Transaction::decode_hex(&rec.signed_hex) else {
+            return Ok(true);
+        };
+        let Some(coin) = self.vault_coin(vault).await? else {
+            return Ok(true);
+        };
+        match self.attribute_under(&tx, vault, &coin, rec.branch_id).await {
+            Ok(a) if a.signers.iter().any(|s| s.pubkey == self.ctx.me) => Ok(true),
+            Ok(_) => {
+                self.ctx.db(|t| t.set_meta(&legacy, "1"))?;
+                self.alarm(
+                    "legacy_adoption_row",
+                    format!(
+                        "vault {vault}: the stored unlock has no signature of this member \
+                         (an adoption recorded before W4-B-2); it does not block a roll"
+                    ),
+                );
+                Ok(false)
+            }
+            Err(_) => Ok(true),
+        }
+    }
+
+    /// `ROLL_DUE` vaults this member signed and so cannot roll (W4-B-2 §4.7).
+    async fn note_pinned(&mut self, due: &[VaultRecord]) -> Result<()> {
+        let tip = self.mem.tip;
+        let margin = self.ctx.params.roll_margin;
+        let set = self.ctx.params.set_id;
+        let mut pinned = vec![];
+        let mut pages = vec![];
+        for v in due {
+            if !self.our_unlock_signature(&v.outpoint).await? {
+                continue;
+            }
+            let burn = self.ctx.db(|t| {
+                Ok(t.unlock_burns_of_vault(&set, &v.outpoint)?
+                    .into_iter()
+                    .find(|r| r.origin != hawkeye_store::UnlockOrigin::Drill)
+                    .map(|r| r.key.nonce.to_string())
+                    .unwrap_or_else(|| "unknown".into()))
+            })?;
+            let left = v.owner_height.saturating_sub(tip);
+            if left <= margin / 2 && !self.mem.mempool_spent.contains(&v.outpoint) {
+                pages.push(format!(
+                    "vault {} (owner height {}, {left} blocks left) cannot be rolled by this \
+                     member (it signed burn {burn}'s unlock of it); check that another member \
+                     rolls it",
+                    v.outpoint, v.owner_height
+                ));
+            }
+            pinned.push(crate::status::PinnedVault {
+                vault: v.outpoint.to_string(),
+                burn,
+                owner_height: v.owner_height,
+                blocks_left: left,
+            });
+        }
+        self.mem.pinned_vaults = pinned;
+        if pages.is_empty() {
+            self.clear_alarm("vault-pinned");
+        } else {
+            self.alarm("vault-pinned", pages.join("; "));
+        }
+        Ok(())
     }
 
     async fn send_roll(&mut self, v: &VaultRecord, signed: &str) -> Result<()> {

@@ -105,6 +105,21 @@ pub struct Status {
     /// Unacknowledged exposures (audit 05/L-5): lock ids (`0x…`) of signed locks that left the
     /// active chain, minted or not.
     pub exposure: Vec<String>,
+    /// `ROLL_DUE` vaults this member cannot roll because it signed an unlock of them (W4-B-2).
+    pub pinned_vaults: Vec<PinnedVault>,
+}
+
+/// A vault this member signed and so cannot roll.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct PinnedVault {
+    /// `txid:vout`.
+    pub vault: String,
+    /// The burn the signed unlock pays, if the ledger names one.
+    pub burn: String,
+    /// The vault's `ownerHeight`.
+    pub owner_height: u32,
+    /// Blocks until `ownerHeight` at the last tick (`0` once the height has passed).
+    pub blocks_left: u32,
 }
 
 fn esc(s: &str) -> String {
@@ -248,6 +263,11 @@ pub fn render_metrics(s: &Status) -> String {
         "hawkeye_ticks_total",
         "Engine ticks run",
         &[(String::new(), s.ticks as f64)],
+    );
+    gauge(
+        "hawkeye_pinned_vaults",
+        "ROLL_DUE vaults this member signed and cannot roll",
+        &[(String::new(), s.pinned_vaults.len() as f64)],
     );
     o
 }
