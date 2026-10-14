@@ -47,7 +47,9 @@ Exactly one `ycashd` that can sign with the member key, exactly one `hawkeye run
 - starting a restored backup while the original host may still run;
 - a second Hawkeye on a second node with the same key;
 - `hawkeye run` twice against one node or one ledger (SQLite serialises the writes, but each process
-  has its own in-memory state and will build its own unlock);
+  has its own in-memory state and will build its own unlock; a second `hawkeye run` on the same
+  host refuses to start while the first holds the advisory lock `hawkeye.db.lock`, which does not
+  see a copy on another host or a network filesystem);
 - cloud auto-recovery or an autoscaling group that boots a VM image containing `wallet.dat`,
   the keystore or `hawkeye.db`.
 

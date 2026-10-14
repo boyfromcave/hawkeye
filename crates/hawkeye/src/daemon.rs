@@ -288,6 +288,7 @@ async fn ledger_audit(ctx: &Ctx, accept: bool) -> Result<()> {
 pub async fn run(s: &Settings, accept_equivocation_risk: bool) -> Result<()> {
     // `s.warnings` (floors, transport) are logged by `main` for every command
     let key = s.load_key()?;
+    let _instance_lock = Store::lock_instance(&s.store_path)?;
     let ctx = connect(s, key, Arc::new(CoreAttributor)).await?;
     startup_checks(&ctx).await?;
     ledger_audit(&ctx, accept_equivocation_risk).await?;
