@@ -714,14 +714,13 @@ impl Engine {
             [one] => Some(one.to_vec()),
             _ => None,
         };
+        let branch = super::sign::branch_id_at(&self.ctx.ycash, None).await?;
         let attribution = if selector == Some(1) {
-            match self.ctx.attributor.attribute(
-                raw,
-                idx,
-                &vault_spk,
-                vault_value,
-                hawkeye_core::VAULT_BRANCH_ID,
-            ) {
+            match self
+                .ctx
+                .attributor
+                .attribute(raw, idx, &vault_spk, vault_value, branch)
+            {
                 Ok(a) => Some(a),
                 Err(e) => {
                     debug!(event = "attribution_failed", txid = %tx.txid(), error = %e);
@@ -795,13 +794,10 @@ impl Engine {
             let Ok(Some((spk, value))) = self.intent_coin(&op).await else {
                 continue;
             };
-            match self.ctx.attributor.attribute(
-                raw,
-                idx,
-                &spk,
-                value,
-                hawkeye_core::VAULT_BRANCH_ID,
-            ) {
+            let branch = super::sign::branch_id_at(&self.ctx.ycash, None)
+                .await
+                .unwrap_or(hawkeye_core::VAULT_BRANCH_ID);
+            match self.ctx.attributor.attribute(raw, idx, &spk, value, branch) {
                 Ok(a) if a.set_id == self.ctx.params.set_id => out.push(a),
                 Ok(_) => {}
                 Err(e) => debug!(event = "attribution_failed", txid = %tx.txid(), error = %e),

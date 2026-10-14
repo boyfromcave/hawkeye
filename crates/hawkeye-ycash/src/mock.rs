@@ -11,8 +11,13 @@
 //! - set signatures are fake 65-byte strings `0x1f ‖ key ‖ sighash[..31]` over a mock sighash
 //!   (SHA256d of the transaction reduced to its template input, scriptSig cleared, and every
 //!   output: like the node's `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, audit 01/V-2, so `vault_refee`
-//!   keeps the signatures valid), act transactions carry a mock payload, fee inputs come from an
-//!   unlimited mock wallet;
+//!   keeps the signatures valid) bound to the next block's branch id
+//!   ([`MockState::branch_sighash`]). `vault_send` and block assembly enforce the node's
+//!   `CheckSetSigs` on that encoding: exactly `unlockThreshold`/`cancelThreshold` distinct keys
+//!   that are current (`status == Active`; a join is current once mined) under the next block's
+//!   branch, else `16: mandatory-script-verify-flag-failed`. A bare selector with no signature
+//!   pushes is still accepted when a block is assembled (tests spend a vault without a script).
+//!   Act transactions carry a mock payload, fee inputs come from an unlimited mock wallet;
 //! - builds are remembered per wallet and vault (`vault_buildunlock`: `reused`, `already built a
 //!   different unlock`, `rebuild`; 07/N-2); the sign-once listing RPCs answer from
 //!   [`MockState::sign_once`] and [`MockState::restored`] (the restore marker, off by default);
@@ -200,6 +205,10 @@ pub struct MockState {
     pub unspent: Vec<Unspent>,
     /// The `(setid, prevout)` → `(role, sighash)` sign-once record.
     pub sign_once: HashMap<(SetId, OutPoint), (u8, Bytes32)>,
+    /// Branch ids that replace the next block's branch from a height (W4-B-5). Each entry is
+    /// `(from_height, branch_id)`; the latest one whose height has been reached wins, and it is
+    /// reported as an upgrade in `getblockchaininfo`.
+    pub branch_from: Vec<(u32, u32)>,
     /// The sign-once records of each wallet view ([`MockState::wallet_views`]): separate
     /// attestor nodes each keep their own (the shared map serves the view-less client).
     pub view_sign_once: HashMap<(String, SetId, OutPoint), (u8, Bytes32)>,
@@ -472,6 +481,7 @@ impl MockState {
             addresses: BTreeMap::new(),
             unspent: vec![],
             sign_once: HashMap::new(),
+            branch_from: vec![],
             view_sign_once: HashMap::new(),
             restored: false,
             recipients: HashMap::new(),
@@ -655,14 +665,29 @@ impl MockState {
         self.txs.insert(cbid, (cb.encode(), Some(hash)));
         let mut txids = vec![cbid];
         let mempool = std::mem::take(&mut self.mempool);
+        let mut left = vec![];
         for txid in mempool {
+            let Some(e) = self.txs.get(&txid) else {
+                continue;
+            };
+            let raw = e.0.clone();
+            let Ok(tx) = Transaction::decode(&raw) else {
+                left.push(txid);
+                continue;
+            };
+            // CheckSetSigs at the block height (W4-B-2). A set spend that cannot confirm is
+            // left in the mempool: a departed signer who rejoins makes the same bytes valid.
+            if self.check_set_sigs(&tx, height, true).is_err() {
+                left.push(txid);
+                continue;
+            }
             if let Some(e) = self.txs.get_mut(&txid) {
                 e.1 = Some(hash);
-                let raw = e.0.clone();
-                self.apply(txid, &raw, height);
-                txids.push(txid);
             }
+            self.apply(txid, &raw, height);
+            txids.push(txid);
         }
+        self.mempool = left;
         self.blocks.push(MockBlock {
             hash,
             height,
@@ -1228,6 +1253,130 @@ impl MockState {
         Bytes32(sha256d(&t.encode()))
     }
 
+    /// [`Self::mock_sighash`] bound to consensus branch `branch` (W4-B-2 / W4-B-5). A signature
+    /// made under one branch does not verify under another: the embedded 31 bytes are the prefix
+    /// of this hash, the stand-in for ZIP-243's `consensusBranchId`.
+    pub fn branch_sighash(tx: &Transaction, idx: usize, branch: u32) -> Bytes32 {
+        let mut buf = Self::mock_sighash(tx, idx).0.to_vec();
+        buf.extend(branch.to_le_bytes());
+        Bytes32(sha256(&buf))
+    }
+
+    /// Drive `getblockchaininfo.consensus.nextblock` and the sighash branch (W4-B-5). From
+    /// `from_height` the next block's branch is `id` (hex, no `0x`), reported as an upgrade
+    /// activating at that height.
+    pub fn set_next_branch(&mut self, id: u32, from_height: u32) {
+        self.branch_from.push((from_height, id));
+        self.branch_from.sort_by_key(|e| e.0);
+    }
+
+    /// The consensus branch id at height `h`.
+    pub fn branch_at(&self, h: u32) -> u32 {
+        let mut id = if self.activation_height >= 0 && i64::from(h) >= self.activation_height {
+            u32::from_str_radix(VAULT_BRANCH_ID, 16).expect("vault branch")
+        } else {
+            u32::from_str_radix(&self.pre_vault_branch_id, 16).unwrap_or(0)
+        };
+        for (from, branch) in &self.branch_from {
+            if h >= *from {
+                id = *branch;
+            }
+        }
+        id
+    }
+
+    fn branch_hex(id: u32) -> String {
+        format!("{id:08x}")
+    }
+
+    /// `CheckSetSigs` for template inputs (ycash-dd `SetSnapshot::CheckSetSigs`): selector 1 on a
+    /// vault and selector 2 on an intent need exactly the threshold of distinct signatures under
+    /// the branch at `height`, each naming a member who is current then (`status == Active`).
+    /// A bare selector (no signature pushes) is allowed when `allow_bare` (block assembly of a
+    /// test spend); `vault_send` does not allow it.
+    fn check_set_sigs(
+        &self,
+        tx: &Transaction,
+        height: u32,
+        allow_bare: bool,
+    ) -> Result<(), (i64, String)> {
+        let branch = self.branch_at(height);
+        for (idx, input) in tx.inputs.iter().enumerate() {
+            let Some((known, _, _)) = self.template(&input.prevout) else {
+                continue;
+            };
+            let Some((sigs, sel)) = parse_scriptsig(&input.script_sig) else {
+                // no selector: an unsigned template spend. Block assembly of a non-script
+                // test input never reaches here (those are not template outpoints, or they
+                // carry a bare selector). `vault_send` refuses it.
+                if allow_bare {
+                    continue;
+                }
+                return err(
+                    -26,
+                    "16: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)",
+                );
+            };
+            let (setid, need) = match (&known, sel) {
+                (KnownScript::Vault(f), 1) => (
+                    f.setid,
+                    self.set(&f.setid)
+                        .map_or(u32::MAX, |s| s.set.params.unlockthreshold),
+                ),
+                (KnownScript::Intent { fields, .. }, 2) => (
+                    fields.cancelsetid,
+                    self.set(&fields.cancelsetid)
+                        .map_or(u32::MAX, |s| s.set.params.cancelthreshold),
+                ),
+                (KnownScript::Vault(_), 4) => continue,
+                _ => continue,
+            };
+            if sigs.is_empty() && allow_bare {
+                continue;
+            }
+            let current: Vec<PubKey> = self
+                .set(&setid)
+                .map(|s| {
+                    s.memberlist
+                        .iter()
+                        .filter(|m| m.status == MemberStatus::Active)
+                        .map(|m| m.key)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let expect = Self::branch_sighash(tx, idx, branch);
+            let mut keys = vec![];
+            for sig in &sigs {
+                let Some(key) = sig_key(sig) else {
+                    return err(
+                        -26,
+                        "16: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)",
+                    );
+                };
+                if sig.len() < 65 || sig[34..] != expect.0[..31] || !current.contains(&key) {
+                    return err(
+                        -26,
+                        "16: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)",
+                    );
+                }
+                if keys.contains(&key) {
+                    return err(
+                        -26,
+                        "16: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)",
+                    );
+                }
+                keys.push(key);
+            }
+            if keys.len() as u32 != need {
+                return err(
+                    -26,
+                    "16: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)",
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn act_tx(&mut self, payload: Vec<u8>, extra: Vec<TxOut>) -> Transaction {
         let mut outs = extra;
         outs.push(TxOut::op_return(&payload));
@@ -1261,10 +1410,18 @@ impl MockState {
         let mut s = s.clone();
         let lw = s.set.params.livenesswindow;
         let since = h.saturating_sub(lw);
+        let maturity = s.set.params.maturity;
         for m in s.memberlist.iter_mut() {
             m.current = m.status == MemberStatus::Active;
             m.live = m.current && m.lastact >= since;
             m.wallet = self.wallet_keys.contains(&m.key);
+            if let Some(b) = self.bonds.get(&m.bondoutpoint)
+                && b.exitheight != 0
+            {
+                m.exitheight = Some(b.exitheight);
+                m.unlockheight = Some(b.exitheight.saturating_add(maturity));
+                m.bondfrozen = b.frozen;
+            }
         }
         let set = &mut s.set;
         set.height = h;
@@ -2273,7 +2430,7 @@ impl MockState {
                             "this wallet already built a different unlock of {op} (sighash {}): members sign once, so \
                              collect signatures on that build (call again with its recipients), or pass rebuild=true \
                              if no member has signed it",
-                            Self::mock_sighash(&old, 0)
+                            Self::branch_sighash(&old, 0, self.branch_at(self.next_height()))
                         ),
                     );
                 }
@@ -2285,7 +2442,7 @@ impl MockState {
                     hex: HexBytes(raw),
                     intents,
                     required,
-                    sighash: Self::mock_sighash(&tx, 0),
+                    sighash: Self::branch_sighash(&tx, 0, self.branch_at(self.next_height())),
                     build: BuildKind::Reused,
                 });
             }
@@ -2316,7 +2473,7 @@ impl MockState {
                 hex,
                 intents,
                 required,
-                sighash: Self::mock_sighash(&tx, 0),
+                sighash: Self::branch_sighash(&tx, 0, self.branch_at(self.next_height())),
                 build: BuildKind::New,
             })
         }
@@ -2351,7 +2508,7 @@ impl MockState {
         } else {
             set.set.params.cancelthreshold
         } as usize;
-        let sighash = Self::mock_sighash(&tx, idx);
+        let sighash = Self::branch_sighash(&tx, idx, self.branch_at(self.next_height()));
         let prevout = tx.inputs[idx].prevout;
         let mut sigs = vec![];
         if !tx.inputs[idx].script_sig.is_empty() {
@@ -2508,7 +2665,11 @@ impl MockState {
         let required = self
             .set(&fields.cancelsetid)
             .map_or(0, |s| s.set.params.cancelthreshold);
-        let sighash = Self::mock_sighash(&Transaction::decode(&hex).expect("cancel build"), 0);
+        let sighash = Self::branch_sighash(
+            &Transaction::decode(&hex).expect("cancel build"),
+            0,
+            self.branch_at(self.next_height()),
+        );
         to_json(&BuildCancelResult {
             hex: HexBytes(hex),
             required,
@@ -2575,7 +2736,7 @@ impl MockState {
         }
         to_json(&RefeeResult {
             hex: HexBytes(tx.encode()),
-            sighash: Self::mock_sighash(&tx, 0),
+            sighash: Self::branch_sighash(&tx, 0, self.branch_at(self.next_height())),
             fee: Amount(FEE),
             replaced,
         })
@@ -2637,18 +2798,8 @@ impl MockState {
             let Some((known, _, _)) = self.template(&input.prevout) else {
                 continue;
             };
-            let (sigs, sel) = parse_scriptsig(&input.script_sig).unwrap_or_default();
-            let need = match (&known, sel) {
-                (KnownScript::Vault(f), 1) => self
-                    .set(&f.setid)
-                    .map_or(u32::MAX, |s| s.set.params.unlockthreshold),
-                (KnownScript::Intent { fields, .. }, 2) => self
-                    .set(&fields.cancelsetid)
-                    .map_or(u32::MAX, |s| s.set.params.cancelthreshold),
-                (KnownScript::Vault(_), 4) => 0,
-                _ => u32::MAX,
-            };
-            if (sigs.len() as u32) < need {
+            let (_, sel) = parse_scriptsig(&input.script_sig).unwrap_or_default();
+            if self.check_set_sigs(&tx, self.next_height(), false).is_err() {
                 return err(
                     -26,
                     "16: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)",
@@ -2805,13 +2956,7 @@ impl MockState {
 
     fn getblockchaininfo(&self) -> RpcResult {
         let tip = self.tip_height();
-        let branch = |h: u32| {
-            if self.activation_height >= 0 && i64::from(h) >= self.activation_height {
-                VAULT_BRANCH_ID.to_owned()
-            } else {
-                self.pre_vault_branch_id.clone()
-            }
-        };
+        let branch = |h: u32| Self::branch_hex(self.branch_at(h));
         let mut upgrades = Map::new();
         if self.activation_height >= 0 {
             let status = if i64::from(tip) >= self.activation_height {
@@ -2822,6 +2967,13 @@ impl MockState {
             upgrades.insert(
                 VAULT_BRANCH_ID.into(),
                 json!({"name": "Vault", "activationheight": self.activation_height, "status": status, "info": "vault primitive"}),
+            );
+        }
+        for (from, id) in &self.branch_from {
+            let status = if tip >= *from { "active" } else { "pending" };
+            upgrades.insert(
+                Self::branch_hex(*id),
+                json!({"name": "Next", "activationheight": from, "status": status, "info": "mock branch"}),
             );
         }
         Ok(json!({
@@ -3226,5 +3378,94 @@ mod tests {
         assert_eq!(parse_scriptsig(&[0x52]).unwrap(), (vec![], 2));
         assert!(parse_scriptsig(&[0x55]).is_none());
         assert!(parse_scriptsig(&[]).is_none());
+    }
+
+    /// W4-B-2 / W4-B-5: `vault_send` enforces `CheckSetSigs` — a departed member's signature is
+    /// refused, the same bytes are accepted again once that key is current, and a signature
+    /// under the previous branch is refused after `set_next_branch`.
+    #[test]
+    fn check_set_sigs_currency_and_branch() {
+        let mut st = MockState::new();
+        let key = st.new_wallet_key();
+        let set = st.add_set(SetParams {
+            seats: 1,
+            unlockthreshold: 1,
+            cancelthreshold: 1,
+            slashthreshold: 1,
+            open: false,
+            ratelimitbps: 0,
+            ratewindow: 100,
+            livenesswindow: 100,
+            bondmin: Amount(COIN),
+            bondlockmin: 1,
+            maturity: 2,
+            admitkey: key,
+        });
+        st.add_member(&set, key, true);
+        let vault = |st: &mut MockState| {
+            let owner = st.new_wallet_owner();
+            st.add_vault(
+                VaultFields {
+                    tag: HexBytes(b"WYEC".to_vec()),
+                    tagtext: "WYEC".into(),
+                    setid: set,
+                    cancelsetid: set,
+                    delay: 1,
+                    ownerheight: 100_000,
+                    appheight: 0,
+                    owner,
+                    ownerscheme: 1,
+                },
+                Amount(COIN),
+            )
+        };
+        let op = vault(&mut st);
+        let built = st
+            .vault_build_spend(
+                &[
+                    serde_json::to_value(op).unwrap(),
+                    serde_json::to_value([Recipient::script(vec![0x51], Amount(COIN / 2))])
+                        .unwrap(),
+                ],
+                false,
+            )
+            .expect("build");
+        let signed = st.set_sign(&[built["hex"].clone()], 1).expect("sign");
+        let hex = signed["hex"].clone();
+        st.leave_member(&set, &key, st.tip_height());
+        let refused = st.vault_send(std::slice::from_ref(&hex)).unwrap_err();
+        assert!(
+            refused.1.contains("mandatory-script-verify-flag-failed"),
+            "{}",
+            refused.1
+        );
+        st.add_member(&set, key, true);
+        st.vault_send(&[hex])
+            .expect("a current member's old signature confirms");
+
+        let op2 = vault(&mut st);
+        let built2 = st
+            .vault_build_spend(
+                &[
+                    serde_json::to_value(op2).unwrap(),
+                    serde_json::to_value([Recipient::script(vec![0x52], Amount(COIN / 2))])
+                        .unwrap(),
+                ],
+                false,
+            )
+            .expect("build 2");
+        let signed2 = st.set_sign(&[built2["hex"].clone()], 1).expect("sign 2");
+        st.set_next_branch(0x1111_1111, st.next_height());
+        let refused = st.vault_send(&[signed2["hex"].clone()]).unwrap_err();
+        assert!(
+            refused.1.contains("mandatory-script-verify-flag-failed"),
+            "old branch: {}",
+            refused.1
+        );
+        assert_eq!(
+            st.branch_at(st.next_height()),
+            0x1111_1111,
+            "next block uses the new branch"
+        );
     }
 }

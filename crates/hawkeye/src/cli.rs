@@ -495,6 +495,17 @@ pub async fn status(s: &Settings, as_json: bool) -> Result<()> {
         st.supply.locked_vault_value,
         if st.supply.ok { "ok" } else { "BREACH" }
     );
+    if st.pinned_vaults.is_empty() {
+        println!("pinned vaults: -");
+    } else {
+        println!("pinned vaults: {}", st.pinned_vaults.len());
+        for v in &st.pinned_vaults {
+            println!(
+                "  {} burn {} ownerHeight {} ({} blocks left)",
+                v.vault, v.burn, v.owner_height, v.blocks_left
+            );
+        }
+    }
     for a in &st.alarms {
         println!("ALARM {}: {}", a.name, a.detail);
     }
@@ -1082,10 +1093,91 @@ pub async fn recover(s: &Settings) -> Result<()> {
 /// `removed`; its bond stays locked — and slashable — for the set's `maturity` (at least 16,128
 /// blocks, 14 days, on mainnet and testnet: D-Q-31), then `hawkeye withdraw-bond` returns it.
 /// Stop the daemon first: it refuses to start once the key is no longer a current member.
-pub async fn leave(s: &Settings) -> Result<()> {
+pub async fn leave(s: &Settings, with_live_unlocks: bool) -> Result<()> {
     let key = s.load_key()?;
     let node = ycash(s)?;
+    if let Some(why) = live_unlocks_block(s, &node, &key).await? {
+        if !with_live_unlocks {
+            anyhow::bail!("{why}");
+        }
+        tracing::warn!(event = "leave_with_live_unlocks", detail = %why);
+    }
     print(&leave_set(&node, &key, &s.params.set_hash()).await?)
+}
+
+/// Why `hawkeye leave` should wait (W4-B-2, V-N2): a live leader/cosign unlock of an unspent
+/// vault, or a burn assigned to this member, or an intent this member signed that is still
+/// pending. `None` when the ledger is absent or holds nothing of that kind.
+pub async fn live_unlocks_block(
+    s: &Settings,
+    node: &YcashRpc,
+    key: &hawkeye_core::SecretKey,
+) -> Result<Option<String>> {
+    if !s.store_path.exists() {
+        return Ok(None);
+    }
+    let me = key.public_key();
+    let mut store = hawkeye_store::Store::open_readonly(&s.store_path)
+        .with_context(|| format!("ledger {}", s.store_path.display()))?;
+    live_unlock_reason(&mut store, s.params.set_id, s.params.deployment, node, me).await
+}
+
+/// The refusal [`live_unlocks_block`] would produce for an already-open ledger.
+pub async fn live_unlock_reason(
+    store: &mut hawkeye_store::Store,
+    set: [u8; 32],
+    deployment: hawkeye_core::Deployment,
+    node: &YcashRpc,
+    me: [u8; 33],
+) -> Result<Option<String>> {
+    let (rows, assigned, pending) = store.read(|t| {
+        let rows = t.live_unlock_rows(&set)?;
+        let assigned = t
+            .burns_in_state(&deployment, hawkeye_store::BurnState::Assigned)?
+            .into_iter()
+            .filter(|b| b.leader == Some(me))
+            .map(|b| b.key.nonce)
+            .collect::<Vec<_>>();
+        let pending = t
+            .burns_in_state(&deployment, hawkeye_store::BurnState::IntentPending)?
+            .into_iter()
+            .filter(|b| b.leader == Some(me))
+            .map(|b| b.key.nonce)
+            .collect::<Vec<_>>();
+        Ok::<_, hawkeye_store::StoreError>((rows, assigned, pending))
+    })?;
+    let mut held = vec![];
+    for row in rows {
+        if !matches!(
+            row.origin,
+            hawkeye_store::UnlockOrigin::Leader | hawkeye_store::UnlockOrigin::Cosign
+        ) {
+            continue;
+        }
+        let op = hawkeye_ycash::OutPoint::new(
+            hawkeye_ycash::Hash256::from_internal(row.prevout.txid),
+            row.prevout.vout,
+        );
+        if node.gettxout(&op.txid, op.vout, true).await?.is_some() {
+            held.push(format!("burn {} on vault {}", row.key.nonce, row.prevout));
+        }
+    }
+    if held.is_empty() && assigned.is_empty() && pending.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = held;
+    for n in assigned {
+        parts.push(format!("burn {n} assigned"));
+    }
+    for n in pending {
+        parts.push(format!("burn {n} intent pending"));
+    }
+    Ok(Some(format!(
+        "this member holds live signed unlocks ({}): let them confirm, or leave with \
+         --with-live-unlocks (the set re-signs those burns and rolls the vaults; \
+         docs/operations.md §7)",
+        parts.join(", ")
+    )))
 }
 
 /// [`leave`] against `node`: checks the key is an ACTIVE member, calls `set_leave`, and answers

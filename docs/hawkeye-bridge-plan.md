@@ -270,6 +270,8 @@ burn freezes the bond in its delay (the member stays `removed`). With `maturity`
 on mainnet, an attestor that leaves right after a fault stays reachable for 14 days, far longer
 than detection (`C_Y` blocks), the vote and submission take. A key cannot rejoin while its old bond
 is unspent (`bad-vault-act-join`), so the member record always names the bond a slash freezes.
+A key that leaves and joins again makes any unlock it signed in its previous membership valid
+again; Hawkeye rolls every vault such an unlock spends as soon as the signer leaves (§5.1).
 
 ---
 
@@ -295,7 +297,7 @@ Hawkeye's answer, no consensus change:
    `ownerHeight = tip + BRIDGE_MAX_AGE`, with a roll memo (kind 2, §4.3) carrying the new V's
    parameters so every watcher can recompute `recipientHash`; after D anyone releases it into the
    new vault (V-1 applies). A roll uses rate-limit budget and is scheduled in the quietest epoch.
-3. **Drain order** — releases spend the vaults with the nearest `ownerHeight` first.
+3. **Drain order** — releases spend the **live** vaults with the nearest `ownerHeight` first; a vault due to roll (`ROLL_DUE`, or within `ROLL_MARGIN` plus one full takeover rotation) is never drawn for a burn.
 4. **Supply alarm** — every block: `wYEC.totalSupply() ≤ Σ value of live WYEC vaults with
    ownerHeight > tip + ROLL_MARGIN` (minus burns not yet released). A breach pages the operators;
    Q-2 asks whether a breach should also pause the bridge (`setPaused`).
@@ -701,9 +703,14 @@ Ycash set, so a removed member is refused at once. `/unlock/sign` is inert at `u
 ledger, and records the signature per burn as well as per vault (schema v6: one live vault per
 burn). **A signed unlock stays revivable while its vault is unspent** (audit 01/V-2: set
 signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY`, so anyone holding the bytes can re-fund
-them), so a record is *dead* — and one more vault may be signed for the burn — only when its
-**vault** is spent by another transaction at least `C_Y` deep; a fee-input spend never counts
-(HK-16). The burn's leader re-sends the live unlock it holds, re-funded when a fee input is gone
+them), so a record is *dead* — and one more vault may be signed for the burn — when (1) its
+**vault** is spent by another transaction at least `C_Y` deep (a fee-input spend never counts;
+HK-16), (2) its intent is cancelled `C_Y` deep, (3) its set signatures can no longer satisfy
+`CheckSetSigs` — a signer REMOVED or EJECTED, in which case the vault is rolled at once — or
+(4) they were made under a branch id that is no longer the next block's, `C_Y` past that
+activation. What is given up: an unlock whose signer later rejoins and matures could have
+confirmed again; the vault is rolled first, so that unlock is deliberately killed and the burn
+is paid from a fresh vault (one more fee). The burn's leader re-sends the live unlock it holds, re-funded when a fee input is gone
 or not its wallet's — its own as leader, or one it co-signed and now leads after a takeover. A
 takeover leader holding none asks the peers `POST /burns/unlock` (authenticated, answer signed; a
 peer serves its signed unlock only to a current member and only while the burn is unpaid in its

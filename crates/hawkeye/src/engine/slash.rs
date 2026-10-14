@@ -254,7 +254,13 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
     // who signed it: recovered here, a current member here
     let attribution = ctx
         .attributor
-        .attribute(&raw, idx, &spk, value, hawkeye_core::VAULT_BRANCH_ID)
+        .attribute(
+            &raw,
+            idx,
+            &spk,
+            value,
+            super::sign::branch_id_at(&ctx.ycash, None).await?,
+        )
         .map_err(|e| anyhow!("the unlock does not attribute: {e}"))?;
     let members = slashable_members(ctx).await?;
     let signer = attribution

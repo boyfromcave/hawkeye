@@ -11,8 +11,10 @@
 /// `sign_once_unlock_burn`, `meta`), `V7` lane `bridge-watch`'s (audit 05/H-2:
 /// `pending_mints.provisional`). V7 touches only `pending_mints`, so it applies on top of V6.
 /// `V8` (audit 05/L-5, `exposure_acks`) and `V9` (audit 05/L-3, `sign_once_mint` keyed per
-/// deployment) are lane `bridge-wave2`'s.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
+/// deployment) are lane `bridge-wave2`'s. `V10` (W4-B-2 / W4-B-5) widens
+/// `sign_once_unlock_burn` with origin `adopted` and the signing branch, and adds
+/// `sign_once_ycash.branch_id`.
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 /// Version 1: the H4 ledger.
 const V1: &str = r#"
@@ -626,6 +628,58 @@ DROP TABLE burns;
 ALTER TABLE burns_v5 RENAME TO burns;
 CREATE INDEX burns_state ON burns (state, nonce);
 CREATE INDEX burns_block ON burns (block_number);
+"#;
+
+/// Version 10 (W4-B-2, W4-B-5): an unlock adopted at takeover without adding a signature of this
+/// member is not a signature of this member. It is recorded per burn (origin `adopted`, the
+/// signed bytes in `adopted_hex`) and never as a `sign_once_ycash` `ycash-unlock` row, so a roll
+/// of that vault does not collide with a signature this member did not make. `branch_id` is the
+/// consensus branch the set signature was made under; `signed_height` is the Ycash height then.
+/// `sign_once_ycash.branch_id` is the same fact for a signature this member did make (NULL on
+/// rows from before this version). SQLite cannot alter a CHECK, so `sign_once_unlock_burn` is
+/// rebuilt; its immutability triggers are recreated as in V6, extended to the new columns.
+const V10: &str = r#"
+CREATE TABLE sign_once_unlock_burn_v10 (
+    set_id        BLOB    NOT NULL CHECK (length(set_id) = 32),
+    chain_id      INTEGER NOT NULL CHECK (chain_id >= 0),
+    bridge        BLOB    NOT NULL CHECK (length(bridge) = 20),
+    nonce         INTEGER NOT NULL CHECK (nonce >= 0),
+    prevout_txid  BLOB    NOT NULL CHECK (length(prevout_txid) = 32),
+    prevout_vout  INTEGER NOT NULL CHECK (prevout_vout >= 0),
+    origin        TEXT    NOT NULL CHECK (origin IN ('leader', 'cosign', 'drill', 'adopted')),
+    signed_at     INTEGER NOT NULL,
+    dead_reason   TEXT,
+    dead_height   INTEGER CHECK (dead_height IS NULL OR dead_height >= 0),
+    adopted_hex   TEXT,
+    branch_id     INTEGER,
+    signed_height INTEGER CHECK (signed_height IS NULL OR signed_height >= 0),
+    CHECK ((dead_reason IS NULL) = (dead_height IS NULL)),
+    CHECK (origin != 'adopted' OR adopted_hex IS NOT NULL),
+    PRIMARY KEY (set_id, chain_id, bridge, nonce, prevout_txid, prevout_vout)
+) WITHOUT ROWID;
+INSERT INTO sign_once_unlock_burn_v10
+    SELECT set_id, chain_id, bridge, nonce, prevout_txid, prevout_vout, origin, signed_at,
+           dead_reason, dead_height, NULL, NULL, NULL
+    FROM sign_once_unlock_burn;
+DROP TABLE sign_once_unlock_burn;
+ALTER TABLE sign_once_unlock_burn_v10 RENAME TO sign_once_unlock_burn;
+CREATE INDEX sign_once_unlock_burn_live ON sign_once_unlock_burn (set_id, chain_id, bridge, nonce)
+    WHERE dead_reason IS NULL;
+CREATE INDEX sign_once_unlock_burn_vault ON sign_once_unlock_burn (set_id, prevout_txid, prevout_vout);
+CREATE TRIGGER sign_once_unlock_burn_immutable_update BEFORE UPDATE ON sign_once_unlock_burn
+    WHEN OLD.dead_reason IS NOT NULL OR NEW.dead_reason IS NULL
+      OR NEW.set_id != OLD.set_id OR NEW.chain_id != OLD.chain_id OR NEW.bridge != OLD.bridge
+      OR NEW.nonce != OLD.nonce OR NEW.prevout_txid != OLD.prevout_txid
+      OR NEW.prevout_vout != OLD.prevout_vout OR NEW.origin != OLD.origin
+      OR NEW.signed_at != OLD.signed_at
+      OR NEW.adopted_hex IS NOT OLD.adopted_hex
+      OR NEW.branch_id IS NOT OLD.branch_id
+      OR NEW.signed_height IS NOT OLD.signed_height
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+CREATE TRIGGER sign_once_unlock_burn_immutable_delete BEFORE DELETE ON sign_once_unlock_burn
+BEGIN SELECT RAISE(ABORT, 'sign-once records are immutable'); END;
+
+ALTER TABLE sign_once_ycash ADD COLUMN branch_id INTEGER;
 "#;
 
 /// Version 6 (remedial report 05/H-1 §4.3, plan HK-13): the **per-burn** sign-once dimension of

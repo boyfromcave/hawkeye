@@ -49,6 +49,8 @@ pub struct SignOutcome {
 pub(crate) struct SetSigning {
     role: Role,
     how: How,
+    /// The next block's branch id, read before signing (W4-B-5).
+    branch_id: u32,
 }
 
 enum How {
@@ -87,6 +89,7 @@ impl SetSigning {
         role: Role,
         template: CoreOutPoint,
     ) -> Result<Self> {
+        let branch_id = next_branch_id(ycash).await?;
         let how = match params.ycash_signing {
             YcashSigning::Wallet => How::Wallet(ycash.clone()),
             YcashSigning::SelfSigned => {
@@ -108,12 +111,21 @@ impl SetSigning {
                         o.script_pub_key.hex.0,
                         u64::try_from(o.value.zat()).unwrap_or(0),
                     ),
-                    branch_id: next_branch_id(ycash).await?,
+                    branch_id,
                     need,
                 }))
             }
         };
-        Ok(Self { role, how })
+        Ok(Self {
+            role,
+            how,
+            branch_id,
+        })
+    }
+
+    /// The consensus branch this signature commits to.
+    pub(crate) fn branch_id(&self) -> u32 {
+        self.branch_id
     }
 
     /// Sign (synchronously: inside the sign-once closure).
@@ -153,7 +165,35 @@ impl SetSigning {
 /// ZIP-243 signature made now commits to.
 pub async fn next_branch_id(ycash: &YcashRpc) -> Result<u32> {
     let b = ycash.getblockchaininfo().await?.consensus.nextblock;
-    u32::from_str_radix(&b, 16).map_err(|e| anyhow!("consensus.nextblock {b:?}: {e}"))
+    parse_branch_id(&b)
+}
+
+/// The consensus branch a spend at `height` commits to. `None`, or a height above the tip, is
+/// the next block's branch (a mempool spend). A mined spend uses the upgrade with the greatest
+/// activation at or below `height` (`getblockchaininfo.upgrades`).
+pub async fn branch_id_at(ycash: &YcashRpc, height: Option<u32>) -> Result<u32> {
+    let info = ycash.getblockchaininfo().await?;
+    let Some(h) = height.filter(|h| *h <= info.blocks) else {
+        return parse_branch_id(&info.consensus.nextblock);
+    };
+    let mut best: Option<(i64, u32)> = None;
+    for (id, u) in &info.upgrades {
+        if u.status == "disabled" || u.activationheight < 0 || u.activationheight > i64::from(h) {
+            continue;
+        }
+        let bid = parse_branch_id(id)?;
+        if best.is_none_or(|(ah, _)| u.activationheight >= ah) {
+            best = Some((u.activationheight, bid));
+        }
+    }
+    if let Some((_, id)) = best {
+        return Ok(id);
+    }
+    parse_branch_id(&info.consensus.chaintip)
+}
+
+fn parse_branch_id(s: &str) -> Result<u32> {
+    u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| anyhow!("branch id {s:?}: {e}"))
 }
 
 /// The self-signed set signature (05/M-1 §4.3 step 1): the ZIP-243 sighash of the template
@@ -379,7 +419,7 @@ impl Adoption<'_> {
                 self.idx,
                 self.coin.0,
                 self.coin.1,
-                hawkeye_core::VAULT_BRANCH_ID,
+                block_on(next_branch_id(&ctx.ycash)).unwrap_or(hawkeye_core::VAULT_BRANCH_ID),
             )
             .map_err(|e| anyhow!("attribution: {e}"))?;
         ensure!(
@@ -408,7 +448,7 @@ impl Adoption<'_> {
                     self.idx,
                     self.coin.0,
                     self.coin.1,
-                    hawkeye_core::VAULT_BRANCH_ID,
+                    block_on(next_branch_id(&ctx.ycash)).unwrap_or(hawkeye_core::VAULT_BRANCH_ID),
                 )
                 .map_err(|e| anyhow!("our own attribution: {e}"))?;
             for s in &mine.signers {

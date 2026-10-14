@@ -211,6 +211,8 @@ pub(crate) struct Memory {
     pub clock_offset: Duration,
     /// Unacknowledged exposures (audit 05/L-5): lock ids, from the ledger every tick.
     pub exposures: Vec<Hash32>,
+    /// `ROLL_DUE` vaults this member signed and cannot roll (W4-B-2).
+    pub pinned_vaults: Vec<crate::status::PinnedVault>,
     /// Locks whose proposal this attestor withdrew (challenged) after the lock reorged.
     pub withdrawn: HashSet<Hash32>,
     /// Peers whose co-signatures failed the adoption checks, by URL: consecutive failures
@@ -704,6 +706,7 @@ impl Engine {
                 .map(|id| format!("0x{}", hex::encode(id)))
                 .collect(),
             eth_finalized_age_secs,
+            pinned_vaults: self.mem.pinned_vaults.clone(),
         })
     }
 
