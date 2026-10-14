@@ -329,7 +329,9 @@ its intent was then cancelled `C_Y` deep (log `unlock_dead`). In practice:
 
 - **Who must answer (review N-1, N-3).** The members asked are the burn's previous leaders in
   this ledger plus every set signer attributed on an unlock of the burn this ledger observed on
-  Ycash; only those still **current** in the set are required — the node accepts an unlock only
+  Ycash, except the signers of an observed unlock that could never be adopted as the burn's
+  own spend (it carries a funded change output, or does not pay the burn here: log
+  `unlock_observed_ignored`); only those still **current** in the set are required — the node accepts an unlock only
   with `unlockThreshold` signatures of members current at the spend height
   (`SetSnapshot::CheckSetSigs`), so a removed or departed member's bytes can never confirm. An
   unlock of the burn this ledger observed (mempool or block) whose vault is unspent is adopted

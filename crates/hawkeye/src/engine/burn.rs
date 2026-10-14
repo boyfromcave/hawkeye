@@ -770,7 +770,7 @@ impl Engine {
         };
         // review N-3: every signer attributed on an unlock this ledger observed for the burn,
         // even if this ledger never recorded it as the burn's leader (ledgers diverge)
-        for s in self.observed_signers(b)? {
+        for s in self.observed_signers(b).await? {
             if !required.contains(&s) {
                 required.push(s);
             }
@@ -906,7 +906,8 @@ impl Engine {
             Ok(Prior::NoneConfirmed)
         } else {
             Ok(Prior::Unknown(format!(
-                "no signed answer that they hold no unlock for it from {} (previous leaders{})",
+                "no signed answer that they hold no unlock for it from {} (previous leaders, \
+                 signers of an unlock observed for it{})",
                 missing.join(", "),
                 if restored {
                     " and, the ledger being restored, every member"
@@ -927,15 +928,32 @@ impl Engine {
     }
 
     /// Every set signer attributed on an unlock of `b` this ledger observed (review N-3).
-    fn observed_signers(&self, b: &BurnRecord) -> Result<Vec<PubKey33>> {
+    ///
+    /// An unlock that could never be adopted as `b`'s own spend — it moves more than its vault
+    /// (a funded change output) or does not pay `b` here — is a fraud the watchers cancel, not an
+    /// answer to wait for, so its signers do not join the required set (W4-B-1). Any other
+    /// outcome, including an error reading the chain, keeps them required.
+    async fn observed_signers(&self, b: &BurnRecord) -> Result<Vec<PubKey33>> {
+        use hawkeye_core::matcher::Classification;
         let rows = self
             .ctx
             .db(|t| t.meta_prefix(&super::ycash::observed_unlock_prefix(&b.key)))?;
         let mut out = vec![];
-        for (_, v) in rows {
+        for (key, v) in rows {
             let Ok(j) = serde_json::from_str::<serde_json::Value>(&v) else {
                 continue;
             };
+            if let Some(tx) = j["raw"]
+                .as_str()
+                .and_then(|r| Transaction::decode_hex(r).ok())
+                && let Ok(f) = classify_unlock(&self.ctx, &tx).await
+                && (super::sign::unlock_value_bounded(&tx, f.coin.1).is_err()
+                    || f.classification != Classification::MatchedBurn { nonce: b.key.nonce })
+            {
+                warn!(event = "unlock_observed_ignored", nonce = b.key.nonce,
+                      record = %key, "an observed unlock that cannot pay the burn does not hold it");
+                continue;
+            }
             for s in j["signers"].as_array().into_iter().flatten() {
                 let mut k = [0u8; 33];
                 if let Some(h) = s.as_str()
