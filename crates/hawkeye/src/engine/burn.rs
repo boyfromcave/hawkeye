@@ -304,7 +304,7 @@ impl Engine {
         // below the activation would make the signatures valid again).
         if let Some(coin) = self.vault_coin(&vault).await? {
             match self.confirmable(&tx, &vault, &coin, row.branch_id).await? {
-                Confirmable::Yes => {}
+                Confirmable::Yes | Confirmable::Incomplete => {}
                 Confirmable::Departed {
                     signers,
                     revivable_after,
@@ -1089,7 +1089,26 @@ impl Engine {
             let Some(b) = self.ctx.db(|t| t.burn(&row.key))? else {
                 continue;
             };
-            let op = op_rpc(&row.prevout);
+            if let LiveUnlock::Dead(why) = self.judge_live_unlock(&row, &hex).await? {
+                self.kill_unlock(&b, &row, &why, self.mem.tip)?;
+            }
+        }
+        // every member that only observed the bytes (no sign-once row) still rolls the vault
+        let observed = self.ctx.db(|t| t.meta_prefix("observed_unlock/"))?;
+        for (_, raw) in observed {
+            let Some(hex) = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|j| j["raw"].as_str().map(str::to_owned))
+            else {
+                continue;
+            };
+            let Ok(tx) = Transaction::decode_hex(&hex) else {
+                continue;
+            };
+            let Some(vault) = tx.inputs.first().map(|i| op_core(&i.prevout)) else {
+                continue;
+            };
+            let op = op_rpc(&vault);
             if self
                 .ctx
                 .ycash
@@ -1099,8 +1118,33 @@ impl Engine {
             {
                 continue;
             }
-            if let LiveUnlock::Dead(why) = self.judge_live_unlock(&row, &hex).await? {
-                self.kill_unlock(&b, &row, &why, self.mem.tip)?;
+            let Some(coin) = self.vault_coin(&vault).await? else {
+                continue;
+            };
+            let signed_under = self.ctx.db(|t| {
+                Ok(t.unlock_burns_of_vault(&p.set_id, &vault)?
+                    .into_iter()
+                    .find(|r| r.is_live())
+                    .and_then(|r| r.branch_id))
+            })?;
+            match self.confirmable(&tx, &vault, &coin, signed_under).await? {
+                Confirmable::Departed { .. } => {
+                    self.ctx.db(|t| {
+                        super::roll::mark_unconfirmable(
+                            t,
+                            &vault,
+                            0,
+                            self.mem.tip,
+                            "departed signer",
+                        )
+                    })?;
+                }
+                Confirmable::WrongBranch { next, .. } if self.branch_buried(next).await? => {
+                    self.ctx.db(|t| {
+                        super::roll::mark_unconfirmable(t, &vault, 0, self.mem.tip, "old branch")
+                    })?;
+                }
+                _ => {}
             }
         }
         self.rejoined_signers().await?;
@@ -1226,6 +1270,10 @@ impl Engine {
             let (n, total, _) = good(a);
             if n == k && total == k {
                 return Ok(Confirmable::Yes);
+            }
+            // short of k, and every signature so far is still good: a co-signer can finish it
+            if total < k && n == total {
+                return Ok(Confirmable::Incomplete);
             }
         }
         let stored = signed_under.filter(|b| *b != next);
@@ -1355,7 +1403,7 @@ impl Engine {
         }
         let k = self.unlock_quorum();
         match self.confirmable(&tx, &f.origin, &f.coin, None).await? {
-            Confirmable::Yes => {}
+            Confirmable::Yes | Confirmable::Incomplete => {}
             Confirmable::Departed {
                 signers,
                 revivable_after,
@@ -1686,6 +1734,9 @@ pub const LEDGER_RESTORED: &str = "ledger_restored";
 pub(crate) enum Confirmable {
     /// Exactly `unlockThreshold` distinct signers are current, or Active and not yet mature.
     Yes,
+    /// Fewer than `unlockThreshold` signatures, each of them still current. A co-signer can
+    /// finish it; the row is not dead.
+    Incomplete,
     /// Below k current signers. `revivable_after` is the earliest height a non-current signer
     /// could be current again, or `None` when one can never be (ejected, or removed with a
     /// frozen bond).
