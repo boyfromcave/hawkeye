@@ -101,16 +101,30 @@ impl AuthState {
         *self.set.write().unwrap_or_else(|e| e.into_inner()) = Some(info.clone());
     }
 
-    /// Admit `(member, nonce)` once within its lifetime; false if seen.
-    fn admit_once(&self, member: PubKey33, nonce: [u8; 16], now: u64) -> bool {
+    /// Admit `(member, nonce)` once within its lifetime: refused if seen, or if `member`
+    /// already has [`REPLAY_PER_MEMBER`] live entries.
+    fn admit_once(&self, member: PubKey33, nonce: [u8; 16], now: u64) -> Admit {
         let mut m = self.replay.lock().unwrap_or_else(|e| e.into_inner());
         m.retain(|_, exp| *exp >= now);
         if m.contains_key(&(member, nonce)) {
-            return false;
+            return Admit::Replayed;
+        }
+        if m.keys().filter(|(k, _)| *k == member).count() >= REPLAY_PER_MEMBER {
+            return Admit::Full;
         }
         m.insert((member, nonce), now + 2 * SKEW_SECS);
-        true
+        Admit::Fresh
     }
+}
+
+/// Live replay-cache entries one member may hold (an honest peer sends a few requests per tick).
+const REPLAY_PER_MEMBER: usize = 4_096;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Fresh,
+    Replayed,
+    Full,
 }
 
 /// An IPv4 or IPv6 network (`10.0.0.0/8`, `::1/128`, or a bare address).
@@ -301,16 +315,21 @@ pub async fn layer(State(ctx): State<Ctx>, req: Request, next: Next) -> Response
                 "signature does not recover to the member",
             );
         }
-        // 3. not replayed (recorded once the signature verified)
-        if !ctx.auth.admit_once(member, nonce, now) {
-            return refuse(StatusCode::UNAUTHORIZED, "replayed");
-        }
         // 5. a current member (a member in its exit delay is not)
         if !is_current_member(&ctx, &member).await {
             return refuse(
                 StatusCode::FORBIDDEN,
                 format!("{} is not a current member", hex::encode(member)),
             );
+        }
+        // 3. not replayed (recorded only for a current member whose signature verified)
+        match ctx.auth.admit_once(member, nonce, now) {
+            Admit::Fresh => {}
+            Admit::Replayed => return refuse(StatusCode::UNAUTHORIZED, "replayed"),
+            Admit::Full => {
+                tracing::warn!(event = "peer_auth_rate_limited", member = %hex::encode(member));
+                return refuse(StatusCode::TOO_MANY_REQUESTS, "too many requests");
+            }
         }
         // 6. the handler sees the requester
         parts.extensions.insert(PeerMember(member));
@@ -453,10 +472,30 @@ mod tests {
     fn replay_cache() {
         let s = AuthState::default();
         let k = [2u8; 33];
-        assert!(s.admit_once(k, [1; 16], 100));
-        assert!(!s.admit_once(k, [1; 16], 150));
-        assert!(s.admit_once(k, [2; 16], 150));
+        assert_eq!(s.admit_once(k, [1; 16], 100), Admit::Fresh);
+        assert_eq!(s.admit_once(k, [1; 16], 150), Admit::Replayed);
+        assert_eq!(s.admit_once(k, [2; 16], 150), Admit::Fresh);
         // expired entries are pruned
-        assert!(s.admit_once(k, [1; 16], 100 + 2 * SKEW_SECS + 1));
+        assert_eq!(
+            s.admit_once(k, [1; 16], 100 + 2 * SKEW_SECS + 1),
+            Admit::Fresh
+        );
+    }
+
+    #[test]
+    fn replay_cache_is_capped_per_member() {
+        let s = AuthState::default();
+        let (a, b) = ([2u8; 33], [3u8; 33]);
+        for i in 0..REPLAY_PER_MEMBER {
+            let mut n = [0u8; 16];
+            n[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert_eq!(s.admit_once(a, n, 100), Admit::Fresh);
+        }
+        assert_eq!(s.admit_once(a, [0xff; 16], 100), Admit::Full);
+        assert_eq!(s.admit_once(b, [0xff; 16], 100), Admit::Fresh);
+        assert_eq!(
+            s.admit_once(a, [0xff; 16], 100 + 2 * SKEW_SECS + 1),
+            Admit::Fresh
+        );
     }
 }
