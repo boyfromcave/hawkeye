@@ -4,10 +4,11 @@
 
 The vault primitive's golden vector, copied verbatim from the node:
 
-- source: `boyfromcave/ycash-dd` `src/test/data/vault_vectors.json` at commit **`8af82551b`**
-  (`upgrade/vault`, after the remedial-action merges), byte-identical to `boyfromcave/ycash6`
-  `upgrade/vault` **`047b561ac`** (checked by sha256 when copied: the vector is the same on both
-  node lines). New since the previous copy (ycash-dd `d41026209`, sha256 `4ba21283…80d03`): set
+- source: `boyfromcave/ycash-dd` `src/test/data/vault_vectors.json` at commit **`ed828e7b2`**
+  (`upgrade/vault`; the file is unchanged since **`8af82551b`**, the remedial-action merges, and
+  at the later head `7cc440fe9`), byte-identical to `boyfromcave/ycash6` `upgrade/vault`
+  **`4129f22cd`** (and `dd3bd98ce`) (checked by sha256: the vector is the same on both node
+  lines). New since the previous copy (ycash-dd `d41026209`, sha256 `4ba21283…80d03`): set
   signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY` (`0x81`, audit 01/V-2), so `spends[0]`
   (`unlock`) and `spends[1]` (`cancel`) have new `sighash`, `setSigMsg`, `sigs`, `scriptSig` and
   `tx`; nothing else changed (`ownerSpends` is untouched: the post-quantum owner signs with the
@@ -36,8 +37,9 @@ post-quantum signature code (the node signs owner spends), and `verify` (`script
 
 The node's transparent signature-hash vector, copied verbatim:
 
-- source: `boyfromcave/ycash-dd` `src/test/data/sighash.json` at commit **`dbc1ab0`**
-  (branch `upgrade/vault`; unchanged from Ycash v4.5.0's Zcash lineage)
+- source: `boyfromcave/ycash-dd` `src/test/data/sighash.json` at commit **`ed828e7b2`**
+  (branch `upgrade/vault`; unchanged since `dbc1ab0` and at the later head `7cc440fe9`, and
+  unchanged from Ycash v4.5.0's Zcash lineage)
 - sha256 `6e10f3e5649c876a8968a3ba13885aeb8dcee8040fd89e7e39651b041d07f30c`
 - rows `[raw_tx, scriptCode, nIn, hashType, branchId, sighash]`, amount 0, `sighash` printed by
   `uint256::GetHex()` (display order: reverse it for the internal bytes);
@@ -78,7 +80,7 @@ text alone (`gen_recipient_vectors.py` beside this file: a hand-rolled base58, `
 the opcode bytes of the three scripts written out; no `hawkeye-core` code), so
 `tests/recipient_vectors.rs` is a cross-check of the Rust codec, not a replay of it. The
 `TX_PQPKH` script bytes (`20 <keyHash> 51|52 c2`) were cross-checked against the node's
-`GetScriptForPQKey` (ycash-dd `upgrade/quantum-vaults` `d41026209` `src/script/standard.cpp:338`:
+`GetScriptForPQKey` (ycash-dd `upgrade/vault` `ed828e7b2` `src/script/standard.cpp:338`:
 `CScript() << ToByteVector(id.hash) << CScript::EncodeOP_N(id.scheme) << OP_CHECKPQSIG`) and the
 `sq…`/`tq…`/`rq…` versions against `src/key_io.cpp:23-27` and `src/test/pq_address_tests.cpp`
 (`sq_roundtrip_per_network`: the leading characters and the 53-character length; the node's
