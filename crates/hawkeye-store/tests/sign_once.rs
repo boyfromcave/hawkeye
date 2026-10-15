@@ -751,3 +751,18 @@ fn adopt_unlock_does_not_block_a_roll() {
     })
     .unwrap();
 }
+
+#[test]
+fn second_instance_lock_is_refused_until_the_first_is_dropped() {
+    let dir = std::env::temp_dir().join(format!("hk-lock-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("hawkeye.db");
+    let first = hawkeye_store::Store::lock_instance(&db).unwrap();
+    let err = hawkeye_store::Store::lock_instance(&db)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&std::process::id().to_string()), "{err}");
+    drop(first);
+    hawkeye_store::Store::lock_instance(&db).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

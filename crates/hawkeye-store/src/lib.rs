@@ -78,7 +78,52 @@ fn system_clock() -> i64 {
         .unwrap_or(0)
 }
 
+/// The single-instance lock (W3-B-10): an exclusive advisory lock on `<ledger>.lock`, held
+/// for the life of the value and released by the kernel when the process exits.
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: std::fs::File,
+}
+
 impl Store {
+    /// Take the single-instance lock beside the ledger at `path` (`hawkeye.db` →
+    /// `hawkeye.db.lock`, mode `0600`). Fails with [`StoreError::Invalid`] naming the holder's
+    /// pid when another process holds it. Covers one host and a local filesystem only.
+    pub fn lock_instance(path: impl AsRef<Path>) -> Result<InstanceLock> {
+        use std::io::{Read, Seek, Write};
+        let mut lock = path.as_ref().as_os_str().to_owned();
+        lock.push(".lock");
+        let lock = std::path::PathBuf::from(lock);
+        create_private(&lock)?;
+        let io =
+            |e: std::io::Error| StoreError::Invalid(format!("cannot lock {}: {e}", lock.display()));
+        // create_private makes it on unix only; elsewhere it is created here
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)
+            .map_err(io)?;
+        match f.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let mut holder = String::new();
+                let _ = f.read_to_string(&mut holder);
+                return Err(StoreError::Invalid(format!(
+                    "ledger {} is in use by pid {}: one hawkeye per ledger (docs/operations.md section 2)",
+                    path.as_ref().display(),
+                    holder.trim()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
+        }
+        f.set_len(0).map_err(io)?;
+        f.rewind().map_err(io)?;
+        write!(f, "{}", std::process::id()).map_err(io)?;
+        Ok(InstanceLock { _file: f })
+    }
+
     /// Open (creating if absent) the ledger file at `path` and migrate it to the current
     /// schema. A new ledger is created mode `0600` before SQLite opens it, and its `-wal` /
     /// `-shm` files are held to `0600` too (remedial report 05/L-2: the sign-once ledger is
