@@ -5059,6 +5059,89 @@ async fn r2_takeover_never_funds_a_fat_unlock() {
     );
 }
 
+/// W4-B-1: a non-leader member signs and sends a fat unlock (a change output) for the burn; it
+/// is observed and then evicted. Its signer holds that sign-once record and answers "held" with
+/// the fat bytes, which nobody may adopt. That signer is not a required answerer: the leader
+/// signs a fresh vault and releases instead of holding the burn forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b1_fat_unlock_by_a_non_leader_does_not_hold_the_burn() {
+    use hawkeye_store::{UnlockBurn, UnlockOrigin, YcashSignKey};
+    let Some(env) = setup_with(views(1, 1)).await else {
+        return;
+    };
+    let (mut engines, _urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x65; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    let rogue = (leader + 1) % 3;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    engines[rogue].tick().await;
+    let b = engines[rogue].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    let memo = hawkeye_core::memo::HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, b.tx_hash);
+    let vault = free_vaults(&env).await[0];
+    let (built, signed) = fat_unlock(&env, &env.node(rogue), &vault, &r, &memo).await;
+    let key = YcashSignKey {
+        domain: hawkeye_store::SignDomain::YcashUnlock,
+        set_id: env.set.0,
+        prevout: CoreOutPoint::new(vault.txid.0, vault.vout),
+    };
+    engines[rogue]
+        .ctx()
+        .db(|t| {
+            t.sign_once_unlock(
+                &key,
+                Some(&UnlockBurn {
+                    key: k,
+                    origin: UnlockOrigin::Leader,
+                    allow_double: false,
+                }),
+                &built,
+                |_| Ok::<_, String>((signed.clone(), [0x34; 32])),
+            )
+        })
+        .unwrap();
+    env.node(rogue)
+        .vault_send(&signed.parse().unwrap())
+        .await
+        .unwrap();
+    // every ledger observes it (attributed to the rogue), then it is evicted
+    for e in engines.iter_mut() {
+        e.tick().await;
+    }
+    let prefix = format!("observed_unlock/{k}/");
+    assert!(
+        !engines[leader]
+            .ctx()
+            .db(|t| t.meta_prefix(&prefix))
+            .unwrap()
+            .is_empty(),
+        "the leader observed the fat unlock"
+    );
+    drop_unlocks(&env, nonce);
+    let mut fresh = None;
+    for _ in 0..4 * TAKEOVER + 8 {
+        env.mine(1);
+        engines[leader].tick().await;
+        if let Some((tx, v)) = unlocks_for(&env, nonce).into_iter().next() {
+            fresh = Some((tx, v));
+            break;
+        }
+    }
+    let (tx, v) = fresh.expect("the leader released without the rogue's \"none\"");
+    let value = u64::try_from(env.mock.state().templates[&v].valuezat()).unwrap();
+    hawkeye::engine::sign::unlock_value_bounded(&tx, value).unwrap();
+    assert!(
+        !engines[leader]
+            .alarms()
+            .iter()
+            .any(|a| a.name == "unlock-prior-unknown"),
+        "the leader did not hold the burn"
+    );
+}
+
 /// (r3) H-1: `send_refunded` never sends a re-fund that would cost this wallet more than the fee
 /// bound (a change output to pay).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
