@@ -23,6 +23,25 @@ pub struct NewSlashCase {
     pub opened_height: Option<u32>,
 }
 
+/// An operator's decision on a slash case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashDecision {
+    /// Vote on the case.
+    Approve,
+    /// Never vote on the case.
+    Reject,
+}
+
+impl SlashDecision {
+    /// The ledger spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+        }
+    }
+}
+
 /// A slash case row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCaseRecord {
@@ -114,6 +133,47 @@ impl Tx<'_> {
             Some(&detail),
         )?;
         Ok((self.require_slash_case(id)?, true))
+    }
+
+    /// Record the operator's decision on a case. Errors if the case does not exist or already
+    /// has a decision (decisions are immutable).
+    pub fn decide_slash(&self, id: i64, decision: SlashDecision, note: &str) -> Result<()> {
+        self.require_slash_case(id)?;
+        if self.slash_decision(id)?.is_some() {
+            return Err(StoreError::Invalid(format!(
+                "slash case {id} already has an operator decision"
+            )));
+        }
+        self.conn().execute(
+            "INSERT INTO slash_decisions (case_id, decision, note, decided_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, decision.as_str(), note, self.now()],
+        )?;
+        self.log(
+            ObjectKind::SlashCase,
+            &id.to_string(),
+            None,
+            "DECIDED",
+            None,
+            Some(&format!("{}: {note}", decision.as_str())),
+        )?;
+        Ok(())
+    }
+
+    /// The operator's decision on a case, if any.
+    pub fn slash_decision(&self, id: i64) -> Result<Option<SlashDecision>> {
+        let d: Option<String> = self.one(
+            "SELECT decision FROM slash_decisions WHERE case_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        Ok(d.map(|d| {
+            if d == "approve" {
+                SlashDecision::Approve
+            } else {
+                SlashDecision::Reject
+            }
+        }))
     }
 
     /// The case with this number.

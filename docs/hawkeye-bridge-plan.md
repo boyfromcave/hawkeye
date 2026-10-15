@@ -609,7 +609,8 @@ takeover overlap are a benign race: the later one is cancelled, nobody is slashe
    channel (H5, §6) or exchanged out of band; each Hawkeye **verifies independently**, then
    contributes its act signature: `set_buildact remove {"burn": true}` (a JSON bool; the decoded act prints it as 1) by the case owner →
    `set_signact` on each verifying peer's node → `set_sendact` once `slashThreshold` is reached.
-   `auto_slash = true|false` per operator (default false on mainnet: an operator confirms).
+   `auto_slash = true|false` per operator (default false on mainnet: an operator confirms, per case, with `hawkeye slash approve|reject <id>`;
+   with false, `/slash/sign` for an unapproved case records it and refuses with "pending operator decision").
 4. Equivocation proofs (`set_equivocation`) need no vote and are submitted automatically.
 5. **Members in their exit delay** (§2.4): attribution (the unlock's signer, the Mint signer, an
    equivocation) and each peer's independent verification accept a member that is current **or**

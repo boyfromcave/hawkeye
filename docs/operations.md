@@ -239,7 +239,7 @@ within a working day.
 | `eth-finality-stall` | ticket | Ethereum `finalized` has not moved for 1,152 s while the head advanced; on mainnet own proposals, executions and Mint signatures pause, challenges continue | nothing but watch; it clears when finality moves |
 | `mint-cap-unbounded` | page | the bridge's `mintCap` was set to 0; on mainnet own mint-side acts pause | a quorum sets a cap again |
 | `matching-proposal-challenged` | ticket | someone challenged a proposal that matched a policy-OK lock (griefing, HK-15); the lock is re-proposed, a `GRIEFING` case is open against the challenger, and once every live proposer is barred the threshold fallback mints it (`mint_threshold_fallback` in the log; `[bridge] fallback_to_threshold`) | review the `GRIEFING` case and vote (`SET_REMOVE burn=0`); a second strike by the same challenger is grounds for removal |
-| `slash-case-<id>` | page | a slash case waits for this operator (`auto_slash = false`, the mainnet default) | verify the evidence (section 10a) and vote |
+| `slash-case-<id>` | page | a slash case, owned here or requested by a peer, waits for this operator's decision (`auto_slash = false`, the mainnet default) | verify the evidence (section 10a), then `hawkeye slash approve <id> --note …` or `reject` |
 | `burn-over-cap` | ticket | a burn larger than the set's whole per-window unlock cap is parked out of the FIFO; later burns are served | governance: a `SET_PARAMS` raising `ratelimitbps`, or a decision to leave it parked |
 | `node-sign-restored` | page | `"wallet"` mode: the node wallet refuses every set signature (`set-sign-restored`, 07/F-5): it imported the member key (enrolment) or was restored from a seed, and its restore marker is set; no unlock or cancel is signed | if no other copy of the key can have signed: `hawkeye acknowledge-restore` (section 4 step 7, section 5 step 5); otherwise do not acknowledge, leave with the key |
 | `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet: its vault is spent in the mempool, or in a block the follower has not recorded at the tip yet, or by another transaction not yet `C_Y` deep | check the node's mempool and the follower's lag |
@@ -410,7 +410,10 @@ coins confirmed (`fee-coins-low`). The node also remembers one build per vault a
 ## 10. Incident response
 
 Talk on the set's out-of-band channel first. On mainnet the slash vote is manual (`auto_slash =
-false`): verify, then vote.
+false`): verify, then `hawkeye slash approve <id> --note …` (or `reject`). With `auto_slash = false`
+this attestor votes, as case owner or for a peer (`POST /slash/sign` answers "pending operator
+decision" and records the case), only on a case its operator approved; `auto_slash = true` votes on
+any independently verified evidence.
 
 a. **Suspected key compromise** (yours or another member's): have the threshold pause the bridge
    (`setPaused(true)`), rotate the key out (section 7, emergency), and slash it (`SET_REMOVE
@@ -459,6 +462,7 @@ accepts that slash and cancel gathering is unavailable until the last attestor h
 | `hawkeye status [--json] [--params]` | read-only summary; `--params`: values against floors |
 | `hawkeye audit-ledger [--json]` | read-only ledger vs node (section 5); non-zero exit when behind |
 | `hawkeye exposure list` / `exposure ack <lockId> --note …` | unacknowledged exposures |
+| `hawkeye slash list` / `slash approve\|reject <id> --note …` | open slash cases; the operator's decision (`auto_slash = false`) |
 | `hawkeye enroll` | `"wallet"` mode: import the member key (nothing in `"self"` mode) |
 | `hawkeye keys derive --secret <hex>` / `keys encrypt --out <file>` | key ceremony (section 4) |
 | `hawkeye split-coins [--count N] [--amount YEC]` | fresh fee coins |

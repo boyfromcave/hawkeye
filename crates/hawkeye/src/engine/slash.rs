@@ -20,8 +20,8 @@ use hawkeye_core::matcher::Classification;
 use hawkeye_core::template::{parse_intent, parse_vault};
 use hawkeye_core::{IntentParams, OutPoint as CoreOutPoint, PubKey33};
 use hawkeye_store::{
-    Chain, FaultKind, LockState, ObjectKind, SignDomain, SlashCaseRecord, SlashProgress,
-    SlashState, VoteGiven, YcashSignKey, classification_code,
+    Chain, FaultKind, LockState, NewSlashCase, ObjectKind, SignDomain, SlashCaseRecord,
+    SlashDecision, SlashProgress, SlashState, VoteGiven, YcashSignKey, classification_code,
 };
 use hawkeye_ycash::tx::Transaction;
 use hawkeye_ycash::types::{ActBody, BuildAct, DecodedAct, DecodedScript};
@@ -570,6 +570,26 @@ pub async fn verify_and_sign(ctx: &Ctx, req: &SlashSignRequest) -> Result<SlashS
         required: st.2,
         reason: verdict.reason.clone(),
     };
+    if !ctx.params.auto_slash {
+        let opened = ctx.ycash.getblockcount().await?;
+        let (case, _) = ctx.db(|t| {
+            t.open_slash_case(&NewSlashCase {
+                target_key: verdict.target,
+                fault: verdict.fault,
+                subject: verdict.subject.clone(),
+                evidence_json: req.evidence.to_string(),
+                opened_height: Some(opened),
+            })
+        })?;
+        match ctx.db(|t| t.slash_decision(case.id))? {
+            Some(SlashDecision::Approve) => {}
+            Some(SlashDecision::Reject) => bail!("this operator rejected slash case {}", case.id),
+            None => bail!(
+                "pending operator decision (slash case {}): auto_slash is off here",
+                case.id
+            ),
+        }
+    }
     let (hex, status) = sign_act(ctx, &req.act, Some(&record))?;
     let (complete, signatures, required) = status.unwrap_or((false, 0, -1));
     warn!(event = "slash_vote_given", fault = %verdict.fault, target = %hex::encode(verdict.target),
@@ -629,14 +649,18 @@ impl Engine {
             Ok(())
         })?;
         for c in cases {
+            // `slash-case-<id>` (auto_slash = false) is answered once the case is decided or over
+            let alarm = format!("slash-case-{}", c.id);
             match self.case_target(&c) {
                 CaseTarget::Done(why) => {
+                    self.clear_alarm(&alarm);
                     self.ctx.db(|t| t.slash_slashed(c.id, tip, Some(why)))?;
                     warn!(event = "slash_done", case = c.id, target = %hex::encode(c.target_key),
                           fault = %c.fault, why);
                     continue;
                 }
                 CaseTarget::Gone(why) => {
+                    self.clear_alarm(&alarm);
                     self.ctx.db(|t| {
                         t.transition_slash(c.id, SlashState::Expired, Some(tip), Some(why))
                     })?;
@@ -648,21 +672,42 @@ impl Engine {
             }
             let opened = c.opened_height.unwrap_or(tip);
             if tip > opened + CASE_EXPIRY_BLOCKS && c.state != SlashState::Submitted {
+                self.clear_alarm(&alarm);
                 self.ctx.db(|t| {
                     t.transition_slash(c.id, SlashState::Expired, Some(tip), Some("lapsed"))
                 })?;
                 continue;
             }
             if !self.ctx.params.auto_slash {
-                self.alarm(
-                    &format!("slash-case-{}", c.id),
-                    format!(
-                        "{} against {}: auto_slash is off, operator action needed",
-                        c.fault,
-                        hex::encode(c.target_key)
-                    ),
-                );
-                continue;
+                match self.ctx.db(|t| t.slash_decision(c.id))? {
+                    // the operator has decided: the page is answered
+                    Some(SlashDecision::Approve) => self.clear_alarm(&alarm),
+                    Some(SlashDecision::Reject) => {
+                        self.clear_alarm(&alarm);
+                        self.ctx.db(|t| {
+                            t.transition_slash(
+                                c.id,
+                                SlashState::Expired,
+                                Some(tip),
+                                Some("operator rejected"),
+                            )
+                        })?;
+                        continue;
+                    }
+                    None => {
+                        self.alarm(
+                            &format!("slash-case-{}", c.id),
+                            format!(
+                                "{} against {}: waits for this operator: `hawkeye slash approve {} \
+                                 --note ...` or `reject`",
+                                c.fault,
+                                hex::encode(c.target_key),
+                                c.id
+                            ),
+                        );
+                        continue;
+                    }
+                }
             }
             if c.fault == FaultKind::Equivocation {
                 continue; // set_equivocation needs no vote

@@ -58,7 +58,7 @@ pub use signonce::{
     ChallengeSignRecord, ChallengedProposal, MintSignRecord, UnlockBurn, UnlockBurnRecord,
     UnlockOrigin, YcashSignKey, YcashSignRecord,
 };
-pub use slash::{NewSlashCase, SlashCaseRecord};
+pub use slash::{NewSlashCase, SlashCaseRecord, SlashDecision};
 pub use state::{
     BurnState, Chain, Edge, FaultKind, IntentState, LockState, Machine, ObjectKind, SignDomain,
     SlashState, VaultState,

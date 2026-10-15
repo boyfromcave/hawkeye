@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hawkeye::config::{Config, Settings, base_dir};
 use hawkeye::{cli, daemon, keys};
+use hawkeye_store::SlashDecision;
 
 #[derive(Parser)]
 #[command(name = "hawkeye", version, about = "Hawkeye: the wYEC bridge attestor")]
@@ -49,6 +50,12 @@ enum Cmd {
     Exposure {
         #[command(subcommand)]
         cmd: ExposureCmd,
+    },
+    /// Slash cases (audit W3-B-2): with `auto_slash = false` the daemon votes, as case owner or for
+    /// a peer, only on a case approved here.
+    Slash {
+        #[command(subcommand)]
+        cmd: SlashCmd,
     },
     /// Print a summary of the ledger, the node and the chain.
     Status {
@@ -208,6 +215,28 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum SlashCmd {
+    /// List the open slash cases and the operator's decision on each.
+    List,
+    /// Approve one case: the daemon may vote on it (the evidence is re-verified when it signs).
+    Approve {
+        /// The case number (`slash list`).
+        id: i64,
+        /// Why (kept with the decision).
+        #[arg(long)]
+        note: String,
+    },
+    /// Reject one case: the daemon never votes on it.
+    Reject {
+        /// The case number (`slash list`).
+        id: i64,
+        /// Why (kept with the decision).
+        #[arg(long)]
+        note: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ExposureCmd {
     /// List the unacknowledged exposures.
     List,
@@ -334,6 +363,15 @@ async fn main() -> Result<()> {
         Cmd::Exposure {
             cmd: ExposureCmd::Ack { lock_id, note },
         } => cli::exposure_ack(&s, lock_id, note),
+        Cmd::Slash {
+            cmd: SlashCmd::List,
+        } => cli::slash_list(&s),
+        Cmd::Slash {
+            cmd: SlashCmd::Approve { id, note },
+        } => cli::slash_decide(&s, *id, SlashDecision::Approve, note),
+        Cmd::Slash {
+            cmd: SlashCmd::Reject { id, note },
+        } => cli::slash_decide(&s, *id, SlashDecision::Reject, note),
         Cmd::Status { json, params: true } => cli::status_params(&s, *json).await,
         Cmd::Status { json, .. } => cli::status(&s, *json).await,
         Cmd::Enroll => cli::enroll(&s).await,
