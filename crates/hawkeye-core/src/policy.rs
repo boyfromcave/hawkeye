@@ -469,6 +469,13 @@ mod tests {
             eval(&o, 10, true).unwrap_err(),
             R::BadDestination(_)
         ));
+        // plan §4.1 rule 3: a mint to the zero address reverts; the lock is never signed (W3-B-4)
+        let mut o = outputs(vault(), 5000);
+        o[1].script_pubkey = op_return_script(&[0; 32]);
+        assert_eq!(
+            eval(&o, 10, true).unwrap_err(),
+            R::BadDestination(crate::Error::Destination("the zero address"))
+        );
 
         let o = outputs(vault(), 5000);
         let f = LockFacts {
