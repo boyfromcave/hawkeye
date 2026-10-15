@@ -649,14 +649,18 @@ impl Engine {
             Ok(())
         })?;
         for c in cases {
+            // `slash-case-<id>` (auto_slash = false) is answered once the case is decided or over
+            let alarm = format!("slash-case-{}", c.id);
             match self.case_target(&c) {
                 CaseTarget::Done(why) => {
+                    self.clear_alarm(&alarm);
                     self.ctx.db(|t| t.slash_slashed(c.id, tip, Some(why)))?;
                     warn!(event = "slash_done", case = c.id, target = %hex::encode(c.target_key),
                           fault = %c.fault, why);
                     continue;
                 }
                 CaseTarget::Gone(why) => {
+                    self.clear_alarm(&alarm);
                     self.ctx.db(|t| {
                         t.transition_slash(c.id, SlashState::Expired, Some(tip), Some(why))
                     })?;
@@ -668,6 +672,7 @@ impl Engine {
             }
             let opened = c.opened_height.unwrap_or(tip);
             if tip > opened + CASE_EXPIRY_BLOCKS && c.state != SlashState::Submitted {
+                self.clear_alarm(&alarm);
                 self.ctx.db(|t| {
                     t.transition_slash(c.id, SlashState::Expired, Some(tip), Some("lapsed"))
                 })?;
@@ -675,8 +680,10 @@ impl Engine {
             }
             if !self.ctx.params.auto_slash {
                 match self.ctx.db(|t| t.slash_decision(c.id))? {
-                    Some(SlashDecision::Approve) => {}
+                    // the operator has decided: the page is answered
+                    Some(SlashDecision::Approve) => self.clear_alarm(&alarm),
                     Some(SlashDecision::Reject) => {
+                        self.clear_alarm(&alarm);
                         self.ctx.db(|t| {
                             t.transition_slash(
                                 c.id,

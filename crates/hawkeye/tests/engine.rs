@@ -1373,6 +1373,97 @@ async fn f_slash_votes_verified_independently() {
     assert!(e.contains("matches finalized burn"), "{e}");
 }
 
+/// Audit W3-B-2: with `auto_slash = false` no act signature leaves this attestor, for its own
+/// case or for a peer's `POST /slash/sign`, until its operator approves that case; a rejected case
+/// is never signed and expires; a decision answers the `slash-case-<id>` page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w3b2_slash_vote_waits_for_operator() {
+    use hawkeye::engine::slash::verify_and_sign;
+    use hawkeye::peers::SlashSignRequest;
+    use hawkeye_store::SlashDecision;
+    let Some(env) = setup().await else { return };
+    let mut engines = vec![];
+    for i in 0..3 {
+        engines.push(env.engine_with(i, vec![], |p| p.auto_slash = false).await);
+    }
+    lock_and_mint(&env, &mut engines).await;
+    let (_, rogue_key) = rogue_unlock(&env).await;
+    tick_all(&mut engines).await;
+    tick_all(&mut engines).await;
+    let rogue = index_of(&env, &rogue_key);
+    let peer = (rogue + 1) % 3;
+    let other = (rogue + 2) % 3;
+    let case_of = |e: &Engine| {
+        open_cases(e)
+            .into_iter()
+            .find(|c| c.target_key == rogue_key)
+            .expect("a case against the rogue")
+    };
+    let page = |e: &Engine, id: i64| {
+        let name = format!("slash-case-{id}");
+        e.alarms().iter().any(|a| a.name == name)
+    };
+    let case = case_of(&engines[other]);
+    assert!(
+        page(&engines[other], case.id),
+        "{:?}",
+        engines[other].alarms()
+    );
+    // the owner's loop built no act: nothing was signed anywhere
+    assert_eq!(env.mock.state().calls_to("set_buildact").len(), 0);
+    assert_eq!(env.mock.state().calls_to("set_signact").len(), 0);
+    let evidence: serde_json::Value = serde_json::from_str(&case.evidence_json).unwrap();
+    let req = SlashSignRequest {
+        evidence,
+        act: remove_act(&env, rogue_key).await,
+    };
+    let refused = |r: anyhow::Result<_>| format!("{:#}", r.unwrap_err());
+
+    // 1. undecided: the verified request is recorded as a local case and refused, unsigned
+    let e = refused(verify_and_sign(engines[peer].ctx(), &req).await);
+    assert!(e.contains("pending operator decision"), "{e}");
+    let mine = case_of(&engines[peer]);
+    assert_eq!(env.mock.state().calls_to("set_signact").len(), 0);
+
+    // 2. rejected: refused for good; the case expires and the page is answered
+    engines[peer]
+        .ctx()
+        .db(|t| t.decide_slash(mine.id, SlashDecision::Reject, "not convinced"))
+        .unwrap();
+    queue_remove_decode(&env, rogue_key);
+    let e = refused(verify_and_sign(engines[peer].ctx(), &req).await);
+    assert!(e.contains("rejected slash case"), "{e}");
+    assert_eq!(env.mock.state().calls_to("set_signact").len(), 0);
+    tick_all(&mut engines).await;
+    let after = engines[peer]
+        .ctx()
+        .db(|t| t.slash_case(mine.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, SlashState::Expired);
+    assert!(
+        !page(&engines[peer], mine.id),
+        "{:?}",
+        engines[peer].alarms()
+    );
+
+    // 3. approved: the same request is signed (re-verified), and the page is answered
+    engines[other]
+        .ctx()
+        .db(|t| t.decide_slash(case.id, SlashDecision::Approve, "verified"))
+        .unwrap();
+    queue_remove_decode(&env, rogue_key);
+    let r = verify_and_sign(engines[other].ctx(), &req).await.unwrap();
+    assert!(r.signatures >= 1, "{r:?}");
+    assert_eq!(env.mock.state().calls_to("set_signact").len(), 1);
+    tick_all(&mut engines).await;
+    assert!(
+        !page(&engines[other], case.id),
+        "{:?}",
+        engines[other].alarms()
+    );
+}
+
 /// The bond exit delay (owner 2026-10-11, D-Q-31): a member that signs a fraudulent unlock and
 /// leaves the set at once (`set_leave`, its bond now in the exit delay) is still attributed,
 /// voted on and slashed: the cosigned `SET_REMOVE burn=1` freezes the bond in its delay.
