@@ -97,9 +97,12 @@ impl Store {
         create_private(&lock)?;
         let io =
             |e: std::io::Error| StoreError::Invalid(format!("cannot lock {}: {e}", lock.display()));
+        // create_private makes it on unix only; elsewhere it is created here
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .create(true)
+            .truncate(false)
             .open(&lock)
             .map_err(io)?;
         match f.try_lock() {
