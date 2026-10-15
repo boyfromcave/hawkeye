@@ -133,11 +133,18 @@ pub enum ErrorReason {
     TemplateNotIntent,
     /// -8 `the template input is not a vault`
     TemplateNotVault,
+    /// -8 `no unspent vault or intent input`: the transaction spends no template output
+    /// (`set_signunlock`, `set_signcancel`, `vault_refee`, `vault_send`)
+    NoTemplateInput,
     /// -4 `set-sign-once`: this wallet already signed a different spend of the outpoint
     SetSignOnce,
     /// -4 `set-sign-restored`: the wallet carries the restore marker (restored from a seed, or it
     /// imported a member key) and has no sign-once record for the outpoint (07/F-5)
     SetSignRestored,
+    /// -8 `set-sign-invalid`: the vault rules would refuse this build at the next block, so the
+    /// wallet recorded and signed nothing; `reason` is the node's (e.g. `bad-txns-vault-cancel`).
+    /// Permanent for this build, never a retry of the same bytes
+    SetSignInvalid { reason: Option<String> },
     /// -8 `already built a different unlock`: the wallet remembers another build of the vault
     /// (07/N-2); `rebuild` discards it, only before anyone signed it
     AlreadyBuiltDifferent,
@@ -230,10 +237,20 @@ impl RpcError {
             R::TemplateNotIntent
         } else if self.has(-8, "the template input is not a vault") {
             R::TemplateNotVault
+        } else if self.has(-8, "no unspent vault or intent input") {
+            R::NoTemplateInput
         } else if self.has(-4, "set-sign-once") {
             R::SetSignOnce
         } else if self.has(-4, "set-sign-restored") {
             R::SetSignRestored
+        } else if self.has(-8, "set-sign-invalid") {
+            R::SetSignInvalid {
+                reason: m
+                    .split_once("set-sign-invalid:")
+                    .and_then(|(_, r)| r.split(';').next())
+                    .map(|r| r.trim().to_owned())
+                    .filter(|r| !r.is_empty()),
+            }
         } else if self.has(-8, "already built a different unlock") {
             R::AlreadyBuiltDifferent
         } else if self.has(-8, "appheight on a tag no module governs") {
@@ -384,6 +401,10 @@ mod tests {
                 ErrorReason::TemplateNotVault,
             ),
             (
+                e(-8, "no unspent vault or intent input"),
+                ErrorReason::NoTemplateInput,
+            ),
+            (
                 e(
                     -4,
                     "set-sign-once: this wallet already signed a different unlock (role 1, sighash ab) of x:0 for set y; ...",
@@ -396,6 +417,26 @@ mod tests {
                     "set-sign-restored: this wallet was restored or imported a member key and has no sign-once history; ...",
                 ),
                 ErrorReason::SetSignRestored,
+            ),
+            (
+                e(
+                    -8,
+                    "set-sign-invalid: bad-txns-vault-cancel; nothing was recorded or signed",
+                ),
+                ErrorReason::SetSignInvalid {
+                    reason: Some("bad-txns-vault-cancel".into()),
+                },
+            ),
+            (
+                e(
+                    -8,
+                    "set-sign-invalid: an existing signature is not by a distinct current member of ab",
+                ),
+                ErrorReason::SetSignInvalid {
+                    reason: Some(
+                        "an existing signature is not by a distinct current member of ab".into(),
+                    ),
+                },
             ),
             (
                 e(

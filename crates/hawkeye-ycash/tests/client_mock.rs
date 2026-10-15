@@ -1250,3 +1250,21 @@ async fn bond_exit_delay_and_slashing_after_exit() {
     let e = c.set_sendact(&signed.hex).await.unwrap_err();
     assert_eq!(e.rpc().unwrap().bad_vault(), Some("bad-vault-act-remove"));
 }
+
+/// `vault_send` refuses a transaction that spends no vault or intent output, as both node lines
+/// do (ycash-dd #90, ycash6 #7): it is not a general wallet signer.
+#[tokio::test]
+async fn vault_send_refuses_a_transaction_without_a_template_input() {
+    let (m, _set, vault) = bridge(0).await;
+    let c = m.client();
+    let u = c
+        .vault_buildunlock(&vault, &[Recipient::address("tmA", Amount(100_000_000))])
+        .await
+        .unwrap();
+    let mut t = Transaction::decode(&u.hex.0).unwrap();
+    t.inputs.retain(|i| i.prevout != vault);
+    assert!(!t.inputs.is_empty(), "the build keeps its fee input");
+    let e = c.vault_send(&HexBytes(t.encode())).await.unwrap_err();
+    assert_eq!(e.rpc().unwrap().code, -8);
+    assert_eq!(rpc_reason(&e), ErrorReason::NoTemplateInput);
+}
