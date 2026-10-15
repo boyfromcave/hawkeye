@@ -531,7 +531,9 @@ msg = sha256d( "HawkeyePeerReq" (14) ‖ set_id (32, internal) ‖ chain_id (u64
 
 The server admits it only if the headers are well formed, `|now − time| ≤ 60 s`, `(member,
 nonce)` was not seen in the last 120 s, the signature recovers to the member, and the member is a
-**current** member of the set (a member in its exit delay is not); else `401`/`403`. The answer
+**current** member of the set (a member in its exit delay is not); else `401`/`403`. The nonce is
+recorded only for a current member whose signature verified, at most 4,096 live per member (more:
+`429`; audit W3-B-6). The answer
 carries `X-Hawkeye-Member` / `X-Hawkeye-Sig` over `sha256d("HawkeyePeerResp" ‖ msg ‖
 sha256(answer body))`, which the client checks (a current member, the peer whose signatures it
 counts). Vector: `crates/hawkeye-core/tests/peerauth.rs` (set `0x11…11`, chain 31337, bridge
