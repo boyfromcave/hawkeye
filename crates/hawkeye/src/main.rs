@@ -36,6 +36,11 @@ enum Cmd {
         /// of that vault, a provable equivocation (docs/operations.md §5).
         #[arg(long)]
         i_accept_equivocation_risk: bool,
+        /// Rewrite the ledger high-water mark from this ledger when the file does not verify
+        /// (edited, or from another ledger). Logged as `ledger_hwm_reset` with the previous
+        /// contents (plan §4.7, docs/operations.md §5).
+        #[arg(long)]
+        reset_ledger_hwm: bool,
     },
     /// Read-only: compare the ledger's sign-once records with the node (docs/operations.md §5).
     /// Exits non-zero when an unlock this member signed has no record here. Opens the ledger
@@ -351,10 +356,11 @@ async fn main() -> Result<()> {
         Cmd::Run {
             i_accept_blind_start,
             i_accept_equivocation_risk,
+            reset_ledger_hwm,
         } => {
             let mut s = s;
             s.params.accept_blind_start = *i_accept_blind_start;
-            daemon::run(&s, *i_accept_equivocation_risk).await
+            daemon::run(&s, *i_accept_equivocation_risk, *reset_ledger_hwm).await
         }
         Cmd::AuditLedger { json } => cli::audit_ledger(&s, *json).await,
         Cmd::Exposure {

@@ -285,7 +285,11 @@ async fn ledger_audit(ctx: &Ctx, accept: bool) -> Result<()> {
 }
 
 /// Run the daemon until SIGINT/SIGTERM.
-pub async fn run(s: &Settings, accept_equivocation_risk: bool) -> Result<()> {
+pub async fn run(
+    s: &Settings,
+    accept_equivocation_risk: bool,
+    reset_ledger_hwm: bool,
+) -> Result<()> {
     // `s.warnings` (floors, transport) are logged by `main` for every command
     let key = s.load_key()?;
     let _instance_lock = Store::lock_instance(&s.store_path)?;
@@ -303,6 +307,12 @@ pub async fn run(s: &Settings, accept_equivocation_risk: bool) -> Result<()> {
         }
     });
     let hwm = crate::restore::hwm_path(&s.store_path);
+    if reset_ledger_hwm {
+        let previous = crate::restore::mark_preview(&hwm);
+        warn!(event = "ledger_hwm_reset", path = %hwm.display(), previous = %previous);
+        let mut store = ctx.store.lock().unwrap_or_else(|e| e.into_inner());
+        crate::restore::reset_from_ledger(&mut store, &hwm, &ctx.key, &ctx.params.set_id)?;
+    }
     crate::restore::check_restore(&ctx, &hwm).await?;
     let mut engine = Engine::new(ctx).with_ledger_hwm(hwm);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

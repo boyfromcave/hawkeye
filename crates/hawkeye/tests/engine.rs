@@ -5568,7 +5568,8 @@ async fn r10_ledger_restore_is_detected() {
     let e = env.engine(0).await;
     let hwm = env.dir.path().join("attestor0.db.hwm");
     assert_eq!(hawkeye::restore::detect(e.ctx(), &hwm).await.unwrap(), None);
-    hawkeye::restore::write_hwm(&hwm, 5).unwrap();
+    let id = e.ctx().db(hawkeye::restore::ensure_ledger_id).unwrap();
+    hawkeye::restore::write_hwm(&hwm, &e.ctx().key, &e.ctx().params.set_id, &id, 5).unwrap();
     let why = hawkeye::restore::detect(e.ctx(), &hwm)
         .await
         .unwrap()
@@ -5584,7 +5585,7 @@ async fn r10_ledger_restore_is_detected() {
             .is_some()
     );
     // the mark never goes down by itself
-    hawkeye::restore::write_hwm(&hwm, 2).unwrap();
+    hawkeye::restore::write_hwm(&hwm, &e.ctx().key, &e.ctx().params.set_id, &id, 2).unwrap();
     assert_eq!(hawkeye::restore::read_hwm(&hwm), 5);
 }
 

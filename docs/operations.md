@@ -118,6 +118,10 @@ Do this once per member key, on an **offline** machine, with two people.
 
 **What, always together:** `wallet.dat` (fee keys; in `"wallet"` mode the member key and the node's
 sign-once records), `hawkeye.db` with its `-wal` and `-shm`, the keystores, and `hawkeye.toml`.
+`hawkeye.db.hwm` is the ledger's high-water mark (plan §4.7): a member-signed count, not a bare
+number. Keep it with the host, apart from the ledger backup (section 9). Editing it, or dropping
+in a mark from another ledger, makes `hawkeye run` refuse to start. After you have inspected the
+file, `hawkeye run --reset-ledger-hwm` rewrites it from this ledger and logs `ledger_hwm_reset`.
 
 **When:** with **both** daemons stopped (`systemctl stop hawkeye ycashd`), never while running: the
 two files would be from different instants. Take one before every upgrade (section 11).
@@ -248,7 +252,7 @@ within a working day.
 | `unlock-prior-unknown` | page | this attestor leads a burn others led before, and not every previous leader (every member, while `ledger-restored`) has answered `POST /burns/unlock`, signed, that it holds no signed unlock for it: no fresh vault is signed (an unreachable previous leader holds the burn, 01/V-2, review M-1) | bring the previous leader's Hawkeye and API back; it then re-sends or serves its bytes, or answers none |
 | `restore-report-flood` | page | another member's restored-ledger orphan reports were refused for volume (more vaults than its restore event stated, or more than 64), review R-1 | ask that operator; its reports are otherwise only accepted while its own signed `/burns/unlock` shows it restored |
 | `gone-member-answered` | page | a member declared gone (`declare-leader-gone`) answered that it holds a signed unlock for a burn: the declaration was wrong, the member's hold stands | find out why the member was declared gone; adopt or wait for its unlock |
-| `ledger-restored` | page | the ledger holds fewer sign-once records than its high-water mark (`hawkeye.db.hwm`), or the node wallet (`"wallet"` mode) signed an unlock or cancel the ledger has no record of: it was restored from a backup (review L-2); fresh unlocks wait for every member's signed "none" | `hawkeye audit-ledger`; ask the other attestors; then `hawkeye acknowledge-ledger-restore` |
+| `ledger-restored` | page | the ledger holds fewer sign-once records than its signed high-water mark (`hawkeye.db.hwm`, plan §4.7), or the node wallet (`"wallet"` mode) signed an unlock or cancel the ledger has no record of: it was restored from a backup (review L-2); fresh unlocks wait for every member's signed "none". A mark that does not verify refuses `hawkeye run` | `hawkeye audit-ledger`; ask the other attestors; then `hawkeye acknowledge-ledger-restore`. If start-up says the mark does not verify, inspect `hawkeye.db.hwm` and rerun with `--reset-ledger-hwm` |
 | `unlock-dead` | ticket | a signed unlock can no longer confirm: its **vault** was spent by another transaction at least `C_Y` deep (from the ledger's own spend record, the follower at the tip), or by this unlock whose intent was then cancelled `C_Y` deep; a fee-input spend never makes it dead (it can be re-funded, 01/V-2); one more vault may now be signed for the burn | check the log line `unlock_dead`; nothing to do if a later unlock confirms |
 | `unlock-unconfirmable` | ticket | a signed unlock's set signatures can no longer satisfy `CheckSetSigs` (a signer left or was ejected, or the signatures were made under a branch that is no longer the next block's and that activation is `C_Y` deep); the burn is re-signed from another vault and this vault is rolled | check that the roll confirms and the burn is released once; do not re-sign the stored bytes |
 | `departed-signer-revivable` | page | a member who left has joined again while a vault their earlier unlock spends is still unspent; that unlock becomes valid again at `joinHeight + maturity` | roll the vault before that height; do not rebroadcast the old unlock |
@@ -387,10 +391,12 @@ A member that answers `held: true` (or `restored: true`) without serving bytes c
 overridden, by design: the declarations about it are dropped the moment it answers. Only removing
 it from the set (`SET_REMOVE`) releases the burns it holds up.
 
-**Backups (N-2).** The restore check compares the ledger with `hawkeye.db.hwm`. A backup of the
+**Backups (N-2).** The restore check compares the ledger with `hawkeye.db.hwm` (section 5). A backup of the
 whole directory restores the mark with the ledger and defeats the check: back the two up
 separately (or not the mark at all), or rely on the `"wallet"`-mode check against the node
-wallet's `set_listsigned`.
+wallet's `set_listsigned`. The mark is a member signature over the count and this ledger's id
+(plan §4.7). A hand-edited number does not verify, and `hawkeye run` stops until
+`--reset-ledger-hwm` rewrites it.
 
 **Upgrading to this release (N-4).** Earlier releases built unlocks, rolls and cancels with a
 change output; this one refuses to co-sign, adopt or re-fund one (H-1). Before upgrading, let

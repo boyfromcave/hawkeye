@@ -541,6 +541,38 @@ counts). Vector: `crates/hawkeye-core/tests/peerauth.rs` (set `0x11…11`, chain
 `msg = fd8d6317…747a7c`). `[peers] require_auth` (default true; false refused on mainnet) and
 `allow_from` (CIDRs, a belt) configure it; mainnet peer URLs are `https://` or loopback.
 
+### 4.7 Ledger high-water mark (V-N1, remedial report MEDIUM-W4-B-1)
+
+`<ledger>.hwm` records how many Ycash sign-once rows this ledger has held. A later open whose
+ledger holds fewer is a restore (review L-2). The mark is bound to that ledger and to this member
+key, so a hand-edited file cannot make a stock daemon answer `restored`.
+
+The first open writes `meta.ledger_id`, 16 bytes from `/dev/urandom`, when the row is absent. The
+id lives in the ledger, so a backup of the ledger keeps it.
+
+```
+msg = sha256d( "HawkeyeLedgerHwm" (16) ‖ set_id (32, internal) ‖ ledger_id (16) ‖ count (u64 LE) )
+sig = sign_compact(member key, msg)     65 bytes, header 31..34, low S
+```
+
+The file is one JSON object:
+`{"v":2,"ledger_id":"<32 lowercase hex>","count":N,"sig":"<130 lowercase hex>"}`.
+A bare decimal (v1) is rewritten once, at that count, when `meta.ledger_id` is still absent, and
+logged (`ledger_hwm_migrated`). A v1 file after a ledger id exists, or a v2 file whose
+`ledger_id` or signature does not match this member and this ledger, refuses start:
+
+```
+ledger high-water mark <path> does not verify (edited, or from another ledger): inspect it, then `hawkeye run --reset-ledger-hwm` to re-write it from this ledger
+```
+
+`--reset-ledger-hwm` logs `ledger_hwm_reset` with the previous contents and rewrites the mark at
+the ledger's current count. A verified mark whose `count` is above the ledger's row count is a
+restore, as before. Vector: `crates/hawkeye-core/tests/peerauth.rs` (set `0x11…11`, ledger id
+`0001…0f`, count 5 → `msg = 51409b34…d2dc94`).
+
+The report's option (c′), overriding a stale `held` answer after a time bound, stays an owner
+decision and is not part of this encoding.
+
 ---
 
 ## 5. The engine
@@ -893,3 +925,4 @@ from the members' compressed keys.
 | HK-12 | (2026-10-11, D-Q-29..D-Q-31) An attestor leaves by `hawkeye leave` (`set_leave`) and recovers its bond by `hawkeye withdraw-bond` after the set's `maturity` (≥ 16,128 on mainnet: the mainnet row's 1,152 became 16,128); slashing reaches members in their exit delay (§2.4, §5.3 step 5) |
 | HK-15 | (audit 05/L-4) Optimistic mode falls back to the threshold path automatically once every live member is barred from a lock (`vetoed`, or a recorded griefer of it); the challenger of a proposal that matched a policy-OK lock gets a `GRIEFING` case (`SET_REMOVE burn=0`) and is not waited for as that lock's proposer (§5.3 step 2) |
 | HK-16 | (2026-10-13, audit 01/V-2 on 05/N-1; review of fix/unlock-revival) Never sign a second unlock for a burn while an unlock any member signed for it could still confirm: a signed unlock is revivable (re-fundable) until its vault is spent by another transaction `C_Y` deep (from the ledger's spend record, the follower at the tip) or its intent is cancelled `C_Y` deep; fee-input spends never make it dead. Leader and co-signed rows are re-sent re-funded by the burn's leader; a takeover leader adopts a peer's signed unlock (`POST /burns/unlock`, members only, unpaid burns only) and signs a fresh vault only on every previous leader's signed "none" (every member's while the ledger is flagged restored); unlocks, rolls and cancels carry no change output and a re-fund costs at most 0.001 YEC; orphaned vaults are rolled; evicted unlocks are re-sent after `max(TAKEOVER, C_Y)` blocks; only signers still current in the set are required (a non-current member's signature can never confirm, `CheckSetSigs`), observed unlocks of the burn are adopted first and their signers required (not those of an observed unlock that could never be adopted: one moving more than its vault, or not paying the burn in this ledger, W4-B-1), a restored ledger answers "unknown", and the owner's override `hawkeye declare-leader-gone` (a quorum of `max(k, floor((n_current − 1)/2) + 1)` — a strict majority of the current members other than the gone one, never less than `unlockThreshold` — each a signed, recorded declaration bound to the member's join height and an expiry height (≤ 10 × TAKEOVER), dropped when the member answers or heartbeats; a declarer that leaves stops counting; it applies only while the declared member stays silent) releases a permanently gone member's holds |
+| HK-17 | (2026-10-16, MEDIUM-W4-B-1 / V-N1) The ledger high-water mark is a member-signed v2 record bound to `meta.ledger_id` (§4.7). A stock daemon does not treat an edited mark as a restore. The report's option (c′), overriding a stale `held` answer, stays an owner decision and is not implemented. | |

@@ -125,6 +125,21 @@ pub fn gone_msg(set_id: &Hash32, member: &PubKey33, seq: u32, expiry: u32) -> Ha
     sha256d(&m)
 }
 
+/// The ledger high-water-mark domain, 16 ASCII bytes (plan §4.7, V-N1).
+pub const HWM_DOMAIN: &[u8; 16] = b"HawkeyeLedgerHwm";
+
+/// `sha256d("HawkeyeLedgerHwm" ‖ set_id ‖ ledger_id ‖ count (u64 LE))`: what the member key signs
+/// over the ledger's sign-once count. `ledger_id` is the 16 bytes stored in the ledger
+/// (`meta.ledger_id`), so a mark from another file does not verify here.
+pub fn hwm_msg(set_id: &Hash32, ledger_id: &[u8; 16], count: u64) -> Hash32 {
+    let mut m = Vec::with_capacity(16 + 32 + 16 + 8);
+    m.extend_from_slice(HWM_DOMAIN);
+    m.extend_from_slice(set_id);
+    m.extend_from_slice(ledger_id);
+    m.extend_from_slice(&count.to_le_bytes());
+    sha256d(&m)
+}
+
 /// Sign a request message with the member key.
 pub fn sign(key: &SecretKey, msg: &Hash32) -> Result<[u8; 65]> {
     sign_compact(key, msg)
