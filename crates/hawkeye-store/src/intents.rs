@@ -135,7 +135,8 @@ fn row(r: &Row<'_>) -> rusqlite::Result<IntentRecord> {
 
 /// The stored form of a classification: `matched-burn`, `matched-roll`, `foreign`, or
 /// `unmatched:<reason>` (`no-memo`, `multiple-memos`, `malformed-memo`, `wrong-deployment`,
-/// `unknown-burn`, `consumed-burn` / `consumed-burn:benign-race`, `wrong-value:<expected>:<got>`,
+/// `unknown-burn`, `consumed-burn` / `consumed-burn:benign-race` /
+/// `consumed-burn:scheduled`, `wrong-value:<expected>:<got>`,
 /// `orphaned-burn`, `wrong-recipient`, `bad-roll`, `roll-too-short:<ownerHeight>`).
 pub fn classification_code(c: &Classification) -> String {
     match c {
@@ -149,6 +150,11 @@ pub fn classification_code(c: &Classification) -> String {
                 Unmatched::MalformedMemo => "malformed-memo".into(),
                 Unmatched::WrongDeployment => "wrong-deployment".into(),
                 Unmatched::UnknownBurn => "unknown-burn".into(),
+                Unmatched::ConsumedBurn {
+                    scheduled: true,
+                    benign_race: false,
+                    ..
+                } => "consumed-burn:scheduled".into(),
                 Unmatched::ConsumedBurn {
                     benign_race: true, ..
                 } => "consumed-burn:benign-race".into(),

@@ -224,6 +224,7 @@ impl Engine {
                         outputs: &outs,
                         spent_vault: None,
                         origin: i.origin_vault.as_ref(),
+                        signer: i.signer_key,
                     },
                 );
                 if c == Classification::Foreign {
@@ -321,6 +322,11 @@ impl Engine {
                     self.note_sign_error(&e);
                 }
             }
+        }
+        if code == "unmatched:consumed-burn:scheduled" {
+            info!(event = "scheduled_duplicate", intent = %i.outpoint,
+                  "a correct duplicate by a recorded leader of the burn is cancelled, never slashed");
+            return Ok(());
         }
         let benign = code == "unmatched:consumed-burn:benign-race";
         if benign {

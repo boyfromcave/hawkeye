@@ -2154,6 +2154,7 @@ pub(crate) async fn classify_unlock(ctx: &super::Ctx, tx: &Transaction) -> Resul
                 outputs: &outs,
                 spent_vault: Some(&vp),
                 origin: Some(&origin),
+                signer: None,
             },
         ))
     })?;

@@ -326,6 +326,7 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
                 outputs: &outs,
                 spent_vault: Some(&vp),
                 origin: Some(&vault),
+                signer: Some(signer),
             },
         ))
     })?;
@@ -338,6 +339,16 @@ async fn verify_intent(ctx: &Ctx, ev: &serde_json::Value) -> Result<Verdict> {
             bail!("the intent matches finalized burn {nonce} here: not a fault")
         }
         Classification::MatchedRoll { .. } => bail!("the intent is a valid roll here: not a fault"),
+        Classification::Unmatched(hawkeye_core::matcher::Unmatched::ConsumedBurn {
+            scheduled: true,
+            benign_race: false,
+            ..
+        }) => {
+            bail!(
+                "{code}: the signer led this burn and did not sign the consuming intent: a \
+                 correct duplicate is cancelled, never slashed (W3-B-1)"
+            )
+        }
         Classification::Unmatched(u) if !u.slashable() => {
             bail!("{code}: a benign race (§5.2) is cancelled, never slashed")
         }
@@ -736,6 +747,30 @@ impl Engine {
 
     async fn drive_case(&mut self, c: &SlashCaseRecord) -> Result<()> {
         let tip = self.mem.tip;
+        // A case opened before this rule (stored `consumed-burn` against a recorded leader)
+        // must not be voted: re-classify on this ledger and expire it (W3-B-1).
+        if c.state != SlashState::Submitted
+            && c.fault == FaultKind::FraudulentIntent
+            && let Ok(ev) = serde_json::from_str::<serde_json::Value>(&c.evidence_json)
+            && let Err(e) = verify_evidence(&self.ctx, &ev).await
+            && e.to_string().contains("W3-B-1")
+        {
+            self.clear_alarm(&format!("slash-case-{}", c.id));
+            self.ctx.db(|t| {
+                t.transition_slash(
+                    c.id,
+                    SlashState::Expired,
+                    Some(tip),
+                    Some("scheduled duplicate (W3-B-1)"),
+                )
+            })?;
+            warn!(
+                event = "slash_case_expired",
+                case = c.id,
+                reason = "scheduled duplicate (W3-B-1)"
+            );
+            return Ok(());
+        }
         let progress = self.ctx.db(|t| t.slash_progress(c.id))?;
         let mut prog = match (c.state, progress) {
             (SlashState::Opened, _) => {

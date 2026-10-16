@@ -98,6 +98,8 @@ pub struct IntentFacts<'a> {
     pub spent_vault: Option<&'a VaultParams>,
     /// The vault outpoint the unlock spent.
     pub origin: Option<&'a CoreOutPoint>,
+    /// The set member this ledger attributes the unlock to, when known.
+    pub signer: Option<PubKey33>,
 }
 
 /// Classify an intent (§3.2) against this ledger's burns. On top of the matcher: a roll of a
@@ -115,6 +117,7 @@ pub fn classify(t: &Tx<'_>, p: &Params, f: &IntentFacts<'_>) -> Classification {
             value: f.value,
             outputs: f.outputs,
             spent_vault: f.spent_vault,
+            signer: f.signer,
         },
         |n| t.matcher_burn(&p.deployment, n).ok().flatten(),
     );
@@ -262,6 +265,7 @@ pub fn apply_unlock(
                         outputs: &obs.outputs,
                         spent_vault: obs.vault_params.as_ref(),
                         origin: Some(&obs.vault),
+                        signer: rec.signer_key,
                     },
                 );
                 if c == Classification::Foreign {

@@ -9,6 +9,7 @@
 
 use crate::bridge::BridgeKind;
 use crate::bytes::Hash32;
+use crate::keys::PubKey33;
 use crate::memo::{Deployment, HawkeyeMemo, MemoKind, is_any_memo_script, parse_any_memo_script};
 use crate::policy::TxOut;
 use crate::recipient::YcashRecipient;
@@ -29,6 +30,10 @@ pub struct Burn {
     pub recipient: Vec<u8>,
     /// The intent that consumed it, if any.
     pub consumed_by: Option<Consumer>,
+    /// Members this ledger assigned the burn to (`ASSIGNED` leaders, in order). A correct
+    /// duplicate signed by one of them, who did not sign [`consumed_by`], is not slashable
+    /// (W3-B-1). Empty when the caller has no assignment history.
+    pub leaders: Vec<PubKey33>,
 }
 
 /// The intent that consumed a burn.
@@ -38,6 +43,8 @@ pub struct Consumer {
     pub txid: Hash32,
     /// The Ycash height at which that intent was first seen (mempool or block).
     pub first_seen: u32,
+    /// The set member that signed the consuming intent, when this ledger attributed it.
+    pub signer: Option<PubKey33>,
 }
 
 /// An intent observed on Ycash (in the mempool or a block).
@@ -55,6 +62,8 @@ pub struct ObservedIntent<'a> {
     pub outputs: &'a [TxOut],
     /// The V the unlock spent, when known (needed to verify a roll).
     pub spent_vault: Option<&'a VaultParams>,
+    /// The set member this ledger attributes the unlock to, when known.
+    pub signer: Option<PubKey33>,
 }
 
 /// The configuration the matcher checks against.
@@ -93,6 +102,12 @@ pub enum Unmatched {
         by: Consumer,
         /// Both intents first seen within `TAKEOVER` blocks: cancel, but do not slash.
         benign_race: bool,
+        /// The signer led this burn on the ledger and did not sign the consuming intent: cancel,
+        /// but do not slash, whatever the first-seen gap (W3-B-1). A second unlock by that
+        /// intent's own signer, a correct duplicate by a member who never led the burn, and a
+        /// duplicate whose consuming intent has no attributed signer, stay slashable outside
+        /// the takeover overlap.
+        scheduled: bool,
     },
     /// The intent's value differs from the burn's amount.
     WrongValue {
@@ -117,12 +132,16 @@ pub enum Unmatched {
 
 impl Unmatched {
     /// Whether the signer of this intent should face a slash case (§2.3): every unmatched
-    /// intent is cancelled, but a benign race is not slashed.
+    /// intent is cancelled, but a benign race is not slashed, and neither is a correct
+    /// duplicate by a recorded leader of the burn who did not sign the consuming intent.
     pub fn slashable(&self) -> bool {
         !matches!(
             self,
             Self::ConsumedBurn {
                 benign_race: true,
+                ..
+            } | Self::ConsumedBurn {
+                scheduled: true,
                 ..
             }
         )
@@ -213,9 +232,17 @@ pub fn classify_intent_for(
                 return U(Unmatched::WrongRecipient);
             }
             if let Some(by) = burn.consumed_by.filter(|c| c.txid != obs.txid) {
+                // Value and recipient already match. A recorded leader who did not sign the
+                // consuming intent posted a correct duplicate (the owner override can still
+                // sign one after takeover). That is cancelled, never slashed. The consuming
+                // intent's own signer, and anyone who never led the burn, are not exempt.
+                let scheduled = obs.signer.is_some_and(|s| {
+                    by.signer.is_some_and(|c| c != s) && burn.leaders.iter().any(|l| *l == s)
+                });
                 return U(Unmatched::ConsumedBurn {
                     by,
                     benign_race: is_benign_race(by.first_seen, obs.first_seen, ctx.takeover),
+                    scheduled,
                 });
             }
             Classification::MatchedBurn { nonce: burn.nonce }
@@ -287,6 +314,7 @@ mod tests {
             amount: 5000,
             recipient: recipient().to_bytes(),
             consumed_by,
+            leaders: vec![],
         }
     }
 
@@ -331,6 +359,7 @@ mod tests {
                     value: self.value,
                     outputs: &self.outputs,
                     spent_vault: Some(&v),
+                    signer: None,
                 },
                 |n| burns.iter().find(|b| b.nonce == n).cloned(),
             )
@@ -352,6 +381,7 @@ mod tests {
         let me = Consumer {
             txid: [0x01; 32],
             first_seen: 10,
+            signer: None,
         };
         assert_eq!(
             c.classify(10, &[burn(Some(me))]),
@@ -373,19 +403,22 @@ mod tests {
         let earlier = Consumer {
             txid: [0x02; 32],
             first_seen: 8,
+            signer: None,
         };
         assert_eq!(
             c.classify(10, &[burn(Some(earlier))]),
             U(Unmatched::ConsumedBurn {
                 by: earlier,
-                benign_race: true
+                benign_race: true,
+                scheduled: false,
             })
         );
         assert_eq!(
             c.classify(20, &[burn(Some(earlier))]),
             U(Unmatched::ConsumedBurn {
                 by: earlier,
-                benign_race: false
+                benign_race: false,
+                scheduled: false,
             })
         );
 
@@ -454,10 +487,94 @@ mod tests {
         assert!(
             !Unmatched::ConsumedBurn {
                 by: earlier,
-                benign_race: true
+                benign_race: true,
+                scheduled: false,
             }
             .slashable()
         );
+    }
+
+    #[test]
+    fn scheduled_leader_duplicate_is_not_slashable() {
+        use Classification::Unmatched as U;
+        let leader = [0x11; 33];
+        let other = [0x22; 33];
+        let earlier = Consumer {
+            txid: [0x02; 32],
+            first_seen: 8,
+            signer: Some(other),
+        };
+        let mut paid = burn(Some(earlier));
+        paid.leaders = vec![leader, other];
+        let c = Case::burn_release(memo9());
+        let v = vault();
+        let class = |signer: Option<PubKey33>, first_seen: u32| {
+            classify_intent(
+                &ctx(),
+                &ObservedIntent {
+                    txid: [0x01; 32],
+                    first_seen,
+                    intent: &c.intent,
+                    value: c.value,
+                    outputs: &c.outputs,
+                    spent_vault: Some(&v),
+                    signer,
+                },
+                |_| Some(paid.clone()),
+            )
+        };
+        // outside the takeover window, a recorded leader who did not sign the consumer
+        let slashable = |c: Classification| match c {
+            U(u) => u.slashable(),
+            _ => false,
+        };
+        let scheduled = class(Some(leader), 20);
+        assert_eq!(
+            scheduled,
+            U(Unmatched::ConsumedBurn {
+                by: earlier,
+                benign_race: false,
+                scheduled: true,
+            })
+        );
+        assert!(!slashable(scheduled));
+        // the consuming intent's own signer is not exempt
+        let self_dup = class(Some(other), 20);
+        assert!(matches!(
+            self_dup,
+            U(Unmatched::ConsumedBurn {
+                benign_race: false,
+                scheduled: false,
+                ..
+            })
+        ));
+        assert!(slashable(self_dup));
+        // a member who never led the burn is not exempt
+        let stranger = class(Some([0x33; 33]), 20);
+        assert!(slashable(stranger));
+        // no attribution of this unlock: stay slashable
+        assert!(slashable(class(None, 20)));
+        // an unattributed consumer is not exempt, even for a recorded leader
+        let mut unknown = burn(Some(Consumer {
+            txid: [0x02; 32],
+            first_seen: 8,
+            signer: None,
+        }));
+        unknown.leaders = vec![leader];
+        let unattributed = classify_intent(
+            &ctx(),
+            &ObservedIntent {
+                txid: [0x01; 32],
+                first_seen: 20,
+                intent: &c.intent,
+                value: c.value,
+                outputs: &c.outputs,
+                spent_vault: Some(&v),
+                signer: Some(leader),
+            },
+            |_| Some(unknown.clone()),
+        );
+        assert!(slashable(unattributed));
     }
 
     #[test]
@@ -530,6 +647,7 @@ mod tests {
                 value: 1,
                 outputs: &outs,
                 spent_vault: None,
+                signer: None,
             },
             |_| None,
         );
@@ -549,6 +667,7 @@ mod tests {
                 value: 1,
                 outputs: &outs,
                 spent_vault: Some(&wrong_spent),
+                signer: None,
             },
             |_| None,
         );
@@ -592,6 +711,7 @@ mod tests {
                     value: case.value,
                     outputs: &case.outputs,
                     spent_vault: Some(&nvault),
+                    signer: None,
                 },
                 |n| Some(burn(None)).filter(|b| b.nonce == n),
             )
@@ -652,6 +772,7 @@ mod tests {
                     value: 5000,
                     outputs: &case.outputs,
                     spent_vault: None,
+                    signer: None,
                 },
                 |_| None,
             ),
