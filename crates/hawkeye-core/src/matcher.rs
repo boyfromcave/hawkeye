@@ -31,7 +31,7 @@ pub struct Burn {
     /// The intent that consumed it, if any.
     pub consumed_by: Option<Consumer>,
     /// Members this ledger assigned the burn to (`ASSIGNED` leaders, in order). A correct
-    /// duplicate signed by one of them, who did not sign [`consumed_by`], is not slashable
+    /// duplicate signed by one of them, who did not sign [`Self::consumed_by`], is not slashable
     /// (W3-B-1). Empty when the caller has no assignment history.
     pub leaders: Vec<PubKey33>,
 }
@@ -237,7 +237,7 @@ pub fn classify_intent_for(
                 // sign one after takeover). That is cancelled, never slashed. The consuming
                 // intent's own signer, and anyone who never led the burn, are not exempt.
                 let scheduled = obs.signer.is_some_and(|s| {
-                    by.signer.is_some_and(|c| c != s) && burn.leaders.iter().any(|l| *l == s)
+                    by.signer.is_some_and(|c| c != s) && burn.leaders.contains(&s)
                 });
                 return U(Unmatched::ConsumedBurn {
                     by,
