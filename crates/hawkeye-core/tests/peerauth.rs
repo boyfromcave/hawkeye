@@ -8,8 +8,8 @@
 
 use hawkeye_core::bytes::sha256d;
 use hawkeye_core::peerauth::{
-    PeerRequest, parse_member, parse_nonce, parse_sig, parse_time, request_msg, request_preimage,
-    response_msg, sign, verify,
+    PeerRequest, hwm_msg, parse_member, parse_nonce, parse_sig, parse_time, request_msg,
+    request_preimage, response_msg, sign, verify,
 };
 use hawkeye_core::{Deployment, EthAddress, SecretKey};
 
@@ -129,4 +129,37 @@ fn sign_verify_round_trip_and_response() {
     assert_ne!(r1, response_msg(&[0; 32], b"{\"hex\":\"01\"}"));
     let rs = sign(&other, &r1).unwrap();
     verify(&other.public_key(), &r1, &rs).unwrap();
+}
+
+/// Plan §4.7: set `0x11…11`, ledger id `0001…0f`, count 5.
+const HWM_MSG: &str = "51409b3495f2d5f7c82d969edca60e081183cf1123f13e1dfd40315d8fd2dc94";
+
+#[test]
+fn ledger_hwm_vector() {
+    let ledger_id: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+    let msg = hwm_msg(&SET, &ledger_id, 5);
+    let mut pre = b"HawkeyeLedgerHwm".to_vec();
+    pre.extend_from_slice(&SET);
+    pre.extend_from_slice(&ledger_id);
+    pre.extend_from_slice(&5u64.to_le_bytes());
+    assert_eq!(pre.len(), 16 + 32 + 16 + 8);
+    assert_eq!(msg, sha256d(&pre));
+    assert_eq!(hex::encode(msg), HWM_MSG);
+    assert_ne!(hwm_msg(&[0x12; 32], &ledger_id, 5), msg);
+    assert_ne!(hwm_msg(&SET, &[0xff; 16], 5), msg);
+    assert_ne!(hwm_msg(&SET, &ledger_id, 6), msg);
+    let key = SecretKey::from_bytes(&[7; 32]).unwrap();
+    let sig = sign(&key, &msg).unwrap();
+    verify(&key.public_key(), &msg, &sig).unwrap();
+    assert!(
+        verify(
+            &SecretKey::from_bytes(&[8; 32]).unwrap().public_key(),
+            &msg,
+            &sig
+        )
+        .is_err()
+    );
 }

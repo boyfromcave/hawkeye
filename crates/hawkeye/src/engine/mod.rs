@@ -336,8 +336,7 @@ impl Engine {
         step!("supply", self.supply());
         step!("gas", self.check_gas());
         if let Some(p) = &self.ledger_hwm
-            && let Ok(n) = self.ctx.db(|t| t.ycash_signature_count())
-            && let Err(e) = crate::restore::write_hwm(p, n)
+            && let Err(e) = crate::restore::raise_ledger_hwm(&self.ctx, p)
         {
             warn!(event = "ledger_hwm_failed", error = %format!("{e:#}"));
         }

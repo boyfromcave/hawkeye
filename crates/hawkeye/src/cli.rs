@@ -81,13 +81,24 @@ pub async fn enroll(s: &Settings) -> Result<()> {
 /// ledger's high-water mark to its current record count. The operator's statement that the
 /// restored ledger lacks no unlock this member signed and might still be revived.
 pub fn acknowledge_ledger_restore(s: &Settings) -> Result<()> {
+    let key = s.load_key()?;
     let mut store = Store::open(&s.store_path)?;
-    let (was, count) = store.tx(|t| {
+    let (was, count, ledger_id) = store.tx(|t| {
         let was = t.meta(crate::engine::burn::LEDGER_RESTORED)?;
         t.set_meta(crate::engine::burn::LEDGER_RESTORED, "acknowledged")?;
-        Ok::<_, hawkeye_store::StoreError>((was, t.ycash_signature_count()?))
+        Ok::<_, hawkeye_store::StoreError>((
+            was,
+            t.ycash_signature_count()?,
+            crate::restore::ensure_ledger_id(t)?,
+        ))
     })?;
-    crate::restore::reset_hwm(&crate::restore::hwm_path(&s.store_path), count)?;
+    crate::restore::reset_hwm(
+        &crate::restore::hwm_path(&s.store_path),
+        &key,
+        &s.params.set_id,
+        &ledger_id,
+        count,
+    )?;
     info!(event = "ledger_restore_acknowledged", previous = ?was, records = count);
     print(&json!({"previous": was, "records": count}))
 }
