@@ -12,7 +12,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-declared() { cat "$@" | grep -cE '^[[:space:]]*function test[A-Za-z0-9_]*\(' || true; }
+# forge test --list counts `test*` and `invariant*`. `afterInvariant` is a hook, not a test.
+declared() { cat "$@" | grep -cE '^[[:space:]]*function (test|invariant)[A-Za-z0-9_]*\(' || true; }
 listed=$(forge test --list --json)
 count() {
     echo "$listed" | jq --arg p "$1" '[to_entries[] | select(.key | startswith($p)) | .value[] | length] | add // 0'

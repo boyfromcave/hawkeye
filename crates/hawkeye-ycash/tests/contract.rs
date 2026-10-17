@@ -128,7 +128,7 @@ fn contract_is_the_node_copy() {
     assert_eq!(c["branchid"], "6d5b7a31");
     assert_eq!(
         c["source"]["sha256"],
-        "e7af3077b0be37ddc716a012139575e2063b34ff9063c3ddba505885ab80d19a"
+        "a2cd7dcc302c15846051f6fd25ba0d2597f44a2831152e0622d2086d58fa5d70"
     );
     assert_eq!(c["methods"].as_object().unwrap().len(), 27);
     assert_eq!(c["types"]["pqkeyid"]["json"], "string");

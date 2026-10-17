@@ -36,6 +36,9 @@ pub struct Deployment {
     /// The rate-limit window, seconds.
     #[serde(default)]
     pub cap_window: u64,
+    /// Most open proposals one proposer may have (0 = no limit; required on mainnet).
+    #[serde(default)]
+    pub max_open_proposals: u128,
     /// The bridge this one succeeded (wyec design §4.6; `null` / absent for a first deployment).
     #[serde(default)]
     pub predecessor: Option<Address>,
@@ -52,6 +55,8 @@ pub struct DeployParams {
     pub mint_cap: u128,
     /// Seconds; > 0 when `mint_cap > 0`.
     pub cap_window: u64,
+    /// Most open proposals one proposer may have; 0 = no limit (not on mainnet).
+    pub max_open_proposals: u128,
     /// Recorded as `mintMode`.
     pub mode: MintMode,
     /// The bridge this one succeeds (its consumed lockIds stay consumed; wyec design §4.6); `None`
@@ -73,6 +78,7 @@ impl DeployParams {
             challenge_window,
             mint_cap: 0,
             cap_window: 0,
+            max_open_proposals: 0,
             mode,
             predecessor: None,
         }
@@ -128,6 +134,11 @@ pub async fn deploy(
             "cap window must be > 0 with a mint cap".into(),
         ));
     }
+    if chain_id == 1 && p.max_open_proposals == 0 {
+        return Err(Error::Config(
+            "maxOpenProposals is required on mainnet".into(),
+        ));
+    }
     let deploy_block = provider.get_block_number().await? + 1;
     let nonce = provider.get_transaction_count(deployer).pending().await?;
     let predicted = deployer.create(nonce + 1);
@@ -140,6 +151,7 @@ pub async fn deploy(
         p.challenge_window,
         U256::from(p.mint_cap),
         U256::from(p.cap_window),
+        U256::from(p.max_open_proposals),
         Address::ZERO,
     )
     .await?
@@ -165,6 +177,7 @@ pub async fn deploy(
         challenge_window: p.challenge_window,
         mint_cap: p.mint_cap,
         cap_window: p.cap_window,
+        max_open_proposals: p.max_open_proposals,
         predecessor: None,
     })
 }
@@ -189,6 +202,7 @@ pub async fn deploy_successor(
         p.challenge_window,
         U256::from(p.mint_cap),
         U256::from(p.cap_window),
+        U256::from(p.max_open_proposals),
         predecessor,
     )
     .await?
@@ -207,6 +221,7 @@ pub async fn deploy_successor(
         challenge_window: p.challenge_window,
         mint_cap: p.mint_cap,
         cap_window: p.cap_window,
+        max_open_proposals: p.max_open_proposals,
         predecessor: Some(predecessor),
     })
 }

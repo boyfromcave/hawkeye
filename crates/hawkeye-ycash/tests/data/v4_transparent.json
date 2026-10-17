@@ -1,6 +1,6 @@
 {
  "generator": "crates/hawkeye-ycash/tests/data/gen_fixtures.py",
- "ycash-dd": "d410262099d7e8fc700c5e0e03e92a6f6534e464",
+ "ycash-dd": "cc8c90764715e6c0769edfaeb624f7b5742b73d4",
  "transactions": [
   {
    "name": "lock",

@@ -2794,6 +2794,18 @@ impl MockState {
     fn vault_send(&mut self, p: &[Value]) -> RpcResult {
         let h: HexBytes = arg(p, 0, "hex")?;
         let mut tx = Transaction::decode(&h.0).map_err(|_| (-22, "TX decode failed".to_owned()))?;
+        // The node finds the template input first (ycash-dd #90, ycash6 #7): vault_send signs and
+        // sends vault spends only, never an arbitrary wallet transaction.
+        match tx
+            .inputs
+            .iter()
+            .filter(|i| self.template(&i.prevout).is_some())
+            .count()
+        {
+            0 => return err(-8, "no unspent vault or intent input"),
+            1 => {}
+            _ => return err(-8, "more than one template input (S-1)"),
+        }
         for input in &tx.inputs {
             let Some((known, _, _)) = self.template(&input.prevout) else {
                 continue;
