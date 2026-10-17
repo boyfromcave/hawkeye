@@ -5734,6 +5734,31 @@ async fn s2_declared_gone_by_a_quorum_releases_the_hold() {
             .unwrap();
         assert_eq!((a.declarations, a.quorum), (2, 2));
     }
+    for (i, e) in engines.iter_mut().enumerate() {
+        if i != leader {
+            e.tick().await;
+        }
+    }
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "a quorum does not apply before a missed heartbeat"
+    );
+    // those declarations name the pre-silence lastact and expire during the wait: sign again
+    advance_until_silent(&env, &mut engines, leader).await;
+    for by in [first, second] {
+        for (i, e) in engines.iter().enumerate() {
+            if i == leader {
+                continue;
+            }
+            hawkeye::engine::burn::record_gone(
+                e.ctx(),
+                None,
+                &gone_decl(&env, &env.keys[by], mk, 4 * TAKEOVER),
+            )
+            .await
+            .unwrap();
+        }
+    }
     for _ in 0..2 {
         for (i, e) in engines.iter_mut().enumerate() {
             if i != leader {
@@ -5885,8 +5910,13 @@ async fn s2b_one_declaration_is_not_a_quorum_at_k1_n4() {
         env.mine(1);
     }
     assert!(unlocks_for(&env, nonce).is_empty(), "held");
+    advance_until_silent(&env, &mut engines, leader).await;
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "still held: silence alone is not the override"
+    );
     let mk = env.key_of_index(leader);
-    let decl = |by: &SecretKey| gone_decl(&env, by, mk, 2 * TAKEOVER);
+    let decl = |by: &SecretKey| gone_decl(&env, by, mk, 10 * TAKEOVER);
     let others: Vec<usize> = (0..4).filter(|i| *i != leader).collect();
     let declare = |by: usize, engines: &Vec<Engine>| {
         let d = decl(&env.keys[by]);
@@ -5959,16 +5989,19 @@ fn gone_decl(
     member: [u8; 33],
     blocks: u32,
 ) -> hawkeye::peers::GoneDeclaration {
-    let (seq, tip) = {
+    let (seq, tip, silent_since) = {
         let st = env.mock.state();
-        let seq = st.sets[&env.set]
+        let m = st.sets[&env.set]
             .memberlist
             .iter()
-            .find(|m| m.key.0 == member)
-            .map_or(0, |m| m.joinheight);
-        (seq, st.tip_height())
+            .find(|m| m.key.0 == member);
+        (
+            m.map_or(0, |m| m.joinheight),
+            st.tip_height(),
+            m.map_or(0, |m| m.lastact),
+        )
     };
-    gone_decl_at(env, by, member, seq, tip + blocks)
+    gone_decl_at(env, by, member, seq, tip + blocks, silent_since)
 }
 
 fn gone_decl_at(
@@ -5977,21 +6010,47 @@ fn gone_decl_at(
     member: [u8; 33],
     seq: u32,
     expiry: u32,
+    silent_since: u32,
 ) -> hawkeye::peers::GoneDeclaration {
     hawkeye::peers::GoneDeclaration {
         member: hex::encode(member),
         declarer: hex::encode(by.public_key()),
         seq,
         expiry,
+        silent_since: Some(silent_since),
         sig: hex::encode(
             hawkeye_core::peerauth::sign(
                 by,
-                &hawkeye_core::peerauth::gone_msg(&env.set.0, &member, seq, expiry),
+                &hawkeye_core::peerauth::gone_msg(&env.set.0, &member, seq, expiry, silent_since),
             )
             .unwrap(),
         ),
         reason: "test".into(),
     }
+}
+
+/// Mine and let everyone but `silent` heartbeat until `silent` has missed a heartbeat by a
+/// takeover's slack (W4-B-4). Declarations signed before this wait expire; sign them after.
+async fn advance_until_silent(env: &Env, engines: &mut [Engine], silent: usize) {
+    let key = env.key_of_index(silent);
+    for _ in 0..40 {
+        if member_missed_heartbeat(env, key) {
+            return;
+        }
+        tick_except(engines, silent).await;
+        env.mine(1);
+    }
+    panic!("member never counted as silent");
+}
+
+fn member_missed_heartbeat(env: &Env, key: [u8; 33]) -> bool {
+    let st = env.mock.state();
+    let m = st.sets[&env.set]
+        .memberlist
+        .iter()
+        .find(|m| m.key.0 == key)
+        .unwrap();
+    st.tip_height() >= m.lastact.saturating_add(10).saturating_add(TAKEOVER)
 }
 
 // ------------------------------------------------------------------------------------------
@@ -6188,13 +6247,14 @@ async fn t2_declarations_are_scoped_and_expire() {
         unlocks_for(&env, nonce).is_empty(),
         "expired declarations release nothing"
     );
-    // the positive control: the same quorum, not expired, releases
+    // the positive control: the same quorum, after a missed heartbeat, not expired, releases
+    advance_until_silent(&env, &mut engines, leader).await;
     for &d in &others {
         for &i in &others {
             hawkeye::engine::burn::record_gone(
                 engines[i].ctx(),
                 None,
-                &gone_decl(&env, &env.keys[d], mk, 4),
+                &gone_decl(&env, &env.keys[d], mk, 4 * TAKEOVER),
             )
             .await
             .unwrap();
@@ -6213,11 +6273,19 @@ async fn t2_declarations_are_scoped_and_expire() {
             .unwrap()
             .joinheight
     };
-    let tip = env.mock.state().tip_height();
+    let (tip, lastact) = {
+        let st = env.mock.state();
+        let m = st.sets[&env.set]
+            .memberlist
+            .iter()
+            .find(|m| m.key.0 == mk)
+            .unwrap();
+        (st.tip_height(), m.lastact)
+    };
     let e = hawkeye::engine::burn::record_gone(
         engines[others[0]].ctx(),
         None,
-        &gone_decl_at(&env, &env.keys[others[1]], mk, seq + 1, tip + 4),
+        &gone_decl_at(&env, &env.keys[others[1]], mk, seq + 1, tip + 4, lastact),
     )
     .await
     .unwrap_err()
@@ -6227,7 +6295,14 @@ async fn t2_declarations_are_scoped_and_expire() {
     let e = hawkeye::engine::burn::record_gone(
         engines[others[0]].ctx(),
         None,
-        &gone_decl_at(&env, &env.keys[others[1]], mk, seq, tip + 100 * TAKEOVER),
+        &gone_decl_at(
+            &env,
+            &env.keys[others[1]],
+            mk,
+            seq,
+            tip + 100 * TAKEOVER,
+            lastact,
+        ),
     )
     .await
     .unwrap_err()
@@ -6238,7 +6313,7 @@ async fn t2_declarations_are_scoped_and_expire() {
     let e = hawkeye::engine::burn::record_gone(
         engines[others[0]].ctx(),
         None,
-        &gone_decl_at(&env, &env.keys[others[1]], stranger, 0, tip + 4),
+        &gone_decl_at(&env, &env.keys[others[1]], stranger, 0, tip + 4, 0),
     )
     .await
     .unwrap_err()
@@ -6795,4 +6870,550 @@ async fn w4b5_unlock_signed_under_the_old_branch_dies_after_activation_plus_cy()
             BurnState::Released
         );
     }
+}
+
+fn park_txid(env: &Env, txid: Hash256) -> Vec<u8> {
+    let mut st = env.mock.state();
+    st.mempool.retain(|t| *t != txid);
+    st.txs
+        .get(&txid)
+        .map(|(raw, _)| raw.clone())
+        .unwrap_or_default()
+}
+
+fn unpark_raw(env: &Env, raw: Vec<u8>) {
+    env.mock.state().submit(raw).expect("reinsert");
+}
+
+/// 05/N-1: A is the linked intent; B is mined and released; A's cancel must leave the burn
+/// `RELEASED` on B, not reassigned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n1_late_cancel_relinks_released_burn() {
+    let Some(env) = setup().await else { return };
+    n1_late_cancel(&env, true).await;
+}
+
+/// 05/N-1: the same with B mined and not yet released. The burn stays on B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n1_late_cancel_relinks_matched_burn() {
+    let Some(env) = setup().await else { return };
+    n1_late_cancel(&env, false).await;
+}
+
+async fn n1_late_cancel(env: &Env, release_b: bool) {
+    let mut engines = three(env).await;
+    lock_and_mint(env, &mut engines).await;
+    lock_and_mint(env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x81; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(env, nonce);
+    engines[leader].tick().await;
+    engines[leader].tick().await;
+    let posted = unlocks_for(env, nonce);
+    assert_eq!(posted.len(), 1, "leader posted A");
+    let a_txid = posted[0].0.txid();
+    tick_all(&mut engines).await;
+    let k = BurnKey::new(dep_of(&engines[0]), nonce);
+    let burn = engines[0].ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+    let a_op = burn.intent.expect("A linked");
+    let memo =
+        hawkeye_core::memo::HawkeyeMemo::burn_release(dep_of(&engines[0]), nonce, burn.tx_hash);
+    let vault = free_vaults(env)
+        .await
+        .into_iter()
+        .find(|v| v.txid != posted[0].1.txid)
+        .expect("a second vault");
+    let hex = unlock_hex(env, &vault, &r, 300_000_000, Some(&memo)).await;
+    let signed = env
+        .mock
+        .client()
+        .set_signunlock(&hex.parse().unwrap())
+        .await
+        .unwrap();
+    let b_txid = env.mock.client().vault_send(&signed.hex).await.unwrap();
+    tick_all(&mut engines).await;
+    let raw_a = park_txid(env, a_txid);
+    env.mine(1);
+    tick_all(&mut engines).await;
+    if release_b {
+        env.mine(u32::from(DELAY));
+        let b_tx = Transaction::decode_hex(&signed.hex.to_string()).unwrap();
+        let b_vout = b_tx
+            .outputs
+            .iter()
+            .position(|o| o.value == 300_000_000)
+            .unwrap_or(0) as u32;
+        env.mock
+            .client()
+            .vault_release(
+                &OutPoint::new(b_txid, b_vout),
+                Some(&hex::encode(r.script())),
+            )
+            .await
+            .expect("B matured");
+        env.mine(1);
+    }
+    unpark_raw(env, raw_a);
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    // Sign A's cancel before a watcher does, while A is back in the mempool.
+    let a_rpc = OutPoint::new(Hash256(a_op.txid), a_op.vout);
+    if env
+        .mock
+        .client()
+        .gettxout(&a_rpc.txid, a_rpc.vout, true)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        let built = env.mock.client().vault_buildcancel(&a_rpc).await.unwrap();
+        let signed_c = env.mock.client().set_signcancel(&built.hex).await.unwrap();
+        env.mock.client().vault_send(&signed_c.hex).await.unwrap();
+    }
+    env.mine(1);
+    tick_all(&mut engines).await;
+    for e in &engines {
+        let b = e.ctx().db(|t| t.burn(&k)).unwrap().unwrap();
+        if release_b {
+            assert_eq!(b.state, BurnState::Released, "re-linked, not reassigned");
+        } else {
+            assert!(
+                matches!(
+                    b.state,
+                    BurnState::IntentConfirmed | BurnState::IntentPending | BurnState::Released
+                ),
+                "B pays the burn, state {}",
+                b.state
+            );
+        }
+        assert_ne!(b.intent, Some(a_op), "not left on the cancelled intent");
+        assert!(b.intent.is_some(), "linked to the paying intent");
+        assert!(
+            !e.alarms().iter().any(|a| a.name == "unlock-prior-unknown"),
+            "no false hold: {:?}",
+            e.alarms()
+        );
+    }
+    for _ in 0..(3 * TAKEOVER) {
+        env.mine(1);
+        tick_all(&mut engines).await;
+    }
+    assert!(
+        unlocks_for(env, nonce).is_empty(),
+        "no third unlock in the mempool"
+    );
+    assert_eq!(
+        env.mock.state().calls_to("set_signunlock").len(),
+        signs,
+        "no fresh vault after the cancel"
+    );
+}
+
+/// W4-B-4: a declaration signed at the member's previous `lastact` and delivered after its
+/// heartbeat does not count, and one recorded before the heartbeat is void once `lastact` moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b4_late_declaration_does_not_count_past_a_heartbeat() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, leader, nonce) = held_takeover(&env).await;
+    advance_until_silent(&env, &mut engines, leader).await;
+    let mk = env.key_of_index(leader);
+    let early = gone_decl(&env, &env.keys[(leader + 1) % 3], mk, 10 * TAKEOVER);
+    // the leader heartbeats: lastact moves past the height the declaration signed
+    engines[leader].tick().await;
+    env.mine(1);
+    let e = hawkeye::engine::burn::record_gone(engines[(leader + 1) % 3].ctx(), None, &early)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("latest heartbeat") || e.contains("silent_since"),
+        "{e}"
+    );
+    // recorded while it still matched, then voided by the next heartbeat
+    let before = gone_decl(&env, &env.keys[(leader + 1) % 3], mk, 10 * TAKEOVER);
+    let other = gone_decl(&env, &env.keys[(leader + 2) % 3], mk, 10 * TAKEOVER);
+    for (i, egn) in engines.iter().enumerate() {
+        if i == leader {
+            continue;
+        }
+        hawkeye::engine::burn::record_gone(egn.ctx(), None, &before)
+            .await
+            .unwrap();
+        hawkeye::engine::burn::record_gone(egn.ctx(), None, &other)
+            .await
+            .unwrap();
+    }
+    engines[leader].tick().await;
+    env.mine(1);
+    for _ in 0..3 {
+        tick_except(&mut engines, leader).await;
+        env.mine(1);
+    }
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "a heartbeat after silent_since voids the quorum"
+    );
+}
+
+/// W4-B-4: two current members cannot use the override, even after a missed heartbeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b4_override_refused_in_a_two_member_set() {
+    let Some(env) = setup_with(Opts {
+        members: 2,
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let mut engines = vec![env.engine(0).await, env.engine(1).await];
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x82; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let mut live: Vec<[u8; 33]> = (0..2).map(|i| env.key_of_index(i)).collect();
+    hawkeye_core::keys::sort_members(&mut live);
+    let leader = (0..2)
+        .find(|i| env.key_of_index(*i) == live[(nonce % 2) as usize])
+        .unwrap();
+    drop(engines);
+    let (mut engines, _) = {
+        // two listeners, the leader's closed
+        let mut listeners = vec![];
+        let mut urls = vec![];
+        for _ in 0..2 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(format!("http://{}", l.local_addr().unwrap()));
+            listeners.push(Some(l));
+        }
+        listeners[leader] = None;
+        let mut engines = vec![];
+        for i in 0..2 {
+            let peers = (0..2)
+                .filter(|j| *j != i)
+                .map(|j| urls[j].clone())
+                .collect();
+            engines.push(env.engine_with_peers(i, peers).await);
+        }
+        for (i, l) in listeners.into_iter().enumerate() {
+            if let Some(l) = l {
+                let ctx = engines[i].ctx().clone();
+                tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+            }
+        }
+        (engines, ())
+    };
+    advance_until_silent(&env, &mut engines, leader).await;
+    let mk = env.key_of_index(leader);
+    let other = (leader + 1) % 2;
+    hawkeye::engine::burn::record_gone(
+        engines[other].ctx(),
+        None,
+        &gone_decl(&env, &env.keys[other], mk, 10 * TAKEOVER),
+    )
+    .await
+    .unwrap();
+    for _ in 0..3 {
+        tick_except(&mut engines, leader).await;
+    }
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "a set of 2 current members cannot use the override"
+    );
+}
+
+/// W4-B-4: a declaration without `silent_since` (v1) is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b4_v1_declaration_refused() {
+    let Some(env) = setup().await else { return };
+    let e = env.engine(0).await;
+    let member = env.key_of_index(1);
+    let mut decl = gone_decl(&env, &env.keys[0], member, 4);
+    decl.silent_since = None;
+    let err = hawkeye::engine::burn::record_gone(e.ctx(), None, &decl)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("re-declare with this release"), "{err}");
+}
+
+/// A peer that answers `POST /burns/unlock` with a fixed signed body.
+async fn held_stub(
+    env: &Env,
+    member: &SecretKey,
+    body: hawkeye::peers::BurnUnlockResponse,
+) -> String {
+    use axum::http::{HeaderMap, StatusCode};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let set = env.set.0;
+    let dep = env.params().deployment;
+    let key = member.clone();
+    let app = axum::Router::new().route(
+        "/burns/unlock",
+        axum::routing::post(move |headers: HeaderMap, req: axum::body::Bytes| {
+            let key = key.clone();
+            let body = body.clone();
+            async move {
+                let Some(nonce_hdr) = headers.get("x-hawkeye-nonce") else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        [
+                            ("x-hawkeye-member", String::new()),
+                            ("x-hawkeye-sig", String::new()),
+                            ("content-type", "application/json".to_owned()),
+                        ],
+                        b"missing nonce".to_vec(),
+                    );
+                };
+                let h = |n: &str| headers.get(n).unwrap().to_str().unwrap().to_owned();
+                let _ = nonce_hdr;
+                let nonce = hawkeye_core::peerauth::parse_nonce(&h("x-hawkeye-nonce")).unwrap();
+                let msg =
+                    hawkeye_core::peerauth::request_msg(&hawkeye_core::peerauth::PeerRequest {
+                        set_id: &set,
+                        deployment: &dep,
+                        method: "POST",
+                        path: "/burns/unlock",
+                        timestamp: h("x-hawkeye-time").parse().unwrap(),
+                        nonce: &nonce,
+                        body: &req,
+                    })
+                    .unwrap();
+                let out = serde_json::to_vec(&body).unwrap();
+                let rs = hawkeye_core::peerauth::sign(
+                    &key,
+                    &hawkeye_core::peerauth::response_msg(&msg, &out),
+                )
+                .unwrap();
+                (
+                    StatusCode::OK,
+                    [
+                        ("x-hawkeye-member", hex::encode(key.public_key())),
+                        ("x-hawkeye-sig", hex::encode(rs)),
+                        ("content-type", "application/json".to_owned()),
+                    ],
+                    out,
+                )
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    url
+}
+
+async fn takeover_with_stub(
+    env: &Env,
+    answer: hawkeye::peers::BurnUnlockResponse,
+) -> (Vec<Engine>, usize, u64) {
+    let mut engines = three(env).await;
+    lock_and_mint(env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x83; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(env, nonce);
+    drop(engines);
+    let stub = held_stub(env, &env.keys[leader], answer).await;
+    let mut listeners = vec![];
+    let mut urls = vec![];
+    for i in 0..3 {
+        if i == leader {
+            urls.push(stub.clone());
+            listeners.push(None);
+        } else {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(format!("http://{}", l.local_addr().unwrap()));
+            listeners.push(Some(l));
+        }
+    }
+    let mut engines = vec![];
+    for i in 0..3 {
+        let peers = (0..3)
+            .filter(|j| *j != i)
+            .map(|j| urls[j].clone())
+            .collect();
+        engines.push(env.engine_with_peers(i, peers).await);
+    }
+    for (i, l) in listeners.into_iter().enumerate() {
+        if let Some(l) = l {
+            let ctx = engines[i].ctx().clone();
+            tokio::spawn(async move { hawkeye::api::serve(l, ctx).await.unwrap() });
+        }
+    }
+    (engines, leader, nonce)
+}
+
+fn held_body(nonce: u64, paying: Option<&str>) -> hawkeye::peers::BurnUnlockResponse {
+    hawkeye::peers::BurnUnlockResponse {
+        nonce,
+        state: "INTENT_CONFIRMED".into(),
+        restored: false,
+        held: true,
+        unlock: None,
+        vault: None,
+        paying_intent: paying.map(str::to_owned),
+        since: 1,
+        restored_since: 0,
+    }
+}
+
+/// W4-B-1: a signed `held` that names an intent this node has never seen pages `unlock-hostage`
+/// and does not release the burn (c′ off).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b1_stale_held_pages_unlock_hostage() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, leader, nonce) = takeover_with_stub(
+        &env,
+        held_body(
+            0,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0"),
+        ),
+    )
+    .await;
+    let bound = 2 * TAKEOVER.max(C_Y);
+    for _ in 0..(TAKEOVER + bound + 16) {
+        env.mine(1);
+        tick_except(&mut engines, leader).await;
+    }
+    let who = hex::encode(env.key_of_index(leader));
+    assert!(
+        engines.iter().enumerate().any(|(i, e)| {
+            i != leader
+                && e.alarms().iter().any(|a| {
+                    a.name == "unlock-hostage"
+                        && a.detail.contains(&who)
+                        && a.detail.contains(&nonce.to_string())
+                })
+        }),
+        "hostage page names the member: {:?}",
+        engines.iter().map(|e| e.alarms()).collect::<Vec<_>>()
+    );
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "page only: the burn stays held"
+    );
+}
+
+/// W4-B-1: a `held` answer that names a transaction this node has mined never pages, and the
+/// override does not sign a fresh vault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b1_honest_held_with_a_mined_intent_never_pages() {
+    let Some(env) = setup().await else { return };
+    let mined = {
+        let st = env.mock.state();
+        let txid = st.blocks.last().unwrap().txids[0];
+        format!("{}:0", hawkeye_core::bytes::txid_to_display(&txid.0))
+    };
+    // nonce is not known yet; the answer's nonce is informational. Use 0 and overwrite after.
+    let (mut engines, leader, nonce) = takeover_with_stub(&env, held_body(1, Some(&mined))).await;
+    let _ = nonce;
+    let bound = 2 * TAKEOVER.max(C_Y);
+    advance_until_silent(&env, &mut engines, leader).await;
+    for _ in 0..(bound + 2) {
+        tick_except(&mut engines, leader).await;
+        env.mine(1);
+    }
+    assert!(
+        engines
+            .iter()
+            .all(|e| !e.alarms().iter().any(|a| a.name == "unlock-hostage")),
+        "a visible paying intent never pages: {:?}",
+        engines.iter().map(|e| e.alarms()).collect::<Vec<_>>()
+    );
+    let mk = env.key_of_index(leader);
+    let others: Vec<usize> = (0..3).filter(|i| *i != leader).collect();
+    for &d in &others {
+        for &i in &others {
+            let _ = hawkeye::engine::burn::record_gone(
+                engines[i].ctx(),
+                None,
+                &gone_decl(&env, &env.keys[d], mk, 10 * TAKEOVER),
+            )
+            .await;
+        }
+    }
+    tick_except(&mut engines, leader).await;
+    tick_except(&mut engines, leader).await;
+    assert!(
+        unlocks_for(&env, nonce).is_empty(),
+        "an honest held is not overridden"
+    );
+}
+
+/// W4-B-3: a restored member with no sign-once row adopts its evicted unlock from a peer's
+/// observed copy instead of signing a fresh vault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4b3_peers_serve_a_restored_members_evicted_unlock() {
+    let Some(env) = setup().await else { return };
+    let (mut engines, urls) = networked(&env).await;
+    lock_and_mint(&env, &mut engines).await;
+    lock_and_mint(&env, &mut engines).await;
+    let r = YcashRecipient::p2pkh([0x84; 20]);
+    let nonce = env.burn(300_000_000, &r).await;
+    env.eth_mine(3).await;
+    let leader = leader_index(&env, nonce);
+    engines[leader].tick().await;
+    engines[leader].tick().await;
+    let posted = unlocks_for(&env, nonce);
+    assert_eq!(posted.len(), 1);
+    let vault = posted[0].1;
+    tick_all(&mut engines).await;
+    drop_unlocks(&env, nonce);
+    let signs = env.mock.state().calls_to("set_signunlock").len();
+    // the leader's ledger is replaced by a fresh one, flagged restored. Peers keep the
+    // observed bytes and are the only APIs it asks.
+    let peer_urls: Vec<String> = urls
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != leader)
+        .map(|(_, u)| u.clone())
+        .collect();
+    let foreign = Arc::new(hawkeye::foreign::EthereumChain::new(
+        env.eth(&env.keys[leader]).await,
+    ));
+    let mut restored = env.engine_db(
+        leader,
+        &format!("attestor{leader}-restored.db"),
+        peer_urls,
+        foreign,
+        |_| {},
+    );
+    restored
+        .ctx()
+        .db(|t| {
+            t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED, "restored copy")?;
+            t.set_meta(hawkeye::engine::burn::LEDGER_RESTORED_HEIGHT, "1")?;
+            Ok::<_, hawkeye_store::StoreError>(())
+        })
+        .unwrap();
+    let k = BurnKey::new(dep_of(&restored), nonce);
+    let mut adopted = false;
+    for _ in 0..(4 * TAKEOVER + 6) {
+        restored.tick().await;
+        if unlocks_for(&env, nonce)
+            .iter()
+            .any(|(_, v)| v.txid == vault.txid)
+        {
+            adopted = true;
+            break;
+        }
+        env.mine(1);
+    }
+    assert!(adopted, "the restored member re-sent the observed unlock");
+    let posted = unlocks_for(&env, nonce);
+    assert_eq!(posted.len(), 1, "one payment: {posted:?}");
+    assert_eq!(
+        posted[0].1.txid, vault.txid,
+        "the evicted vault, not a fresh one"
+    );
+    let row = restored
+        .ctx()
+        .db(|t| t.live_unlock_for_burn(&env.set.0, &k))
+        .unwrap();
+    assert!(
+        row.as_ref()
+            .is_some_and(|r| r.origin == hawkeye_store::UnlockOrigin::Adopted),
+        "adopted from the peer, not signed fresh: {row:?}"
+    );
+    let _ = signs;
 }

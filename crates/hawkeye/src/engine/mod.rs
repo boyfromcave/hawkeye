@@ -225,6 +225,9 @@ pub(crate) struct Memory {
     pub evicted_since: HashMap<Hash32, u32>,
     /// Once-only warnings about a burn held by a live unlock this attestor will not re-send.
     pub held_logged: HashSet<u64>,
+    /// First height a member's evidence-free `held` answer was stale, by `(burn nonce, member)`
+    /// (W4-B-1). The ledger's `held_stale/` rows keep the same clock across a restart.
+    pub held_stale: HashMap<(u64, PubKey33), u32>,
     /// The fee coins counted at the last capacity check.
     pub fee_coins: Option<u64>,
     /// The foreign-chain sender and its balance at the last gas check.

@@ -1,7 +1,7 @@
 //! The burn side (plan §1.3, §5.2, §5.5): leader assignment and takeover, the rate limit, the
 //! unlock with its `HKB1` memo (sign-once), and the release after the delay.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use hawkeye_core::address::encode_address;
 use hawkeye_core::leader::{leader_for, mint_leader_for};
 use hawkeye_core::lock::lock_id;
@@ -856,10 +856,58 @@ impl Engine {
                     none_from.insert(who);
                 }
                 (None, true) => {
-                    held_from.insert(who);
-                    info!(event = "unlock_prior_held", nonce = b.key.nonce,
-                          peer = %peer, state = %signed.body.state,
-                          "the peer holds an unlock it no longer serves (paid in its view)");
+                    let visible = self.held_claim_visible(b, &signed.body).await?;
+                    if visible {
+                        self.clear_stale_held(b, &who)?;
+                        held_from.insert(who);
+                        info!(event = "unlock_prior_held", nonce = b.key.nonce,
+                              peer = %peer, state = %signed.body.state,
+                              paying = ?signed.body.paying_intent,
+                              "the peer holds an unlock it no longer serves (paid in its view)");
+                    } else {
+                        let first = self.note_stale_held(b, &who)?;
+                        let bound = held_bound(&self.ctx.params);
+                        let waited = tip.saturating_sub(first);
+                        if waited >= bound {
+                            let named = signed
+                                .body
+                                .paying_intent
+                                .clone()
+                                .unwrap_or_else(|| "none".into());
+                            self.alarm(
+                                "unlock-hostage",
+                                format!(
+                                    "member {} has held burn {} for {waited} blocks naming intent {named} that this node has never seen mined or in its mempool (or naming none): honest software re-serves the signed unlock within max(TAKEOVER, C_Y); review and, if confirmed, remove it (SET_REMOVE, docs/operations.md §9)",
+                                    hex::encode(who),
+                                    b.key.nonce
+                                ),
+                            );
+                        }
+                        // (c′) stays off: a stale claim pages, it does not release the hold.
+                        held_from.insert(who);
+                        info!(event = "unlock_prior_held_stale", nonce = b.key.nonce,
+                              peer = %peer, since = first, waited,
+                              paying = ?signed.body.paying_intent);
+                    }
+                    if signed.body.restored {
+                        let deadline = self
+                            .ctx
+                            .params
+                            .takeover
+                            .max(1)
+                            .saturating_mul(GONE_MAX_TAKEOVERS);
+                        let since = signed.body.restored_since;
+                        if tip.saturating_sub(since) >= deadline {
+                            self.alarm(
+                                "member-restored-unacknowledged",
+                                format!(
+                                    "member {} has been restored since height {since} and still answers held for burn {} (deadline {deadline} blocks): run audit-ledger, import the sign-once history and acknowledge-ledger-restore, or remove it (SET_REMOVE, docs/operations.md §9)",
+                                    hex::encode(who),
+                                    b.key.nonce
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -887,9 +935,28 @@ impl Engine {
                 ),
             );
         }
+        // W4-B-4: the override applies only once the member has missed a heartbeat by a
+        // takeover's slack. A signed `held` is never overridden (c′ off: page only).
+        let slack = self
+            .ctx
+            .params
+            .heartbeat_blocks
+            .saturating_add(self.ctx.params.takeover);
+        let missed_heartbeat = |k: &PubKey33| {
+            self.mem
+                .members
+                .iter()
+                .find(|m| m.key.0 == *k)
+                .is_some_and(|m| tip >= m.lastact.saturating_add(slack))
+        };
         let overridden: Vec<PubKey33> = required
             .iter()
-            .filter(|k| !none_from.contains(*k) && declared.contains(*k) && !held_from.contains(*k))
+            .filter(|k| {
+                !none_from.contains(*k)
+                    && declared.contains(*k)
+                    && !held_from.contains(*k)
+                    && missed_heartbeat(k)
+            })
             .copied()
             .collect();
         if !overridden.is_empty() {
@@ -897,25 +964,114 @@ impl Engine {
                   declared_gone = %overridden.iter().map(hex::encode).collect::<Vec<_>>().join(","),
                   "not waiting for member(s) declared gone by a quorum (owner's override)");
         }
-        let missing: Vec<String> = required
+        let missing: Vec<PubKey33> = required
             .iter()
             .filter(|k| !none_from.contains(*k) && !overridden.contains(*k))
-            .map(hex::encode)
+            .copied()
             .collect();
         if missing.is_empty() {
             Ok(Prior::NoneConfirmed)
         } else {
+            let leaders = self.ctx.db(|t| t.burn_leaders(&b.key))?;
+            let observed = self.observed_signers(b).await?;
+            let list = |keys: &[PubKey33]| {
+                keys.iter()
+                    .filter(|k| missing.contains(k))
+                    .map(hex::encode)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let prev = list(&leaders);
+            let seen = observed
+                .iter()
+                .filter(|k| !leaders.contains(k))
+                .copied()
+                .collect::<Vec<_>>();
+            let seen = list(&seen);
             Ok(Prior::Unknown(format!(
-                "no signed answer that they hold no unlock for it from {} (previous leaders, \
-                 signers of an unlock observed for it{})",
-                missing.join(", "),
+                "no signed answer that they hold no unlock for it from previous leaders \
+                 ({prev}) and observed signers ({seen}){}",
                 if restored {
-                    " and, the ledger being restored, every member"
+                    "; the ledger is restored, so every member was asked"
                 } else {
                     ""
                 }
             )))
         }
+    }
+
+    /// A `held` answer without bytes is honest when the intent it names is on this node, in
+    /// this mempool, or already linked to the burn (W4-B-1). Anything else starts the stale clock.
+    async fn held_claim_visible(
+        &self,
+        b: &BurnRecord,
+        body: &crate::peers::BurnUnlockResponse,
+    ) -> Result<bool> {
+        let Some(named) = body.paying_intent.as_deref() else {
+            return Ok(false);
+        };
+        if b.intent.is_some_and(|op| op.to_string() == named) {
+            return Ok(true);
+        }
+        let Some((txid, vout)) = named.rsplit_once(':') else {
+            return Ok(false);
+        };
+        let Ok(vout) = vout.parse::<u32>() else {
+            return Ok(false);
+        };
+        let Ok(op) = CoreOutPoint::from_display(txid, vout) else {
+            return Ok(false);
+        };
+        if self.mem.mempool_seen.contains(&op.txid) {
+            return Ok(true);
+        }
+        if self
+            .ctx
+            .db(|t| t.intent(&op))?
+            .is_some_and(|i| i.confirmed_height.is_some())
+        {
+            return Ok(true);
+        }
+        match self
+            .ctx
+            .ycash
+            .getrawtransaction(&hawkeye_ycash::Hash256::from_internal(op.txid))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn note_stale_held(&mut self, b: &BurnRecord, member: &PubKey33) -> Result<u32> {
+        let id = (b.key.nonce, *member);
+        if let Some(h) = self.mem.held_stale.get(&id) {
+            return Ok(*h);
+        }
+        let key = stale_held_key(&b.key, member);
+        if let Some(h) = self
+            .ctx
+            .db(|t| t.meta(&key))?
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+        {
+            self.mem.held_stale.insert(id, h);
+            return Ok(h);
+        }
+        let tip = self.mem.tip;
+        self.ctx.db(|t| t.set_meta(&key, &tip.to_string()))?;
+        self.mem.held_stale.insert(id, tip);
+        Ok(tip)
+    }
+
+    fn clear_stale_held(&mut self, b: &BurnRecord, member: &PubKey33) -> Result<()> {
+        self.mem.held_stale.remove(&(b.key.nonce, *member));
+        let key = stale_held_key(&b.key, member);
+        self.ctx.db(|t| {
+            t.delete_meta_prefix(&key)?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// The unlock quorum `k` (the set's `unlockThreshold`; 1 before the set is read).
@@ -1593,8 +1749,9 @@ pub fn gone_quorum(k: u32, n_current: u32) -> u32 {
 /// The members declared permanently gone in this ledger by at least [`gone_quorum`] distinct
 /// members that are current **now** (a declarer that left stops counting) and are not the member.
 /// A declaration counts only for the membership it names (`seq` = the member's join height now)
-/// and only up to its `expiry` height, and not once the member has acted (`lastact`, a heartbeat)
-/// after it was recorded (review R-2).
+/// and only up to its `expiry` height, and not once the member has acted (`lastact`) after the
+/// `silent_since` height the declarer signed (W4-B-4). A set of fewer than three current members
+/// has no override: this returns nothing (remove the member on chain).
 pub(crate) fn declared_gone(
     t: &hawkeye_store::Tx<'_>,
     members: &[hawkeye_ycash::types::Member],
@@ -1602,6 +1759,9 @@ pub(crate) fn declared_gone(
     tip: u32,
 ) -> Result<Vec<PubKey33>, hawkeye_store::StoreError> {
     let current = members.iter().filter(|m| m.current).count();
+    if current < 3 {
+        return Ok(vec![]);
+    }
     let quorum = gone_quorum(k, u32::try_from(current).unwrap_or(u32::MAX));
     Ok(gone_counts(t, members, tip)?
         .into_iter()
@@ -1641,14 +1801,17 @@ fn gone_counts(
         let Ok(j) = serde_json::from_str::<serde_json::Value>(&v) else {
             continue;
         };
-        let (seq, expiry, height) = (
+        let (seq, expiry, silent_since) = (
             j["seq"].as_u64().unwrap_or(u64::MAX),
             j["expiry"].as_u64().unwrap_or(0),
-            j["height"].as_u64().unwrap_or(0),
+            j["silent_since"].as_u64(),
         );
+        let Some(silent_since) = silent_since else {
+            continue; // v1, recorded before W4-B-4: it does not count
+        };
         if seq != u64::from(member.joinheight)
             || expiry < u64::from(tip)
-            || u64::from(member.lastact) > height
+            || u64::from(member.lastact) > silent_since
         {
             continue;
         }
@@ -1684,10 +1847,19 @@ pub async fn record_gone(
         anyhow::ensure!(r == declarer, "a declaration is sent by its own declarer");
     }
     anyhow::ensure!(declarer != member, "a member cannot declare itself gone");
+    let Some(silent_since) = req.silent_since else {
+        bail!("a v1 gone declaration is refused: re-declare with this release");
+    };
     let sig = hawkeye_core::peerauth::parse_sig(&req.sig).map_err(|e| anyhow!("sig: {e}"))?;
     hawkeye_core::peerauth::verify(
         &declarer,
-        &hawkeye_core::peerauth::gone_msg(&ctx.params.set_id, &member, req.seq, req.expiry),
+        &hawkeye_core::peerauth::gone_msg(
+            &ctx.params.set_id,
+            &member,
+            req.seq,
+            req.expiry,
+            silent_since,
+        ),
         &sig,
     )
     .map_err(|e| anyhow!("declaration signature: {e}"))?;
@@ -1717,6 +1889,11 @@ pub async fn record_gone(
             .any(|m| m.key.0 == declarer && m.current),
         "the declarer is not a current member"
     );
+    anyhow::ensure!(
+        silent_since == m.lastact,
+        "the declaration's silent_since {silent_since} is not the member's last act {} (it must have seen the latest heartbeat)",
+        m.lastact
+    );
     let k = set.set.params.unlockthreshold;
     let current = set.memberlist.iter().filter(|m| m.current).count();
     let quorum = gone_quorum(k, u32::try_from(current).unwrap_or(u32::MAX));
@@ -1728,7 +1905,7 @@ pub async fn record_gone(
             hex::encode(declarer)
         );
         let v = serde_json::json!({"sig": req.sig, "reason": req.reason, "seq": req.seq,
-                                   "expiry": req.expiry, "height": tip, "at": t.now()});
+                                   "expiry": req.expiry, "silent_since": silent_since, "at": t.now()});
         t.set_meta(&key, &v.to_string())?;
         Ok(gone_counts(t, &set.memberlist, tip)?
             .get(&member)
@@ -1746,6 +1923,54 @@ pub async fn record_gone(
 /// The `meta` key set when the ledger is found restored from a backup (review L-2): its value
 /// says how; `acknowledged` once the operator clears it (`hawkeye acknowledge-ledger-restore`).
 pub const LEDGER_RESTORED: &str = "ledger_restored";
+
+/// The Ycash height at which [`LEDGER_RESTORED`] was raised (V-N1). Peers page
+/// `member-restored-unacknowledged` once `tip − this ≥ 10 × TAKEOVER`.
+pub const LEDGER_RESTORED_HEIGHT: &str = "ledger_restored_height";
+
+/// `meta` prefix `held_stale/<burn key>/<member hex>` → the height a stale `held` answer was
+/// first seen (W4-B-1).
+fn stale_held_key(burn: &BurnKey, member: &PubKey33) -> String {
+    format!("held_stale/{burn}/{}", hex::encode(member))
+}
+
+/// Blocks before a stale `held` answer pages `unlock-hostage`: `2 × max(TAKEOVER, C_Y)`.
+fn held_bound(p: &crate::config::Params) -> u32 {
+    2 * p.takeover.max(p.confirmations).max(1)
+}
+
+/// The first observed unlock of `burn` whose bytes still pay it (value-bounded, `MatchedBurn`,
+/// vault unspent). Served by `POST /burns/unlock` when this member has no live row of its own
+/// (W4-B-3). The asker runs the full adoption checks before sending it.
+pub(crate) async fn observed_unlock_bytes(
+    ctx: &super::Ctx,
+    burn: &BurnKey,
+) -> Result<Option<(String, CoreOutPoint)>> {
+    use hawkeye_core::matcher::Classification;
+    let rows = ctx.db(|t| t.meta_prefix(&super::ycash::observed_unlock_prefix(burn)))?;
+    for (_, v) in rows {
+        let Some(raw) = serde_json::from_str::<serde_json::Value>(&v)
+            .ok()
+            .and_then(|j| j["raw"].as_str().map(str::to_owned))
+        else {
+            continue;
+        };
+        let Ok(tx) = Transaction::decode_hex(&raw) else {
+            continue;
+        };
+        let Ok(f) = classify_unlock(ctx, &tx).await else {
+            continue;
+        };
+        if super::sign::unlock_value_bounded(&tx, f.coin.1).is_err() {
+            continue;
+        }
+        if f.classification != (Classification::MatchedBurn { nonce: burn.nonce }) {
+            continue;
+        }
+        return Ok(Some((raw, f.origin)));
+    }
+    Ok(None)
+}
 
 /// Whether signed bytes could satisfy `CheckSetSigs` at the next height (W4-B-2, W4-B-5).
 #[derive(Debug, Clone, PartialEq, Eq)]

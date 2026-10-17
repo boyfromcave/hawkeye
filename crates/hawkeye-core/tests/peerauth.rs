@@ -8,7 +8,7 @@
 
 use hawkeye_core::bytes::sha256d;
 use hawkeye_core::peerauth::{
-    PeerRequest, hwm_msg, parse_member, parse_nonce, parse_sig, parse_time, request_msg,
+    PeerRequest, gone_msg, hwm_msg, parse_member, parse_nonce, parse_sig, parse_time, request_msg,
     request_preimage, response_msg, sign, verify,
 };
 use hawkeye_core::{Deployment, EthAddress, SecretKey};
@@ -162,4 +162,30 @@ fn ledger_hwm_vector() {
         )
         .is_err()
     );
+}
+
+/// Plan §4.6 (W4-B-4): set `0x11…11`, member `0x22…22`, seq 7, expiry 100, silent_since 40.
+const GONE_MSG: &str = "474425d59bcba3f55dbffbdfac58237834c22bab520f6a77d388616e6c2e0460";
+
+#[test]
+fn gone_declaration_v2_vector() {
+    let member = [0x22; 33];
+    let msg = gone_msg(&SET, &member, 7, 100, 40);
+    let mut pre = b"HawkeyeMemberGone2".to_vec();
+    pre.extend_from_slice(&SET);
+    pre.extend_from_slice(&member);
+    pre.extend_from_slice(&7u32.to_le_bytes());
+    pre.extend_from_slice(&100u32.to_le_bytes());
+    pre.extend_from_slice(&40u32.to_le_bytes());
+    assert_eq!(pre.len(), 18 + 32 + 33 + 12);
+    assert_eq!(msg, sha256d(&pre));
+    assert_eq!(hex::encode(msg), GONE_MSG);
+    assert_ne!(gone_msg(&[0x12; 32], &member, 7, 100, 40), msg);
+    assert_ne!(gone_msg(&SET, &[0x23; 33], 7, 100, 40), msg);
+    assert_ne!(gone_msg(&SET, &member, 8, 100, 40), msg);
+    assert_ne!(gone_msg(&SET, &member, 7, 101, 40), msg);
+    assert_ne!(gone_msg(&SET, &member, 7, 100, 41), msg);
+    let key = SecretKey::from_bytes(&[7; 32]).unwrap();
+    let sig = sign(&key, &msg).unwrap();
+    verify(&key.public_key(), &msg, &sig).unwrap();
 }
