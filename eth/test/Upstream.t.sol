@@ -12,3 +12,5 @@ import {OptimisticMintTest} from "wyec-test/OptimisticMint.t.sol";
 import {RateLimitTest} from "wyec-test/RateLimit.t.sol";
 import {DeployScriptTest} from "wyec-test/Deploy.t.sol";
 import {SuccessorTest} from "wyec-test/Successor.t.sol";
+import {ProposalCapTest} from "wyec-test/ProposalCap.t.sol";
+import {ProposalCapInvariantTest} from "wyec-test/ProposalCapInvariant.t.sol";
