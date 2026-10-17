@@ -249,9 +249,7 @@ contract Eip712VectorsTest is Test {
         // setBridge refuses an EOA (BadSuccessor). The recorded address stays newBridge; the stub
         // deployed there bridges this token and reads this bridge as predecessor.
         deployCodeTo(
-            "Vectors.t.sol:SetBridgeSuccessorStub",
-            abi.encode(address(b.token()), address(b)),
-            newBridge
+            "Vectors.t.sol:SetBridgeSuccessorStub", abi.encode(address(b.token()), address(b)), newBridge
         );
         b.setBridge(newBridge, one(sig));
         assertEq(WrappedYcash(address(b.token())).bridge(), newBridge);
