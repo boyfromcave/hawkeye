@@ -180,7 +180,10 @@ impl Engine {
                     .into_iter()
                     .filter(|i| {
                         i.released_txid.is_some()
-                            && i.classification.as_deref() == Some("unmatched:unknown-burn")
+                            && (i.classification.as_deref() == Some("unmatched:unknown-burn")
+                                || i.classification
+                                    .as_deref()
+                                    .is_some_and(super::ycash::duplicate_payer_code))
                     }),
             );
             for i in open {

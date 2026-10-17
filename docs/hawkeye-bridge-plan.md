@@ -542,6 +542,15 @@ counts). Vector: `crates/hawkeye-core/tests/peerauth.rs` (set `0x11…11`, chain
 `msg = fd8d6317…747a7c`). `[peers] require_auth` (default true; false refused on mainnet) and
 `allow_from` (CIDRs, a belt) configure it; mainnet peer URLs are `https://` or loopback.
 
+A declaration that a member is permanently gone (W4-B-4) is version 2:
+
+```
+msg = sha256d( "HawkeyeMemberGone2" (18) ‖ set_id (32) ‖ member (33) ‖ seq (u32 LE)
+             ‖ expiry (u32 LE) ‖ silent_since (u32 LE) )
+```
+
+`silent_since` is the declarer's view of that member's `lastact` (`set_getinfo`) when it signs. A ledger counts the declaration only while the member's `lastact` is still that height, so a declaration delivered after a heartbeat does not start its clock on arrival. A v1 declaration (no `silent_since`) is refused (`re-declare with this release`). The override applies only when the member has missed a heartbeat by a takeover's slack (`tip ≥ lastact + heartbeat_blocks + takeover`) and never when fewer than three members are current. Vector: `crates/hawkeye-core/tests/peerauth.rs` (set `0x11…11`, member `0x22…22`, seq 7, expiry 100, silent_since 40 → `msg = 474425d5…2e0460`).
+
 ### 4.7 Ledger high-water mark (V-N1, remedial report MEDIUM-W4-B-1)
 
 `<ledger>.hwm` records how many Ycash sign-once rows this ledger has held. A later open whose
@@ -571,8 +580,8 @@ the ledger's current count. A verified mark whose `count` is above the ledger's 
 restore, as before. Vector: `crates/hawkeye-core/tests/peerauth.rs` (set `0x11…11`, ledger id
 `0001…0f`, count 5 → `msg = 51409b34…d2dc94`).
 
-The report's option (c′), overriding a stale `held` answer after a time bound, stays an owner
-decision and is not part of this encoding.
+Overriding a stale `held` answer (option (c′)) is not part of this encoding. The decision is in §12:
+a stale `held` pages and is not overridden.
 
 ---
 
@@ -588,7 +597,11 @@ Lock:   SEEN → CONFIRMED → POLICY_OK | POLICY_REJECTED
         CHALLENGED → PROPOSED (re-proposed by the next eligible attestor, §3.3)
 Burn:   SEEN(unfinalized) → FINALIZED → (ORPHANED | ASSIGNED(leader, deadline))
         ASSIGNED → INTENT_PENDING(intent) → INTENT_CONFIRMED → RELEASED
-        INTENT_* → CANCELLED (by a watcher; the burn returns to FINALIZED for reassignment)
+        INTENT_* → CANCELLED (by a watcher). If another intent already paid the burn — `RELEASED`,
+              `MATCHED`, or a matured correct duplicate with its release recorded — the burn is
+              re-linked to that intent (`FINALIZED → INTENT_PENDING → INTENT_CONFIRMED` if mined
+              → `RELEASED` if already released) instead of being reassigned (05/N-1). Otherwise
+              it returns to FINALIZED for reassignment.
         INTENT_PENDING → FINALIZED (its unlock left the mempool unmined for max(TAKEOVER, C_Y)
               blocks: reassigned, so the signed unlock is re-sent or adopted — HK-16)
         FINALIZED → WAITING_CAP(epoch) when S-3 would refuse
@@ -613,8 +626,20 @@ burn, who is not the signer of the consuming intent, is also cancelled and not s
 the owner override can still sign a fresh vault for a live leader, and that honest unlock must not
 cost a bond. A second unlock by the consuming intent's own signer, and a correct duplicate by a
 member who never led the burn, stay slashable outside the overlap. The consuming intent has to be
-attributed; an unknown consumer signer is not exempt. The late-cancel re-link and the override
-gate are unchanged.
+attributed; an unknown consumer signer is not exempt. A late cancel of the linked intent re-links
+the burn to an intent that already paid it (05/N-1, §5.1) and does not hold it for a new vault.
+Before a fresh vault, the required answerers are the burn's previous leaders plus the signers of
+observed unlocks that can still be adopted. `POST /burns/unlock` carries the evidence of a `held`
+answer without bytes (the vault, the paying intent, the height it was linked). A stale claim —
+the named intent is not mined here, not in the mempool, and not linked — pages `unlock-hostage`
+after `2 × max(TAKEOVER, C_Y)` and names the member. An honest `held` whose paying intent is
+visible does not page and is not overridden. A peer that only observed an evicted unlock serves
+those bytes, so a restored member adopts them instead of signing a fresh vault (W4-B-3). The
+owner override (`declare-leader-gone`, §4.6) applies only to a member that has missed a heartbeat
+by a takeover's slack, never in a set of fewer than three current members, and counts each
+declaration from the `silent_since` height the declarer signed (W4-B-4). What was given up: a
+scheduled taker that posts a correct duplicate anyway is cancelled, not slashed; a two-member set
+removes a gone member on chain.
 
 ### 5.3 Watcher and slash flow
 
@@ -805,7 +830,8 @@ installer and the native `solc` download are blocked, Foundry's npm packages
 |---|---|---|
 | D-1 | Happy path, both directions, 3 attestors | lock → mint; burn → intent → release; supply invariant holds |
 | D-2 | Rogue intent (a member signs an unlock with no burn) | cancelled within the window by ≥ 1 other Hawkeye; slash case reaches `SET_REMOVE burn=1` |
-| D-3 | Double release (second intent for a consumed burn) | cancelled; slashed (outside the race window) |
+| D-3 | Double release by a member that was not the burn's leader or a scheduled taker (unsolicited) | cancelled; slashed (`unmatched:consumed-burn`) |
+| D-3b | Double release by the scheduled taker (override path: leader API down, node and heartbeats up, quorum after a missed heartbeat) | `consumed-burn:scheduled`; cancelled; no case and no vote |
 | D-4 | Wrong amount / wrong recipient intent | cancelled; slashed |
 | D-5 | Rogue mint: one member proposes a mint with no lock behind it (`rogue-mint`) | another attestor challenges it before `eta`; no wYEC minted, the proposer `vetoed`; slash case → `SET_REMOVE burn=1` (removed, bond frozen) |
 | D-6 | Equivocation (one key, two unlocks of one vault) | `set_equivocation` submitted automatically; member ejected |
@@ -933,4 +959,5 @@ from the members' compressed keys.
 | HK-12 | (2026-10-11, D-Q-29..D-Q-31) An attestor leaves by `hawkeye leave` (`set_leave`) and recovers its bond by `hawkeye withdraw-bond` after the set's `maturity` (≥ 16,128 on mainnet: the mainnet row's 1,152 became 16,128); slashing reaches members in their exit delay (§2.4, §5.3 step 5) |
 | HK-15 | (audit 05/L-4) Optimistic mode falls back to the threshold path automatically once every live member is barred from a lock (`vetoed`, or a recorded griefer of it); the challenger of a proposal that matched a policy-OK lock gets a `GRIEFING` case (`SET_REMOVE burn=0`) and is not waited for as that lock's proposer (§5.3 step 2) |
 | HK-16 | (2026-10-13, audit 01/V-2 on 05/N-1; review of fix/unlock-revival) Never sign a second unlock for a burn while an unlock any member signed for it could still confirm: a signed unlock is revivable (re-fundable) until its vault is spent by another transaction `C_Y` deep (from the ledger's spend record, the follower at the tip) or its intent is cancelled `C_Y` deep; fee-input spends never make it dead. Leader and co-signed rows are re-sent re-funded by the burn's leader; a takeover leader adopts a peer's signed unlock (`POST /burns/unlock`, members only, unpaid burns only) and signs a fresh vault only on every previous leader's signed "none" (every member's while the ledger is flagged restored); unlocks, rolls and cancels carry no change output and a re-fund costs at most 0.001 YEC; orphaned vaults are rolled; evicted unlocks are re-sent after `max(TAKEOVER, C_Y)` blocks; only signers still current in the set are required (a non-current member's signature can never confirm, `CheckSetSigs`), observed unlocks of the burn are adopted first and their signers required (not those of an observed unlock that could never be adopted: one moving more than its vault, or not paying the burn in this ledger, W4-B-1), a restored ledger answers "unknown", and the owner's override `hawkeye declare-leader-gone` (a quorum of `max(k, floor((n_current − 1)/2) + 1)` — a strict majority of the current members other than the gone one, never less than `unlockThreshold` — each a signed, recorded declaration bound to the member's join height and an expiry height (≤ 10 × TAKEOVER), dropped when the member answers or heartbeats; a declarer that leaves stops counting; it applies only while the declared member stays silent) releases a permanently gone member's holds |
-| HK-17 | (2026-10-16, MEDIUM-W4-B-1 / V-N1) The ledger high-water mark is a member-signed v2 record bound to `meta.ledger_id` (§4.7). A stock daemon does not treat an edited mark as a restore. The report's option (c′), overriding a stale `held` answer, stays an owner decision and is not implemented. | |
+| HK-17 | (2026-10-17, MEDIUM-W4-B-1) A stale `held` answer pages `unlock-hostage` and an unacknowledged restore pages `member-restored-unacknowledged`; neither is overridden. Option (c′) stays off, which is the report's default. |
+| HK-18 | (2026-10-17, W4-B-4 / 05/N-1) Gone declarations are v2, bound to `silent_since` (§4.6). The override needs a missed heartbeat and at least three current members. A late cancel re-links a burn another intent already paid (§5.1). |

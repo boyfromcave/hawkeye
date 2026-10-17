@@ -290,6 +290,65 @@ pub fn apply_unlock(
     Ok(())
 }
 
+/// Whether `code` is a correct duplicate this ledger may adopt as the burn's payer (05/N-1).
+pub(crate) fn duplicate_payer_code(code: &str) -> bool {
+    code.starts_with("unmatched:consumed-burn") || code.starts_with("unmatched:duplicate-burn")
+}
+
+/// Another intent that already pays burn `k`, other than the one just cancelled (05/N-1).
+fn paying_intent(
+    t: &Tx<'_>,
+    k: &BurnKey,
+    cancelled: &CoreOutPoint,
+) -> Result<Option<hawkeye_store::IntentRecord>, StoreError> {
+    Ok(t.intents_for_burn(k)?.into_iter().find(|j| {
+        j.outpoint != *cancelled
+            && (matches!(j.state, IntentState::Released | IntentState::Matched)
+                || (j.state == IntentState::MaturedUnmatched
+                    && j.released_txid.is_some()
+                    && j.classification
+                        .as_deref()
+                        .is_some_and(duplicate_payer_code)))
+    }))
+}
+
+/// `CANCELLED → FINALIZED → INTENT_PENDING(payer)`, then `INTENT_CONFIRMED` when `payer` is
+/// mined and `RELEASED` when it was already released. Does not reset the burn for a new leader.
+fn relink_paid_burn(
+    t: &Tx<'_>,
+    k: &BurnKey,
+    payer: &hawkeye_store::IntentRecord,
+    h: u32,
+) -> Result<(), StoreError> {
+    let released = payer.state == IntentState::Released
+        || (payer.state == IntentState::MaturedUnmatched && payer.released_txid.is_some());
+    let detail = format!(
+        "re-linked to {op}: already released (05/N-1)",
+        op = payer.outpoint
+    );
+    t.transition_burn(
+        k,
+        BurnState::Finalized,
+        Some(h.into()),
+        Some(if released {
+            detail.as_str()
+        } else {
+            "re-linked: another intent already pays (05/N-1)"
+        }),
+    )?;
+    t.burn_intent_pending(k, &payer.outpoint, h)?;
+    let mined = payer.confirmed_height.is_some() || released;
+    if mined {
+        t.transition_burn(k, BurnState::IntentConfirmed, Some(h.into()), Some(&detail))?;
+    }
+    if released {
+        t.transition_burn(k, BurnState::Released, Some(h.into()), Some(&detail))?;
+    }
+    info!(event = "burn_relinked", nonce = k.nonce, payer = %payer.outpoint,
+          released, "a late cancel left the burn on the intent that already pays it (05/N-1)");
+    Ok(())
+}
+
 /// Spends of the set's vaults and intents by a mined transaction: vault `SPENT`, intent
 /// `CANCELLED` (selector 2) or `RELEASED` (selector 1), and the burn moves with its intent.
 fn apply_spends(
@@ -370,13 +429,17 @@ fn apply_spends(
                     )
                 {
                     t.transition_burn(&b.key, BurnState::Cancelled, Some(h.into()), None)?;
-                    t.transition_burn(
-                        &b.key,
-                        BurnState::Finalized,
-                        Some(h.into()),
-                        Some("intent cancelled: reassign"),
-                    )?;
-                    info!(event = "burn_reassign", nonce = b.key.nonce, cancelled_intent = %op);
+                    if let Some(payer) = paying_intent(t, &b.key, &op)? {
+                        relink_paid_burn(t, &b.key, &payer, h)?;
+                    } else {
+                        t.transition_burn(
+                            &b.key,
+                            BurnState::Finalized,
+                            Some(h.into()),
+                            Some("intent cancelled: reassign"),
+                        )?;
+                        info!(event = "burn_reassign", nonce = b.key.nonce, cancelled_intent = %op);
+                    }
                 }
             }
             _ => {}
@@ -1008,5 +1071,71 @@ mod tests {
         let theirs = HawkeyeMemo::roll_for(BridgeKind::Near, p.deployment, &v).unwrap();
         assert_eq!(roll_memo(&p, &[out(ours)]), Some(ours));
         assert_eq!(roll_memo(&p, &[out(theirs)]), None);
+    }
+
+    /// 05/N-1: cancelling the linked intent re-links a burn another intent already released.
+    #[test]
+    fn late_cancel_relinks_a_released_payer() {
+        use hawkeye_core::{Deployment, EthAddress};
+        use hawkeye_store::{NewBurn, NewIntent, Store};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("ledger.db")).unwrap();
+        let deployment = Deployment {
+            chain_id: 1,
+            bridge: EthAddress([0x11; 20]),
+        };
+        store
+            .tx(|t| {
+                let k = BurnKey::new(deployment, 7);
+                t.insert_burn(&NewBurn {
+                    key: k,
+                    tx_hash: [1; 32],
+                    block_number: 1,
+                    block_hash: [2; 32],
+                    from: hawkeye_core::Destination::Ethereum(EthAddress([3; 20])),
+                    amount: 5,
+                    recipient: vec![2; 22],
+                    finalized: true,
+                })?;
+                let a = CoreOutPoint::new([4; 32], 0);
+                let b = CoreOutPoint::new([5; 32], 1);
+                let new = |op: CoreOutPoint, h: u32| NewIntent {
+                    outpoint: op,
+                    value_zat: 5,
+                    recipient_hash: [6; 32],
+                    vault_hash: [7; 32],
+                    origin_vault: None,
+                    signer_key: None,
+                    memo: None,
+                    first_seen_height: h,
+                    confirmed_height: Some(h),
+                };
+                t.insert_intent(&new(a, 1))?;
+                t.insert_intent(&new(b, 2))?;
+                t.classify_intent(
+                    &a,
+                    &deployment,
+                    &Classification::MatchedBurn { nonce: 7 },
+                    Some(1),
+                )?;
+                t.classify_intent(
+                    &b,
+                    &deployment,
+                    &Classification::MatchedBurn { nonce: 7 },
+                    Some(2),
+                )?;
+                t.burn_intent_pending(&k, &a, 3)?;
+                t.transition_burn(&k, BurnState::IntentConfirmed, Some(4), None)?;
+                t.intent_released(&b, &[9; 32], 5)?;
+                t.transition_burn(&k, BurnState::Cancelled, Some(6), None)?;
+                let payer = paying_intent(t, &k, &a)?.expect("B pays");
+                assert_eq!(payer.outpoint, b);
+                relink_paid_burn(t, &k, &payer, 6)?;
+                let burn = t.burn(&k)?.unwrap();
+                assert_eq!(burn.state, BurnState::Released);
+                assert_eq!(burn.intent, Some(b));
+                Ok::<_, hawkeye_store::StoreError>(())
+            })
+            .unwrap();
     }
 }

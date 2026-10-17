@@ -118,17 +118,18 @@ pub async fn declare_leader_gone(
     hex::decode_to_slice(member.trim_start_matches("0x"), &mut mk)
         .map_err(|_| anyhow!("member must be 66 hex"))?;
     let set = ctx.ycash.set_getinfo(&ctx.set_hash(), None).await?;
-    let seq = set
+    let (seq, silent_since) = set
         .memberlist
         .iter()
         .find(|m| m.key.0 == mk)
-        .map(|m| m.joinheight)
+        .map(|m| (m.joinheight, m.lastact))
         .ok_or_else(|| anyhow!("{member} is not in the set's member list"))?;
+    let n_current = set.memberlist.iter().filter(|m| m.current).count();
     let tip = ctx.ycash.getblockcount().await?;
     let expiry = tip.saturating_add(expires_in.unwrap_or(2 * s.params.takeover.max(1)));
     let sig = hawkeye_core::peerauth::sign(
         &key,
-        &hawkeye_core::peerauth::gone_msg(&s.params.set_id, &mk, seq, expiry),
+        &hawkeye_core::peerauth::gone_msg(&s.params.set_id, &mk, seq, expiry, silent_since),
     )
     .map_err(|e| anyhow!("{e}"))?;
     let decl = crate::peers::GoneDeclaration {
@@ -136,9 +137,17 @@ pub async fn declare_leader_gone(
         declarer: hex::encode(key.public_key()),
         seq,
         expiry,
+        silent_since: Some(silent_since),
         sig: hex::encode(sig),
         reason: reason.to_owned(),
     };
+    if n_current < 3 {
+        let note = format!(
+            "a set of {n_current} current members cannot use the override: remove the member on chain (SET_REMOVE)"
+        );
+        warn!(event = "declare_leader_gone_refused", %note);
+        return print(&json!({"member": decl.member, "note": note, "declarations": 0}));
+    }
     let here = crate::engine::burn::record_gone(&ctx, None, &decl).await?;
     let mut peers = vec![];
     for peer in ctx.peers.urls().to_vec() {
