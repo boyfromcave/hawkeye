@@ -15,15 +15,13 @@
 # WYEC_COMMIT= line below: a re-pin without regenerating fails `forge test` (audit 05/T-1).
 set -eu
 
-# wyec `fix/bridge-wave2` @ 28e806e (on top of upgrade/vault d3d34e2; merged by the coordinator):
-# the successor's immutable `predecessor` and `isConsumed` (audit 05/L-3, design §4.6; new last
-# constructor argument), `ConsumedView`. Was f50eae6 (upgrade/vault): the mainnet constructor floors (audit 05/H-2: MIN_MAINNET_CHALLENGE_WINDOW
-# = 2 hours, MainnetThreshold, MainnetChallengeWindow, MainnetMintCapRequired), exact revert
-# selectors in its tests (05/T-2). Was be177c5 (the merge of wyec#2, contracts = c23849a: CR-W4,
-# ycashRecipient revision 2, `burn(uint256, bytes)`, `InvalidRecipient()`), cad126a (main at
-# the merge of PR #1: CR-W1 optimistic mint + rate limit, CR-W2 Foundry project, CR-W3 recipient
-# NatSpec), and d2e382b before that (threshold mint only).
-WYEC_COMMIT=28e806ebc9e979a8cd853807fd7195a5b6762753
+# wyec `upgrade/vault` @ e9ea41a: per-proposer `maxOpenProposals` (audit W3-B-3; new constructor
+# argument before `predecessor`, `TooManyOpenProposals`, `MainnetOpenProposalCapRequired`),
+# `setBridge` refuses a successor that does not read this bridge (`BadSuccessor`, audit W3-B-7),
+# and the mainnet threshold and mint-cap floors hold in the admin acts (audit W3-B-8).
+# Was 28e806e (`fix/bridge-wave2`): the successor's immutable `predecessor` and `isConsumed`
+# (audit 05/L-3). Was f50eae6: the mainnet constructor floors (audit 05/H-2).
+WYEC_COMMIT=e9ea41aa185c348c4f6c72085b18bff8eda49bb5
 WYEC_URL=${WYEC_URL:-https://github.com/boyfromcave/wyec.git}
 
 here=$(cd "$(dirname "$0")/.." && pwd)

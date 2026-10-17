@@ -246,6 +246,13 @@ contract Eip712VectorsTest is Test {
         bytes memory sig = signLowS(pks[k], d);
         WyecBridge b = deployAt(cid, vm.addr(pks[k]));
         setAdminNonce(b, adminNonce);
+        // setBridge refuses an EOA (BadSuccessor). The recorded address stays newBridge; the stub
+        // deployed there bridges this token and reads this bridge as predecessor.
+        deployCodeTo(
+            "Vectors.t.sol:SetBridgeSuccessorStub",
+            abi.encode(address(b.token()), address(b)),
+            newBridge
+        );
         b.setBridge(newBridge, one(sig));
         assertEq(WrappedYcash(address(b.token())).bridge(), newBridge);
         string memory t = tail(sh, d, k, sig);
@@ -617,7 +624,7 @@ contract Eip712VectorsTest is Test {
         g[0] = guardian;
         deployCodeTo(
             "WyecBridge.sol:WyecBridge",
-            abi.encode(t, g, uint8(1), uint64(60), uint256(0), uint256(0), address(0)),
+            abi.encode(t, g, uint8(1), uint64(60), uint256(0), uint256(0), uint256(0), address(0)),
             BRIDGE
         );
         return WyecBridge(BRIDGE);
@@ -633,7 +640,7 @@ contract Eip712VectorsTest is Test {
         }
         deployCodeTo(
             "WyecBridge.sol:WyecBridge",
-            abi.encode(t, g, uint8(2), uint64(60), uint256(0), uint256(0), address(0)),
+            abi.encode(t, g, uint8(2), uint64(60), uint256(0), uint256(0), uint256(0), address(0)),
             BRIDGE
         );
         return WyecBridge(BRIDGE);
@@ -642,5 +649,16 @@ contract Eip712VectorsTest is Test {
     function setAdminNonce(WyecBridge b, uint256 n) internal {
         if (n != 0) stdstore.target(address(b)).sig("adminNonce()").checked_write(n);
         assertEq(b.adminNonce(), n);
+    }
+}
+
+/// What `setBridge` accepts as a successor: code, this token, and this bridge as `predecessor`.
+contract SetBridgeSuccessorStub {
+    address public immutable token;
+    address public immutable predecessor;
+
+    constructor(address token_, address predecessor_) {
+        token = token_;
+        predecessor = predecessor_;
     }
 }

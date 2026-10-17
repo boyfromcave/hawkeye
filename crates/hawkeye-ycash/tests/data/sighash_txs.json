@@ -1,6 +1,6 @@
 {
  "generator": "crates/hawkeye-ycash/tests/data/gen_fixtures.py",
- "ycash-dd": "ed828e7b22c068bce147690704195af1b581e5d2",
+ "ycash-dd": "cc8c90764715e6c0769edfaeb624f7b5742b73d4",
  "_source": "ycash-dd src/test/data/sighash.json (raw_transaction column), classified by gen_fixtures.py",
  "counts": {
   "overwinter-v3": 139,

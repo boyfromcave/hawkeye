@@ -22,12 +22,14 @@ import {IWrappedYcash, IWyecBridgeConsumed, WyecBridge} from "wyec/WyecBridge.so
 ///   MINT_CAP           mint rate limit in wYEC base units per CAP_WINDOW (default 0 = no limit;
 ///                      not on mainnet, where it is required)
 ///   CAP_WINDOW         rate-limit window in seconds (default 0; > 0 when MINT_CAP > 0)
+///   MAX_OPEN_PROPOSALS most proposals one proposer may have open (default 0 = no limit;
+///                      not on mainnet, where it is required)
 ///   MINT_MODE          "optimistic" (default: proposeMint + window, the Foundation's model) or
 ///                      "threshold" (k-of-n mint), recorded as mintMode
 ///   DEPLOYMENT_FILE    output path (default deployments/<chainid>.json)
 ///
 /// Output: {chainId, bridge, token, deployBlock, guardians, threshold, mintMode, challengeWindow,
-/// mintCap, capWindow}. deployBlock is the first block the deployment can be in (head + 1 at
+/// mintCap, capWindow, maxOpenProposals}. deployBlock is the first block the deployment can be in (head + 1 at
 /// script time): exact on an automining anvil, a safe lower bound for a log scanner elsewhere.
 contract Deploy is Script {
     struct Result {
@@ -42,6 +44,7 @@ contract Deploy is Script {
         uint256 challengeWindow;
         uint256 mintCap;
         uint256 capWindow;
+        uint256 maxOpenProposals;
         string mintMode;
         string file;
     }
@@ -53,6 +56,7 @@ contract Deploy is Script {
         c.challengeWindow = vm.envUint("CHALLENGE_WINDOW");
         c.mintCap = vm.envOr("MINT_CAP", uint256(0));
         c.capWindow = vm.envOr("CAP_WINDOW", uint256(0));
+        c.maxOpenProposals = vm.envOr("MAX_OPEN_PROPOSALS", uint256(0));
         c.mintMode = vm.envOr("MINT_MODE", string("optimistic"));
         c.file = vm.envOr(
             "DEPLOYMENT_FILE",
@@ -76,6 +80,7 @@ contract Deploy is Script {
             "CHALLENGE_WINDOW must be >= 2 hours on mainnet"
         );
         require(block.chainid != 1 || c.mintCap > 0, "MINT_CAP is required on mainnet");
+        require(block.chainid != 1 || c.maxOpenProposals > 0, "MAX_OPEN_PROPOSALS is required on mainnet");
         require(c.mintCap == 0 || c.capWindow > 0, "CAP_WINDOW must be > 0 when MINT_CAP > 0");
         bytes32 mode = keccak256(bytes(c.mintMode));
         require(
@@ -97,6 +102,7 @@ contract Deploy is Script {
             uint64(c.challengeWindow),
             c.mintCap,
             c.capWindow,
+            c.maxOpenProposals,
             // a first deployment; a successor is wyec's script with OLD_BRIDGE (design §4.6)
             IWyecBridgeConsumed(address(0))
         );
@@ -120,7 +126,8 @@ contract Deploy is Script {
         vm.serializeString(o, "mintMode", c.mintMode);
         vm.serializeUint(o, "challengeWindow", c.challengeWindow);
         vm.serializeUint(o, "mintCap", c.mintCap);
-        string memory json = vm.serializeUint(o, "capWindow", c.capWindow);
+        vm.serializeUint(o, "capWindow", c.capWindow);
+        string memory json = vm.serializeUint(o, "maxOpenProposals", c.maxOpenProposals);
         vm.writeJson(json, c.file);
 
         console.log("deployer   ", deployer);

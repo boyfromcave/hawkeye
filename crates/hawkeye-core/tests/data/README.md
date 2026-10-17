@@ -4,11 +4,11 @@
 
 The vault primitive's golden vector, copied verbatim from the node:
 
-- source: `boyfromcave/ycash-dd` `src/test/data/vault_vectors.json` at commit **`ed828e7b2`**
-  (`upgrade/vault`; the file is unchanged since **`8af82551b`**, the remedial-action merges, and
-  at the later head `7cc440fe9`), byte-identical to `boyfromcave/ycash6` `upgrade/vault`
-  **`4129f22cd`** (and `dd3bd98ce`) (checked by sha256: the vector is the same on both node
-  lines). New since the previous copy (ycash-dd `d41026209`, sha256 `4ba21283…80d03`): set
+- source: `boyfromcave/ycash-dd` `src/test/data/vault_vectors.json` at commit **`cc8c90764`**
+  (`upgrade/vault`; the file is unchanged since **`8af82551b`**, including `ed828e7b2`,
+  `7cc440fe9` and this head), byte-identical to `boyfromcave/ycash6` `upgrade/vault`
+  **`23515263c`** (checked by sha256: the vector is the same on both node
+  lines). New since the copy at ycash-dd `d41026209` (sha256 `4ba21283…80d03`): set
   signatures are over `SIGHASH_ALL|SIGHASH_ANYONECANPAY` (`0x81`, audit 01/V-2), so `spends[0]`
   (`unlock`) and `spends[1]` (`cancel`) have new `sighash`, `setSigMsg`, `sigs`, `scriptSig` and
   `tx`; nothing else changed (`ownerSpends` is untouched: the post-quantum owner signs with the
@@ -37,8 +37,8 @@ post-quantum signature code (the node signs owner spends), and `verify` (`script
 
 The node's transparent signature-hash vector, copied verbatim:
 
-- source: `boyfromcave/ycash-dd` `src/test/data/sighash.json` at commit **`ed828e7b2`**
-  (branch `upgrade/vault`; unchanged since `dbc1ab0` and at the later head `7cc440fe9`, and
+- source: `boyfromcave/ycash-dd` `src/test/data/sighash.json` at commit **`cc8c90764`**
+  (branch `upgrade/vault`; unchanged since `dbc1ab0`, including `ed828e7b2` and `7cc440fe9`, and
   unchanged from Ycash v4.5.0's Zcash lineage)
 - sha256 `6e10f3e5649c876a8968a3ba13885aeb8dcee8040fd89e7e39651b041d07f30c`
 - rows `[raw_tx, scriptCode, nIn, hashType, branchId, sighash]`, amount 0, `sighash` printed by

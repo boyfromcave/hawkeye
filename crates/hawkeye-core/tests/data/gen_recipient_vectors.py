@@ -3,7 +3,7 @@
 
 Written from the plan text alone (no hawkeye-core code): the 22/35-byte field, the three
 recipient scripts, recipientHash = SHA256(script), and the Base58Check addresses with the
-node's version bytes (ycash-dd ed828e7b2, unchanged since d41026209: chainparams.cpp P2PKH/P2SH,
+node's version bytes (ycash-dd cc8c90764, unchanged since d41026209: chainparams.cpp P2PKH/P2SH,
 key_io.cpp:23-27 sq/tq/rq).
 """
 import hashlib, json, sys
