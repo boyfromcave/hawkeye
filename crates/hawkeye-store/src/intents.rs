@@ -178,6 +178,18 @@ fn oid(op: &OutPoint) -> String {
     op.to_string()
 }
 
+/// The burn row a consumed-burn classification refers to, from the intent's memo. `None` when
+/// the memo does not name a burn this ledger has.
+fn consumed_burn_row(t: &Tx<'_>, deployment: &Deployment, intent: &IntentRecord) -> Option<i64> {
+    let raw = intent.memo.as_deref()?;
+    let memo = hawkeye_core::memo::HawkeyeMemo::decode_any(raw).ok()?;
+    if memo.kind != hawkeye_core::memo::MemoKind::BurnRelease {
+        return None;
+    }
+    let k = BurnKey::new(*deployment, memo.reference);
+    t.burn_rowid(&k).ok()
+}
+
 impl Tx<'_> {
     /// Record an intent (`OBSERVED`), or return the stored one. Re-observing an existing intent
     /// is idempotent, except that a `confirmed_height` the row lacks is recorded
@@ -306,6 +318,7 @@ impl Tx<'_> {
         c: &Classification,
         height: Option<u32>,
     ) -> Result<IntentState> {
+        let old = self.require_intent(op)?;
         let (to, burn) = match c {
             Classification::Foreign => {
                 return Err(StoreError::Invalid(
@@ -322,13 +335,20 @@ impl Tx<'_> {
                 (IntentState::Matched, Some(self.burn_rowid(&k)?))
             }
             Classification::MatchedRoll { .. } => (IntentState::Matched, None),
+            // A correct duplicate still names the burn (05/N-1): `intents_for_burn` must find it
+            // when a later cancel of the linked intent would otherwise reassign a paid burn.
+            Classification::Unmatched(Unmatched::ConsumedBurn { .. }) => (
+                IntentState::Unmatched,
+                consumed_burn_row(self, deployment, &old),
+            ),
             Classification::Unmatched(_) => (IntentState::Unmatched, None),
         };
         let code = classification_code(c);
-        let old = self.require_intent(op)?;
         let id = oid(op);
         if old.state == to {
-            if old.classification.as_deref() == Some(code.as_str()) {
+            if old.classification.as_deref() == Some(code.as_str())
+                && (burn.is_none() || old.matched_burn.is_some())
+            {
                 return Ok(old.state);
             }
         } else {

@@ -268,9 +268,21 @@ pub async fn check_restore(ctx: &Ctx, hwm: &Path) -> Result<()> {
         })?;
     }
     if let Some(why) = detect(ctx, hwm).await? {
-        error!(event = "ledger_restored", reason = %why,
+        let tip = ctx.ycash.getblockcount().await?;
+        error!(event = "ledger_restored", reason = %why, height = tip,
                "fresh unlocks wait for every member's signed answer until `hawkeye acknowledge-ledger-restore`");
-        ctx.db(|t| t.set_meta(LEDGER_RESTORED, &why))?;
+        ctx.db(|t| {
+            t.set_meta(LEDGER_RESTORED, &why)?;
+            if t.meta(crate::engine::burn::LEDGER_RESTORED_HEIGHT)?
+                .is_none()
+            {
+                t.set_meta(
+                    crate::engine::burn::LEDGER_RESTORED_HEIGHT,
+                    &tip.to_string(),
+                )?;
+            }
+            Ok(())
+        })?;
     } else {
         info!(event = "ledger_restore_check_ok");
     }

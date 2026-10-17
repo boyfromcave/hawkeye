@@ -95,10 +95,23 @@ pub struct BurnUnlockResponse {
     /// none (review M-1).
     pub held: bool,
     /// That signed unlock (hex), served only while the burn is unpaid in the peer's ledger
-    /// (`FINALIZED`, `ASSIGNED`, `WAITING_CAP`): a takeover leader re-sends it (re-funded)
-    /// instead of signing another vault for the burn. Never on the public `GET /burns/<nonce>`.
+    /// (`FINALIZED`, `ASSIGNED`, `WAITING_CAP`), or from an observed unlock of the burn that
+    /// still passes the adoption checks (W4-B-3: a restored member adopts its own evicted
+    /// bytes). Never on the public `GET /burns/<nonce>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlock: Option<String>,
+    /// The vault of the live row, or of the observed unlock, the `held` refers to (W4-B-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<String>,
+    /// With `held` and no `unlock`: the intent this ledger links to the burn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paying_intent: Option<String>,
+    /// The height that intent was linked at (`INTENT_PENDING`), or 0.
+    #[serde(default)]
+    pub since: u32,
+    /// With `restored`: the height the ledger was flagged restored at (V-N1).
+    #[serde(default)]
+    pub restored_since: u32,
 }
 
 /// `POST /vaults/orphaned` request (authenticated, review H-2): a member that holds a signed
@@ -134,7 +147,11 @@ pub struct GoneDeclaration {
     pub seq: u32,
     /// The last Ycash height the declaration counts at (review R-2).
     pub expiry: u32,
-    /// `sign_compact(declarer, gone_msg(set, member, seq, expiry))`, 130 hex.
+    /// The declarer's view of the member's `lastact` when it signed (W4-B-4, plan §4.6). Absent
+    /// on a v1 declaration, which this release refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silent_since: Option<u32>,
+    /// `sign_compact(declarer, gone_msg(set, member, seq, expiry, silent_since))`, 130 hex.
     pub sig: String,
     /// Why (kept with the record).
     pub reason: String,

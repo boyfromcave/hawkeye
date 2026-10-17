@@ -137,7 +137,7 @@ async fn burn_unlock(
         return err(StatusCode::FORBIDDEN, "member-signed requests only");
     }
     let k = BurnKey::new(ctx.params.deployment, req.nonce);
-    let r = ctx.db(|t| {
+    let gathered = ctx.db(|t| {
         let burn = t.burn(&k)?;
         let row = t.live_unlock_for_burn(&ctx.params.set_id, &k)?;
         let unpaid = burn.as_ref().is_some_and(|b| {
@@ -156,18 +156,72 @@ async fn burn_unlock(
                 .map(|r| r.signed_hex),
             _ => None,
         };
+        let vault = row.as_ref().map(|r| r.prevout.to_string());
+        let (paying_intent, since) = match &burn {
+            Some(b) => {
+                let since = t
+                    .events_for(hawkeye_store::ObjectKind::Burn, &b.key.to_string())?
+                    .into_iter()
+                    .rev()
+                    .find(|e| e.to == BurnState::IntentPending.as_str())
+                    .and_then(|e| e.height)
+                    .and_then(|h| u32::try_from(h).ok())
+                    .unwrap_or(0);
+                (b.intent.map(|op| op.to_string()), since)
+            }
+            None => (None, 0),
+        };
         // review N-2: a restored ledger may have forgotten what it signed: never "none"
         let restored = t
             .meta(crate::engine::burn::LEDGER_RESTORED)?
             .is_some_and(|v| v != "acknowledged");
-        Ok(crate::peers::BurnUnlockResponse {
-            nonce: req.nonce,
-            state: burn.map_or_else(|| "unknown".to_owned(), |b| b.state.to_string()),
-            restored,
-            held: row.is_some() || restored,
+        let restored_since = t
+            .meta(crate::engine::burn::LEDGER_RESTORED_HEIGHT)?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        Ok((
+            burn.map(|b| b.state.to_string()),
             unlock,
-        })
+            vault,
+            paying_intent,
+            since,
+            restored,
+            restored_since,
+            row.is_some(),
+        ))
     });
+    let r = match gathered {
+        Ok((state, mut unlock, mut vault, paying_intent, since, restored, restored_since, row)) => {
+            // W4-B-3: no live row here, but an observed unlock of the burn can still be adopted.
+            if unlock.is_none()
+                && let Ok(Some((hex, origin))) =
+                    crate::engine::burn::observed_unlock_bytes(&ctx, &k).await
+            {
+                vault = Some(origin.to_string());
+                unlock = Some(hex);
+            }
+            let held_without_bytes = unlock.is_none() && (row || restored);
+            let paying_intent = if held_without_bytes {
+                paying_intent
+            } else {
+                None
+            };
+            let since = if held_without_bytes { since } else { 0 };
+            let restored_since = if restored { restored_since } else { 0 };
+            Ok(crate::peers::BurnUnlockResponse {
+                nonce: req.nonce,
+                state: state.unwrap_or_else(|| "unknown".to_owned()),
+                restored,
+                held: row || restored || unlock.is_some(),
+                unlock,
+                vault,
+                paying_intent,
+                since,
+                restored_since,
+            })
+        }
+        Err(e) => Err(e),
+    };
     match r {
         Ok(v) => Json(v).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
