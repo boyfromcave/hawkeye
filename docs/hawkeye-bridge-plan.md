@@ -236,7 +236,7 @@ mainnet row (Q-1).
 | Fault | Evidence (objective, public) | Consequence | Who acts |
 |---|---|---|---|
 | Two set signatures by one key over two different spends of one outpoint | the two signatures | `SET_EQUIVOCATION`: EJECTED, bond frozen | anyone; Hawkeye submits automatically |
-| A fraudulent intent (no finalized burn behind it, or the wrong value or recipient, or a burn already consumed) | the intent tx: its set signature recovers to the signer's key (§15.2 step 4); the memo or its absence | cancel (I-2) + `SET_REMOVE burn=1` | cancel: any one Hawkeye at once; slash: `slashThreshold` Hawkeyes co-sign a slash proposal after independent verification (§5.3) |
+| A fraudulent intent (no finalized burn behind it, or the wrong value or recipient, or a burn already consumed by someone else). A correct duplicate — the burn's amount to its recipient — whose signer this ledger assigned the burn to, and who did not sign the consuming intent, is cancelled and not slashed (W3-B-1, §5.2) | the intent tx: its set signature recovers to the signer's key (§15.2 step 4); the memo or its absence | cancel (I-2) + `SET_REMOVE burn=1` | cancel: any one Hawkeye at once; slash: `slashThreshold` Hawkeyes co-sign a slash proposal after independent verification (§5.3) |
 | A fraudulent mint signature or proposal (no lock behind the `lockId`, or a different amount or recipient) | the EIP-712 signature over `Mint(lockId, amount, to)` recovers to the signer | challenge (CR-W1) + `SET_REMOVE burn=1` on Ycash | same |
 | Griefing (cancelling or challenging honest work) | the cancel's signer vs a matching burn; the `MintChallenged` challenger of a proposal that matched a policy-OK lock (HK-15) | `SET_REMOVE burn=0` (O-6, bond returned) | `slashThreshold` |
 | Equivocating EIP-712 Mint signatures (one `lockId`, two `(amount, to)`) | the two signatures | `SET_REMOVE burn=1` | `slashThreshold` |
@@ -320,7 +320,8 @@ pays once:
 - an intent whose memo names an already-consumed burn, an unknown burn, a burn with a different
   value or recipient, or that has no memo, is **unmatched** → cancelled, and slashed unless it is a
   benign race (§5.2: two leaders' intents for one burn inside the takeover window are cancelled
-  but not slashed).
+  but not slashed) or a correct duplicate by a member this ledger assigned the burn to who did not
+  sign the consuming intent (§5.2, W3-B-1).
 
 Until CR-N2 lands, Hawkeye inserts the memo into `vault_buildunlock`'s unsigned hex itself (the fee
 inputs are unsigned and no set signature exists yet), which needs a v4 transparent transaction
@@ -606,7 +607,14 @@ Attestors are ordered by member key. For burn nonce `n` the leader is `live[n mo
 intent for `n` appears within `TAKEOVER` blocks (mempool counts), the next attestor in order takes
 over, and so on. Mints use the same rule over `lockId mod |live|`. Every attestor still *verifies*
 every mint and intent; leadership only decides who spends fees. Two intents for one burn within the
-takeover overlap are a benign race: the later one is cancelled, nobody is slashed.
+takeover overlap are a benign race: the later one is cancelled, nobody is slashed. A correct
+duplicate posted after that overlap by a member this ledger recorded as an `ASSIGNED` leader of the
+burn, who is not the signer of the consuming intent, is also cancelled and not slashed (W3-B-1):
+the owner override can still sign a fresh vault for a live leader, and that honest unlock must not
+cost a bond. A second unlock by the consuming intent's own signer, and a correct duplicate by a
+member who never led the burn, stay slashable outside the overlap. The consuming intent has to be
+attributed; an unknown consumer signer is not exempt. The late-cancel re-link and the override
+gate are unchanged.
 
 ### 5.3 Watcher and slash flow
 

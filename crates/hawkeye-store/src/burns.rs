@@ -317,7 +317,7 @@ impl Tx<'_> {
         }
         let id = self.burn_rowid(&k)?;
         let consumed_by = self.one(
-            "SELECT txid, first_seen_height FROM intents
+            "SELECT txid, first_seen_height, signer_key FROM intents
              WHERE matched_burn = ?1 AND confirmed_height IS NOT NULL AND state IN (?2, ?3)
              ORDER BY first_seen_height, txid LIMIT 1",
             params![id, IntentState::Matched, IntentState::Released],
@@ -325,15 +325,18 @@ impl Tx<'_> {
                 Ok(Consumer {
                     txid: r.get(0)?,
                     first_seen: r.get(1)?,
+                    signer: r.get(2)?,
                 })
             },
         )?;
+        let leaders = self.burn_leaders(&k)?;
         Ok(Some(Burn {
             nonce,
             tx_hash: b.tx_hash,
             amount: b.amount,
             recipient: b.recipient.clone(),
             consumed_by,
+            leaders,
         }))
     }
 
