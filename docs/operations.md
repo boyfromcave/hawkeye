@@ -126,7 +126,8 @@ file, `hawkeye run --reset-ledger-hwm` rewrites it from this ledger and logs `le
 **When:** with **both** daemons stopped (`systemctl stop hawkeye ycashd`), never while running: the
 two files would be from different instants. Take one before every upgrade (section 11).
 
-**How:** `tar` the set, encrypt it (`age`, `gpg`), keep two generations off-host.
+**How:** `tar` the set, encrypt it (`age`, `gpg`), keep two generations off-host. Do not put
+`hawkeye.db.hwm` in that tarball: restoring the mark with the ledger hides the restore (section 9).
 
 **Restore** only onto a host where the original is **destroyed or powered off for good**
 (section 2). Then, before `hawkeye run`:
@@ -249,7 +250,9 @@ within a working day.
 | `burn-over-cap` | ticket | a burn larger than the set's whole per-window unlock cap is parked out of the FIFO; later burns are served | governance: a `SET_PARAMS` raising `ratelimitbps`, or a decision to leave it parked |
 | `node-sign-restored` | page | `"wallet"` mode: the node wallet refuses every set signature (`set-sign-restored`, 07/F-5): it imported the member key (enrolment) or was restored from a seed, and its restore marker is set; no unlock or cancel is signed | if no other copy of the key can have signed: `hawkeye acknowledge-restore` (section 4 step 7, section 5 step 5); otherwise do not acknowledge, leave with the key |
 | `unlock-held` | ticket | this attestor's signed unlock for a burn cannot be sent yet: its vault is spent in the mempool, or in a block the follower has not recorded at the tip yet, or by another transaction not yet `C_Y` deep | check the node's mempool and the follower's lag |
-| `unlock-prior-unknown` | page | this attestor leads a burn others led before, and not every previous leader (every member, while `ledger-restored`) has answered `POST /burns/unlock`, signed, that it holds no signed unlock for it: no fresh vault is signed (an unreachable previous leader holds the burn, 01/V-2, review M-1) | bring the previous leader's Hawkeye and API back; it then re-sends or serves its bytes, or answers none |
+| `unlock-prior-unknown` | page | this attestor leads a burn others led before, and not every previous leader and every observed signer (every member, while `ledger-restored`) has answered `POST /burns/unlock`, signed, that it holds no signed unlock for it: no fresh vault is signed (an unreachable previous leader holds the burn, 01/V-2, review M-1). The text lists previous leaders and observed signers separately | bring the previous leader's Hawkeye and API back; it then re-sends or serves its bytes, or answers none |
+| `unlock-hostage` | page | a member has answered `held` without bytes for `2 × max(TAKEOVER, C_Y)` blocks, naming an intent this node has never seen mined or in its mempool (or naming none). Honest software re-serves the signed unlock within `max(TAKEOVER, C_Y)` | the alarm names the member; review, and if it is griefing remove it (`SET_REMOVE`, this section). A `held` that names a visible paying intent does not page and is not overridden |
+| `member-restored-unacknowledged` | page | a member has answered `restored` for `10 × TAKEOVER` blocks (`RESTORED_ACK_DEADLINE`, the longest gone declaration) without `acknowledge-ledger-restore` | within that deadline of `ledger-restored`: `hawkeye audit-ledger`, `set_importsigned` in wallet mode, and `hawkeye acknowledge-ledger-restore`, or leave the set |
 | `restore-report-flood` | page | another member's restored-ledger orphan reports were refused for volume (more vaults than its restore event stated, or more than 64), review R-1 | ask that operator; its reports are otherwise only accepted while its own signed `/burns/unlock` shows it restored |
 | `gone-member-answered` | page | a member declared gone (`declare-leader-gone`) answered that it holds a signed unlock for a burn: the declaration was wrong, the member's hold stands | find out why the member was declared gone; adopt or wait for its unlock |
 | `ledger-restored` | page | the ledger holds fewer sign-once records than its signed high-water mark (`hawkeye.db.hwm`, plan §4.7), or the node wallet (`"wallet"` mode) signed an unlock or cancel the ledger has no record of: it was restored from a backup (review L-2); fresh unlocks wait for every member's signed "none". A mark that does not verify refuses `hawkeye run` | `hawkeye audit-ledger`; ask the other attestors; then `hawkeye acknowledge-ledger-restore`. If start-up says the mark does not verify, inspect `hawkeye.db.hwm` and rerun with `--reset-ledger-hwm` |
@@ -280,7 +283,7 @@ bridge vault's owner branch opens (plan §1.4): a dormant set protects nobody. A
 ```yaml
 # Prometheus alert rules (examples)
 - alert: HawkeyePage
-  expr: hawkeye_alarm{name=~"supply|exposure|fraudulent-mint|matured-unmatched|not-a-member|mint-cap-unbounded|fee-coins-exhausted|heartbeat-too-slow|slash-case-.*"} == 1
+  expr: hawkeye_alarm{name=~"supply|exposure|fraudulent-mint|matured-unmatched|not-a-member|mint-cap-unbounded|fee-coins-exhausted|heartbeat-too-slow|unlock-hostage|member-restored-unacknowledged|slash-case-.*"} == 1
 - alert: HawkeyeTicket
   expr: hawkeye_alarm == 1
   for: 30m
@@ -321,9 +324,17 @@ its intent was then cancelled `C_Y` deep (log `unlock_dead`). In practice:
   (authenticated; the answer is signed). A peer serves the signed unlock it holds only while the
   burn is unpaid in its own ledger, and only to a current member — never on the public `GET
   /burns/<nonce>`. A valid one is adopted (logs `unlock_prior_found`, `unlock_adopted`, `refee`).
-  A fresh vault is signed only when every previous leader of the burn in this ledger (every
-  member, while `ledger-restored`) has answered, signed, that it holds none; an unreachable or
-  unsigned answer counts for nothing (alarm `unlock-prior-unknown`, log `unlock_prior_unknown`).
+  A fresh vault is signed only when every previous leader of the burn in this ledger and every
+  signer of an adoptable observed unlock (every member, while `ledger-restored`) has answered,
+  signed, that it holds none; an unreachable or unsigned answer counts for nothing (alarm
+  `unlock-prior-unknown`, which names previous leaders and observed signers separately, log
+  `unlock_prior_unknown`). A peer with no live row of its own still serves an observed unlock
+  that passes the adoption checks, so a restored member adopts its own evicted bytes instead of
+  signing another vault. A `held` answer without those bytes names the vault, the paying intent
+  and the height it was linked. If that intent is not mined here, not in the mempool and not
+  linked, the answer is stale: after `2 × max(TAKEOVER, C_Y)` blocks it pages `unlock-hostage`
+  and names the member. It is not overridden. An honest `held` whose paying intent is visible
+  never pages.
 - A co-signer asked again for the same unlock re-funded adds the signature it already made (log
   `unlock_cosign_merged`) and still refuses any other unlock of the vault.
 - **Orphans (H-2).** A member holding a signed unlock of a vault for a burn that was paid by
@@ -367,31 +378,43 @@ out:
    fee, and the burn waits a takeover).
 2. **Off chain, the operator override:** each attestor that agrees runs
    `hawkeye declare-leader-gone <member key> --reason "<why>" [--expires-in <blocks>]`. It signs
-   a declaration (`sha256d("HawkeyeMemberGone" ‖ setId ‖ member ‖ seq ‖ expiry)` with its member
-   key), records it in its
+   a declaration (`sha256d("HawkeyeMemberGone2" ‖ setId ‖ member ‖ seq ‖ expiry ‖ silent_since)`
+   with its member key, plan §4.6), records it in its
    ledger and sends it to every peer (`POST /members/gone`, authenticated); each ledger records it
-   after checking the signature and that the declarer is a current member other than the gone one
-   (logs `member_declared_gone`, `declare_leader_gone`, then `unlock_prior_excluded`). **Quorum: a
+   after checking the signature, that `silent_since` is the member's current `lastact` (the
+   declarer has seen the latest heartbeat), and that the declarer is a current member other than
+   the gone one
+   (logs `member_declared_gone`, `declare_leader_gone`, then `unlock_prior_overridden`). **Quorum: a
    strict majority of the current members other than the gone one, and never less than
    `unlockThreshold` (k): `max(k, floor((n − 1) / 2) + 1)`, n counting the gone member** (a
    single member at `k = 1` could otherwise release an honest but slow leader's hold and double a
-   burn). Declarations from members that later leave the set stop counting. Each declaration names the
-   member's current membership (its join height) and an expiry height (`--expires-in`, default
-   2 × `TAKEOVER`, at most 10 × `TAKEOVER`); it counts only for that membership, until that height,
-   and not once the member has acted (a heartbeat) after it was recorded; all declarations about a
-   member are dropped as soon as it answers a peer, signed (log `gone_declarations_cleared`), and a
-   declaration about a key that is not in the set's member list is refused (review R-2, R-3). The override applies
-   only while the declared member stays silent: if it answers that it holds a signed unlock, the
-   adoption path wins and the alarm `gone-member-answered` is raised (log `gone_member_answered`;
-   the override itself logs `unlock_prior_overridden`). Only declare a member
+   burn). **A set of fewer than three current members cannot use the override** — the command
+   prints `a set of <n> current members cannot use the override: remove the member on chain (SET_REMOVE)`.
+   Declarations from members that later leave the set stop counting. Each declaration names the
+   member's current membership (its join height), an expiry height (`--expires-in`, default
+   2 × `TAKEOVER`, at most 10 × `TAKEOVER`), and `silent_since`, the member's `lastact` when the
+   declarer signed. It counts only for that membership, until that height, and not once `lastact`
+   moves past `silent_since` (a heartbeat voids it, including a declaration that arrives late).
+   A v1 declaration (no `silent_since`) is refused: re-declare with this release. All declarations
+   about a member are dropped as soon as it answers a peer, signed (log `gone_declarations_cleared`),
+   and a declaration about a key that is not in the set's member list is refused (review R-2, R-3).
+   The override applies only when the member has missed a heartbeat by a takeover's slack
+   (`tip ≥ lastact + heartbeat_blocks + takeover`) and stays silent: if it answers that it holds
+   a signed unlock, the adoption path wins and the alarm `gone-member-answered` is raised (log
+   `gone_member_answered`). Only declare a member
    gone when you are sure its signed unlocks are lost with it; if it comes back with them, the
-   watchers' benign-race cancel and the orphan roll are the remaining net.
+   watchers' benign-race cancel and the orphan roll are the remaining net. Land the duplicate
+   classification on every attestor before using the override on mainnet: an override is how a
+   live leader's correct unlock gets duplicated.
 
-A member that answers `held: true` (or `restored: true`) without serving bytes can never be
-overridden, by design: the declarations about it are dropped the moment it answers. Only removing
-it from the set (`SET_REMOVE`) releases the burns it holds up.
+A `held` answer without bytes must name its evidence (the paying intent and since when). A stale
+claim pages `unlock-hostage` and names the member; an unacknowledged restore pages
+`member-restored-unacknowledged` after `10 × TAKEOVER` blocks. Neither is overridden (option (c′)
+is off). Removing the member from the set (`SET_REMOVE`) is what releases the burns. The
+declarations about a member are still dropped the moment it answers.
 
-**Backups (N-2).** The restore check compares the ledger with `hawkeye.db.hwm` (section 5). A backup of the
+**Backups (N-2).** The restore check compares the ledger with `hawkeye.db.hwm` (section 5, which keeps
+the mark out of the ledger tarball). A backup of the
 whole directory restores the mark with the ledger and defeats the check: back the two up
 separately (or not the mark at all), or rely on the `"wallet"`-mode check against the node
 wallet's `set_listsigned`. The mark is a member signature over the count and this ledger's id
@@ -423,7 +446,9 @@ Talk on the set's out-of-band channel first. On mainnet the slash vote is manual
 false`): verify, then `hawkeye slash approve <id> --note …` (or `reject`). With `auto_slash = false`
 this attestor votes, as case owner or for a peer (`POST /slash/sign` answers "pending operator
 decision" and records the case), only on a case its operator approved; `auto_slash = true` votes on
-any independently verified evidence.
+any independently verified evidence. Before approving a `FRAUDULENT_INTENT` vote on a duplicate,
+check `/burns/<nonce>` on the accused's API, the takeover history and any `declare-leader-gone`
+in the last `10 × TAKEOVER`.
 
 a. **Suspected key compromise** (yours or another member's): have the threshold pause the bridge
    (`setPaused(true)`), rotate the key out (section 7, emergency), and slash it (`SET_REMOVE
