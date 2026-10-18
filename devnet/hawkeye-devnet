@@ -2923,12 +2923,31 @@ format = "text"
         self.step("stop attestor%d's hawkeye (the leader of burn %d). Its node stays up and heartbeats stop, "
                   "so a missed heartbeat can release the hold" % (lead, nonce))
         self.silence(lead, True)
-        info = self.node(0).set_getinfo(set_id)
-        member = next(m for m in info["memberlist"] if m["key"] == la["memberkey"])
-        last = member["lastact"]
         slack = p["heartbeat_blocks"] + p["takeover_blocks"]
-        # 10 x TAKEOVER is the longest a declaration may run; the slack is heartbeat + takeover,
-        # so the declaration has to still be alive when the override applies.
+        # A heartbeat raises lastact at the height it confirms (ycash6). Declaring against the
+        # pre-confirmation height is voided by that confirmation, and the override never applies.
+        # Wait until lastact has settled and the missed-heartbeat slack has already passed.
+        from_h = self.tip()
+        b = self.burn_tracked("4")
+        settled = {"last": None, "since": None}
+
+        def lastact_settled():
+            info = self.node(0).set_getinfo(set_id)
+            member = next(m for m in info["memberlist"] if m["key"] == la["memberkey"])
+            last = member["lastact"]
+            tip = self.tip()
+            if settled["last"] != last:
+                settled["last"] = last
+                settled["since"] = tip
+                return None
+            if tip < last + slack or tip < settled["since"] + 2:
+                return None
+            return last
+
+        last = self.wait_for("attestor%d's lastact has settled past the missed-heartbeat slack" % lead,
+                             lastact_settled, timeout)
+        # 10 x TAKEOVER is the longest a declaration may run. The slack has already passed, so the
+        # next tick can apply the override while this declaration is still alive.
         expires = 10 * p["takeover_blocks"]
         self.step("the other attestors declare attestor%d gone (quorum, silent_since %d, expires in %d blocks)"
                   % (lead, last, expires))
@@ -2947,16 +2966,12 @@ format = "text"
                 reached = True
         if not reached:
             die("no attestor recorded a quorum of gone declarations")
-        from_h = self.tip()
-        b = self.burn_tracked("4")
 
         def takeover_intent():
-            if self.tip() < last + slack:
-                return None
             found = self.burn_intents(nonce, from_h)
             return found[0] if found else None
 
-        self.step("after the missed-heartbeat slack, the scheduled taker posts the release")
+        self.step("the scheduled taker posts the release")
         it = self.wait_for("an intent for burn %d from someone else" % nonce, takeover_intent, timeout + 90)
         tx = self.node(0).getrawtransaction(it["txid"], 1)
         by = self.owner_of_inputs(tx)
