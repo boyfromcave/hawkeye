@@ -14,8 +14,8 @@ starts `hawkeye run` beside each attestor's own node. Each Hawkeye talks only to
 
 The commands mirror bridge-sim's (ycash-dd contrib/yellowback/devnet/bridge-sim) so the two can be
 compared: up | lock | burn | rogue | rogue-mint | silence | unsilence | mine | pause | resume | status |
-logs | cli | down | clean | scenario demo | roll | dormancy | takeover | double | restart | reorg |
-rogue-mint | pq-recipient.  Python 3 standard library only; Foundry (anvil, forge, cast) on PATH.
+logs | cli | down | clean | scenario demo | roll | dormancy | takeover | double | double-scheduled |
+restart | reorg | rogue-mint | pq-recipient.  Python 3 standard library only; Foundry (anvil, forge, cast) on PATH.
 
 The bridge (wyec @ the pin in eth/tools/fetch-wyec.sh) is deployed with threshold 2 and a 12 s
 challenge window, and the attestors run mint_mode = optimistic (the Foundation's model: one attestor
@@ -2832,10 +2832,11 @@ format = "text"
         h_first = self.tip() - self.confirmations(first["txid"]) + 1
         self.say("  burn %d released through intent %s (mined at %d)" % (nonce, first["outpoint"], h_first))
 
-        rogue = 1
+        lead = self.burn_leader(nonce)
+        rogue = next(i for i in range(1, len(self.s["attestors"]) + 1) if i != lead)
         ra = self.attestor(rogue)
-        self.step("attestor%d posts a SECOND unlock for burn %d: `rogue-unlock --replay-burn %d` (the burn's valid HKB1 memo)"
-                  % (rogue, nonce, nonce))
+        self.step("attestor%d (not the burn's leader, attestor%d) posts a SECOND unlock for burn %d: "
+                  "`rogue-unlock --replay-burn %d`" % (rogue, lead, nonce, nonce))
         out = self.hawkeye(ra["config"], "rogue-unlock", "--replay-burn", str(nonce)).stdout.strip()
         self.say("  hawkeye --config attestor%d.toml rogue-unlock --replay-burn %d: %s" % (rogue, nonce, out))
         rep = json.loads(out)
@@ -2909,6 +2910,120 @@ format = "text"
             die("supply invariant broken (supply %s, locked %s)" % (yec(supply), yec(locked)))
         return ("second unlock for released burn %d (valid memo, %d blocks later) -> cancelled by another attestor -> "
                 "classified consumed-burn (not a benign race) -> attestor%d removed, bond frozen" % (nonce, gap, rogue))
+
+    # ================================================================ drill D-3b: scheduled duplicate
+    def drill_double_scheduled(self, timeout):
+        set_id = self.s["set"]["setid"]
+        p = self.bridge()
+        self.step("lock 30 YEC and mint, so a later replay of 4 YEC fits the rate limit")
+        self.lock_mint("30", 30 * COIN, timeout)
+        nonce = self.burn_nonce()
+        lead = self.burn_leader(nonce)
+        la = self.attestor(lead)
+        self.step("stop attestor%d's hawkeye (the leader of burn %d). Its node stays up and heartbeats stop, "
+                  "so a missed heartbeat can release the hold" % (lead, nonce))
+        self.silence(lead, True)
+        slack = p["heartbeat_blocks"] + p["takeover_blocks"]
+        # A heartbeat raises lastact at the height it confirms (ycash6). Declaring against the
+        # pre-confirmation height is voided by that confirmation, and the override never applies.
+        # Wait until lastact has settled and the missed-heartbeat slack has already passed.
+        from_h = self.tip()
+        b = self.burn_tracked("4")
+        settled = {"last": None, "since": None}
+
+        def lastact_settled():
+            info = self.node(0).set_getinfo(set_id)
+            member = next(m for m in info["memberlist"] if m["key"] == la["memberkey"])
+            last = member["lastact"]
+            tip = self.tip()
+            if settled["last"] != last:
+                settled["last"] = last
+                settled["since"] = tip
+                return None
+            if tip < last + slack or tip < settled["since"] + 2:
+                return None
+            return last
+
+        last = self.wait_for("attestor%d's lastact has settled past the missed-heartbeat slack" % lead,
+                             lastact_settled, timeout)
+        # 10 x TAKEOVER is the longest a declaration may run. The slack has already passed, so the
+        # next tick can apply the override while this declaration is still alive.
+        expires = 10 * p["takeover_blocks"]
+        self.step("the other attestors declare attestor%d gone (quorum, silent_since %d, expires in %d blocks)"
+                  % (lead, last, expires))
+        reached = False
+        for a in self.s["attestors"]:
+            if a["index"] == lead:
+                continue
+            out = self.hawkeye(a["config"], "declare-leader-gone", la["memberkey"],
+                               "--reason", "D-3b: leader API down", "--expires-in", str(expires)).stdout.strip()
+            self.say("  attestor%d: %s" % (a["index"], out))
+            decl = json.loads(out)
+            if decl.get("note"):
+                die("declare-leader-gone refused: %s" % decl["note"])
+            here = decl.get("here") or {}
+            if here.get("declarations", 0) >= here.get("quorum", 1) and here.get("quorum"):
+                reached = True
+        if not reached:
+            die("no attestor recorded a quorum of gone declarations")
+
+        def takeover_intent():
+            found = self.burn_intents(nonce, from_h)
+            return found[0] if found else None
+
+        self.step("the scheduled taker posts the release")
+        it = self.wait_for("an intent for burn %d from someone else" % nonce, takeover_intent, timeout + 90)
+        tx = self.node(0).getrawtransaction(it["txid"], 1)
+        by = self.owner_of_inputs(tx)
+        self.say("  intent %s funded by attestor%s" % (it["outpoint"], ",".join(map(str, by))))
+        if lead in by or not by:
+            die("the release was not posted by another attestor (funders %s)" % by)
+        self.wait_for("4 YEC received at %s" % b["recipient"],
+                      lambda: self.received(b["recipient"]) == 4 or None, timeout + 60)
+
+        self.step("restart the leader and have it post a correct duplicate of the released burn")
+        self.silence(lead, False)
+        self.wait_for("attestor%d knows burn %d" % (lead, nonce),
+                      lambda: self.api(la, "burns/%d" % nonce)[0] == 200 or None, timeout)
+        out = self.hawkeye(la["config"], "rogue-unlock", "--replay-burn", str(nonce)).stdout.strip()
+        self.say("  hawkeye --config attestor%d.toml rogue-unlock --replay-burn %d: %s" % (lead, nonce, out))
+        rep = json.loads(out)
+        intent = rep["intent"]
+        self.wait_for("node0 sees the duplicate %s" % rep["txid"][:16], lambda: self._tx(rep["txid"]), 60, poll=0.2)
+
+        def cancelled():
+            sp = self.spender_of(intent, from_h)
+            if not sp:
+                return None
+            t, tx = sp
+            types = [self.node(0).vault_decodescript(o["scriptPubKey"]["hex"]).get("type") for o in tx["vout"]]
+            if "vault" not in types:
+                die("the duplicate %s was spent by %s, which is not a cancel (outputs %s)" % (intent, t, types))
+            return t
+        self.wait_for("duplicate cancelled", cancelled, timeout)
+
+        self.step("watchers classify it consumed-burn:scheduled and open no slash case")
+        cls = []
+        for a in self.s["attestors"]:
+            for ln in self.log_events(a, "intent_classified", needle=intent):
+                cls.append((a["index"], ln))
+        if not any("unmatched:consumed-burn:scheduled" in ln for _, ln in cls):
+            die("no watcher classified %s as unmatched:consumed-burn:scheduled: %s" % (intent, cls))
+        for i, ln in cls:
+            self.say("  attestor%d: %s" % (i, ln.strip()[:220]))
+        opened = [ln for a in self.s["attestors"] for ln in self.log_events(a, "slash_case_opened", needle=intent)]
+        if opened:
+            die("a slash case was opened for the scheduled duplicate: %s" % opened[0].strip()[:240])
+        info = self.node(0).set_getinfo(set_id)
+        member = next(m for m in info["memberlist"] if m["key"] == la["memberkey"])
+        if member["status"] != "active" or member["bondfrozen"]:
+            die("the scheduled signer was slashed: %s" % jdump(member))
+        self.say("  attestor%d stays active, bond not frozen" % lead)
+        if self.received(b["recipient"]) != 4:
+            die("the burn recipient received %s, not 4" % self.received(b["recipient"]))
+        return ("leader attestor%d's hawkeye was down, its node kept heartbeating; a takeover released burn %d; "
+                "the leader's correct duplicate was cancelled as consumed-burn:scheduled, with no slash"
+                % (lead, nonce))
 
     # ================================================================ drill D-5: rogue mint (optimistic proposal)
     def report_mint_path(self):
@@ -3697,6 +3812,7 @@ DRILLS = {
     "dormancy": ("plan §8 D-11, R1: all attestors silent", "drill_dormancy", {}),
     "takeover": ("plan §8 D-7: leader down", "drill_takeover", {}),
     "double": ("plan §8 D-3: double release", "drill_double", {}),
+    "double-scheduled": ("plan §8 D-3b: a recorded leader's correct duplicate is cancelled, not slashed", "drill_double_scheduled", {}),
     "restart": ("plan §8 D-16: crash mid-flow", "drill_restart", {}),
     # finalized = latest - 16 on anvil, so a burn can be reorged out below finality (D-10)
     "reorg": ("plan §8 D-9 + D-10: Ycash and Ethereum reorgs", "drill_reorg", {"slots": 8}),
@@ -3707,7 +3823,7 @@ DRILLS = {
 }
 
 # The scenarios that run with --foreign near (NEAR plan NH5; pq-recipient: NH-R5).
-NEAR_SCENARIOS = ("demo", "rogue-mint", "pq-recipient")
+NEAR_SCENARIOS = ("demo", "rogue-mint", "pq-recipient", "double", "double-scheduled")
 
 
 def main():

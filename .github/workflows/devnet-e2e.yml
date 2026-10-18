@@ -10,13 +10,17 @@
 # a TX_PQPKH release the node wallet spends with its SLH-DSA key).
 # This is the plan's §9 success criterion as a repeatable job; the mock never counts toward it.
 #
-# Slow (a cold node build is ~1 h), so it runs nightly, on demand, and when devnet/ or the
-# daemon changes on main. The node build is cached per node commit.
+# Slow (a cold node build is ~1 h), so it runs nightly, on demand, on a pull request that
+# changes the devnet or the workflow, and when devnet/ or the daemon changes on main.
+# The node build is cached per node commit. A pull request runs scenario demo, rogue-mint,
+# pq-recipient, double (D-3) and double-scheduled (D-3b).
 name: devnet-e2e
 
 on:
   schedule:
     - cron: "17 3 * * *"
+  pull_request:
+    paths: ["devnet/**", "crates/**", "eth/**", "near/**", ".github/workflows/devnet-e2e.yml"]
   workflow_dispatch:
     inputs:
       node_ref:
@@ -234,7 +238,7 @@ jobs:
           bin=$(near/tools/fetch-sandbox.sh)
           "$bin" --version
           echo "NEAR_SANDBOX_BIN=$bin" >>"$GITHUB_ENV"
-      - name: scenario demo, rogue-mint and pq-recipient
+      - name: scenario demo, rogue-mint, pq-recipient, double and double-scheduled
         env:
           DEVNET_NATIVE_SOLC: "1"
           DAEMON: ${{ matrix.daemon }}
@@ -248,6 +252,8 @@ jobs:
           python3 devnet/hawkeye-devnet scenario demo --fresh --foreign "$FOREIGN"
           python3 devnet/hawkeye-devnet scenario rogue-mint --fresh --foreign "$FOREIGN"
           python3 devnet/hawkeye-devnet scenario pq-recipient --fresh --foreign "$FOREIGN"
+          python3 devnet/hawkeye-devnet scenario double --fresh --foreign "$FOREIGN"
+          python3 devnet/hawkeye-devnet scenario double-scheduled --fresh --foreign "$FOREIGN"
       - name: stop the devnet
         if: always()
         run: python3 devnet/hawkeye-devnet down || true
