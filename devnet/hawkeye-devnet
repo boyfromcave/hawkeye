@@ -2932,6 +2932,7 @@ format = "text"
         expires = 10 * p["takeover_blocks"]
         self.step("the other attestors declare attestor%d gone (quorum, silent_since %d, expires in %d blocks)"
                   % (lead, last, expires))
+        reached = False
         for a in self.s["attestors"]:
             if a["index"] == lead:
                 continue
@@ -2942,9 +2943,10 @@ format = "text"
             if decl.get("note"):
                 die("declare-leader-gone refused: %s" % decl["note"])
             here = decl.get("here") or {}
-            if here.get("declarations", 0) < here.get("quorum", 1):
-                self.say("  attestor%d holds %s of quorum %s; the other declaration still has to land"
-                         % (a["index"], here.get("declarations"), here.get("quorum")))
+            if here.get("declarations", 0) >= here.get("quorum", 1) and here.get("quorum"):
+                reached = True
+        if not reached:
+            die("no attestor recorded a quorum of gone declarations")
         from_h = self.tip()
         b = self.burn_tracked("4")
 
