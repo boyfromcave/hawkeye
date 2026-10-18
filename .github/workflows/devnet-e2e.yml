@@ -234,7 +234,7 @@ jobs:
           bin=$(near/tools/fetch-sandbox.sh)
           "$bin" --version
           echo "NEAR_SANDBOX_BIN=$bin" >>"$GITHUB_ENV"
-      - name: scenario demo, rogue-mint and pq-recipient
+      - name: scenario demo, rogue-mint, pq-recipient, double and double-scheduled
         env:
           DEVNET_NATIVE_SOLC: "1"
           DAEMON: ${{ matrix.daemon }}
@@ -248,6 +248,8 @@ jobs:
           python3 devnet/hawkeye-devnet scenario demo --fresh --foreign "$FOREIGN"
           python3 devnet/hawkeye-devnet scenario rogue-mint --fresh --foreign "$FOREIGN"
           python3 devnet/hawkeye-devnet scenario pq-recipient --fresh --foreign "$FOREIGN"
+          python3 devnet/hawkeye-devnet scenario double --fresh --foreign "$FOREIGN"
+          python3 devnet/hawkeye-devnet scenario double-scheduled --fresh --foreign "$FOREIGN"
       - name: stop the devnet
         if: always()
         run: python3 devnet/hawkeye-devnet down || true
