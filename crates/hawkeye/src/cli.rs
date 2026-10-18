@@ -966,11 +966,11 @@ pub async fn rogue_unlock(
             prevout: op_core(&r.outpoint),
         };
         if store.tx(|t| t.ycash_signature(&key))?.is_none() {
-            chosen = Some((r.outpoint, key));
+            chosen = Some((r.outpoint, key, r.valuezat));
             break;
         }
     }
-    let (vault, key) = chosen.ok_or_else(|| {
+    let (vault, key, vault_value) = chosen.ok_or_else(|| {
         anyhow!(
             "no unsigned {} vault holds {value} zat",
             s.params.tag_text()
@@ -982,8 +982,20 @@ pub async fn rogue_unlock(
             .await?;
     let vout = built.intents.first().map_or(0, |i| i.vout);
     let unsigned = match &replay {
-        Some(r) => hawkeye_ycash::tx::insert_op_return(&built.hex.to_string(), &r.memo)
-            .map_err(|e| anyhow!("memo: {e}"))?,
+        Some(r) => {
+            let with = hawkeye_ycash::tx::insert_op_return(&built.hex.to_string(), &r.memo)
+                .map_err(|e| anyhow!("memo: {e}"))?;
+            // The memo is not in the build the wallet remembered, so vault_send refuses the
+            // fee coin (vault-send-foreign-input). Fund exactly, as a real burn unlock does:
+            // vault_refee remembers these outputs before anyone signs them.
+            crate::engine::sign::fund_exactly(
+                &node,
+                &with,
+                &op_core(&vault),
+                u64::try_from(vault_value)?,
+            )
+            .await?
+        }
         None => built.hex.to_string(),
     };
     let n2 = node.clone();
