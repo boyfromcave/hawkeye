@@ -92,23 +92,3 @@ reason = "Alias of RUSTSEC-2022-0054; same reason."
 id = "GHSA-7c78-jf6q-g5cm"
 ignoreUntil = 2027-01-20T00:00:00Z
 reason = "eth/package-lock.json: tmp 0.2.6, which solc-js 0.8.37 pins exactly; a devDependency used only by the local solc-js shim (eth/tools/solc), never in CI's native-solc build or at runtime, and only exploitable with attacker-controlled tmp options. solc stays at the version wyec's contracts are compiled with (wyec design §8)."
-
-[[IgnoredVulns]]
-id = "PYSEC-2026-4320"
-ignoreUntil = 2027-01-20T00:00:00Z
-reason = "contrib/semgrep/requirements.txt: certifi, a dependency of the semgrep CLI used only on CI runners to scan this repository (no secrets, no outbound TLS beyond the rule fetch from github.com). The file is shared verbatim by every Yellowback repo and moves with the semgrep pin, all repos together."
-
-[[IgnoredVulns]]
-id = "GHSA-6q48-6c7w-9gw2"
-ignoreUntil = 2027-01-20T00:00:00Z
-reason = "Alias of PYSEC-2026-4320; same reason."
-
-[[IgnoredVulns]]
-id = "GHSA-84m7-p3x7-pcfv"
-ignoreUntil = 2027-01-20T00:00:00Z
-reason = "contrib/semgrep/requirements.txt: mcp, a semgrep CLI dependency; the vulnerable StreamableHTTP server transport is never started by `semgrep scan`. Moves with the shared semgrep pin."
-
-[[IgnoredVulns]]
-id = "GHSA-xcq7-p3pf-p88h"
-ignoreUntil = 2027-01-20T00:00:00Z
-reason = "contrib/semgrep/requirements.txt: opentelemetry-api, a semgrep CLI dependency; scans run with --metrics=off and no tracing endpoint. Moves with the shared semgrep pin."
