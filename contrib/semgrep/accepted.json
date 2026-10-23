@@ -1,0 +1,286 @@
+{
+  "_comment": "Accepted Semgrep findings (contrib/semgrep/README.md, 'Accepting a finding'). findings: fingerprint -> {rule, path, reason, by, date}. rule_paths: [{rule (glob), paths (globs), reason, by, date}]. Every entry needs a reason a reviewer can check.",
+  "findings": {
+    "bbb1e5ac3bd4aafb": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/address.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "db3ae6960fa1e1d7": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/address.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "1e09e76c4b1d441b": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/address.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "24ec711848b63440": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/eth.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "9baf72c10d407eb5": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/lock.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "dddae4fa69360727": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/memo.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "710dd3d93949bd92": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/memo.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "4e383bdd20ecd04a": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/memo.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "5d2b5afb4de34da2": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/near.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "7221d59f4656e0dd": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/near.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "5d2b5afb4de34da2-1": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/near.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "7c7748e27e400f95": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/pq.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "813ac86bcc6b5a5a": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/recipient.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "c0b57263494e3d21": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/recipient.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "6e0594b402b4bc1b": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/recipient.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "a822739144b8ded6": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/setsig.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "d7d83ef7e5487bc1": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/setsig.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "df0991b5526d08e9": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-core/src/tx.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "0217e2b495c05559": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-near/src/admin.rs",
+      "reason": "serde_json::to_vec of a serde_json::Value / derived-Serialize value cannot fail (no non-string map keys, no custom Serialize that errors); devnet admin helper.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "d906990eb4229f7d": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-near/src/keys.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "831538b57ea856d0": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-near/src/mock.rs",
+      "reason": "serde_json::to_vec of a serde_json::Value cannot fail; the in-process NEAR mock used by tests.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "3d40042df884b312": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-near/src/tx.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "650bab1c33898498": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-store/src/lib.rs",
+      "reason": "schema::MIGRATIONS is a compile-time list of a few dozen entries; its length always fits in u32.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "650bab1c33898498-1": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-store/src/lib.rs",
+      "reason": "schema::MIGRATIONS is a compile-time list of a few dozen entries; its length always fits in u32.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "c4f012d9dee78633": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye-ycash/src/tx.rs",
+      "reason": "Slice-to-array conversion of a range whose length is fixed by the slice bounds just above (or checked before the call, e.g. take(N) returns N bytes); try_into cannot fail, the expect documents the invariant.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "664ca05f91219412": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye/src/engine/burn.rs",
+      "reason": "leader_for returns None only for an empty live set, and live.is_empty() `continue`s three lines above.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "720a0ed92695f6cd": {
+      "rule": "hawkeye.signing.outside-sign-once",
+      "path": "crates/hawkeye/src/engine/burn.rs",
+      "reason": "Takeover adoption (01/V-2, W4-B-2): the set signature is made inside the same ledger transaction (ctx.db) that records it, via adopt_unlock when no signature of this member was added, or the sign-once unlock record otherwise; the record, not the closure name, is the guard. Reviewed 2026-10-23.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "28589d963f8a68eb": {
+      "rule": "hawkeye.signing.outside-sign-once",
+      "path": "crates/hawkeye/src/engine/roll.rs",
+      "reason": "Legacy adoption roll: signed once into the ledger metadata (legacy_roll/<outpoint>), checked just above and reused on every retry (send_roll with the stored hex), so a retry never re-signs. Reviewed 2026-10-23.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "87169f4701426263": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye/src/engine/sign.rs",
+      "reason": "The ensure! just above requires the template input to be spent exactly once in both transactions, so input_index finds it.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "450f8540ae734e8e": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye/src/engine/sign.rs",
+      "reason": "The ensure! just above requires the template input to be spent exactly once in both transactions, so input_index finds it.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    "5eae7019a80852ec": {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "path": "crates/hawkeye/src/main.rs",
+      "reason": "settings() has already loaded the configuration from --config (it errors without it) before this line runs.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    }
+  },
+  "rule_paths": [
+    {
+      "rule": "generic.secrets.*",
+      "paths": [
+        "eth/vectors/**",
+        "near/vectors/**",
+        "crates/*/tests/data/**",
+        "devnet/transcripts/**",
+        "*.md"
+      ],
+      "reason": "Golden vectors, devnet transcripts and documentation: public test keys (anvil account 0, 0x01.. dev keys) and public member keys, not secrets (checked 2026-10-23; gitleaks agrees, .gitleaks.toml). A secret anywhere else is still reported.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    {
+      "rule": "trailofbits.rs.panic-in-function-returning-result",
+      "paths": [
+        "crates/*/tests/**",
+        "near/tests/**",
+        "near/src/tests.rs",
+        "near/src/tests/**"
+      ],
+      "reason": "Test code: a panic is a test failure, which is the intent.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    {
+      "rule": "rust.lang.security.temp-dir",
+      "paths": [
+        "crates/*/tests/**",
+        "near/tests/**"
+      ],
+      "reason": "Tests create scratch directories under the OS temp dir for throwaway stores and sandboxes; the daemon's store path comes from its config.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    {
+      "rule": "rust.lang.security.args",
+      "paths": [
+        "crates/hawkeye-near/examples/**"
+      ],
+      "reason": "near-admin is a devnet set-up helper run by the operator (devnet/hawkeye-devnet); its argv is the operator's own command line, not a trust boundary.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    {
+      "rule": "javascript.lang.security.*",
+      "paths": [
+        "eth/tools/solc-shim.js"
+      ],
+      "reason": "Local solc-js shim invoked by forge with forge's own --base-path/--include-path arguments on the developer's machine; reading those paths is its job. Never runs in CI or production.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    },
+    {
+      "rule": "python.lang.security.audit.*",
+      "paths": [
+        "devnet/hawkeye-devnet"
+      ],
+      "reason": "The devnet harness starts and drives local regtest nodes, anvil and Hawkeye processes and talks to them over 127.0.0.1 HTTP by design; argv comes from its own constants and the operator's own command line (`hawkeye-devnet cli ...` execs ycash-cli with the operator's arguments). Never shipped, never run on a public network.",
+      "by": "semgrep CI setup",
+      "date": "2026-10-23"
+    }
+  ]
+}

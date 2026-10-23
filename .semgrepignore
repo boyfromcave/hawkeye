@@ -1,0 +1,22 @@
+# Paths Semgrep never scans (contrib/semgrep/README.md). Semgrep scans git-tracked files only; this file
+# replaces its built-in ignore list, so the usual build and vendor directories are named here too.
+# The wyec contracts fetched at the pin (eth/tools/fetch-wyec.sh) and npm/forge dependencies: wyec's
+# and upstream's code, scanned in their own repositories, never Hawkeye's (gitignored; listed in case a
+# local checkout has them).
+eth/vendor/
+eth/node_modules/
+eth/lib/
+# Build output and caches.
+target/
+near/target/
+eth/out/
+eth/cache/
+eth/broadcast/
+node_modules/
+.cargo/
+# Generated ABIs (exported from the wyec build, checked by eth/tools/export-abi.sh --check).
+crates/hawkeye-eth/abi/
+# Recorded devnet runs (text transcripts, not code).
+devnet/transcripts/
+# The scanner's own rules, rule test inputs and ledgers.
+contrib/semgrep/

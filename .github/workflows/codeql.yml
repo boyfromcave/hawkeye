@@ -1,0 +1,54 @@
+name: codeql
+
+# CodeQL (security-extended) on Hawkeye's own code, results to GitHub code scanning (SECURITY-CI.md).
+#   rust                   crates/ and near/ (build-mode none: no cargo build, the extractor reads the source)
+#   actions                .github/workflows
+#   python                 the golden-vector generators (crates/*/tests/data/*.py); devnet/hawkeye-devnet has
+#                          no .py suffix, so Semgrep (shebang detection) covers it instead
+#   javascript-typescript  eth/tools/solc-shim.js
+# The wyec contracts fetched at the pin (eth/vendor/, gitignored) are never checked out here, so never scanned.
+# Report only: alerts land in Security -> Code scanning; a PR is never failed on a pre-existing alert.
+on:
+  push:
+    branches: [upgrade/vault]
+  pull_request:
+  schedule:
+    - cron: '29 4 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions, python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+          config: |
+            paths-ignore:
+              - eth/vendor
+              - eth/node_modules
+              - target
+              - near/target
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: codeql-${{ matrix.language }}

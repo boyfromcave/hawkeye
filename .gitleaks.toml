@@ -1,0 +1,32 @@
+# gitleaks configuration (.github/workflows/secops.yml, SECURITY-CI.md): the default rules, plus the
+# allowlists below for values that are public by construction. Every entry says why; a value outside
+# them is still reported. Triaged 2026-10-23 (full history, 519 hits, all public, no live secret).
+title = "hawkeye"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Golden vectors and devnet transcripts: generated test data (EIP-712 / vault / NEAR vectors, regtest runs). Their keys are public test keys and public member keys; nothing in them signs on a public network."
+paths = [
+  '''^eth/vectors/eip712\.json$''',
+  '''^crates/[^/]+/tests/data/[^/]+\.json$''',
+  '''^near/vectors/[^/]+\.json$''',
+  '''^devnet/transcripts/[^/]+\.txt$''',
+]
+
+[[allowlists]]
+description = "Anvil's well-known account-0 development key (published in Foundry's docs; funds only local anvil chains)."
+regexTarget = "match"
+regexes = [
+  '''0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80''',
+]
+
+[[allowlists]]
+description = "Public values that the generic-api-key rule mistakes for keys: 20-byte Ethereum addresses (deterministic anvil deploy addresses) and 33-byte compressed secp256k1 public keys (member / owner keys)."
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^0x[0-9a-fA-F]{40}$''',
+  '''^0[23][0-9a-fA-F]{64}$''',
+]

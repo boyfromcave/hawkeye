@@ -1,0 +1,182 @@
+# Copyright (c) 2026 The Ycash developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://www.opensource.org/licenses/mit-license.php .
+#
+# Hawkeye-specific Semgrep rules, scanned beside the pinned semgrep-rules packs (contrib/semgrep/README.md).
+# They encode AGENTS.md rules 1 (interfaces only) and 7 (sign once) and the key-handling invariants.
+# metadata.bucket pins a rule's bucket; without it the bucket follows severity/impact/confidence.
+# Tests: contrib/semgrep/rules/hawkeye.rs (`semgrep --test contrib/semgrep/rules`, run by secops.yml).
+rules:
+  - id: hawkeye.interface.yed-rpc
+    languages: [generic]
+    paths:
+      include: ["/crates/**", "/near/**", "/devnet/**", "/eth/**"]
+    pattern-regex: '["''](yed_[a-z0-9_]+)["'']'
+    message: >-
+      A `yed_*` RPC method name in a string. Hawkeye reaches ycashd only through stock RPCs and the vault
+      primitive's set_* / vault_* RPCs, never a yed_* call (AGENTS.md rule 1; workspace CLAUDE.md rule 2).
+      A needed node change is a change request in plan §10, not a call.
+    severity: ERROR
+    metadata:
+      category: security
+      bucket: critical
+      cwe: ["CWE-1061: Insufficient Encapsulation"]
+      references: ["AGENTS.md rule 1", "docs/hawkeye-bridge-plan.md §10"]
+
+  - id: hawkeye.signing.primitive-outside-signing-modules
+    languages: [rust]
+    paths:
+      include: ["/crates/**", "/near/src/**"]
+      exclude:
+        # the signing primitives themselves (one wrapper per scheme)
+        - "/crates/hawkeye-core/src/setsig.rs"
+        - "/crates/hawkeye-core/src/eth.rs"
+        - "/crates/hawkeye-core/src/near.rs"
+        - "/crates/hawkeye-core/src/peerauth.rs"
+        - "/crates/hawkeye-eth/src/eip712.rs"
+        - "/crates/hawkeye-near/src/tx.rs"
+        # tests sign freely
+        - "/crates/*/tests/**"
+        - "/near/src/tests.rs"
+        - "/near/src/tests/**"
+        - "/near/tests/**"
+    pattern-either:
+      - pattern: $K.sign_prehash_recoverable(...)
+      - pattern: $K.sign_prehash(...)
+      - pattern: $K.sign_hash_sync(...)
+      - pattern: $K.sign_hash(...)
+      - pattern: $K.sign_message_sync(...)
+      - pattern: $K.sign_typed_data_sync(...)
+      - pattern: $K.sign_recoverable(...)
+      - pattern: $K.try_sign(...)
+    message: >-
+      A raw signing primitive (k256 / alloy / ed25519) called outside the one wrapper module per scheme
+      (hawkeye-core setsig/eth/near/peerauth, hawkeye-eth eip712, hawkeye-near tx). Every signature Hawkeye
+      makes goes through those wrappers and, for set signatures, EIP-712 / NEAR attestations and acts, through
+      the sign-once records (AGENTS.md rule 7): a retry reuses the bytes it signed, never re-signs.
+    severity: ERROR
+    metadata:
+      category: security
+      bucket: high
+      cwe: ["CWE-837: Improper Enforcement of a Single, Unique Action"]
+      references: ["AGENTS.md rule 7", "crates/hawkeye-store/src/signonce.rs"]
+
+  - id: hawkeye.signing.outside-sign-once
+    languages: [rust]
+    paths:
+      include: ["/crates/hawkeye/src/**"]
+      exclude:
+        # the scheme adapters define `sign`; sign.rs is the body the sign-once closures call
+        - "/crates/hawkeye/src/foreign/**"
+        - "/crates/hawkeye/src/engine/sign.rs"
+        # peer request authentication (peer_auth.rs / peers.rs): HTTP request signatures, not attestations
+        - "/crates/hawkeye/src/peer_auth.rs"
+        - "/crates/hawkeye/src/peers.rs"
+    patterns:
+      - pattern-either:
+          - pattern: hawkeye_core::eth::sign_digest(...)
+          - pattern: hawkeye_core::near::sign_digest(...)
+          - pattern: sign_compact(...)
+          - pattern: sign_der(...)
+          - pattern: $F.sign(&$KEY, $D)
+          # SetSigning::sign (engine/sign.rs), the set signature itself
+          - pattern: $S.sign($H)
+          - pattern: $Y.set_signunlock(...)
+          - pattern: $Y.set_signcancel(...)
+          - pattern: $Y.set_signact(...)
+      # peer authentication (requests, leader-gone declarations) is not an attestation
+      - pattern-not: hawkeye_core::peerauth::sign(...)
+      - pattern-not-inside: $T.sign_once_mint(...)
+      - pattern-not-inside: $T.sign_once_challenge(...)
+      - pattern-not-inside: $T.sign_once_drill_mint(...)
+      - pattern-not-inside: $T.sign_once_ycash(...)
+      - pattern-not-inside: $T.sign_once_ycash_at(...)
+      - pattern-not-inside: $T.sign_once_unlock(...)
+      - pattern-not-inside: $T.sign_once_unlock_at(...)
+    message: >-
+      A set signature, EIP-712 / NEAR attestation or act signed outside a sign-once closure
+      (hawkeye-store signonce.rs: sign_once_mint / _challenge / _drill_mint / _ycash / _unlock). Code that
+      signs must go through the sign-once records; a retry reuses the bytes it signed, never re-builds and
+      re-signs (AGENTS.md rule 7).
+    severity: ERROR
+    metadata:
+      category: security
+      bucket: high
+      cwe: ["CWE-837: Improper Enforcement of a Single, Unique Action"]
+      references: ["AGENTS.md rule 7"]
+
+  - id: hawkeye.crypto.non-crypto-rng
+    languages: [rust]
+    paths:
+      include: ["/crates/**", "/near/src/**"]
+      exclude: ["/crates/*/tests/**", "/near/src/tests.rs", "/near/src/tests/**", "/near/tests/**"]
+    pattern-either:
+      - pattern: SmallRng::$F(...)
+      - pattern: rand::rngs::SmallRng::$F(...)
+      - pattern: StdRng::seed_from_u64(...)
+      - pattern: $R::seed_from_u64(...)
+      - pattern: fastrand::$F(...)
+      - pattern: oorandom::$T::new(...)
+      - pattern: rand_pcg::$T::$F(...)
+      - pattern: rand_xorshift::$T::$F(...)
+      - pattern: rand_chacha::$T::seed_from_u64(...)
+    message: >-
+      A non-cryptographic or deterministically seeded RNG in Hawkeye code. Member keys, NEAR keys, nonces and
+      peer-auth secrets come only from the OS CSPRNG (OsRng / getrandom) or the signing library's RFC 6979
+      nonces.
+    severity: ERROR
+    metadata:
+      category: security
+      impact: HIGH
+      likelihood: LOW
+      confidence: MEDIUM
+      bucket: high
+      cwe: ["CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)"]
+
+  - id: hawkeye.secrets.logged-key-material
+    languages: [rust]
+    paths:
+      include: ["/crates/**", "/near/src/**"]
+      exclude: ["/crates/*/tests/**", "/near/src/tests.rs", "/near/src/tests/**", "/near/tests/**"]
+    patterns:
+      - pattern-either:
+          - pattern-inside: trace!(...)
+          - pattern-inside: tracing::trace!(...)
+          - pattern-inside: debug!(...)
+          - pattern-inside: tracing::debug!(...)
+          - pattern-inside: info!(...)
+          - pattern-inside: tracing::info!(...)
+          - pattern-inside: warn!(...)
+          - pattern-inside: tracing::warn!(...)
+          - pattern-inside: error!(...)
+          - pattern-inside: tracing::error!(...)
+          - pattern-inside: event!(...)
+          - pattern-inside: tracing::event!(...)
+          - pattern-inside: println!(...)
+          - pattern-inside: eprintln!(...)
+          - pattern-inside: print!(...)
+          - pattern-inside: eprint!(...)
+          - pattern-inside: panic!(...)
+          - pattern-inside: format!(...)
+          - pattern-inside: format_args!(...)
+          - pattern-inside: write!(...)
+          - pattern-inside: writeln!(...)
+          - pattern-inside: bail!(...)
+          - pattern-inside: anyhow!(...)
+          - pattern-inside: ensure!(...)
+          - pattern-inside: assert!(...)
+          - pattern-inside: assert_eq!(...)
+      # an argument (after `(` or `,`, or an inline `{name}`) that names key material
+      - pattern-regex: (?i)(?:[,(]\s*&?\s*(?:[a-z_]+(?:::|\.))*|\{)(?:secret(?:_key|_hex|_bytes)?|seed|mnemonic|private_key|priv_?key|signing_key)\b|\bkey\.to_bytes\(\)|\bsecret\.to_bytes\(\)
+    message: >-
+      Key material passed to a logging / formatting macro. Secret keys, seeds and their bytes never reach logs,
+      errors or panics; log the public key or the Ethereum address instead (SecretKey's Debug prints only the
+      public key).
+    severity: ERROR
+    metadata:
+      category: security
+      impact: HIGH
+      likelihood: LOW
+      confidence: MEDIUM
+      bucket: high
+      cwe: ["CWE-532: Insertion of Sensitive Information into Log File"]

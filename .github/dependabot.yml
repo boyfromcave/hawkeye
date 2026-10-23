@@ -1,21 +1,22 @@
-# Weekly update PRs for the pinned actions, the Cargo workspace and the eth/ npm pins.
-# Every PR runs the full CI; nothing merges without review.
+# Dependabot: security updates only, one grouped PR per ecosystem (SECURITY-CI.md). Version updates are
+# suppressed (open-pull-requests-limit: 0); dependencies move in deliberate, reviewed changes (AGENTS.md
+# rule 6: exact pins, Cargo.lock committed, --locked builds). Every PR runs the full CI.
+# Not covered: contrib/semgrep/requirements.txt, the semgrep pin shared verbatim by every Yellowback repo
+# (it moves with config.json "semgrep_version", all repos together; OSV-Scanner reports it).
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
+    open-pull-requests-limit: 0
     groups:
-      actions: { patterns: ["*"] }
+      security: { applies-to: security-updates, patterns: ["*"] }
   - package-ecosystem: cargo
     directory: /
     schedule: { interval: weekly }
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
-      # Patch releases arrive as one PR, verified once (each merge otherwise rebases the rest and
-      # queues another devnet-e2e run). Minor and major bumps stay individual.
-      cargo-patch:
-        update-types: ["patch"]
+      security: { applies-to: security-updates, patterns: ["*"] }
     ignore:
       # The byte-exact stack (txids, lockId, recipient hashes, set-signature messages, keccak
       # addresses, hash160, ZIP-243). The RustCrypto digest 0.11 generation cannot move alone
@@ -32,10 +33,19 @@ updates:
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: blake2b_simd
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+  # The wyec-near contract (its own workspace and lockfile).
+  - package-ecosystem: cargo
+    directory: /near
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 0
+    groups:
+      security: { applies-to: security-updates, patterns: ["*"] }
   - package-ecosystem: npm
     directory: /eth
     schedule: { interval: weekly }
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
+    groups:
+      security: { applies-to: security-updates, patterns: ["*"] }
     ignore:
       # Pinned to the versions the wyec contracts of record are compiled with (wyec design §8),
       # so the ABIs and bytecode Hawkeye binds match the deployed contract.
