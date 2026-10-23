@@ -24,13 +24,13 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 sha2 = "=0.10.9"
 thiserror = "=2.0.21"
-tokio = { version = "=1.53.2", features = ["net", "rt", "sync", "time", "macros"] }
+tokio = { version = "=1.53.3", features = ["net", "rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
 # Cross-check of the hand-rolled codec against the borsh crate's derive (tests/codec.rs).
 borsh = { version = "=1.8.1", features = ["derive"] }
 tempfile = "=3.27.0"
-tokio = { version = "=1.53.2", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "=1.53.3", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [lints]
 workspace = true
