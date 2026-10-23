@@ -25,7 +25,7 @@ sha2 = "=0.10.9"
 hex = "=0.4.3"
 serde_json = "=1.0.151"
 anyhow = "=1.0.104"
-tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread"] }
 # No `install` feature: building must not download the sandbox binary (S3 is unreachable here);
 # the sandbox tests are skipped unless NEAR_SANDBOX=1 (tests/sandbox.rs).
 near-workspaces = { version = "=0.23.0", default-features = false, features = ["rustls"] }
