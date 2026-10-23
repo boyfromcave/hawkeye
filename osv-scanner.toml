@@ -1,0 +1,114 @@
+# OSV-Scanner configuration (.github/workflows/secops.yml, SECURITY-CI.md).
+# Every ignored vulnerability needs a reason a reviewer can check and an ignoreUntil at most 90 days out;
+# when it lapses the scan fails again and the entry is re-justified or the dependency is fixed.
+# Triaged 2026-10-23.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Cargo.lock: paste, unmaintained proc-macro (compile time only) via alloy-primitives; no vulnerability. Also ignored in deny.toml; revisit at each alloy bump."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0388"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Cargo.lock: derivative, unmaintained proc-macro reached only through ark-ff (optional ruint/alloy features Hawkeye does not enable; absent from `cargo tree --all-features`); no vulnerability."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0253"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "near/Cargo.lock: lru 0.16.4 via near-vm-runner, the near-sdk unit-testing VM (dev-dependency only, never in the wyec-near wasm). The fix (0.18.2) is a semver-major bump near-sdk =5.29.1 does not allow; revisit at the next near-sdk pin."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0285"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "near/Cargo.lock: rustls 0.23.43 via near-workspaces (dev-dependency: sandbox tests against a local 127.0.0.1 NEAR node). 0.23.45+ needs aws-lc-rs >=1.18, which near-crypto =0.37.4 pins to =1.16.2; revisit at the next near-workspaces/near-crypto pin. Hawkeye's own Cargo.lock has rustls 0.23.46."
+
+[[IgnoredVulns]]
+id = "GHSA-2mjx-qc3c-rqvc"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Alias of RUSTSEC-2026-0285 (near/Cargo.lock rustls, dev-dependency only); same reason."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0346"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "near/Cargo.lock: rustls 0.23.43, dev-dependency only (near-workspaces sandbox tests); fix blocked by near-crypto's aws-lc-rs =1.16.2 pin (see RUSTSEC-2026-0285)."
+
+[[IgnoredVulns]]
+id = "GHSA-c8m5-c952-6cm4"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Alias of RUSTSEC-2026-0346; same reason."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0348"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "near/Cargo.lock: rustls 0.23.43, dev-dependency only (near-workspaces sandbox tests); fix blocked by near-crypto's aws-lc-rs =1.16.2 pin (see RUSTSEC-2026-0285)."
+
+[[IgnoredVulns]]
+id = "GHSA-h2v8-394m-p7vv"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Alias of RUSTSEC-2026-0348; same reason."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0349"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "near/Cargo.lock: rustls 0.23.43, dev-dependency only (near-workspaces sandbox tests); fix blocked by near-crypto's aws-lc-rs =1.16.2 pin (see RUSTSEC-2026-0285)."
+
+[[IgnoredVulns]]
+id = "GHSA-w44r-93j7-qv28"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Alias of RUSTSEC-2026-0349; same reason."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0382"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "near/Cargo.lock only: rustls-webpki 0.103.13 via near-workspaces (dev-dependency); 0.103.16 needs the newer rustls/aws-lc-rs that near-crypto =0.37.4 blocks. Fixed in Hawkeye's own Cargo.lock (0.103.16) in this change."
+
+[[IgnoredVulns]]
+id = "CVE-2026-111943"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Alias of RUSTSEC-2026-0381/0382/0383; fixed in Cargo.lock and in near/Cargo.lock's webpki-roots, left only on near/'s dev-only rustls-webpki (see RUSTSEC-2026-0382)."
+
+[[IgnoredVulns]]
+id = "GO-2026-6809"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Alias of RUSTSEC-2026-0381/0382/0383; same as CVE-2026-111943."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0449"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "near/Cargo.lock: unsafe-libyaml, unmaintained, via serde_yaml in near-parameters (the near-sdk unit-testing VM, dev-dependency only); no vulnerability."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2022-0054"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "near/Cargo.lock: wee_alloc, unmaintained, an optional near-sdk allocator feature wyec-near does not enable (in the lock, not in the build graph); no vulnerability."
+
+[[IgnoredVulns]]
+id = "GHSA-rc23-xxgq-x27g"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Alias of RUSTSEC-2022-0054; same reason."
+
+[[IgnoredVulns]]
+id = "GHSA-7c78-jf6q-g5cm"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "eth/package-lock.json: tmp 0.2.6, which solc-js 0.8.37 pins exactly; a devDependency used only by the local solc-js shim (eth/tools/solc), never in CI's native-solc build or at runtime, and only exploitable with attacker-controlled tmp options. solc stays at the version wyec's contracts are compiled with (wyec design §8)."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-4320"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "contrib/semgrep/requirements.txt: certifi, a dependency of the semgrep CLI used only on CI runners to scan this repository (no secrets, no outbound TLS beyond the rule fetch from github.com). The file is shared verbatim by every Yellowback repo and moves with the semgrep pin, all repos together."
+
+[[IgnoredVulns]]
+id = "GHSA-6q48-6c7w-9gw2"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "Alias of PYSEC-2026-4320; same reason."
+
+[[IgnoredVulns]]
+id = "GHSA-84m7-p3x7-pcfv"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "contrib/semgrep/requirements.txt: mcp, a semgrep CLI dependency; the vulnerable StreamableHTTP server transport is never started by `semgrep scan`. Moves with the shared semgrep pin."
+
+[[IgnoredVulns]]
+id = "GHSA-xcq7-p3pf-p88h"
+ignoreUntil = 2027-01-20T00:00:00Z
+reason = "contrib/semgrep/requirements.txt: opentelemetry-api, a semgrep CLI dependency; scans run with --metrics=off and no tracing endpoint. Moves with the shared semgrep pin."

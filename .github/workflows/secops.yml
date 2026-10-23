@@ -1,0 +1,157 @@
+name: secops
+
+# Hawkeye's security legs besides Semgrep (semgrep.yml) and CodeQL (codeql.yml); SECURITY-CI.md has the policy.
+#   gitleaks        secrets: the PR's own commits on a pull request (fails on a new leak); the whole history
+#                   nightly and on demand. Allowlist with reasons: .gitleaks.toml.
+#   osv-scanner     known vulnerabilities in every lockfile (Cargo.lock, near/Cargo.lock, eth/package-lock.json,
+#                   contrib/semgrep/requirements.txt). Fails on any not listed in osv-scanner.toml with a reason
+#                   and an ignoreUntil (at most 90 days).
+#   npm-audit       eth/package-lock.json production dependencies, high and above.
+#   semgrep-rules   the tests of Hawkeye's own Semgrep rules (contrib/semgrep/rules/hawkeye.rs).
+# Kept in ci.yml, not duplicated here: cargo-deny (advisories, bans, licences, sources; job "cargo-deny") and
+# zizmor + actionlint (job "lint workflows"), both on every push and pull request.
+# Not applicable: Slither (Hawkeye owns no deployed Solidity: eth/ holds forge tests and a deploy script run
+# against wyec at its pinned commit, and wyec's contracts are analysed in the wyec repository); pip-audit (no
+# Python dependencies: the devnet script is standard library only; semgrep's own pins are covered by OSV here);
+# Checkov (no Dockerfile, Kubernetes or Terraform).
+# Tools are release binaries checked against the SHA-256 recorded below, or hash-locked PyPI packages.
+on:
+  push:
+    branches: [upgrade/vault]
+  pull_request:
+  schedule:
+    - cron: '43 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: secops-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  OSV_SCANNER_VERSION: 2.6.0
+  OSV_SCANNER_SHA256: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
+
+jobs:
+  gitleaks:
+    name: secrets (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0  # history scan; on a PR, the range base..head
+          persist-credentials: false
+      - name: install gitleaks
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+      - name: scan
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          args=(git --config .gitleaks.toml --redact --no-banner --report-format sarif --report-path gitleaks.sarif)
+          if [ "$EVENT" = pull_request ]; then
+            args+=(--log-opts "${PR_BASE}..${PR_HEAD}")
+            echo "Scanning the PR's commits ${PR_BASE}..${PR_HEAD}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Scanning the full history" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          rc=0
+          "$RUNNER_TEMP/gitleaks" "${args[@]}" . || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "gitleaks found a possible secret (values redacted; see the code scanning alert). Rotate it if real; allowlist it in .gitleaks.toml with a reason if public." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No leaks found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: ${{ !cancelled() && hashFiles('gitleaks.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  osv-scanner:
+    name: dependency vulnerabilities (osv-scanner)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: install osv-scanner
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+          "$RUNNER_TEMP/osv-scanner" --version
+      - name: scan every lockfile
+        run: |
+          rc=0
+          "$RUNNER_TEMP/osv-scanner" scan source --recursive --config osv-scanner.toml \
+            --format sarif --output-file osv.sarif . || rc=$?
+          { echo '### OSV-Scanner'; echo; } >> "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/osv-scanner" scan source --recursive --config osv-scanner.toml \
+            --format markdown . >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          exit "$rc"
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: ${{ !cancelled() && hashFiles('osv.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner
+
+  npm-audit:
+    name: npm audit (eth/)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: eth
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # The lockfile alone: nothing is installed, no install scripts run.
+      - run: npm audit --package-lock-only --omit=dev --audit-level=high
+
+  semgrep-rules:
+    name: semgrep rule tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # ubuntu-24.04's python3 is CPython 3.12, the version requirements.txt is locked for.
+      - name: install semgrep (hash-locked)
+        run: |
+          python3 --version
+          python3 -m venv "$RUNNER_TEMP/sg"
+          "$RUNNER_TEMP/sg/bin/pip" install --quiet --disable-pip-version-check --require-hashes --no-deps \
+            -r contrib/semgrep/requirements.txt
+      # A copy outside the repository: .semgrepignore skips contrib/semgrep/ in the real scans.
+      - name: rule tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/rules"
+          cp contrib/semgrep/rules/hawkeye.yaml contrib/semgrep/rules/hawkeye.rs "$RUNNER_TEMP/rules/"
+          cd "$RUNNER_TEMP/rules"
+          "$RUNNER_TEMP/sg/bin/semgrep" --test --metrics=off --disable-version-check .
