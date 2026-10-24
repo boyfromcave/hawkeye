@@ -1,0 +1,138 @@
+{
+  "_comment": "Code-scanning alerts dismissed by .github/workflows/code-scanning.yml (contrib/secops/code-scanning-triage.py). One entry per tool + rule + path glob: reason is one of 'false positive', 'won't fix', 'used in tests'; comment is the argument a reviewer can check (280 characters reach GitHub). A real finding is fixed in code, never listed here.",
+  "dismissals": [
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye-core/src/leader.rs",
+      "reason": "false positive",
+      "comment": "The 'nonce' is the wYEC burn nonce (the bridge's public replay/sequence number, plan §5), used only to pick the leader index; lock_id_mod's 0 is the n == 0 guard. Other hits are the #[cfg(test)] rotation table. No key, IV or secret."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye-core/src/matcher.rs",
+      "reason": "used in tests",
+      "comment": "All 5 hits are in #[cfg(test)] (module from line 273): burn nonce 9 and tx hash [0xee;32] passed to HawkeyeMemo::burn_release fixtures. The burn nonce is the bridge's public sequence number, not a cryptographic nonce."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye-core/src/memo.rs",
+      "reason": "used in tests",
+      "comment": "All 6 hits are in #[cfg(test)] (from line 263): burn nonces 1/3/7/0x0102 for the burn-release memo encoding tests (plan §4). The memo's nonce is the public wYEC burn sequence number, not a cryptographic nonce."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye/src/cli.rs",
+      "reason": "used in tests",
+      "comment": "All 6 hits are in #[cfg(test)] (from line 1454): BurnKey/replay_plan fixtures with burn nonces 0/3/4. The burn nonce is the bridge's public sequence number, not a cryptographic value."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye/src/engine/burn.rs",
+      "reason": "false positive",
+      "comment": "Lines 1310/1318 pass 0 as the 'nonce' of roll::mark_unconfirmable, which only uses it as the burn number in a status text. Burn nonces are the bridge's public sequence numbers; no key, IV or secret is involved."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye/src/engine/roll.rs",
+      "reason": "false positive",
+      "comment": "127: burn_unlock(peer, 0) asks a peer's /burns/unlock for burn nonce 0 to learn its responder key; 302/605: mark_orphan's nonce is only the burn number in a status text. Public bridge sequence numbers; the peer-auth nonce is random_nonce()."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye/src/engine/slash.rs",
+      "reason": "false positive",
+      "comment": "leader_for(0, ...) picks the slash-vote owner by rotation index 0; the parameter is named for the burn nonce (public bridge sequence number), not a cryptographic nonce."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye/src/engine/ycash.rs",
+      "reason": "used in tests",
+      "comment": "The hit (1089) is in #[cfg(test)] (from line 1042): BurnKey::new(deployment, 7), a burn sequence number in a fixture."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye/src/keys.rs",
+      "reason": "used in tests",
+      "comment": "Both 'password' hits (152, 164) are \"pw\" in the #[cfg(test)] keystore round-trip test (from line 117). Production takes the keystore password from the operator's environment variable (main.rs keys encrypt --password-env, config KeySource::Keystore)."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye/src/peer_auth.rs",
+      "reason": "used in tests",
+      "comment": "All 8 hits are in #[cfg(test)] (from line 445): fixed [u8;16] values fed to admit_once to test the replay cache. Production request nonces come from random_nonce() (/dev/urandom, line 192, used at 400)."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye-core/tests/peerauth.rs",
+      "reason": "used in tests",
+      "comment": "The peer-channel authentication golden vectors (plan §4.6): NONCE 00..0f and [0xff;16] are fixed inputs whose committed message is checked byte-exactly. Production nonces are random (hawkeye peer_auth::random_nonce)."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye-core/tests/near_vectors.rs",
+      "reason": "used in tests",
+      "comment": "NEAR golden-vector test: burn nonce 258 in a HawkeyeMemo::burn_release fixture; the burn nonce is the public bridge sequence number."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye-store/tests/*",
+      "reason": "used in tests",
+      "comment": "Store tests (events, migrations, reorg, sign_once, transitions): every one of the 65 hits was read and is a burn sequence number (burn_key(n), new_burn(n,..), BurnKey::new(dep,n), matcher_burn/adopt_release nonce) in a fixture."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/hawkeye/tests/*",
+      "reason": "used in tests",
+      "comment": "Integration tests (bond_exit.rs, engine.rs): all 6 hits were read and are burn sequence numbers (BurnKey::new, burn_release memo nonce 77, burn_unlock(url, 5), held_body(0,..)) in regtest fixtures."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/request-forgery",
+      "path": "crates/hawkeye-ycash/src/client.rs",
+      "reason": "false positive",
+      "comment": "The URL is the operator's own [ycash] rpc_url from the config file (config.rs, transport-checked by credentials_safe: loopback or TLS unless allow_insecure_rpc), set once at start; no part comes from a peer, the API or chain data."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/cleartext-logging",
+      "path": "crates/hawkeye-near/examples/near-admin.rs",
+      "reason": "false positive",
+      "comment": "Prints the JSON outcome: account id, public key text and the key file path. The secret key is only written to the --out file, never printed. near-admin is a devnet set-up helper."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/cleartext-logging",
+      "path": "crates/hawkeye-near/tests/client_mock.rs",
+      "reason": "used in tests",
+      "comment": "panic!(\"{e:?}\") of unexpected error variants in mock-RPC tests; the 'sensitive' value is a NEAR account id (public), no key material."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/cleartext-logging",
+      "path": "crates/hawkeye-near/tests/sandbox.rs",
+      "reason": "used in tests",
+      "comment": "Sandbox test output: gas figures, scan heights and events, the relayer account id (public NEAR account names). No key material is printed."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/log-injection",
+      "path": "crates/hawkeye/tests/engine.rs",
+      "reason": "used in tests",
+      "comment": "The assert! message prints the JSON body returned by the test's own local Hawkeye API (regtest engine test); no operator log is written."
+    }
+  ]
+}
