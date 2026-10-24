@@ -281,6 +281,15 @@
       "reason": "The devnet harness starts and drives local regtest nodes, anvil and Hawkeye processes and talks to them over 127.0.0.1 HTTP by design; argv comes from its own constants and the operator's own command line (`hawkeye-devnet cli ...` execs ycash-cli with the operator's arguments). Never shipped, never run on a public network.",
       "by": "semgrep CI setup",
       "date": "2026-10-23"
+    },
+    {
+      "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
+      "paths": [
+        "contrib/secops/**"
+      ],
+      "reason": "contrib/secops/code-scanning-triage.py runs `gh api` with an argv list (no shell) built from constants, the alert number from the API and the workflow-supplied repository name; it runs only in .github/workflows/code-scanning.yml with that job's own token. A subprocess call anywhere else is still reported.",
+      "by": "secops triage",
+      "date": "2026-10-24"
     }
   ]
 }
