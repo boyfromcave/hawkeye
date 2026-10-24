@@ -92,3 +92,8 @@ reason = "Alias of RUSTSEC-2022-0054; same reason."
 id = "GHSA-7c78-jf6q-g5cm"
 ignoreUntil = 2027-01-20T00:00:00Z
 reason = "eth/package-lock.json: tmp 0.2.6, which solc-js 0.8.37 pins exactly; a devDependency used only by the local solc-js shim (eth/tools/solc), never in CI's native-solc build or at runtime, and only exploitable with attacker-controlled tmp options. solc stays at the version wyec's contracts are compiled with (wyec design §8)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+ignoreUntil = 2027-01-22T00:00:00Z
+reason = "crypto-bigint 0.5.5 timing variability in operations meant to be constant-time (fixed only in 0.7.6). Cargo.lock: compiled, in the member-key ECDSA path (k256 0.13.4 Scalar is a crypto-bigint U256; alloy-signer 2.5.0, the newest alloy, requires k256/elliptic-curve ^0.13, so 0.7.6 cannot be reached without forking alloy). Accepted risk, time-bounded: signing is RFC6979-deterministic on the operator's own host, and the sign-once records sign each set/EIP-712/act message once and reuse the bytes on retry, so a remote party cannot elicit repeated signatures to average a timing signal. near/Cargo.lock: dev-dependency only (k256 dev-dependency of wyec-near tests, near-vm-runner unit-testing VM), never in the wasm. Also ignored in deny.toml; revisit when alloy moves to k256 0.14."
