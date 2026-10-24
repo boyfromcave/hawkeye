@@ -12,6 +12,12 @@ ignore = [
     # paste: proc-macro only (compile time), flagged unmaintained, no vulnerability; pulled in by
     # alloy-primitives with no maintained replacement upstream yet. Revisit at each alloy bump.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro via alloy; no known vulnerability (revisit 2027-01)" },
+    # crypto-bigint 0.5.5 (k256 0.13.4 scalars, the member-key ECDSA path): timing variability in
+    # operations meant to be constant-time, fixed only in 0.7.6, which needs k256 0.14; alloy-signer
+    # 2.5.0 (newest) requires k256 ^0.13. Accepted, time-bounded: RFC6979 signing on the operator's
+    # host, and sign-once records mean no message is signed twice, so a remote party cannot collect
+    # repeated signatures to average a timing signal. osv-scanner.toml carries the same entry.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via k256 0.13 / alloy; no fixed version reachable (revisit 2027-01-22 or at the alloy k256 0.14 bump)" },
 ]
 
 [licenses]
