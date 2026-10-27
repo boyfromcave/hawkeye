@@ -97,3 +97,73 @@ reason = "eth/package-lock.json: tmp 0.2.6, which solc-js 0.8.37 pins exactly; a
 id = "RUSTSEC-2026-0387"
 ignoreUntil = 2027-01-22T00:00:00Z
 reason = "crypto-bigint 0.5.5 timing variability in operations meant to be constant-time (fixed only in 0.7.6). Cargo.lock: compiled, in the member-key ECDSA path (k256 0.13.4 Scalar is a crypto-bigint U256; alloy-signer 2.5.0, the newest alloy, requires k256/elliptic-curve ^0.13, so 0.7.6 cannot be reached without forking alloy). Accepted risk, time-bounded: signing is RFC6979-deterministic on the operator's own host, and the sign-once records sign each set/EIP-712/act message once and reuse the bytes on retry, so a remote party cannot elicit repeated signatures to average a timing signal. near/Cargo.lock: dev-dependency only (k256 dev-dependency of wyec-near tests, near-vm-runner unit-testing VM), never in the wasm. Also ignored in deny.toml; revisit when alloy moves to k256 0.14."
+
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "Cargo.lock: block-buffer 0.10.4 under digest 0.10 (sha2/sha3/k256/ed25519-dalek, the attestor's hashing and signing; its 0.12.1 is fixed). near/Cargo.lock: 0.10.4 (near-sdk hashing, the wyec-near wasm and its tests). GHSA-qwgh-2vcv-g2f7 (moderate, GitHub-only, not in the RustSec database cargo-deny reads): a panic caught inside a digest's compress callback can leave block-buffer's cursor out of range, so a later use of the same buffer reads or writes out of bounds. Fixed only in 0.12.1 (the digest 0.11 line); the digest 0.10 line, which every released sha2/sha3/blake2 still uses, has no fixed release. Hawkeye never catches a panic (the one catch_unwind, near/src/tests.rs, wraps a rejected contract call on the mocked runtime, not a hash), so a corrupted cursor is never reused: a panic on a hashing path ends that process or receipt. Revisit when the RustCrypto hashes ship on digest 0.11."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0391"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd 0.13.3 / zstd-safe 7.3.0, which near-primitives =0.37.4 (zstd ^0.13) pulls in through near-workspaces, a dev-dependency (sandbox tests against a local NEAR node) never in the wyec-near wasm or in Hawkeye; the fixes are zstd 0.14.3 / zstd-safe 8.2.0, outside near-primitives' requirement; revisit at the next near pin. zstd-sys is bumped to 2.1.2 there in this change (RUSTSEC-2026-0410)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0395"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0396"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0397"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0398"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0399"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0400"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0401"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0402"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0403"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0404"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0405"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0406"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
