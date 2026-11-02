@@ -8,6 +8,12 @@
 # NEAR: the wyec-near contract (unit tests, wasm, near-workspaces sandbox tests) and Hawkeye's NEAR
 # adapter against a real NEAR sandbox node (crates/hawkeye-near/tests/sandbox.rs).
 # Workflows: actionlint.
+# kogany (report-only; a push to or a dispatch on vaults/kogany-compat): the regtest self-signing
+# test (crates/hawkeye/tests/regtest_self_signing.rs) against a ycash6 node that a regtest kogany
+# node (the third node line, workspace kogany plan W9-c) follows and validates block by block
+# (devnet/kogany-rig.py follow): the kogany + ycash6 test rig column. zakurad is kogany's
+# zakurad-bin artifact at KOGANY_REF, else built at that commit; ycashd is ycash6's node-bin of
+# vaults/kogany-compat.
 #
 # Every third-party action is pinned to a commit SHA (the tag in the trailing comment); the
 # Rust toolchain comes from rust-toolchain.toml; builds are --locked.
@@ -16,8 +22,9 @@ name: ci
 on:
   push:
     # main, the vault upgrade line (upgrade/vault, the GitHub default) and the post-quantum line
-    # (upgrade/quantum-vaults: PQ vault owners, rpcversion 7).
-    branches: [main, upgrade/vault, upgrade/quantum-vaults, "claude/**"]
+    # (upgrade/quantum-vaults: PQ vault owners, rpcversion 7), vaults/kogany-compat (the kogany
+    # work's integration branch, workspace kogany plan section 4.2 rule 0).
+    branches: [main, upgrade/vault, upgrade/quantum-vaults, vaults/kogany-compat, "claude/**"]
   pull_request:
   workflow_dispatch:
 
@@ -309,3 +316,116 @@ jobs:
       - name: sandbox log
         if: failure()
         run: tail -n 200 "$RUNNER_TEMP/near-sandbox.log"
+
+  # The kogany leg (report-only until the lead architect flips it: drop continue-on-error). No
+  # cache: zakurad, ycashd and fetch-params.sh are other repositories' code.
+  kogany:
+    name: kogany (report-only)
+    if: github.ref_name == 'vaults/kogany-compat' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    continue-on-error: true
+    env:
+      # kogany vaults/kogany-compat at W5-f (the YED module registered: the real index answers)
+      KOGANY_REF: 1eca93d3f462fb5a10815b4267acb9157843b253
+      YCASH6_REPO: boyfromcave/ycash6
+      YCASH6_BRANCH: vaults/kogany-compat
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # zakurad-bin.tgz: zakurad (dev profile, --features ycash, ubuntu-24.04, the runner's librocksdb)
+      # and zakurad-bin.json, from a push, schedule or dispatch run of kogany at KOGANY_REF only (the
+      # contract of the workspace's docs/plans/kogany/ci-design.md), never a pull_request run.
+      - name: kogany's zakurad-bin at KOGANY_REF
+        id: zakurad
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$KOGANY_REF" in *[!0-9a-f]*|'') echo "::error::KOGANY_REF is not a commit id"; exit 1 ;; esac
+          trusted='select(.event == "push" or .event == "schedule" or .event == "workflow_dispatch")'
+          runs=$(gh run list -R boyfromcave/kogany -c "$KOGANY_REF" -L 50 --json databaseId,event,headSha \
+            -q ".[] | select(.headSha == \"$KOGANY_REF\") | $trusted | .databaseId" 2>/dev/null || true)
+          for r in $runs; do
+            if gh run download "$r" -R boyfromcave/kogany -n zakurad-bin -D "$RUNNER_TEMP/zk-dl" 2>/dev/null \
+               && [ -f "$RUNNER_TEMP/zk-dl/zakurad-bin.tgz" ]; then
+              mkdir -p "$RUNNER_TEMP/zk" && tar xzf "$RUNNER_TEMP/zk-dl/zakurad-bin.tgz" -C "$RUNNER_TEMP/zk"
+              cat "$RUNNER_TEMP/zk/zakurad-bin.json"
+              echo "ZAKURAD=$RUNNER_TEMP/zk/zakurad" >> "$GITHUB_ENV"
+              echo "got=true" >> "$GITHUB_OUTPUT"
+              echo "zakurad from boyfromcave/kogany run $r"; exit 0
+            fi
+          done
+          echo "got=false" >> "$GITHUB_OUTPUT"
+          echo "no zakurad-bin of boyfromcave/kogany at $KOGANY_REF: building it here"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: boyfromcave/kogany
+          ref: ${{ env.KOGANY_REF }}
+          path: kogany
+          persist-credentials: false
+          sparse-checkout: ${{ steps.zakurad.outputs.got == 'true' && '.github/actions/setup-zakura-build' || '' }}
+      # kogany's setup-zakura-build as its script (librocksdb for zakurad). The fallback build fails at
+      # dependency resolution until boyfromcave/zakura-common-ycash exists on GitHub (kogany plan K-2).
+      - name: kogany build packages
+        env:
+          INSTALL_LIBCLANG: "false"
+          INSTALL_PROTOC: "false"
+        run: bash kogany/.github/actions/setup-zakura-build/install-ubuntu-packages.sh
+      - name: build zakurad (kogany at KOGANY_REF, --features ycash)
+        if: steps.zakurad.outputs.got != 'true'
+        working-directory: kogany
+        env:
+          CARGO_INCREMENTAL: 0
+        run: |
+          cargo build --locked -p zakura --features ycash --bin zakurad
+          echo "ZAKURAD=$GITHUB_WORKSPACE/kogany/target/debug/zakurad" >> "$GITHUB_ENV"
+      - name: zakurad runs here
+        run: |
+          if ldd "$ZAKURAD" | grep 'not found'; then echo "::error::zakurad needs a library this runner lacks"; exit 1; fi
+          "$ZAKURAD" --version
+      - name: ycashd from ycash6's node-bin (vaults/kogany-compat)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          trusted='select(.event == "push" or .event == "schedule" or .event == "workflow_dispatch")'
+          runs=$(gh run list -R "$YCASH6_REPO" -w yellowback-tests.yml -b "$YCASH6_BRANCH" -L 20 --json databaseId,event -q ".[] | $trusted | .databaseId")
+          for r in $runs; do
+            if gh run download "$r" -R "$YCASH6_REPO" -n node-bin -D "$RUNNER_TEMP/dl" 2>/dev/null; then
+              echo "ycashd from $YCASH6_REPO run $r"; break
+            fi
+          done
+          mkdir -p "$RUNNER_TEMP/node"
+          tar -xzf "$RUNNER_TEMP/dl/node-bin.tgz" -C "$RUNNER_TEMP/node" src/ycashd src/ycash-cli
+          test -x "$RUNNER_TEMP/node/src/ycashd"
+          echo "YCASHD=$RUNNER_TEMP/node/src/ycashd" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.YCASH6_REPO }}
+          ref: ${{ env.YCASH6_BRANCH }}
+          path: ycash6
+          persist-credentials: false
+          sparse-checkout: zcutil
+      - name: fetch zcash params
+        run: ycash6/zcutil/fetch-params.sh
+      - name: the self-signing regtest test, followed by kogany (report-only)
+        env:
+          KOGANY_RIG_DIR: ${{ runner.temp }}/kogany-rig
+          HAWKEYE_REGTEST_PORT: "29880"
+          HAWKEYE_REGTEST_DIR: ${{ runner.temp }}/hawkeye-regtest
+        run: |
+          export HAWKEYE_REGTEST_YCASHD="$YCASHD"
+          python3 devnet/kogany-rig.py --dir "$KOGANY_RIG_DIR" follow --zakurad "$ZAKURAD" \
+            --peer-p2p "$HAWKEYE_REGTEST_PORT" --peer-rpc "http://127.0.0.1:$((HAWKEYE_REGTEST_PORT + 1))/" --vault 110 -- \
+            cargo test --locked -p hawkeye --test regtest_self_signing -- --nocapture
+      - name: upload the rig logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hawkeye-kogany-logs
+          path: |
+            ${{ runner.temp }}/kogany-rig/*.log
+            ${{ runner.temp }}/kogany-rig/*.json
+          retention-days: 14
+          if-no-files-found: ignore
