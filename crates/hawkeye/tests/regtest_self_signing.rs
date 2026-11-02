@@ -198,10 +198,7 @@ async fn self_signed_set_and_act_signatures_on_a_real_node() {
     call(
         rpc,
         "set_sendact",
-        vec![
-            json!(admitted.hex.to_string()),
-            json!({"allowoutflow": 2}),
-        ],
+        vec![json!(admitted.hex.to_string()), json!({"allowoutflow": 2})],
     )
     .await;
     rpc.generate(4).await.unwrap(); // current after the set's maturity
