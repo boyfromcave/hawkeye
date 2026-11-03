@@ -442,5 +442,29 @@ async fn self_signed_set_and_act_signatures_on_a_real_node() {
         .await
         .unwrap_err();
     eprintln!("dumpprivkey {addr}: {e}");
+    wait_for_kogany(rpc).await;
     let _ = rpc.call_value("stop", vec![]).await;
+}
+
+/// Under `devnet/kogany-rig.py follow` (`KOGANY_RIG_KOGANY_RPC` set): wait, at most 60 s, until
+/// kogany's best block hash equals this node's, so the node is not stopped before kogany (whose
+/// only peer it is) has received and validated its last block.
+async fn wait_for_kogany(rpc: &YcashRpc) {
+    let Ok(url) = std::env::var("KOGANY_RIG_KOGANY_RPC") else {
+        return;
+    };
+    let kogany = YcashRpc::new(url.clone(), Auth::None).unwrap();
+    let tip = rpc.call_value("getbestblockhash", vec![]).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let k = kogany.call_value("getbestblockhash", vec![]).await.ok();
+        if k.as_ref() == Some(&tip) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "kogany ({url}) did not reach this node's tip {tip} within 60 s (kogany at {k:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
