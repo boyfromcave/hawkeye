@@ -321,7 +321,8 @@ jobs:
   # cache: koganyd, ycashd and fetch-params.sh are other repositories' code.
   kogany:
     name: kogany (report-only)
-    if: github.ref_name == 'vaults/kogany-compat' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    # Cache poisoning (code scanning): a downloaded artifact runs here, so only the repository owner starts it.
+    if: (github.ref_name == 'vaults/kogany-compat' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) && github.actor == github.repository_owner
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     continue-on-error: true
@@ -414,11 +415,24 @@ jobs:
           KOGANY_RIG_DIR: ${{ runner.temp }}/kogany-rig
           HAWKEYE_REGTEST_PORT: "29880"
           HAWKEYE_REGTEST_DIR: ${{ runner.temp }}/hawkeye-regtest
+        # Report-only: the result goes to the step summary and the step exits 0, so a kogany
+        # difference never turns the check red; the rig logs are uploaded below.
         run: |
+          set -uo pipefail
           export HAWKEYE_REGTEST_YCASHD="$YCASHD"
+          log=$RUNNER_TEMP/kogany-leg.out
           python3 devnet/kogany-rig.py --dir "$KOGANY_RIG_DIR" follow --koganyd "$KOGANYD" \
             --peer-p2p "$HAWKEYE_REGTEST_PORT" --peer-rpc "http://127.0.0.1:$((HAWKEYE_REGTEST_PORT + 1))/" --vault 110 -- \
-            cargo test --locked -p hawkeye --test regtest_self_signing -- --nocapture
+            cargo test --locked -p hawkeye --test regtest_self_signing -- --nocapture 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          {
+            echo "### kogany leg (report-only): exit $status"
+            echo '```'
+            grep -E '^test |test result|"(wait|kogany_height|peer_tips_seen)"|FAIL|panicked' "$log" | tail -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then echo "::warning::kogany leg failed (exit $status); report-only, see the step summary"; fi
+          exit 0
       - name: upload the rig logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
