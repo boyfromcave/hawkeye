@@ -421,7 +421,7 @@ jobs:
         # Report-only: the result goes to the step summary and the step exits 0, so a kogany
         # difference never turns the check red; the rig logs are uploaded below.
         run: |
-          set -uo pipefail
+          set +e -uo pipefail # the runner shell is bash -e: keep going to the report
           export HAWKEYE_REGTEST_YCASHD="$YCASHD"
           log=$RUNNER_TEMP/kogany-leg.out
           python3 devnet/kogany-rig.py --dir "$KOGANY_RIG_DIR" follow --koganyd "$KOGANYD" \
