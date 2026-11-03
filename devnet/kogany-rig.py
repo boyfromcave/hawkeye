@@ -37,7 +37,8 @@ against the sidecar, a reference for byte-for-byte comparisons.
 
 `follow` is the rig for a client test that starts its own ycashd (Hawkeye's regtest tests): it
 starts kogany, has the test's node dial kogany as soon as its RPC answers (`addnode onetry`),
-runs CMD, records every tip the test's node reaches while CMD runs, and afterwards checks that
+runs CMD (with `KOGANY_RIG_KOGANY_RPC` = kogany's RPC URL in its environment, so the test can wait
+for kogany to hold its tip before it stops its node), records every tip the test's node reaches while CMD runs, and afterwards checks that
 kogany holds every one of them on its best chain (kogany validated every block the test made).
 Exit: CMD's status, else 3 when kogany did not follow.
 """
@@ -401,7 +402,11 @@ def cmd_follow(args):
     t = threading.Thread(target=watch, daemon=True)
     t.start()
     try:
-        status = subprocess.call(args.command)
+        # The test's node must not stop before kogany holds its tip (it is kogany's only peer):
+        # a test that sees KOGANY_RIG_KOGANY_RPC waits for kogany's best hash to equal its node's
+        # (bounded, 60 s) before it stops its node.
+        env = dict(os.environ, KOGANY_RIG_KOGANY_RPC=kogany.url)
+        status = subprocess.call(args.command, env=env)
     finally:
         stop.set()
         t.join()
