@@ -3,7 +3,7 @@
 # version into near/vendor/sandbox (gitignored) and print the binary's path on stdout.
 #
 # The version is near-sandbox-utils' DEFAULT_NEAR_SANDBOX_VERSION for the near-workspaces in
-# near/Cargo.lock (near-sandbox 0.3.16 -> 2.13.4), so the devnet, the adapter's sandbox test and
+# near/Cargo.lock (near-sandbox 0.4.0 -> 2.14.0), so the devnet, the adapter's sandbox test and
 # the contract's near-workspaces tests all run the same node; the archive's SHA-256 is checked.
 #
 #   ./tools/fetch-sandbox.sh                       # download from nearcore's build bucket
@@ -13,8 +13,8 @@
 # Re-pinning is deliberate: change SANDBOX_VERSION and SANDBOX_SHA256 together.
 set -eu
 
-SANDBOX_VERSION=2.13.4
-SANDBOX_SHA256=5690a4635172263cf026683f75965cac09dd916912584f12709974fed620163f
+SANDBOX_VERSION=2.14.0
+SANDBOX_SHA256=a0ba004218b218bd74351795e7ce2eda4a2b6af5cd3e252bd5e8bfe3c8f2e691
 SANDBOX_URL=${SANDBOX_URL:-https://s3-us-west-1.amazonaws.com/build.nearprotocol.com/nearcore/Linux-x86_64/$SANDBOX_VERSION/near-sandbox.tar.gz}
 
 here=$(cd "$(dirname "$0")/.." && pwd)

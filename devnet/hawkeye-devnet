@@ -87,7 +87,7 @@ TAGS = {"ethereum": "WYEC", "near": "NYEC"}                 # NEAR plan N-1
 NEAR = 10 ** 24                                             # yoctoNEAR
 NEAR_NETWORK_ID = "sandbox"                                 # bound into every NEAR attestation (N-6)
 NEAR_ROOT = "test.near"                                     # the sandbox's genesis account (validator_key.json)
-NEAR_SANDBOX_PIN = "2.13.4"                                 # near/tools/fetch-sandbox.sh
+NEAR_SANDBOX_PIN = "2.14.0"                                 # near/tools/fetch-sandbox.sh
 NEAR_EPOCH_LENGTH = 100_000                                 # no epoch change (and no GC) during a devnet run
 VAULT_BRANCH = "6d5b7a31"
 # The four Ycash upgrades and the two Zcash ones they sit on, all at 1 (the qa tests' YCASH_UPGRADE_ARGS);

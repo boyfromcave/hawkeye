@@ -399,7 +399,7 @@ devnet/hawkeye-devnet scenario pq-recipient --fresh --foreign near
 
 The Ycash half is the same devnet (nodes, set, joins, Hawkeyes) on the same post-quantum nodes:
 the `NYEC` vaults have PQ owners (`hawkeye lock --owner` / `vault_getnewowner`, as the `WYEC` ones),
-which the contract never sees; the foreign half is a real nearcore sandbox (`near-sandbox` 2.13.4, `NEAR_SANDBOX_BIN` overrides) instead of anvil, on
+which the contract never sees; the foreign half is a real nearcore sandbox (`near-sandbox` 2.14.0, `NEAR_SANDBOX_BIN` overrides) instead of anvil, on
 `--near-port` (default 18630; p2p the next port). `up` runs `near-sandbox init --fast` (epoch length
 raised to 100 000 blocks, so no epoch change or garbage collection happens during a run), then, as
 `test.near` (the genesis account, `<run>/near/validator_key.json`) through the `near-admin` helper
