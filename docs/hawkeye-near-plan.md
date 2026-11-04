@@ -182,8 +182,8 @@ business step, not code.
    guardians (`ethereum:0x…` / `secp256k1:<x‖y>`), cursor `foreign`; v3 ledgers migrate losslessly.
    Status: `foreign_kind`, `guardian`, `foreign` (the old `eth_address` / `ethereum` kept).
 6. **As built (NH5): against a real nearcore.** The NEAR sandbox node is pinned at nearcore
-   **2.13.4** (`near/tools/fetch-sandbox.sh`, SHA-256 checked; the version near-workspaces 0.23 /
-   near-sandbox 0.3.16 uses, so the contract tests, the adapter test and the devnet run one node).
+   **2.14.0** (`near/tools/fetch-sandbox.sh`, SHA-256 checked; the version near-workspaces 0.24 /
+   near-sandbox 0.4.0 uses, so the contract tests, the adapter test and the devnet run one node).
    `crates/hawkeye-near/tests/sandbox.rs` (env-gated: `HAWKEYE_NEAR_SANDBOX_RPC`,
    `HAWKEYE_NEAR_SANDBOX_KEY`) drives every RPC shape the NH4 client had only seen from its mock;
    two differed and are fixed in the client and the mock: (a) a **view call that panics** is

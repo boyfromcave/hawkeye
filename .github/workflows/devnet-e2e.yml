@@ -171,7 +171,7 @@ jobs:
             cli: src/ycash-cli
           - foreign: ethereum
             runner: ubuntu-22.04
-          # the pinned NEAR sandbox (nearcore 2.13.4) needs glibc >= 2.39
+          # the pinned NEAR sandbox (nearcore 2.14.0) needs glibc >= 2.39
           - foreign: near
             runner: ubuntu-24.04
     steps:
