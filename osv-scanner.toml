@@ -167,3 +167,8 @@ reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026
 id = "RUSTSEC-2026-0406"
 ignoreUntil = 2027-01-25T00:00:00Z
 reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0441"
+ignoreUntil = 2027-02-09T00:00:00Z
+reason = "Triaged 2026-11-11. Cargo.lock: pin-utils 0.1.1 is unmaintained (informational, no vulnerability, no fixed release). It comes only through wasmtimer, alloy's wasm32-only timer: `cargo tree --locked -e normal,build -i pin-utils` on the native target prints nothing. Also ignored in deny.toml; revisit at each alloy bump."

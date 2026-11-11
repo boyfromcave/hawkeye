@@ -10,7 +10,7 @@ publish.workspace = true
 [dependencies]
 hawkeye-core = { path = "../hawkeye-core" }
 hex = "=0.4.3"
-rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "fallible_uint"] }
 thiserror = "=2.0.21"
 
 [dev-dependencies]

@@ -12,6 +12,10 @@ ignore = [
     # paste: proc-macro only (compile time), flagged unmaintained, no vulnerability; pulled in by
     # alloy-primitives with no maintained replacement upstream yet. Revisit at each alloy bump.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro via alloy; no known vulnerability (revisit 2027-01)" },
+    # pin-utils: flagged unmaintained 2026-10-01, no vulnerability, no fixed release; in the lock only through
+    # wasmtimer (alloy), a wasm32-only dependency: `cargo tree -e normal,build -i pin-utils` on the native target
+    # prints nothing. Triaged 2026-11-11; revisit at each alloy bump.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained, wasm32-only via alloy wasmtimer; not built for any hawkeye target (revisit 2027-02)" },
     # crypto-bigint 0.5.5 (k256 0.13.4 scalars, the member-key ECDSA path): timing variability in
     # operations meant to be constant-time, fixed only in 0.7.6, which needs k256 0.14; alloy-signer
     # 2.5.0 (newest) requires k256 ^0.13. Accepted, time-bounded: RFC6979 signing on the operator's
