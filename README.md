@@ -42,7 +42,9 @@ challenges protect the wrapped token. The design is
   EC signatures (EIP-712, NEAR `ecrecover`).
 
 Addresses: post-quantum Yellowback owner addresses are `yb…` on mainnet (`yt…` testnet, `yr…`
-regtest); plain-YEC post-quantum addresses are `sq…` / `tq…` / `rq…`.
+regtest); plain-YEC post-quantum addresses are `sq…` / `tq…` / `rq…`. The third character names
+the scheme (decision D-9): `ybf…`/`sqf…` FN-DSA-512, `ybs…`/`sqs…` SLH-DSA. The earlier
+post-quantum form (`yb5…`, `sq4…`, before D-9) is refused.
 
 ## Joining and leaving the signer set
 
@@ -151,9 +153,12 @@ Hawkeye needs `upgrade/vault` nodes, on either node line
 ([ycash-dd](https://github.com/boyfromcave/ycash-dd) or
 [ycash6](https://github.com/boyfromcave/ycash6)), which carry the post-quantum layer (built on
 `upgrade/quantum-vaults`, merged into `upgrade/vault`): the vault upgrade (branch ID `0x6d5b7a31`)
-and `rpcversion` 8 (`yed_getinfo`; 5 was the vault upgrade, 7 post-quantum owners, 8 the fee
-rules). It parses only the post-quantum owner shape, so a node from before the post-quantum layer
-(`rpcversion` below 7) has no vault this Hawkeye recognises. The workspace's agent rules
+and `rpcversion` 9 (`yed_getinfo`; 5 was the vault upgrade, 7 post-quantum owners, 8 the fee
+rules, 9 the scheme-visible post-quantum address prefixes of decision D-9). It parses only the
+post-quantum owner shape, so a node from before the post-quantum layer (`rpcversion` below 7) has
+no vault this Hawkeye recognises, and only the D-9 address form, so a node before 9 (which prints
+and takes the earlier `yb5…`/`sq4…` form) is not one this Hawkeye can name owners or recipients
+with: use ycash-dd or ycash6 (6.22.x) from the D-9 change on. The workspace's agent rules
 (`AGENTS.md` rule 2, in [yellowback](https://github.com/boyfromcave/yellowback)) state the same
 `rpcversion` for every client; keep the two in step.
 
