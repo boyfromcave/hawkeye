@@ -53,9 +53,9 @@
       "script": "20c554ba62cf5f3a25601f8d6d0e6ff2ce41f3917407402ca623dd83e292e6b25851c2",
       "recipientHash": "f68ce7da966cdea9294f6474c396ed63afab43afb1220adbb78e778a710c366e",
       "addresses": {
-        "mainnet": "sq4dd1yaBk7vNHKXnkLpBETW9Pd4drGdG7xA4i6miNa93JnE4ucTW",
-        "testnet": "tq3vo9EppNP4GGAiuY3YFJgb4wwpM6JvDw8MA4Aapr9a3gYCxkyak",
-        "regtest": "rq5LStiKZ7rnUJULfxe67AERDqJJvcELJJmxyN2xbtzi2w2A7xSr6"
+        "mainnet": "sqs3t3JioyNB4w4jeZuep8UeXwx3ZRcvNsnP9ozEQxLiJSFW53sHq",
+        "testnet": "tqs3soGqsGXFAfk9yAeYvBjU3mWCCkK135UzjRBByFnuSxNVMDuJK",
+        "regtest": "rqs3tHLbkgD6yCPKKyAki5Dq28Ptv6vqig5maCoGretX9v8SB2f5q"
       },
       "scheme": 1
     },
@@ -68,9 +68,9 @@
       "script": "20ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff52c2",
       "recipientHash": "3bec2d433e4d42cfab15f4f614d3d41965ca0ae1f947d4db4616a41d82561991",
       "addresses": {
-        "mainnet": "sq4g1bmrsxBW5H4QKTksBZQLD4s81ubworVRhiU3o1EUWZJ1erUQK",
-        "testnet": "tq3yBj37WaSdyFubSFTbFddR8dBsj9eEmffco4XruUouWw44waFrF",
-        "regtest": "rq5NqUWcFKvNBJDDCg497VBFHWYNJfZer3KEcNQEgXf3WBY5W1R6q"
+        "mainnet": "sqf4RNmmNiW1ydQ6Z5sbzk1MMcS9rgaSQFqCNAmjYm8oNTc5ax2ZX",
+        "testnet": "tqf4R8jtS1f65N5WsgcW6oGAsRzJW1GX4TXowmxh74azWyj9QK3MK",
+        "regtest": "rqf4RcoeKRLwstigEV8htgkXqnt1DMtMk48anZamzTgcDwV5p3kn1"
       },
       "scheme": 2
     },
@@ -83,9 +83,9 @@
       "script": "205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a51c2",
       "recipientHash": "68ce4eadb217fb2344d6e1eae03dde4c8821e3289ea3f85a232dfded0f3b6448",
       "addresses": {
-        "mainnet": "sq4couNBfnJoRxqXF89SWjiPh5wktFi5bb5S4F89xMMsCrqRf2L4z",
-        "testnet": "tq3uz2dSJQZwKwgiMurAaowUceGWbVkNZQFd9bBy4pwJDEbVRn79A",
-        "regtest": "rq5Kdn6w3A3fXyzL8LSiSfVJmXd1B1fndmuExu4LqsnSCV5XgxPS9"
+        "mainnet": "sqs34vhLJ1Z48caj6wiH9djY5eGjoq4NiLuf9M1cew8STzJkZtyAr",
+        "testnet": "tqs34gfTMJi8EMG9RYTBFgzMbTptT9kTNYcGixCaDEadcWRpg4MCp",
+        "regtest": "rqs35AjDEiPz2suJnLyP3aUiZpibAWNJ49D3Zjpf6dgFKUBixgabq"
       },
       "scheme": 1
     },
@@ -98,9 +98,9 @@
       "script": "205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a52c2",
       "recipientHash": "92012959c0f371202ae2d35f31c4b6355d069c95e1cc657e47a53097488b7f03",
       "addresses": {
-        "mainnet": "sq4ekeYR7pAE7ByLpq428jfiHrrsVyMnSTs58MNJeFMXDFL63vTbT",
-        "testnet": "tq3wvmofkSRN1ApXwckkCotoDRBdDDQ5QH3GDhS7kivxDd62xcj3F",
-        "regtest": "rq5MaXHAVBu6DD89i3MJ4fSdNJY7njKVUegt31JVXmn6Csa3sdQfi"
+        "mainnet": "sqf3ARYKcaUk1YK34TAkwvGjSQRuLkLH2sCqnofzQ1Fr59eA2Past",
+        "testnet": "tqf3ABWSfsdp7GzTP3uf3yXYxDz3z52Mh4uTNQrwxJi3DfmBp7uvg",
+        "regtest": "rqf3AfaCZHKfuodcjrRrqs1uvaskhReCNfWEDCV2qhoevdX6xqPBL"
       },
       "scheme": 2
     },
@@ -113,9 +113,9 @@
       "script": "20000000000000000000000000000000000000000000000000000000000000000051c2",
       "recipientHash": "7c628529201db819c8e1940cb3896e20dfcbd7475dc875500576f92f3ab5d7a6",
       "addresses": {
-        "mainnet": "sq4c87RPytUeipnmA3whwZVh1X2tnUJY86v9ZVykRDFAVnJuRzNDT",
-        "testnet": "tq3uJEgecWjncodxGqeS1dimw5MeViLq5v6Ler3ZXgpbWA4t1z2wh",
-        "regtest": "rq5JwzA9MGDWpqwa3GEysVGc5xi95EGFAHjxU9uwJjfjVQYzoGhd2"
+        "mainnet": "sqs2P8kYc7iuRUXy1sWYaTWqQ5Msi3eqErkNebsD7o1jkunE2U1Fw",
+        "testnet": "tqs2NtiffQsyXDDPLUFSgWmeutv2MNLuu4SzED4Ag6TvuRuJ6C7u8",
+        "regtest": "rqs2PNnRYpZqKjrYhGmeUQG1tFoj4ixkaf3m4zgFZVZYcPfCCPH5A"
       },
       "scheme": 1
     }
@@ -273,11 +273,11 @@
     }
   ],
   "ownerAddressesNotRecipients": {
-    "note": "the PQ owner address (yb\u2026/yt\u2026/yr\u2026) of the scheme-1 pqOwner key: refused as a burn recipient on every network",
+    "note": "the PQ owner address (ybs\u2026/yts\u2026/yrs\u2026) of the scheme-1 pqOwner key: refused as a burn recipient on every network",
     "addresses": {
-      "mainnet": "yb5uQ2PDR3EcpZmSHVS4eqT7uLihaqAthhUkNBo5V53tB6DJDyVow",
-      "testnet": "yt6aumwesAuyddGxd69TMPTzuxgobqJ5JRHPMY2vNY5Z2UHDaLMVu",
-      "regtest": "yr2U5mgcGim9hz2msM5vrF2g6UbzU9SH896fXhg53fP14XePwX6PL"
+      "mainnet": "ybs3nm1Yz46hpcPU4WYshmE5WUFM77pRoBQgmCQr3b3ZBUw4QkgvM",
+      "testnet": "yts4Rd3MTYjZ79Can18fzLAYXbuAokwXYPUYLPmhB8C7u78UQC2ub",
+      "regtest": "yrs2kSJbczYdh8QUvJfsD66LrbYGogPeAwHo9hB7mcmWkUhVMYWMy"
     }
   }
 }

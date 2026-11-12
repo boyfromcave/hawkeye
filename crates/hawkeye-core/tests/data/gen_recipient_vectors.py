@@ -3,8 +3,9 @@
 
 Written from the plan text alone (no hawkeye-core code): the 22/35-byte field, the three
 recipient scripts, recipientHash = SHA256(script), and the Base58Check addresses with the
-node's version bytes (ycash-dd cc8c90764, unchanged since d41026209: chainparams.cpp P2PKH/P2SH,
-key_io.cpp:23-27 sq/tq/rq).
+node's version bytes (ycash-dd cc8c90764, unchanged since d41026209: chainparams.cpp P2PKH/P2SH;
+the post-quantum versions are decision D-9's, one 3-byte version per network, form and scheme,
+quantum spec section 4.1: sqf/sqs, tqf/tqs, rqf/rqs plain, ybf/ybs, ytf/yts, yrf/yrs owner).
 """
 import hashlib, json, sys
 
@@ -27,9 +28,9 @@ def b58check(payload: bytes) -> str:
     return b58(payload + sha256(sha256(payload))[:4])
 
 NETS = {
-    "mainnet": {"p2pkh": bytes([0x1c, 0x28]), "p2sh": bytes([0x1c, 0x2c]), "pq": bytes([0x4d, 0xd9])},
-    "testnet": {"p2pkh": bytes([0x1c, 0x95]), "p2sh": bytes([0x1c, 0x2a]), "pq": bytes([0x4f, 0x61])},
-    "regtest": {"p2pkh": bytes([0x1c, 0x95]), "p2sh": bytes([0x1c, 0x2a]), "pq": bytes([0x4c, 0x51])},
+    "mainnet": {"p2pkh": bytes([0x1c, 0x28]), "p2sh": bytes([0x1c, 0x2c]), "pq": {2: bytes.fromhex("4ddd04"), 1: bytes.fromhex("4dde6a")}},
+    "testnet": {"p2pkh": bytes([0x1c, 0x95]), "p2sh": bytes([0x1c, 0x2a]), "pq": {2: bytes.fromhex("4f6519"), 1: bytes.fromhex("4f667f")}},
+    "regtest": {"p2pkh": bytes([0x1c, 0x95]), "p2sh": bytes([0x1c, 0x2a]), "pq": {2: bytes.fromhex("4c54ef"), 1: bytes.fromhex("4c5655")}},
 }
 VERSION = 0x02
 KIND = {"p2pkh": 0x00, "p2sh": 0x01, "pqpkh": 0x02}
@@ -50,7 +51,7 @@ def field(kind, scheme, h):
 def addresses(kind, scheme, h):
     out = {}
     for net, v in NETS.items():
-        if kind == "pqpkh": payload = v["pq"] + bytes([scheme]) + h
+        if kind == "pqpkh": payload = v["pq"][scheme] + h
         else: payload = v[kind] + h
         out[net] = b58check(payload)
     return out
@@ -116,9 +117,9 @@ scripts_invalid = [
     {"note": "a bare OP_CHECKPQSIG", "script": "c2"},
     {"note": "empty", "script": ""},
 ]
-# PQ owner addresses (yb…/yt…/yr…): the same payload under the owner versions is NOT a recipient
-OWNER = {"mainnet": bytes([0x56, 0xab]), "testnet": bytes([0x57, 0x1e]), "regtest": bytes([0x57, 0x10])}
-owner_addresses = {net: b58check(v + bytes([1]) + pq1) for net, v in OWNER.items()}
+# PQ owner addresses (ybs…/yts…/yrs…, the scheme-1 owner versions of D-9): the same key is NOT a recipient
+OWNER = {"mainnet": bytes.fromhex("56b044"), "testnet": bytes.fromhex("572330"), "regtest": bytes.fromhex("5715aa")}
+owner_addresses = {net: b58check(v + pq1) for net, v in OWNER.items()}
 
 out = {
     "version": 2,
@@ -126,7 +127,7 @@ out = {
     "valid": valid,
     "invalid": invalid,
     "scriptsInvalid": scripts_invalid,
-    "ownerAddressesNotRecipients": {"note": "the PQ owner address (yb…/yt…/yr…) of the scheme-1 pqOwner key: refused as a burn recipient on every network", "addresses": owner_addresses},
+    "ownerAddressesNotRecipients": {"note": "the PQ owner address (ybs…/yts…/yrs…) of the scheme-1 pqOwner key: refused as a burn recipient on every network", "addresses": owner_addresses},
 }
 json.dump(out, open(sys.argv[1], "w"), indent=2)
 open(sys.argv[1], "a").write("\n")

@@ -14,9 +14,9 @@ and the [wYEC contract design](https://github.com/boyfromcave/wyec/blob/main/doc
 line every vault's owner is post-quantum, bridge vaults included (the owner's decision; the
 workspace's `yellowback-quantum-spec.md` §1, §4, §6.2): the owner slot of V and I is
 `<ownerHash:32> OP_1|OP_2 OP_CHECKPQSIG` (35 bytes; V 45 tokens, I 32), the owner is a `pqkeyid`
-(`scheme ‖ SHA256(scheme ‖ pk)`) or a 53-character PQ address (`yb…`/`yt…`/`yr…`; the mainnet
-version is `0x56AB`, quantum plan D-Q-21), and the secp256k1 owner shape is not a template. The
-node also renders a PQ key as a plain-YEC address (`sq…`/`tq…`/`rq…`, D-Q-20, a `TX_PQPKH`
+(`scheme ‖ SHA256(scheme ‖ pk)`) or a 53-character PQ address (`ybf…`/`ybs…` mainnet, `ytf…`/`yts…`,
+`yrf…`/`yrs…`; quantum plan D-Q-21, the scheme in the prefix since D-9), and the secp256k1 owner shape is not a template. The
+node also renders a PQ key as a plain-YEC address (`sqf…`/`sqs…`, `tqf…`/`tqs…`, `rqf…`/`rqs…`, D-Q-20, D-9, a `TX_PQPKH`
 output) and takes one wherever it takes an address; Hawkeye's recipient codec (§4.2) stays
 P2PKH/P2SH — a PQ burn recipient is an open question (Q-7), not a codec change. Hawkeye still holds no owner key and no post-quantum
 code: `hawkeye lock` takes the owner from `vault_getnewowner` (or `--owner`), the depositor's node
@@ -468,10 +468,16 @@ node refuses before activation (`hawkeye burn` warns). Shielded recipients are o
 
 Ycash address prefixes: mainnet `{0x1C,0x28}` P2PKH / `{0x1C,0x2C}` P2SH; testnet and regtest
 `{0x1C,0x95}` / `{0x1C,0x2A}` (ycash-dd `src/chainparams.cpp:155,157,420,422`); the plain-YEC
-post-quantum address (`sq…` / `tq…` / `rq…`, 53 characters, Base58Check of `version(2) ‖ scheme ‖
-keyHash` with versions `0x4DD9` / `0x4F61` / `0x4C51`, D-Q-20, `src/key_io.cpp:23-27`) names a
-kind-2 recipient; the PQ *owner* address (`yb…`/`yt…`/`yr…`, §1 "Post-quantum owners") is not
-accepted as a burn recipient — owner keys are vault owners, not holder addresses.
+post-quantum address (53 characters, D-Q-20) names a kind-2 recipient; the PQ *owner* address
+(§1 "Post-quantum owners") is not accepted as a burn recipient — owner keys are vault owners, not
+holder addresses. Since decision D-9 (workspace quantum spec §4.1, 2026-11-11) both are Base58Check
+of `version(3) ‖ keyHash`, one 3-byte version per network, form and scheme (FN-DSA-512 / SLH-DSA):
+plain `sqf…` `0x4DDD04` / `sqs…` `0x4DDE6A`, `tqf…` `0x4F6519` / `tqs…` `0x4F667F`, `rqf…` `0x4C54EF` /
+`rqs…` `0x4C5655`; owner `ybf…` `0x56AEDE` / `ybs…` `0x56B044`, `ytf…` `0x5721C9` / `yts…` `0x572330`,
+`yrf…` `0x571444` / `yrs…` `0x5715AA` (the node's `PlainPQAddressVersions` / `pqAddressVersions`). The
+earlier form (`version(2) ‖ scheme ‖ keyHash`, versions `0x4DD9` / `0x4F61` / `0x4C51` and `0x56AB` /
+`0x571E` / `0x5710`) is refused. The recipient field, script and `recipientHash` are unchanged: only
+the address text moved.
 
 ### 4.3 The Hawkeye memo (`OP_RETURN`, 73 data bytes ≤ 80, script 75 bytes `6a 49 …`, `MAX_OP_RETURN_RELAY`)
 
