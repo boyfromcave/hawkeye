@@ -621,10 +621,53 @@ def jdump(x):
     return json.dumps(x, default=str, sort_keys=True)
 
 
+def parse_node_banner(banner):
+    """(line, version) read from a `ycashd -version` banner; line is None when the banner names no version.
+    The version token is the one after "version ": "v<major>.<minor>.<patch>[-rcN|-betaN|-alphaN]..." is ycash6
+    from major 6 on, else ycash-dd ("v4.5.0-<sha>"). ycash-dd's release tags are named "vault-params/v6.22.0-...",
+    so a ycash-dd build at (or `git describe`d from) one reads "version vault-params/v6.22.0-beta2[-61-g<sha>]":
+    that is ycash-dd whatever its major (its version is the tag's release part)."""
+    rel = r"(v(\d+)\.\d+\.\d+(?:-(?:rc|beta|alpha)\d+)?)"
+    m = re.search(r"\bversion vault-params/" + rel, banner)
+    if m:
+        return "ycash-dd", m.group(1)
+    m = re.search(r"\bversion " + rel, banner)
+    if m:
+        return ("ycash6" if int(m.group(2)) >= 6 else "ycash-dd"), m.group(1)
+    return None, None
+
+
+# (banner, line, version): `hawkeye-devnet _selftest` checks parse_node_banner against these.
+NODE_BANNER_CASES = [
+    ("Ycash Daemon version v4.5.0-abc", "ycash-dd", "v4.5.0"),
+    ("Ycash Daemon version vault-params/v6.22.0-beta2", "ycash-dd", "v6.22.0-beta2"),
+    ("Ycash Daemon version vault-params/v6.22.0-beta2-61-g4a39e3fcb9996f9b281828e2f35ad4a2985caff3",
+     "ycash-dd", "v6.22.0-beta2"),
+    ("Ycash Daemon version v6.22.0-beta2", "ycash6", "v6.22.0-beta2"),
+    ("Ycash Daemon version v6.22.0-beta2-82f90b2f9", "ycash6", "v6.22.0-beta2"),
+    ("Ycash Daemon version v6.22.0-rc1-abc", "ycash6", "v6.22.0-rc1"),
+    ("Ycash Daemon version v6.20.0-abc", "ycash6", "v6.20.0"),
+    ("", None, None),
+    ("Ycash Daemon version unknown", None, None),
+]
+
+
+def selftest():
+    """The node-line table above; returns the number of failures (printed)."""
+    bad = 0
+    for banner, line, version in NODE_BANNER_CASES:
+        got = parse_node_banner(banner)
+        if got != (line, version):
+            bad += 1
+            print("FAIL %r: %r, want %r" % (banner, got, (line, version)))
+    print("node line: %d/%d banners ok" % (len(NODE_BANNER_CASES) - bad, len(NODE_BANNER_CASES)))
+    return bad
+
+
 def node_line(ycashd):
     """(line, version, banner) of a ycashd binary. The line is $DEVNET_NODE_LINE when set (ycash-dd | ycash6),
-    else read from `ycashd -version`: "Ycash Daemon version v4.5.0-..." is ycash-dd, a major version of 6 or
-    more ("v6.22.0-rc1-...") is ycash6. The version is the release part of the tag (v4.5.0, v6.22.0-rc1)."""
+    else read from `ycashd -version` (parse_node_banner). The version is the release part of the tag
+    (v4.5.0, v6.22.0-rc1)."""
     banner = ""
     if ycashd and os.access(ycashd, os.X_OK):
         try:
@@ -632,14 +675,13 @@ def node_line(ycashd):
             banner = (p.stdout.splitlines() or [""])[0].strip()
         except (OSError, subprocess.TimeoutExpired):
             banner = ""
-    m = re.search(r"\bv(\d+)\.(\d+)\.(\d+)(-(?:rc|beta|alpha)\d+)?", banner)
-    version = m.group(0) if m else None
+    detected, version = parse_node_banner(banner)
     line = os.environ.get("DEVNET_NODE_LINE")
     if line:
         if line not in NODE_LINES:
             die("DEVNET_NODE_LINE must be one of %s, not %r" % (", ".join(NODE_LINES), line))
-    elif m:
-        line = "ycash6" if int(m.group(1)) >= 6 else "ycash-dd"
+    elif detected:
+        line = detected
     else:
         die("cannot tell the node line from `%s -version` (%r): set DEVNET_NODE_LINE=ycash-dd|ycash6" % (ycashd, banner))
     return line, version or "unknown", banner
@@ -3912,7 +3954,10 @@ def main():
     p.add_argument("--fresh", action="store_true", help="clean a stopped devnet in --dir first")
     p.add_argument("--timeout", type=int, default=180, help="seconds per wait step")
     sub.add_parser("_miner")
+    sub.add_parser("_selftest")
     args = parser.parse_args()
+    if args.command == "_selftest":
+        return 1 if selftest() else 0
 
     dv = Devnet(getattr(args, "dir", None) or os.environ.get("HAWKEYE_DEVNET_DIR") or DEFAULT_DIR)
     if hasattr(args, "mint_mode"):

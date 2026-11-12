@@ -63,7 +63,7 @@ jobs:
         run: zizmor --offline .github/workflows
 
   devnet-script:
-    name: devnet script (compile, help)
+    name: devnet script (compile, help, self-test)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -72,6 +72,7 @@ jobs:
           persist-credentials: false
       - run: python3 -m py_compile devnet/hawkeye-devnet
       - run: python3 devnet/hawkeye-devnet --help
+      - run: python3 devnet/hawkeye-devnet _selftest
 
   fmt:
     name: rustfmt
