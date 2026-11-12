@@ -1913,6 +1913,26 @@ format = "text"
         self.say("removed %s" % self.dir)
 
     # ================================================================ scenario demo
+    def z_send(self, node, src, dest, amount, timeout):
+        """z_sendmany `amount` from `src` to `dest` and wait for the operation; returns the txid. The fee is the wallet's
+        default (both lines raise it to what a post-quantum input needs); 6.x takes the privacy policy a transparent
+        party needs (AllowFullyTransparent), v4.5.0 has no such argument."""
+        if (self.s.get("node_line") or node_line(self.s["binaries"]["ycashd"])[0]) == "ycash6":
+            opid = node.z_sendmany(src, [{"address": dest, "amount": amount}], 1, None, "AllowFullyTransparent")
+        else:
+            opid = node.z_sendmany(src, [{"address": dest, "amount": amount}], 1)
+
+        def done():
+            st = node.z_getoperationstatus([opid])
+            if not st or st[0]["status"] in ("queued", "executing"):
+                return None
+            if st[0]["status"] != "success":
+                die("z_sendmany %s from %s: %s" % (opid, src, jdump(st[0].get("error") or st[0])))
+            return st[0]["result"]["txid"]
+        txid = self.wait_for("z_sendmany %s" % opid, done, timeout, poll=0.5)
+        node.z_getoperationresult([opid])
+        return txid
+
     def wait_for(self, what, predicate, timeout, poll=1.0):
         t0 = time.time()
         last_error = None
@@ -3564,7 +3584,8 @@ format = "text"
         `getnewaddress "" "pq"` (an rq… address, D-Q-20), `hawkeye burn` encodes it as the 35-byte revision-2
         recipient `02 02 ‖ scheme ‖ keyHash`, the bridge records those bytes, the intent commits
         SHA256(`20 <keyHash> 51 c2`), the release pays that TX_PQPKH output, node0's wallet sees it and spends
-        it with its post-quantum key (the ~8 KB SLH-DSA scriptSig, priced at max(DEFAULT_FEE, -pqfeerate x size));
+        it with its post-quantum key through z_sendmany from the rq… address (the stock sends select ECC coins only; the
+        ~8 KB SLH-DSA scriptSig is priced at the wallet's PQ fee, at least max(DEFAULT_FEE, -pqfeerate x size));
         the PQ owner form (yr…) is refused as a recipient. Hawkeye holds no post-quantum key or code throughout."""
         n0 = self.node(0)
         set_id = self.s["set"]["setid"]
@@ -3705,31 +3726,16 @@ format = "text"
             if bv["intent"] != it["outpoint"] or bv.get("recipient_address") != rq:
                 die("attestor%d's ledger: %s" % (a["index"], jdump(bv)))
 
-        self.step("node0 spends the PQ coin with its SLH-DSA key: sendtoaddress 1.5 YEC to a fresh node1 t-address "
-                  "(the other coins locked, the miner paused for the build)")
+        self.step("node0 spends the PQ coin with its SLH-DSA key: z_sendmany from %s, 1.5 YEC to a fresh node1 t-address "
+                  "(the stock sends select ECC coins only; z_sendmany from the PQ address spends its coins, change back to it)" % rq)
         dest = self.node(1).getnewaddress()
-        self.pause(True)
-        others = []
-        try:
-            time.sleep(0.5)                  # a block the miner was generating lands before the coins are listed
-            others = [{"txid": u["txid"], "vout": u["vout"]} for u in n0.listunspent(0)
-                      if (u["txid"], u["vout"]) != (rtxid, ro["n"])]
-            if others and not n0.lockunspent(False, others):
-                die("lockunspent refused")
-            spend = n0.sendtoaddress(dest, Decimal("1.5"))
-        finally:
-            if others:
-                try:
-                    n0.lockunspent(True, others)
-                except RPCError as error:
-                    self.say("  lockunspent(true): %s" % error)
-            self.pause(False)
+        spend = self.z_send(n0, rq, dest, Decimal("1.5"), timeout)
         stx = n0.getrawtransaction(spend, 1)
         fee = -Decimal(n0.gettransaction(spend)["fee"])
         size = len(stx["hex"]) // 2
         sigs = [(i["txid"], i["vout"], len(i["scriptSig"]["hex"]) // 2) for i in stx["vin"]]
-        self.say("  spend %s: %d bytes, inputs %s, fee %s YEC (%d zat; max(DEFAULT_FEE 1000, -pqfeerate x size) = %d at the "
-                 "default 100 zat/kB); outputs %s"
+        self.say("  spend %s: %d bytes, inputs %s, fee %s YEC (%d zat, the wallet's default for a PQ input; the floor "
+                 "max(DEFAULT_FEE 1000, -pqfeerate x size) = %d at the default 100 zat/kB); outputs %s"
                  % (spend, size, ["%s:%d scriptSig %d B" % (t[:16], n, l) for t, n, l in sigs], fee, zat(fee),
                     max(1000, 100 * size // 1000), ["%s %s" % (o["value"], (o["scriptPubKey"].get("addresses") or [o["scriptPubKey"]["type"]])[0]) for o in stx["vout"]]))
         if [(t, n) for t, n, _ in sigs] != [(rtxid, ro["n"])]:
@@ -3741,10 +3747,12 @@ format = "text"
         self.wait_for("spend %s confirmed" % spend[:16], lambda: self.confirmations(spend) >= 1, 120)
         self.wait_for("node1 received 1.5 YEC at %s" % dest, lambda: Decimal(self.node(1).getreceivedbyaddress(dest, 1)) == Decimal("1.5"), 60)
         left = n0.listunspent(0, 9999999, [rq])
-        if left:
+        if any((u["txid"], u["vout"]) == (rtxid, ro["n"]) for u in left):
             die("the PQ coin is still unspent: %s" % jdump(left))
-        self.say("  the PQ coin is spent (listunspent [%s] empty); scriptSig %d bytes = %s"
-                 % (rq, sigs[0][2], "the SLH-DSA-SHA2-128s TX_PQPKH scriptSig of quantum spec §2.1" if sigs[0][2] == self.SLH_DSA_SCRIPTSIG
+        if any(u["txid"] != spend for u in left) or sum(zat(u["amount"]) for u in left) != 4 * COIN - 150000000 - zat(fee):
+            die("listunspent [%s] after the spend is not the change of %s alone: %s" % (rq, spend, jdump(left)))
+        self.say("  the PQ coin is spent (listunspent [%s] holds only the change, %s YEC); scriptSig %d bytes = %s"
+                 % (rq, yec(sum(zat(u["amount"]) for u in left)), sigs[0][2], "the SLH-DSA-SHA2-128s TX_PQPKH scriptSig of quantum spec §2.1" if sigs[0][2] == self.SLH_DSA_SCRIPTSIG
                     else "unexpected (spec §2.1 says %d)" % self.SLH_DSA_SCRIPTSIG))
 
         self.step("the supply invariant holds; nobody slashed")

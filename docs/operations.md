@@ -103,6 +103,24 @@ Do this once per member key, on an **offline** machine, with two people.
    it audits the ledger against the node, imports the ledger's sign-once records
    (`set_importsigned`) and clears the marker (`set_acknowledgerestore`). For the fresh key of
    this ceremony that is a true statement; never run it for a key another host may have used.
+   **Fund the fee coins at an ordinary (ECC) address** (`getnewaddress`, the default `p2pkh`
+   type), never at a post-quantum address of the node wallet (`getnewaddress "" "pq"` or
+   `"pqslh"`). `split-coins` pays through the stock `sendmany`, and on both node lines the stock
+   sends (`sendtoaddress`, `sendmany`, `sendfrom`, `fundrawtransaction`) select ECC coins only; a
+   wallet whose spendable YEC sits at post-quantum addresses makes `split-coins` fail (`sendmany`) with
+   the node's error:
+
+   ```
+   Insufficient funds in ordinary transparent addresses; this wallet also holds <n> YEC at
+   post-quantum addresses: send from one with z_sendmany, which returns the change to it
+   ```
+
+   Move such funds to an ECC address first, naming the post-quantum address as the source:
+   `ycash-cli z_sendmany <pq address> '[{"address":"<a getnewaddress address>","amount":<n>}]'`
+   (on ycash6 append `1 null AllowFullyTransparent`, the privacy policy a transparent party
+   needs), wait for `z_getoperationresult`, and run `split-coins` again once it confirms. Hawkeye
+   itself counts and spends P2PKH coins only, so a post-quantum coin is never a fee coin
+   (`fee-coins-low` ignores it).
 8. Hand `eth_address` (or `near_guardian`) to the governance round (section 7).
 
 | Step | Done by | Signature |
@@ -263,7 +281,7 @@ within a working day.
 | `legacy_adoption_row` | ticket | upgrading only: a `ycash-unlock` record from before W4-B-2 has no signature of this member (an adoption recorded as if this member had signed) | settle burns before upgrading; the vault is rolled by a member who did not sign it |
 | `roll-overdue` | ticket | vaults past half their `ROLL_MARGIN` without a roll (HK-6) | check the roll leader and the rate limit |
 | `roll-waiting-cap` | ticket | rolls wait for rate-limit room | expected under load; governance if it persists |
-| `fee-coins-low` | ticket | fewer than 8 confirmed fee coins in the node wallet: a flood of intents can outrun the cancels | fund the wallet; `hawkeye split-coins --count 16` |
+| `fee-coins-low` | ticket | fewer than 8 confirmed fee coins in the node wallet: a flood of intents can outrun the cancels | fund the wallet at an ECC `getnewaddress` address (section 4, step 7); `hawkeye split-coins --count 16` |
 | `fee-coins-exhausted` | page | no confirmed coin can fund a cancel | fund the wallet now; `hawkeye split-coins` |
 | `gas-low` | ticket | the gas account holds less than `[eth] min_sender_balance_wei` | fund the gas key |
 | `heartbeat-too-slow` | page | `heartbeat_blocks` exceeds the set's `livenesswindow / 4`: members would go DORMANT | lower `heartbeat_blocks`, restart |

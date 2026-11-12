@@ -363,11 +363,16 @@ holds the key.
    by the `rq…` lists the coin as spendable with that `scriptPubKey`, `getbalance` grew by ≥ 4; every
    attestor's ledger shows the burn `RELEASED` with that intent. The transcript records the release
    transaction's size.
-7. **Spend (the wallet's Q5 path):** with the miner paused and every other coin `lockunspent`-locked,
-   node0 `sendtoaddress` 1.5 YEC to a fresh node1 t-address. The spend's only input must be the PQ
-   coin, its `scriptSig` an SLH-DSA signature (7,938 bytes, quantum spec §2.1; the transcript records
-   it, the transaction size and the fee, which must be ≥ `max(DEFAULT_FEE, -pqfeerate × size)` at the
-   default 100 zat/kB); mined and confirmed, node1 received 1.5, the `rq…` coin is gone.
+7. **Spend (the wallet's Q5 path):** node0 `z_sendmany` from the `rq…` address, 1.5 YEC to a fresh
+   node1 t-address (fee: the wallet's default; on ycash6 the privacy policy `AllowFullyTransparent`).
+   The stock sends (`sendtoaddress`, `sendmany`, `sendfrom`, `fundrawtransaction`) select ECC coins
+   only on both node lines (beta2, confirmed by the Yellowback lead architect 2026-11-12), so a coin
+   at a post-quantum address is spent by naming its address in `z_sendmany`; the drill no longer locks
+   node0's other coins. The spend's only input must be the PQ coin, its `scriptSig` an SLH-DSA
+   signature (7,938 bytes, quantum spec §2.1; the transcript records it, the transaction size and the
+   fee, which must be ≥ `max(DEFAULT_FEE, -pqfeerate × size)` at the default 100 zat/kB; both lines
+   price one SLH-DSA input at the ZIP-317 conventional fee, 27,000 zat); mined and confirmed, node1
+   received 1.5, the released coin is spent and `listunspent [rq…]` holds only the change back to it.
 8. `wYEC.totalSupply()` (`ft_total_supply`) = 6 ≤ the value under the set; nobody slashed, no
    alarm.
 
@@ -377,7 +382,9 @@ green round is run 38162162277 (2026-10-11, ycash-dd `d41026209` and ycash6 `0c6
 the `devnet-<line>-<foreign>` artifacts). Measured there, identical on both lines and both bridges: the
 release is a 296-byte transaction (297 once) whose `TX_PQPKH` output decodes as type `pqpubkeyhash`
 with the `rq…` in `addresses`; the PQ spend is 8,078 bytes with a 7,938-byte scriptSig and pays
-8,078 zat (the wallet's `-mintxfee` 1,000 zat/kB prices it above the `-pqfeerate` floor).
+8,078 zat (the wallet's `-mintxfee` 1,000 zat/kB prices it above the `-pqfeerate` floor). (That
+first round spent through `sendtoaddress` with the other coins locked; the drill moved to
+`z_sendmany` with the ECC-only stock-send rule.)
 
 `[devnet] drills = true` (refused on mainnet) gates the drill-only daemon features: the
 `rogue-unlock` command (with `--replay-burn <nonce>` for D-3), the `rogue-mint` command (D-5) and the

@@ -127,6 +127,14 @@ for any peer that is not loopback); `[peers] allow_from` adds an address check.
 
 Keep at least 8 confirmed fee coins in the node wallet (`fee-coins-low` below that):
 `hawkeye split-coins --count 16` splits the wallet into fresh coins in one transaction.
+Fund the node wallet at an ordinary (ECC) address from `getnewaddress`, never at a post-quantum one
+(`getnewaddress "" "pq"`/`"pqslh"`): `split-coins` uses the stock `sendmany`, and the stock sends
+select ECC coins only, so a wallet whose YEC sits at post-quantum addresses fails with
+`Insufficient funds in ordinary transparent addresses; this wallet also holds <n> YEC at
+post-quantum addresses: send from one with z_sendmany, which returns the change to it`. Move such
+funds first: `z_sendmany <pq address> '[{"address":"<getnewaddress>","amount":<n>}]'` (on ycash6 add
+`1 null AllowFullyTransparent`). Post-quantum coins never count as fee coins
+([docs/operations.md](docs/operations.md) section 4, step 7).
 
 ## Commands
 
