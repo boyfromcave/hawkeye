@@ -63,15 +63,38 @@ impl Drop for Node {
     }
 }
 
+/// Whether a `ycashd -version` banner is ycash6: the token after "version " is `v<major>.…` with
+/// major 6 or more. ycash-dd reads `v4.5.0-<sha>`, or `vault-params/v6.22.0-…` when built at (or
+/// described from) one of its release tags, which are named `vault-params/…`: ycash-dd either way.
+fn is_ycash6(banner: &str) -> bool {
+    banner
+        .split_once("version v")
+        .and_then(|(_, v)| v.split('.').next())
+        .and_then(|m| m.parse::<u32>().ok())
+        .is_some_and(|m| m >= 6)
+}
+
+#[test]
+fn node_line_from_banner() {
+    for (banner, ycash6) in [
+        ("Ycash Daemon version v4.5.0-abc", false),
+        ("Ycash Daemon version vault-params/v6.22.0-beta2", false),
+        (
+            "Ycash Daemon version vault-params/v6.22.0-beta2-61-g4a39e3fcb9996f9b281828e2f35ad4a2985caff3",
+            false,
+        ),
+        ("Ycash Daemon version v6.22.0-beta2", true),
+        ("Ycash Daemon version v6.22.0-beta2-82f90b2f9", true),
+        ("", false),
+    ] {
+        assert_eq!(is_ycash6(banner), ycash6, "{banner}");
+    }
+}
+
 async fn start(bin: &str, dir: &std::path::Path, port: u16) -> Node {
     let version = Command::new(bin).arg("-version").output().unwrap();
     let text = String::from_utf8_lossy(&version.stdout).to_string();
-    let major: u32 = text
-        .split(" v")
-        .nth(1)
-        .and_then(|v| v.split('.').next())
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(4);
+    let ycash6 = is_ycash6(&text);
     eprintln!("regtest node: {}", text.lines().next().unwrap_or_default());
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
@@ -85,7 +108,7 @@ async fn start(bin: &str, dir: &std::path::Path, port: u16) -> Node {
     )
     .unwrap();
     let mut args = vec![format!("-datadir={}", dir.display())];
-    if major >= 6 {
+    if ycash6 {
         args.push("-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025".into());
     }
     args.extend(UPGRADES.iter().map(|s| s.to_string()));
