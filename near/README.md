@@ -7,7 +7,7 @@ metadata: "Wrapped Ycash", `wYEC`, 8 decimals) and the **bridge policy**, mirror
 YEC locked on Ycash in `NYEC`-tagged vaults is minted here; wYEC burned here is released on Ycash.
 Ycash consensus never reads NEAR, and this contract never reads Ycash (R2).
 
-The Ycash side's vault owners are post-quantum (the `upgrade/quantum-vaults` node line: the owner
+The Ycash side's vault owners are post-quantum (the node's `upgrade/vault` line: the owner
 slot `<ownerHash:32> OP_1|OP_2 OP_CHECKPQSIG`); this contract is unaffected. It never sees a vault
 owner, its guardians are the attestors' secp256k1 keys and its attestations are `ecrecover`
 signatures, which stay secp256k1 (quantum plan D-Q-5). `burn`'s `ycash_recipient` is the main
