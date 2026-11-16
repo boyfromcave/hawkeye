@@ -161,8 +161,12 @@ Hawkeye needs `upgrade/vault` nodes, on either node line
 ([ycash-dd](https://github.com/boyfromcave/ycash-dd) or
 [ycash6](https://github.com/boyfromcave/ycash6)), which carry the post-quantum layer (built on
 `upgrade/quantum-vaults`, merged into `upgrade/vault`): the vault upgrade (branch ID `0x6d5b7a31`)
-and `rpcversion` 9 (`yed_getinfo`; 5 was the vault upgrade, 7 post-quantum owners, 8 the fee
-rules, 9 the scheme-visible post-quantum address prefixes of decision D-9). It parses only the
+and `rpcversion` 9 or 10 (`yed_getinfo`; 5 was the vault upgrade, 7 post-quantum owners, 8 the fee
+rules, 9 the scheme-visible post-quantum address prefixes of decision D-9, 10 beta3: the new call
+`getcoinbasetemplatefor`, `getblockchaininfo.transparentPools`, input addresses for post-quantum
+spends, the `gettransaction` fee and the `-ydf` default, none of which Hawkeye calls or reads, so a
+beta2 node (9) and a beta3 node (10) both serve it). Hawkeye does not read `rpcversion` itself (it
+calls no `yed_*` RPC); the requirement is the address and owner shapes. It parses only the
 post-quantum owner shape, so a node from before the post-quantum layer (`rpcversion` below 7) has
 no vault this Hawkeye recognises, and only the D-9 address form, so a node before 9 (which prints
 and takes the earlier `yb5…`/`sq4…` form) is not one this Hawkeye can name owners or recipients
