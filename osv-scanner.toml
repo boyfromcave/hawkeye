@@ -172,3 +172,8 @@ reason = "near/Cargo.lock: zstd-safe 7.3.0, dev-dependency only; as RUSTSEC-2026
 id = "RUSTSEC-2026-0441"
 ignoreUntil = 2027-02-09T00:00:00Z
 reason = "Triaged 2026-11-11. Cargo.lock: pin-utils 0.1.1 is unmaintained (informational, no vulnerability, no fixed release). It comes only through wasmtimer, alloy's wasm32-only timer: `cargo tree --locked -e normal,build -i pin-utils` on the native target prints nothing. Also ignored in deny.toml; revisit at each alloy bump."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+ignoreUntil = 2027-02-15T00:00:00Z
+reason = "Triaged 2026-11-17; accepted by the Yellowback lead architect 2026-11-18. chrono 0.4.45 is unmaintained (informational: unmaintained, no vulnerability, no fixed version). Cargo.lock: a lock entry from serde_with's optional chrono feature (a weak dependency), in no build graph: `cargo tree --locked --all-features --target all -i chrono` prints nothing, so cargo-deny does not report it. near/Cargo.lock: through near-primitives / near-chain-configs under near-workspaces, a dev-dependency (sandbox tests) never in the wasm contract. Leaves when the lock is regenerated without the weak entry and when near-primitives drops chrono."
