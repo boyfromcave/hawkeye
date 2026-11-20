@@ -8,12 +8,13 @@
 # NEAR: the wyec-near contract (unit tests, wasm, near-workspaces sandbox tests) and Hawkeye's NEAR
 # adapter against a real NEAR sandbox node (crates/hawkeye-near/tests/sandbox.rs).
 # Workflows: actionlint.
-# kogany (report-only; a push to or a dispatch on vaults/kogany-compat): the regtest self-signing
+# kogany (report-only; a dispatch, from any branch, by the repository owner, or a push to the retired
+# vaults/kogany-compat): the regtest self-signing
 # test (crates/hawkeye/tests/regtest_self_signing.rs) against a ycash6 node that a regtest kogany
 # node (the third node line, workspace kogany plan W9-c) follows and validates block by block
 # (devnet/kogany-rig.py follow): the kogany + ycash6 test rig column. koganyd is kogany's
 # koganyd-bin artifact at KOGANY_REF, else built at that commit; ycashd is ycash6's node-bin of
-# vaults/kogany-compat.
+# upgrade/vault (beta4: kogany #49 and ycash6 #145, rpcversion 11).
 #
 # Every third-party action is pinned to a commit SHA (the tag in the trailing comment); the
 # Rust toolchain comes from rust-toolchain.toml; builds are --locked.
@@ -323,15 +324,15 @@ jobs:
   kogany:
     name: kogany (report-only)
     # Cache poisoning (code scanning): a downloaded artifact runs here, so only the repository owner starts it.
-    if: (github.ref_name == 'vaults/kogany-compat' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) && github.actor == github.repository_owner
+    if: ((github.ref_name == 'vaults/kogany-compat' && github.event_name == 'push') || github.event_name == 'workflow_dispatch') && github.actor == github.repository_owner
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     continue-on-error: true
     env:
-      # kogany vaults/kogany-compat at W5-f (the YED module registered: the real index answers)
-      KOGANY_REF: dd834da8b77e882b9e6a00b3ce70f2b30b930c37
+      # kogany upgrade/vault at the beta4 consensus merge (kogany #49: tag v2, rpcversion 11)
+      KOGANY_REF: 09a4c14084411c92af275994fc3b2e61d0f57118
       YCASH6_REPO: boyfromcave/ycash6
-      YCASH6_BRANCH: vaults/kogany-compat
+      YCASH6_BRANCH: upgrade/vault
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -364,7 +365,7 @@ jobs:
         with:
           repository: boyfromcave/kogany
           # The literal of KOGANY_REF (bump both): a fixed commit, checked in "koganyd runs here".
-          ref: dd834da8b77e882b9e6a00b3ce70f2b30b930c37
+          ref: 09a4c14084411c92af275994fc3b2e61d0f57118
           path: kogany
           persist-credentials: false
           sparse-checkout: ${{ steps.koganyd.outputs.got == 'true' && '.github/actions/setup-zakura-build' || '' }}
@@ -388,7 +389,7 @@ jobs:
           [ "$(git -C kogany rev-parse HEAD)" = "$KOGANY_REF" ] || { echo "::error::the kogany checkout differs from KOGANY_REF"; exit 1; }
           if ldd "$KOGANYD" | grep 'not found'; then echo "::error::koganyd needs a library this runner lacks"; exit 1; fi
           "$KOGANYD" --version
-      - name: ycashd from ycash6's node-bin (vaults/kogany-compat)
+      - name: ycashd from ycash6's node-bin (upgrade/vault)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -408,7 +409,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.YCASH6_REPO }}
-          ref: vaults/kogany-compat # the literal of YCASH6_BRANCH
+          ref: upgrade/vault # the literal of YCASH6_BRANCH
           path: ycash6
           persist-credentials: false
           sparse-checkout: zcutil
