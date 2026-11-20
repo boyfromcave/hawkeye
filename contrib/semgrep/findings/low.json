@@ -1,0 +1,30 @@
+{
+ "bucket": "low",
+ "sla_days": 180,
+ "findings": [
+  {
+   "fingerprint": "b70e64c61c32d587",
+   "rule": "python.lang.security.audit.dynamic-urllib-use-detected",
+   "path": "devnet/kogany-rig.py",
+   "line": 77,
+   "first_seen": "2026-11-04",
+   "due": "2027-05-03"
+  },
+  {
+   "fingerprint": "04218d7251963532",
+   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
+   "path": "devnet/kogany-rig.py",
+   "line": 156,
+   "first_seen": "2026-11-04",
+   "due": "2027-05-03"
+  },
+  {
+   "fingerprint": "e6c5af3d208bb276",
+   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
+   "path": "devnet/kogany-rig.py",
+   "line": 409,
+   "first_seen": "2026-11-04",
+   "due": "2027-05-03"
+  }
+ ]
+}
